@@ -166,6 +166,12 @@ describe("buildHubItems: app mapping", () => {
     expect(item.status).toBe("unchecked");
   });
 
+  test("maps unmapped app status (e.g. 'weird') to unchecked fallback", () => {
+    const app = mkApp({ status: "weird" as any });
+    const [item] = buildHubItems({ plugins: [], apps: [app], skills: [] });
+    expect(item.status).toBe("unchecked");
+  });
+
   test("kind is mcp-server, installed true, nav appDetail, icon null, uses initial/color", () => {
     const app = mkApp({ id: "slack", initial: "S", color: "#ff00ff" });
     const [item] = buildHubItems({ plugins: [], apps: [app], skills: [] });
@@ -424,6 +430,19 @@ describe("filterHubItems: sort", () => {
     const result = filterHubItems(data, { state: "installed", kind: null, category: null }, "");
     expect(result.map((i) => i.name)).toEqual(["Alpha", "Zebra"]);
   });
+
+  test("within 'updates', items sort attention-first-then-alphabetical", () => {
+    const data = buildHubItems({
+      plugins: [
+        mkPlugin({ id: "zebra", name: "Zebra", status: "update-available", installed: true }),
+        mkPlugin({ id: "alpha", name: "Alpha", status: "update-available", installed: true }),
+      ],
+      apps: [],
+      skills: [],
+    });
+    const result = filterHubItems(data, { state: "updates", kind: null, category: null }, "");
+    expect(result.map((i) => i.name)).toEqual(["Alpha", "Zebra"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -443,10 +462,24 @@ test("railCounts totals match filterHubItems for each state", () => {
 test("kindCounts totals: per-kind counts sum to the full item count, integrations aggregates integration+gateway", () => {
   const data = items();
   const counts = kindCounts(data);
-  const perKindSum =
-    (counts.integration ?? 0) + (counts.gateway ?? 0) + (counts.provider ?? 0) + (counts["skill-pack"] ?? 0) + (counts["mcp-server"] ?? 0);
+  const perKindSum = counts.integration + counts.gateway + counts.provider + counts["skill-pack"] + counts["mcp-server"];
   expect(perKindSum).toBe(data.length);
-  expect(counts.integrations).toBe((counts.integration ?? 0) + (counts.gateway ?? 0));
+  expect(counts.integrations).toBe(counts.integration + counts.gateway);
+});
+
+test("kindCounts pre-seeds all kinds and aggregates to zero even when absent from fixtures", () => {
+  const data = buildHubItems({
+    plugins: [mkPlugin({ id: "github", kind: "integration" })],
+    apps: [],
+    skills: [],
+  });
+  const counts = kindCounts(data);
+  expect(counts.integration).toBe(1);
+  expect(counts.gateway).toBe(0);
+  expect(counts.provider).toBe(0);
+  expect(counts["skill-pack"]).toBe(0);
+  expect(counts["mcp-server"]).toBe(0);
+  expect(counts.integrations).toBe(1);
 });
 
 // ---------------------------------------------------------------------------

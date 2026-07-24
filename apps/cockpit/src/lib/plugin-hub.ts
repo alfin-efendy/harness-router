@@ -215,11 +215,18 @@ export function railCounts(items: HubItem[]): Record<RailState, number> {
 /** Per-kind totals plus an "integrations" aggregate (integration + gateway)
  *  matching the `RailFilter.kind` vocabulary's collapsed option. */
 export function kindCounts(items: HubItem[]): Record<string, number> {
-  const counts: Record<string, number> = {};
+  const counts: Record<string, number> = {
+    integration: 0,
+    gateway: 0,
+    provider: 0,
+    "skill-pack": 0,
+    "mcp-server": 0,
+    integrations: 0,
+  };
   for (const item of items) {
     counts[item.kind] = (counts[item.kind] ?? 0) + 1;
   }
-  counts.integrations = (counts.integration ?? 0) + (counts.gateway ?? 0);
+  counts.integrations = counts.integration + counts.gateway;
   return counts;
 }
 
