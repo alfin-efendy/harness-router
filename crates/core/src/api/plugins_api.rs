@@ -2359,6 +2359,7 @@ mod tests {
     use crate::Registries;
     use ryuzi_plugin_sdk::{AuthSpec, ModelDef, PluginManifest, ProviderMeta};
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -4714,38 +4715,50 @@ writes = true
     /// (`plugins_api.rs`'s step-2 tool source). Unlike `doctor.rs`'s
     /// `WasmComponentDoctorInputs::bundle_root`, `declared_component_tool_entries`
     /// has no injected-root test seam, so pinning its "installed manifest wins
-    /// over embedded" precedence has no choice but to write (and then
-    /// meticulously restore) the real per-user install root. Mirrors
-    /// `doctor.rs`'s `wasm_component_findings::write_bundle` fixture (same
-    /// signed-envelope shape) rather than inventing a new signing path; the
-    /// signature itself is inert for THIS test (`load_active_bundles` never
-    /// reads `plugin.sig` — only `verify_bundle`, a different call path,
+    /// over embedded" precedence has no choice but to write the real per-user
+    /// install root. Mirrors `doctor.rs`'s `wasm_component_findings::write_bundle`
+    /// fixture (same signed-envelope shape) rather than inventing a new signing
+    /// path; the signature itself is inert for THIS test (`load_active_bundles`
+    /// never reads `plugin.sig` — only `verify_bundle`, a different call path,
     /// does), but it is staged anyway to keep the fixture a faithful "real
     /// installed bundle".
+    ///
+    /// `installed_bundle_root()` is process-global (same per-user path every
+    /// test run resolves to — see `StateDirGuard` in `daemon.rs`/`control/tests.rs`
+    /// for the same-shaped precedent), so every test using this fixture must be
+    /// `#[serial]`. It also NEVER hijacks a plugin id that is already installed
+    /// for real on this machine: `stage` refuses (returning `None`, skip-style)
+    /// rather than repointing a real install's `current` pointer at placeholder
+    /// bytes, since a SIGKILL mid-test could otherwise strand the real install.
     struct InstalledBundleFixture {
         plugin_root: std::path::PathBuf,
-        version_dir: std::path::PathBuf,
-        pointer_path: std::path::PathBuf,
-        previous_pointer: Option<Vec<u8>>,
-        plugin_root_preexisted: bool,
     }
 
     impl InstalledBundleFixture {
         /// Stage `plugin_id`@`version` declaring exactly one tool named
-        /// `tool_name`. Returns `(fixture, component_sha256)` — the caller
-        /// still owns recording + activating the release in the store (this
-        /// only touches disk, matching `write_bundle` + `seed_active`'s
-        /// split in `doctor.rs`).
-        fn stage(plugin_id: &str, version: &str, tool_name: &str) -> (Self, String) {
+        /// `tool_name`. Returns `Some((fixture, component_sha256))` — the
+        /// caller still owns recording + activating the release in the store
+        /// (this only touches disk, matching `write_bundle` + `seed_active`'s
+        /// split in `doctor.rs`) — or `None` if `plugin_id` already has a real
+        /// install at this root, in which case nothing on disk is touched and
+        /// the caller must skip the test rather than proceed.
+        fn stage(plugin_id: &str, version: &str, tool_name: &str) -> Option<(Self, String)> {
             use base64::Engine as _;
             use ed25519_dalek::{Signer, SigningKey};
             use sha2::{Digest, Sha256};
 
             let root = crate::plugins::bundle::installed_bundle_root();
             let plugin_root = root.join(plugin_id);
-            let plugin_root_preexisted = plugin_root.is_dir();
+            if plugin_root.exists() {
+                // A real install already lives here — refuse to touch it.
+                eprintln!(
+                    "skipping plugin_tools_prefers_installed_manifest_over_embedded: \
+                     a real install already exists at {} — refusing to hijack it",
+                    plugin_root.display()
+                );
+                return None;
+            }
             let pointer_path = plugin_root.join("current");
-            let previous_pointer = std::fs::read(&pointer_path).ok();
             let version_dir = plugin_root.join(version);
             std::fs::create_dir_all(&version_dir)
                 .expect("create installed-bundle fixture version dir");
@@ -4783,38 +4796,18 @@ writes = true
 
             std::fs::write(&pointer_path, version).expect("write fixture current pointer");
 
-            (
-                Self {
-                    plugin_root,
-                    version_dir,
-                    pointer_path,
-                    previous_pointer,
-                    plugin_root_preexisted,
-                },
-                sha,
-            )
+            Some((Self { plugin_root }, sha))
         }
     }
 
     impl Drop for InstalledBundleFixture {
         fn drop(&mut self) {
+            // `stage`'s guard above guarantees `plugin_root` did NOT exist
+            // before this fixture created it, so it's always safe (and
+            // sufficient) to remove the whole thing on the way out.
             // Best-effort: a cleanup failure must never mask (or panic over)
             // the test's own assertion outcome.
-            let _ = std::fs::remove_dir_all(&self.version_dir);
-            match &self.previous_pointer {
-                Some(bytes) => {
-                    let _ = std::fs::write(&self.pointer_path, bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(&self.pointer_path);
-                }
-            }
-            if !self.plugin_root_preexisted {
-                // Only succeeds if empty — leaves any unrelated real content
-                // this test didn't touch (e.g. another already-installed
-                // version) alone.
-                let _ = std::fs::remove_dir(&self.plugin_root);
-            }
+            let _ = std::fs::remove_dir_all(&self.plugin_root);
         }
     }
 
@@ -4829,7 +4822,13 @@ writes = true
     // ACTIVE installed release declaring a totally different single tool
     // (`installed_only_tool`), then asserts `plugin_tools` returns the
     // installed manifest's tool, not the embedded one's.
+    //
+    // `InstalledBundleFixture` writes the real, process-global
+    // `installed_bundle_root()` (see its doc) — `#[serial]` per this crate's
+    // convention for any test touching a process-global resource (mirrors
+    // `daemon.rs`'s/`control/tests.rs`'s `StateDirGuard` tests).
     #[tokio::test]
+    #[serial]
     async fn plugin_tools_prefers_installed_manifest_over_embedded() {
         let cp = test_cp().await;
 
@@ -4841,11 +4840,16 @@ writes = true
         assert!(embedded.iter().any(|t| t.name == "auth_status"));
         assert!(!embedded.iter().any(|t| t.name == "installed_only_tool"));
 
-        let (_fixture, sha) = InstalledBundleFixture::stage(
+        let Some((_fixture, sha)) = InstalledBundleFixture::stage(
             "github",
             "9.9.9-installed-fixture",
             "installed_only_tool",
-        );
+        ) else {
+            // A real `github` component install already exists on this
+            // machine — `stage` already printed why, and it refused to touch
+            // it. Skip rather than assert anything.
+            return;
+        };
         cp.store()
             .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
                 plugin_id: "github".into(),
