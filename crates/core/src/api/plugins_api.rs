@@ -1468,54 +1468,67 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             .iter()
             .any(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
         let ledger = InstallLedgerFields::from_option(installs.get(pack.id));
-        out.push(PluginInfo {
-            id: pack.id.to_string(),
-            name: pack.name.to_string(),
-            description: pack.description.to_string(),
-            icon: Some("sparkles".to_string()),
-            categories: vec!["skills".to_string()],
-            // A synthesized curated pack has no manifest to declare a slot.
-            slot: None,
-            owns_slot: false,
-            verified: true,
-            experimental: false,
-            // A synthesized pack isn't a registered plugin, so `enabled` /
-            // `configured` are meaningless here — only `installed` drives the
-            // Browse/Installed split.
-            enabled: false,
-            configured: false,
-            source: "skill-pack".to_string(),
-            capabilities: vec![],
-            kind: "skill-pack".to_string(),
-            installed,
-            family: None,
-            pinned: ledger.pinned,
-            source_spec: ledger.source_spec,
-            resolved_commit: ledger.resolved_commit,
-            installed_at: ledger.installed_at,
-            updated_at: ledger.updated_at,
-            trust_tier: ledger.trust_tier,
-            // A synthesized curated pack resolves via git clone, so it is
-            // never a component bundle and never came from a manifest feed.
-            component_backed: false,
-            catalog_version: None,
-            blocked_reason: None,
-            // Synthesized rows have no manifest-backed status machinery
-            // (`enabled`/`configured` are meaningless here too, see above) —
-            // always the Browse-tile default per Task 3's spec.
-            status: "not-installed".to_string(),
-            status_detail: None,
-            auth_kind: "none".to_string(),
-            tool_count: None,
-            skill_count: None,
-        });
+        out.push(curated_pack_row(pack, installed, ledger));
     }
     Ok(out)
 }
 
+/// Synthesizes the `PluginInfo` row for a curated skill pack (e.g.
+/// `superpowers`) that has no registered `CorePlugin`/manifest — shared by
+/// `assemble_list`'s curated-pack loop (a Browse tile before install) and
+/// `assemble_detail`'s not-a-registered-plugin fallback (Task 5), so the two
+/// surfaces can never drift.
+fn curated_pack_row(
+    pack: &crate::skills_install::CuratedSkillPack,
+    installed: bool,
+    ledger: InstallLedgerFields,
+) -> PluginInfo {
+    PluginInfo {
+        id: pack.id.to_string(),
+        name: pack.name.to_string(),
+        description: pack.description.to_string(),
+        icon: Some("sparkles".to_string()),
+        categories: vec!["skills".to_string()],
+        // A synthesized curated pack has no manifest to declare a slot.
+        slot: None,
+        owns_slot: false,
+        verified: true,
+        experimental: false,
+        // A synthesized pack isn't a registered plugin, so `enabled` /
+        // `configured` are meaningless here — only `installed` drives the
+        // Browse/Installed split.
+        enabled: false,
+        configured: false,
+        source: "skill-pack".to_string(),
+        capabilities: vec![],
+        kind: "skill-pack".to_string(),
+        installed,
+        family: None,
+        pinned: ledger.pinned,
+        source_spec: ledger.source_spec,
+        resolved_commit: ledger.resolved_commit,
+        installed_at: ledger.installed_at,
+        updated_at: ledger.updated_at,
+        trust_tier: ledger.trust_tier,
+        // A synthesized curated pack resolves via git clone, so it is
+        // never a component bundle and never came from a manifest feed.
+        component_backed: false,
+        catalog_version: None,
+        blocked_reason: None,
+        // Synthesized rows have no manifest-backed status machinery
+        // (`enabled`/`configured` are meaningless here too, see above) —
+        // always the Browse-tile default per Task 3's spec.
+        status: "not-installed".to_string(),
+        status_detail: None,
+        auth_kind: "none".to_string(),
+        tool_count: None,
+        skill_count: None,
+    }
+}
+
 async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDetail> {
     let Some(plugin) = cp.plugins().get(id) else {
-        anyhow::bail!("unknown plugin: {id}");
+        return curated_pack_detail(cp, id).await;
     };
     let settings = SettingsStore::new(cp.store().clone());
     let enabled = cp.plugins().is_enabled(&settings, id).await?;
@@ -1587,6 +1600,39 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
         models,
         homepage: m.homepage.clone(),
         publisher: m.publisher.clone(),
+    })
+}
+
+/// `assemble_detail`'s fallback when `id` isn't a registered `CorePlugin`: an
+/// uninstalled curated skill pack (e.g. `superpowers`, see
+/// `crate::skills_install::curated_skill_packs`) has no manifest, but
+/// `assemble_list` already synthesizes a Browse-tile row for it via
+/// `curated_pack_row` — navigating into that tile before install must resolve
+/// the same row wrapped in a minimal `PluginDetail`, not 500. A truly unknown
+/// id (matches no curated pack either) still bails `unknown plugin: {id}`,
+/// same text/mechanism `assemble_detail` used before this fallback existed.
+async fn curated_pack_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDetail> {
+    let Some(pack) = crate::skills_install::curated_skill_packs()
+        .iter()
+        .find(|p| p.id == id)
+    else {
+        anyhow::bail!("unknown plugin: {id}");
+    };
+    let ctx = installed_ctx(cp.store()).await?;
+    let installed = ctx
+        .installed_skills
+        .iter()
+        .any(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+    let record = cp.store().get_plugin_install(id).await?;
+    let ledger = InstallLedgerFields::from_option(record.as_ref());
+    Ok(PluginDetail {
+        info: curated_pack_row(pack, installed, ledger),
+        auth: None,
+        settings: vec![],
+        mcp: vec![],
+        models: vec![],
+        homepage: Some(pack.repo.to_string()),
+        publisher: String::new(),
     })
 }
 
@@ -3556,6 +3602,37 @@ mod tests {
             Ok(_) => panic!("expected an error for an unknown plugin id"),
             Err(e) => assert_eq!(e.to_string(), "unknown plugin: nope"),
         }
+    }
+
+    /// Task 5: an uninstalled curated skill pack (e.g. `superpowers`) has no
+    /// registered `CorePlugin` — before this fix, `assemble_detail` bailed
+    /// `unknown plugin: superpowers` for it even though `assemble_list`
+    /// already synthesizes a Browse-tile row (see
+    /// `assemble_list_excludes_runtimes_and_synthesizes_curated_packs`).
+    /// Navigating into that tile must resolve, not 500.
+    #[tokio::test]
+    async fn detail_resolves_uninstalled_curated_skill_pack() {
+        let cp = test_cp().await;
+        assert!(
+            cp.plugins().get("superpowers").is_none(),
+            "precondition: superpowers is a synthesized curated pack, not a registered plugin"
+        );
+        let detail = assemble_detail(&cp, "superpowers")
+            .await
+            .expect("uninstalled curated skill pack should resolve, not error");
+        assert_eq!(detail.info.id, "superpowers");
+        assert_eq!(detail.info.kind, "skill-pack");
+        assert!(!detail.info.installed);
+        assert_eq!(detail.info.status, "not-installed");
+        assert!(detail.auth.is_none());
+        assert!(detail.settings.is_empty());
+        assert!(detail.mcp.is_empty());
+        assert!(detail.models.is_empty());
+        assert_eq!(detail.publisher, "");
+        assert_eq!(
+            detail.homepage.as_deref(),
+            Some("https://github.com/obra/superpowers")
+        );
     }
 
     #[tokio::test]
