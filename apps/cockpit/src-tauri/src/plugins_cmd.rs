@@ -189,7 +189,10 @@ pub async fn plugin_tools(
 ) -> R<PluginToolsResult> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
-        .rpc("plugin_tools", serde_json::json!({ "plugin_id": plugin_id }))
+        .rpc(
+            "plugin_tools",
+            serde_json::json!({ "plugin_id": plugin_id }),
+        )
         .await
 }
 
