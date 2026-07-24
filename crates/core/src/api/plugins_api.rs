@@ -4708,6 +4708,174 @@ writes = true
         assert!(discord.entries.is_empty());
     }
 
+    /// Stages a REAL, `load_active_bundles`-verifiable component bundle
+    /// directly at the production [`crate::plugins::bundle::installed_bundle_root`]
+    /// path — the exact root `declared_component_tool_entries` reads
+    /// (`plugins_api.rs`'s step-2 tool source). Unlike `doctor.rs`'s
+    /// `WasmComponentDoctorInputs::bundle_root`, `declared_component_tool_entries`
+    /// has no injected-root test seam, so pinning its "installed manifest wins
+    /// over embedded" precedence has no choice but to write (and then
+    /// meticulously restore) the real per-user install root. Mirrors
+    /// `doctor.rs`'s `wasm_component_findings::write_bundle` fixture (same
+    /// signed-envelope shape) rather than inventing a new signing path; the
+    /// signature itself is inert for THIS test (`load_active_bundles` never
+    /// reads `plugin.sig` — only `verify_bundle`, a different call path,
+    /// does), but it is staged anyway to keep the fixture a faithful "real
+    /// installed bundle".
+    struct InstalledBundleFixture {
+        plugin_root: std::path::PathBuf,
+        version_dir: std::path::PathBuf,
+        pointer_path: std::path::PathBuf,
+        previous_pointer: Option<Vec<u8>>,
+        plugin_root_preexisted: bool,
+    }
+
+    impl InstalledBundleFixture {
+        /// Stage `plugin_id`@`version` declaring exactly one tool named
+        /// `tool_name`. Returns `(fixture, component_sha256)` — the caller
+        /// still owns recording + activating the release in the store (this
+        /// only touches disk, matching `write_bundle` + `seed_active`'s
+        /// split in `doctor.rs`).
+        fn stage(plugin_id: &str, version: &str, tool_name: &str) -> (Self, String) {
+            use base64::Engine as _;
+            use ed25519_dalek::{Signer, SigningKey};
+            use sha2::{Digest, Sha256};
+
+            let root = crate::plugins::bundle::installed_bundle_root();
+            let plugin_root = root.join(plugin_id);
+            let plugin_root_preexisted = plugin_root.is_dir();
+            let pointer_path = plugin_root.join("current");
+            let previous_pointer = std::fs::read(&pointer_path).ok();
+            let version_dir = plugin_root.join(version);
+            std::fs::create_dir_all(&version_dir)
+                .expect("create installed-bundle fixture version dir");
+
+            let component_bytes = b"plugin_tools installed-manifest-precedence fixture component";
+            std::fs::write(version_dir.join("plugin.wasm"), component_bytes)
+                .expect("write fixture component");
+            let sha = format!("{:x}", Sha256::digest(component_bytes));
+
+            let manifest_toml = format!(
+                "id = \"{plugin_id}\"\nname = \"{plugin_id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"plugin.wasm\"\n\n[[tools]]\nname = \"{tool_name}\"\ndescription = \"Only present in the installed release.\"\n"
+            );
+            std::fs::write(version_dir.join("ryuzi-plugin.toml"), &manifest_toml)
+                .expect("write fixture manifest");
+
+            let release_bytes = format!(
+                "{{\"id\":\"{plugin_id}\",\"version\":\"{version}\",\"wit-api\":\"0.1.0\",\"component_url\":\"https://registry.example.test/{plugin_id}/{version}/plugin.wasm\",\"component_sha256\":\"{sha}\"}}"
+            )
+            .into_bytes();
+            std::fs::write(version_dir.join("release.json"), &release_bytes)
+                .expect("write fixture release.json");
+
+            let key = SigningKey::from_bytes(&[9u8; 32]);
+            let signature = key.sign(&release_bytes);
+            let envelope = serde_json::json!({
+                "key_id": "first-party",
+                "signature": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(signature.to_bytes()),
+            });
+            std::fs::write(
+                version_dir.join("plugin.sig"),
+                serde_json::to_vec(&envelope).unwrap(),
+            )
+            .expect("write fixture signature envelope");
+
+            std::fs::write(&pointer_path, version).expect("write fixture current pointer");
+
+            (
+                Self {
+                    plugin_root,
+                    version_dir,
+                    pointer_path,
+                    previous_pointer,
+                    plugin_root_preexisted,
+                },
+                sha,
+            )
+        }
+    }
+
+    impl Drop for InstalledBundleFixture {
+        fn drop(&mut self) {
+            // Best-effort: a cleanup failure must never mask (or panic over)
+            // the test's own assertion outcome.
+            let _ = std::fs::remove_dir_all(&self.version_dir);
+            match &self.previous_pointer {
+                Some(bytes) => {
+                    let _ = std::fs::write(&self.pointer_path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.pointer_path);
+                }
+            }
+            if !self.plugin_root_preexisted {
+                // Only succeeds if empty — leaves any unrelated real content
+                // this test didn't touch (e.g. another already-installed
+                // version) alone.
+                let _ = std::fs::remove_dir(&self.plugin_root);
+            }
+        }
+    }
+
+    // Task 4 follow-up (review finding): pins branch 2's "prefer the
+    // currently-installed release's on-disk manifest over the embedded one"
+    // precedence in `declared_component_tool_entries` — a brief-mandated
+    // behavior (post-install tool listing must reflect the running release)
+    // that was previously unexercised by any test, resting entirely on manual
+    // mirroring of `plugin_release_detail`'s own active-release-then-disk
+    // read. Stages a real signed bundle for `github` — an embedded id whose
+    // baked-in manifest declares 12 tools including `auth_status` — at an
+    // ACTIVE installed release declaring a totally different single tool
+    // (`installed_only_tool`), then asserts `plugin_tools` returns the
+    // installed manifest's tool, not the embedded one's.
+    #[tokio::test]
+    async fn plugin_tools_prefers_installed_manifest_over_embedded() {
+        let cp = test_cp().await;
+
+        // Fixture premise: github's EMBEDDED manifest has `auth_status` among
+        // its 12 tools and no `installed_only_tool` — if this ever stops
+        // being true the installed-vs-embedded divergence this test relies on
+        // is gone, and it must be revisited rather than silently pass.
+        let embedded = crate::plugins::component_catalog::declared_tools("github");
+        assert!(embedded.iter().any(|t| t.name == "auth_status"));
+        assert!(!embedded.iter().any(|t| t.name == "installed_only_tool"));
+
+        let (_fixture, sha) = InstalledBundleFixture::stage(
+            "github",
+            "9.9.9-installed-fixture",
+            "installed_only_tool",
+        );
+        cp.store()
+            .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
+                plugin_id: "github".into(),
+                version: "9.9.9-installed-fixture".into(),
+                source_url: "https://registry.example.test/github/9.9.9-installed-fixture".into(),
+                sha256: sha,
+                signing_key_id: "first-party".into(),
+                installed_at: crate::paths::now_ms(),
+                active: false,
+                revoked: false,
+                revocation_reason: None,
+            })
+            .await
+            .unwrap();
+        cp.store()
+            .set_active_component_release("github", "9.9.9-installed-fixture")
+            .await
+            .unwrap();
+
+        let res = plugin_tools(&cp, "github").await.unwrap();
+        assert!(!res.live);
+        let names: Vec<&str> = res.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["installed_only_tool"],
+            "the active installed release's manifest must win over the embedded one, \
+             got {names:?}"
+        );
+    }
+
     /// Like `api::tests_support::state`, but with `install_builtins` run
     /// against the `Registries` first (that helper deliberately starts from
     /// an empty registry — see its own doc — so a dispatch test that needs a
