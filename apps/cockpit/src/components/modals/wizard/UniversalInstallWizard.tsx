@@ -30,6 +30,11 @@ export function UniversalInstallWizard({
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [releaseDetail, setReleaseDetail] = useState<ComponentReleaseDetail | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
+  // Guards the premature-close race: before both fetches settle, `plan`
+  // defaults to a single "overview" step, so isLast is (wrongly) true and a
+  // Continue click during the round trip would close the wizard outright.
+  // Stays true until the Promise.all below settles, success or error alike.
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let active = true;
@@ -43,6 +48,7 @@ export function UniversalInstallWizard({
       else toast.error(detailRes.error.message);
       if (releaseRes.status === "ok") setReleaseDetail(releaseRes.data);
       else toast.error(releaseRes.error.message);
+      setLoading(false);
     })();
     return () => {
       active = false;
@@ -111,18 +117,22 @@ export function UniversalInstallWizard({
         ))}
       </div>
       <ModalBody className="mt-3">
-        <StepBody step={currentStep} />
+        {loading ? <div className="text-[13px] text-muted-foreground">Loading…</div> : <StepBody step={currentStep} />}
       </ModalBody>
       <ModalFooter>
-        <Button variant="outline" disabled={isFirst} onClick={back}>
-          Back
-        </Button>
-        {SKIPPABLE_STEPS.has(currentStep) && (
+        {!loading && (
+          <Button variant="outline" disabled={isFirst} onClick={back}>
+            Back
+          </Button>
+        )}
+        {!loading && SKIPPABLE_STEPS.has(currentStep) && (
           <Button variant="ghost" onClick={advance}>
             Skip
           </Button>
         )}
-        <Button onClick={advance}>Continue</Button>
+        <Button disabled={loading} onClick={advance}>
+          Continue
+        </Button>
       </ModalFooter>
     </Modal>
   );

@@ -71,6 +71,54 @@ function releaseFixture(): ComponentReleaseDetail {
   return { pluginId: "notion", releases: [], activeVersion: null, activeManifest: null };
 }
 
+// Provider-shaped fixture with no permissions gate (not component-backed),
+// no settings, and no oauth requirement other than the provider-kind rule
+// itself — planWizardSteps collapses this down to overview/install/connect/
+// done (4 steps), exercising the shell against a plan shorter than the
+// full six-step fixture every other test in this file uses.
+function providerDetailFixture(): PluginDetail {
+  return {
+    info: {
+      id: "openai",
+      name: "OpenAI",
+      description: "OpenAI provider",
+      icon: null,
+      categories: ["llm"],
+      slot: null,
+      ownsSlot: false,
+      verified: true,
+      experimental: false,
+      enabled: false,
+      configured: false,
+      source: "catalog",
+      capabilities: ["provider"],
+      kind: "provider",
+      installed: false,
+      family: "openai",
+      pinned: false,
+      sourceSpec: null,
+      resolvedCommit: null,
+      installedAt: null,
+      updatedAt: null,
+      trustTier: null,
+      catalogVersion: null,
+      componentBacked: false,
+      blockedReason: null,
+      status: "not-installed",
+      statusDetail: null,
+      authKind: "none",
+      toolCount: null,
+      skillCount: null,
+    },
+    auth: null,
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: null,
+    publisher: "OpenAI",
+  };
+}
+
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 
 let detailData: PluginDetail = detailFixture();
@@ -221,4 +269,76 @@ test("a pluginDetail error toasts and still renders the shell", async () => {
 
   expect(toastError).toHaveBeenCalledWith("manifest read failed");
   expect(screen.getByRole("dialog")).toBeTruthy();
+});
+
+test("a pluginReleaseDetail error toasts and still renders the shell", async () => {
+  pluginReleaseDetail.mockImplementationOnce(() =>
+    Promise.resolve({ status: "error" as const, error: { message: "release lookup failed" } }),
+  );
+  await renderWizard();
+
+  expect(toastError).toHaveBeenCalledWith("release lookup failed");
+  const dialog = screen.getByRole("dialog", { name: "Install Notion" });
+  expect(within(dialog).getByText("Step 1 of 6 — Overview")).toBeTruthy();
+});
+
+test("initialStep falls back to step 1 when the plan doesn't include that step", async () => {
+  pluginDetail.mockImplementationOnce(() => ok(providerDetailFixture()));
+  await renderWizard("settings");
+
+  const dialog = screen.getByRole("dialog", { name: "Install OpenAI" });
+  expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
+});
+
+// Finding 1 — before both fetches settle, `plan` used to default to a single
+// "overview" step, making isLast true on first paint; a Continue click
+// during the round trip closed the wizard outright. A permanently-pending
+// pluginDetail mock (same deterministic technique as
+// PluginDetailView.test.tsx's `pluginToolsPendingIds`) freezes the shell
+// mid-fetch so this is reproducible without racing a real promise.
+test("Continue is disabled while the initial fetch is pending and does not close the wizard", async () => {
+  pluginDetail.mockImplementationOnce(() => new Promise<never>(() => {}));
+  render(<UniversalInstallWizard pluginId="notion" onClose={onClose} />);
+  await act(async () => {});
+
+  const dialog = screen.getByRole("dialog");
+  expect(within(dialog).getByText("Loading…")).toBeTruthy();
+  expect(within(dialog).queryByRole("button", { name: "Back" })).toBeNull();
+  expect(within(dialog).queryByRole("button", { name: "Skip" })).toBeNull();
+  const continueButton = within(dialog).getByRole("button", { name: "Continue" }) as HTMLButtonElement;
+  expect(continueButton.disabled).toBe(true);
+
+  act(() => {
+    continueButton.click();
+  });
+  expect(onClose).not.toHaveBeenCalled();
+});
+
+// Finding 2 — every other shell test in this file plans the full six steps;
+// this fixture (provider kind, no auth, no settings, not component-backed,
+// no oauth profiles) collapses the plan to overview/install/connect/done so
+// the progress math and step sequencing are exercised against a shorter plan.
+test("renders a shortened 4-step plan for a provider with no settings or permissions gate", async () => {
+  pluginDetail.mockImplementationOnce(() => ok(providerDetailFixture()));
+  await renderWizard();
+
+  const dialog = screen.getByRole("dialog", { name: "Install OpenAI" });
+  expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
+  const segments = dialog.querySelectorAll(".rounded-full.h-1, .h-1.rounded-full");
+  expect(segments.length).toBe(4);
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  expect(within(dialog).getByText("Step 2 of 4 — Install")).toBeTruthy();
+  expect(within(dialog).queryByText("Permissions")).toBeNull();
+  expect(within(dialog).queryByText("Settings")).toBeNull();
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  expect(within(dialog).queryByText("Permissions")).toBeNull();
+  expect(within(dialog).queryByText("Settings")).toBeNull();
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  expect(within(dialog).getByText("Step 4 of 4 — Done")).toBeTruthy();
+  expect(within(dialog).queryByText("Permissions")).toBeNull();
+  expect(within(dialog).queryByText("Settings")).toBeNull();
 });
