@@ -1591,9 +1591,10 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
 }
 
 /// `plugin_tools` RPC: everything a plugin currently offers — an agent-facing
-/// tool, an installed skill, or a provider's model — as one flat list.
-/// Exactly one of the sources below applies per plugin id (first match
-/// wins):
+/// tool, an installed skill, or a provider's model — as one flat list. The
+/// sources below are tried in order; a branch "wins" (returns) only when it
+/// actually has at least one entry, EXCEPT the last one, which always wins
+/// (it's the terminal fallback):
 ///
 /// 1. **Live extension tools** — this plugin declares the `extension`
 ///    capability AND the host has at least one `Running` instance spawned
@@ -1609,7 +1610,15 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
 ///    `plugin_release_detail` performs) so a post-install listing reflects
 ///    the running release; falls back to the embedded manifest
 ///    ([`crate::plugins::component_catalog::declared_tools`]) so a bundle
-///    not yet installed still shows "what you'll get". `live: false`.
+///    not yet installed still shows "what you'll get". `live: false`. A
+///    component-backed id with ZERO declared tools does NOT return here — it
+///    falls through to steps 3-4, because a component-backed *provider*
+///    (e.g. `mimo`, `opencode`: `is_component_bundle` is true for them, but
+///    their embedded bundle manifest declares no `[[tools]]`) must still
+///    reach step 4's model list rather than short-circuit to an empty
+///    result. A gateway like `discord` (also zero declared tools, no
+///    provider capability) still ends up empty — it just gets there via
+///    step 4's empty-list fallback instead of step 2's early return.
 /// 3. **Skill packs** — `id` is an installed skill pack
 ///    ([`crate::skills_install::get_installed_skill_pack`]): one entry per
 ///    installed skill, description-less (a skill's prose lives in its own
@@ -1663,14 +1672,19 @@ async fn plugin_tools(cp: &ControlPlane, id: &str) -> Result<PluginToolsResult, 
         }
     }
 
-    // 2. Declared component tools.
+    // 2. Declared component tools. Only short-circuits when there's actually
+    // something to show — a component-backed provider (mimo, opencode) has
+    // no declared tools and must fall through to step 4's model list instead
+    // of resolving to a misleadingly empty result.
     if crate::plugins::component_catalog::is_component_bundle(id) {
         let entries = declared_component_tool_entries(cp, id).await?;
-        return Ok(PluginToolsResult {
-            plugin_id: id.to_string(),
-            live: false,
-            entries,
-        });
+        if !entries.is_empty() {
+            return Ok(PluginToolsResult {
+                plugin_id: id.to_string(),
+                live: false,
+                entries,
+            });
+        }
     }
 
     // 3. Skill packs.
@@ -4603,7 +4617,7 @@ writes = true
         let cp = test_cp().await;
         let res = plugin_tools(&cp, "github").await.unwrap();
         assert!(!res.live);
-        assert!(!res.entries.is_empty());
+        assert_eq!(res.entries.len(), 12, "github declares exactly 12 tools");
         assert!(res.entries.iter().all(|e| e.kind == "tool"));
         assert!(res.entries.iter().all(|e| e.writes.is_some()));
     }
@@ -4636,6 +4650,62 @@ writes = true
         for model in &models {
             assert!(names.contains(&model.as_str()));
         }
+    }
+
+    // "mimo" is the exact regression this test guards: `is_component_bundle`
+    // is true (it's an embedded first-party bundle, see
+    // `component_catalog::COMPONENT_BUNDLE_MANIFESTS`) AND it's a
+    // component-BACKED PROVIDER (`install_providers` registers it — its bundle
+    // id also sits in `llm_router::registry::CATALOG` — so its `CorePlugin`
+    // has `manifest.provider.is_some()`), AND its embedded bundle manifest
+    // declares zero `[[tools]]`. Before this fix, branch 2 returned that empty
+    // tool list and never reached branch 4, hiding the provider's models from
+    // the Tools & Skills surface entirely. Also re-asserts the two contracts
+    // this fix must NOT disturb: github (non-empty declared tools) still
+    // resolves at branch 2 with exactly its 12 declared tools, and discord (a
+    // gateway component with zero declared tools and no provider capability)
+    // still falls through to an empty, well-formed result rather than an
+    // error.
+    #[tokio::test]
+    async fn plugin_tools_component_backed_provider_lists_models() {
+        let cp = test_cp().await;
+
+        // Precondition: mimo really is component-backed with nothing declared.
+        assert!(crate::plugins::component_catalog::is_component_bundle(
+            "mimo"
+        ));
+        assert!(crate::plugins::component_catalog::declared_tools("mimo").is_empty());
+        let plugin = cp.plugins().get("mimo").expect("mimo registered");
+        assert!(
+            plugin.manifest.provider.is_some(),
+            "mimo must be registered as a provider plugin, not a bare component"
+        );
+
+        let models = providers::list_models(cp.store(), "mimo").await.unwrap();
+        assert!(!models.is_empty(), "fixture assumption: mimo seeds models");
+
+        let res = plugin_tools(&cp, "mimo").await.unwrap();
+        assert!(!res.live);
+        assert_eq!(res.entries.len(), models.len());
+        assert!(res.entries.iter().all(|e| e.kind == "model"));
+        assert!(res.entries.iter().all(|e| e.writes.is_none()));
+        let names: Vec<&str> = res.entries.iter().map(|e| e.name.as_str()).collect();
+        for model in &models {
+            assert!(names.contains(&model.as_str()));
+        }
+
+        // github: unchanged — non-empty declared tools still short-circuit at
+        // branch 2, with exactly its 12 declared tools.
+        let github = plugin_tools(&cp, "github").await.unwrap();
+        assert!(!github.live);
+        assert_eq!(github.entries.len(), 12);
+        assert!(github.entries.iter().all(|e| e.kind == "tool"));
+
+        // discord: unchanged — zero declared tools, no provider capability,
+        // still resolves to an empty, well-formed result via the fallthrough.
+        let discord = plugin_tools(&cp, "discord").await.unwrap();
+        assert!(!discord.live);
+        assert!(discord.entries.is_empty());
     }
 
     /// Like `api::tests_support::state`, but with `install_builtins` run
