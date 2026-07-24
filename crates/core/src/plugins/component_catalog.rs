@@ -239,4 +239,24 @@ mod tests {
             );
         }
     }
+
+    // Every first-party connector/gateway manifest must declare the tools its
+    // component registers, with no duplicate names, so Cockpit can show "what
+    // you'll get" before the bundle is ever installed (Task 1).
+    #[test]
+    fn first_party_connector_manifests_declare_tools() {
+        for id in ["github", "discord", "atlassian", "bitbucket"] {
+            let (_, src) = COMPONENT_BUNDLE_MANIFESTS
+                .iter()
+                .find(|(got, _)| *got == id)
+                .unwrap_or_else(|| panic!("`{id}` must be an embedded component manifest"));
+            let m: PluginBundleManifest = toml::from_str(src)
+                .unwrap_or_else(|e| panic!("component manifest `{id}` failed to parse: {e}"));
+            assert!(!m.tools.is_empty(), "{id} must declare its tools");
+            let mut names: Vec<_> = m.tools.iter().map(|t| t.name.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), m.tools.len(), "{id} tool names must be unique");
+        }
+    }
 }

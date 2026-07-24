@@ -600,6 +600,7 @@ pub(crate) async fn build_test_transport_with_grants(
                 })
                 .collect(),
             provider_ids: grants.provider_ids.clone(),
+            tools: vec![],
         },
         release: PluginRelease {
             id: provider_id.to_string(),

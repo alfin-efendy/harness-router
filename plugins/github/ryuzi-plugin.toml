@@ -39,3 +39,63 @@ scopes = ["repo", "read:org", "user"]
 # Public identifier, not a secret.
 client-id = "Ov23lijhiwiIgxoH2VcV"
 dynamic-registration = false
+
+# The tools this component exposes to agents (name/description copied verbatim
+# from `plugins/github/src/logic.rs::tool_definitions`). `writes = true` marks
+# every tool that mutates GitHub state — these are exactly the ones gated
+# behind `confirm=true` in the component (see the description above); `graphql`
+# is included because an unconfirmed mutation query is rejected, not because
+# every call mutates.
+[[tools]]
+name = "auth_status"
+description = "Report whether GitHub is connected, and the authenticated login/name when it is."
+
+[[tools]]
+name = "repo_get"
+description = "Get metadata for a repository (owner/repo)."
+
+[[tools]]
+name = "repo_list"
+description = "List repositories for the authenticated user, or for `user` when given."
+
+[[tools]]
+name = "issue_list"
+description = "List issues in a repository. Optional `state` = open | closed | all."
+
+[[tools]]
+name = "pr_list"
+description = "List pull requests in a repository. Optional `state` = open | closed | all."
+
+[[tools]]
+name = "rest_get"
+description = "Arbitrary authenticated GET against api.github.com; `path` is the API path (e.g. /rate_limit)."
+
+[[tools]]
+name = "graphql"
+description = "Run a GitHub GraphQL query. A mutation (query starting with `mutation`) requires confirm=true."
+writes = true
+
+[[tools]]
+name = "issue_create"
+description = "Create an issue. Mutating: requires confirm=true."
+writes = true
+
+[[tools]]
+name = "issue_comment"
+description = "Comment on an issue. Mutating: requires confirm=true."
+writes = true
+
+[[tools]]
+name = "pr_create"
+description = "Open a pull request. Mutating: requires confirm=true."
+writes = true
+
+[[tools]]
+name = "pr_review"
+description = "Submit a pull-request review. `event` = APPROVE | REQUEST_CHANGES | COMMENT. Mutating: requires confirm=true."
+writes = true
+
+[[tools]]
+name = "pr_merge"
+description = "Merge a pull request. `method` = merge | squash | rebase. Mutating: requires confirm=true."
+writes = true

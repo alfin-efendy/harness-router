@@ -1376,6 +1376,7 @@ mod tests {
             },
             oauth: vec![],
             provider_ids: vec![],
+            tools: vec![],
         }
     }
 
