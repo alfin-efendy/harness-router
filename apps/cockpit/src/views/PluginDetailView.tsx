@@ -36,6 +36,7 @@ import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
 import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
+import { deriveSetupChecklist, SetupChecklist } from "@/components/plugins/SetupChecklist";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { useNav } from "@/store-nav";
 import { usePlugins } from "@/store-plugins";
@@ -741,6 +742,23 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   // to the Versions tab's `ComponentReleaseCard`.
   const showPermissionSummary = hasVersionsTab;
 
+  // Setup checklist — Task 11. Same inputs `hasAuthTab`/`hasSettingsTab`
+  // above already derive from (`PluginInfo.authKind`/`installed`, `detail.
+  // auth?.configured`, `detail.settings`), just reshaped into the pure
+  // `deriveSetupChecklist` contract. Renders only while something's still
+  // undone AND the install gate is actually reachable — either the plugin is
+  // already installed (mid-setup: connect/settings left) or it's
+  // component-backed (its own install gate lives on the Versions tab
+  // regardless of `installed`, same condition `visibleTabs` uses for that
+  // tab).
+  const setupItems = deriveSetupChecklist({
+    installed: info.installed,
+    authKind: info.authKind,
+    authConfigured: detail.auth?.configured ?? true,
+    requiredSettingsMissing: detail.settings.filter((f) => f.required && !f.valueSet).length,
+  });
+  const showSetupChecklist = setupItems.some((item) => !item.done) && (info.installed || info.componentBacked);
+
   const onToggleEnabled = async () => {
     if (experimental) return;
     await setEnabled(id, !info.enabled);
@@ -750,6 +768,14 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const onInstallClick = () => {
     if (info.componentBacked) setTab("versions");
     else setInstallWizardOpen(true);
+  };
+
+  // `install` reuses the SAME hero handler above (not a duplicate branch);
+  // `connect`/`settings` both land on the Settings tab today — Task 14
+  // upgrades these two to resume the guided wizard at that specific step.
+  const onSetupChecklistAction = (itemId: "install" | "connect" | "settings") => {
+    if (itemId === "install") onInstallClick();
+    else setTab("settings");
   };
 
   const onUninstall = async () => {
@@ -985,6 +1011,8 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
             )}
 
             {attachFailureBanner}
+
+            {showSetupChecklist && <SetupChecklist items={setupItems} onAction={onSetupChecklistAction} />}
 
             <Card className="mb-3">
               <CardHeader>

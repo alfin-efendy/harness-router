@@ -350,6 +350,15 @@ const oauthDetail: PluginDetail = {
   publisher: "Acme",
 };
 
+// Task 11: the SAME oauth plugin as `oauthDetail`, but already connected —
+// used to prove the setup checklist disappears once nothing is left undone
+// (as opposed to `oauthDetail`, its mid-setup counterpart).
+const oauthConnectedDetail: PluginDetail = {
+  ...oauthDetail,
+  info: { ...oauthDetail.info, id: "acme-oauth-connected", name: "Acme OAuth Connected" },
+  auth: { ...(oauthDetail.auth as NonNullable<PluginDetail["auth"]>), configured: true, oauthTokenStored: true },
+};
+
 // A plugin exercising every `SettingField.kind` shape (Feature C3):
 // `verbose` is a Bool (renders a Switch), `tier` is an enum (`options`
 // non-empty, renders a Combobox), `retries` is a plain Int (renders a
@@ -479,6 +488,7 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
   if (id === "acme-oauth") return ok(oauthDetail);
+  if (id === "acme-oauth-connected") return ok(oauthConnectedDetail);
   if (id === "acme-rich") return ok(richFieldsDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
   if (id === "acme-fresh") return ok(freshDetail);
@@ -1226,8 +1236,11 @@ test("a never-installed component plugin opens its management page (not 'Plugin 
   expect(await screen.findByText("mimo")).toBeTruthy();
   // The hero's Install action is reachable even before any release exists —
   // for a component-backed plugin it jumps to the Versions tab, where the
-  // real install gate lives.
-  fireEvent.click(screen.getByRole("button", { name: "Install" }));
+  // real install gate lives. Task 11: the Overview setup checklist ALSO
+  // shows its own "Install" button for this exact (component-backed,
+  // never-installed) scenario, so this specifically targets the hero's copy
+  // — first in DOM order, since it renders above the tabbed content.
+  fireEvent.click(screen.getAllByRole("button", { name: "Install" })[0]);
   expect(await screen.findByText("Not installed")).toBeTruthy();
   expect(screen.queryByText("Plugin not found.")).toBeNull();
 });
@@ -1505,4 +1518,61 @@ test("pre-install (never enabled/configured, non-experimental, non-component) sh
 
   fireEvent.click(screen.getByRole("button", { name: "Install" }));
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-fresh"));
+});
+
+// ---------- Setup checklist (Overview) — Task 11 ----------
+//
+// `oauthDetail` is already the exact mid-setup shape the brief calls for
+// (installed, oauth, not connected) — no new fixture needed for the
+// "appears" half; `oauthConnectedDetail` (same plugin, fully connected)
+// proves the "hides once complete" half.
+
+test("the setup checklist appears on Overview for a mid-setup plugin (installed, oauth, not connected)", async () => {
+  render(<PluginDetailView id="acme-oauth" />);
+  await screen.findByText("Acme OAuth");
+
+  const panel = within(screen.getByTestId("tab-panel-overview"));
+  expect(panel.getByText("Finish setting up")).toBeTruthy();
+  // install is already done (installed: true); connect is the first (and
+  // only) undone item, so it — not install — carries the action button.
+  expect(panel.getByText("Install the plugin").className).toContain("text-muted-foreground");
+  expect(panel.getByText("Connect your account").className).not.toContain("text-muted-foreground");
+  expect(panel.getByRole("button", { name: "Connect" })).toBeTruthy();
+});
+
+test("the setup checklist is hidden once every item is done", async () => {
+  render(<PluginDetailView id="acme-oauth-connected" />);
+  await screen.findByText("Acme OAuth Connected");
+
+  expect(screen.queryByText("Finish setting up")).toBeNull();
+});
+
+test("the checklist's Connect action switches to the Settings tab (Task 14 upgrades this to resume the wizard)", async () => {
+  render(<PluginDetailView id="acme-oauth" />);
+  await screen.findByText("Acme OAuth");
+
+  const panel = within(screen.getByTestId("tab-panel-overview"));
+  fireEvent.click(panel.getByRole("button", { name: "Connect" }));
+
+  expect(await screen.findByText("Authentication")).toBeTruthy();
+  const settingsTabButton = screen.getByRole("button", { name: "Settings" });
+  expect(settingsTabButton.className).toContain("bg-background");
+});
+
+test("the checklist's install action reuses the hero's Install handler (component-backed jumps straight to Versions)", async () => {
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  // mimo is never-installed + component-backed: the checklist's first
+  // undone item is "install", scoped to the Overview panel so this can't
+  // accidentally hit the hero's OWN (separate) Install button above it.
+  const panel = within(screen.getByTestId("tab-panel-overview"));
+  expect(panel.getByText("Finish setting up")).toBeTruthy();
+  fireEvent.click(panel.getByRole("button", { name: "Install" }));
+
+  // Same behavior the hero's own Install button exercises elsewhere
+  // (component-backed → jump to the Versions tab, where the real install/
+  // permission gate lives) — proves the checklist reused that handler
+  // rather than duplicating the branch.
+  expect(await screen.findByTestId("tab-panel-versions")).toBeTruthy();
 });
