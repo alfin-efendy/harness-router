@@ -8,6 +8,7 @@ import {
   type DoctorFinding,
   type PluginInfo,
   type PluginProfileDeviceFlowStart,
+  type PluginToolEntry,
 } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
@@ -48,6 +49,16 @@ type PluginsState = {
    *  `PluginInfo` row does not carry. */
   componentPlugins: ComponentReleaseDetail[];
   componentPluginsLoaded: boolean;
+  /** `plugin_tools` results cached by plugin id — the Tools & Skills tab's
+   *  RPC-fed entries (Task 10). Absent until `loadTools` resolves for that
+   *  id; a re-`loadTools` call always refetches (no staleness guard), same
+   *  as `pluginReleaseDetail`. */
+  toolsById: Record<string, PluginToolEntry[]>;
+  /** `PluginToolsResult.live` per plugin id, alongside `toolsById` — whether
+   *  those cached entries came from a live extension enumeration versus
+   *  declared/manifest/model data (see `PluginToolEntry`'s doc). Drives
+   *  `PluginToolsList`'s "Declared by the plugin…" hint. */
+  toolsLiveById: Record<string, boolean>;
   load: () => Promise<void>;
   loadDoctor: () => Promise<void>;
   refreshCatalog: () => Promise<void>;
@@ -58,6 +69,11 @@ type PluginsState = {
   loadComponentBootstrapStatus: () => Promise<void>;
   loadComponentPlugins: () => Promise<void>;
   pluginReleaseDetail: (id: string) => Promise<ComponentReleaseDetail | null>;
+  /** `plugin_tools` for one plugin id — caches into `toolsById`, toast on
+   *  error (matches `loadDoctor`'s reasoning: unlike `pluginReleaseDetail`'s
+   *  expected-404 case, a `plugin_tools` failure for a known id is a real
+   *  error worth surfacing). Callers re-invoke to force a refetch. */
+  loadTools: (id: string) => Promise<void>;
   installComponentPlugin: (id: string, version?: string) => Promise<ComponentReleaseDetail | null>;
   rollbackComponentPlugin: (id: string, fromVersion: string, toVersion: string) => Promise<ComponentReleaseDetail | null>;
   /** Component OAuth profile device-flow connect. Thin RPC wrappers — the
@@ -107,6 +123,8 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   componentBootstrapStatus: null,
   componentPlugins: [],
   componentPluginsLoaded: false,
+  toolsById: {},
+  toolsLiveById: {},
 
   load: async () => {
     const res = await commands.listPlugins("local");
@@ -236,6 +254,18 @@ export const usePlugins = create<PluginsState>((set, get) => ({
       return null;
     }
     return res.data;
+  },
+
+  loadTools: async (id) => {
+    const res = await commands.pluginTools("local", id);
+    if (res.status === "error") {
+      toast.error(`Couldn't load tools: ${res.error.message}`);
+      return;
+    }
+    set({
+      toolsById: { ...get().toolsById, [id]: res.data.entries },
+      toolsLiveById: { ...get().toolsLiveById, [id]: res.data.live },
+    });
   },
 
   installComponentPlugin: async (id, version) => {

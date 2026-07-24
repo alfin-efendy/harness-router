@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { DoctorFinding, ExtensionStatusEntry, PluginDetail } from "@/bindings";
+import type { DoctorFinding, ExtensionStatusEntry, PluginDetail, PluginToolEntry } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
@@ -518,6 +518,24 @@ const setPluginPin = mock((_runnerId: string, id: string, pinned: boolean, _reas
   return ok(null);
 });
 const uninstallPlugin = mock((_runnerId: string, _id: string) => ok([]));
+// Task 10: `plugin_tools` per-id fixtures. Absent from the map ⇒ the same
+// "no live data yet" baseline the brief calls for
+// (`{ pluginId, live: false, entries: [] }`) — a plugin id this file doesn't
+// opt into stays exactly as before Task 10 (an empty Tools tab if it has one
+// at all).
+let pluginToolsFixtures: Record<string, { live: boolean; entries: PluginToolEntry[] }> = {};
+// A real `plugin_tools` call resolves the SAME declared manifest tools a
+// pre-install component's `pluginReleaseDetail` fallback would use (branch 2
+// of the daemon's `plugin_tools`, see `plugins_api.rs`), so in production the
+// fallback is only ever visible for the brief window before that RPC
+// resolves. To test the fallback deterministically (rather than racing a
+// promise that always wins by the time `findByText` settles), a test can
+// register an id here to keep its `plugin_tools` call permanently pending.
+const pluginToolsPendingIds = new Set<string>();
+const pluginTools = mock((_runnerId: string, id: string) => {
+  if (pluginToolsPendingIds.has(id)) return new Promise<never>(() => {});
+  return ok({ pluginId: id, live: pluginToolsFixtures[id]?.live ?? false, entries: pluginToolsFixtures[id]?.entries ?? [] });
+});
 // Task 9: the pre-install hero's Install action opens `InstallWizardModal`
 // for a non-component plugin — these are its own mount-time RPCs (a full
 // happy-path stub, matching `InstallWizardModal.test.tsx`'s own baseline),
@@ -568,6 +586,11 @@ type ReleaseDetailFixture = {
     lifecycle: string;
     domains: string[];
     oauthProfiles: { id: string; scopes: string[] }[];
+    // Task 10: the pre-install Tools tab fallback source
+    // (`ComponentManifestInfo.tools`) — optional here (rather than mirroring
+    // the real DTO's required field) so every pre-Task-10 fixture literal in
+    // this file stays valid without adding `tools: []` to each one.
+    tools?: { name: string; description: string; writes: boolean }[];
   } | null;
 };
 const emptyReleaseDetail = (id: string): ReleaseDetailFixture => ({
@@ -659,6 +682,7 @@ mock.module("@/bindings", () => ({
     beginPluginInstall,
     cancelPluginInstall,
     setPluginOauthClientId,
+    pluginTools,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
@@ -691,11 +715,14 @@ beforeEach(() => {
   beginPluginInstall.mockClear();
   cancelPluginInstall.mockClear();
   setPluginOauthClientId.mockClear();
+  pluginTools.mockClear();
   doctorFindingsFixture = [];
   extensionStatusFixture = [];
   acmePackPinned = false;
   mimoReleaseFixture = emptyReleaseDetail("mimo");
   componentReleaseFixtures = {};
+  pluginToolsFixtures = {};
+  pluginToolsPendingIds.clear();
   openUrl.mockClear();
   usePlugins.setState({
     plugins: [],
@@ -706,6 +733,8 @@ beforeEach(() => {
     componentBootstrapStatus: null,
     componentPlugins: [],
     componentPluginsLoaded: false,
+    toolsById: {},
+    toolsLiveById: {},
   });
 });
 
@@ -720,6 +749,8 @@ afterEach(() => {
     componentBootstrapStatus: null,
     componentPlugins: [],
     componentPluginsLoaded: false,
+    toolsById: {},
+    toolsLiveById: {},
   });
 });
 
@@ -881,26 +912,78 @@ test("lists MCP servers with their transport and endpoint", async () => {
   expect(screen.getByText("https://api.githubcopilot.com/mcp/")).toBeTruthy();
 });
 
-test("renders a Models card listing every model for provider-capable plugins", async () => {
+// ---------- Tools & Skills tab — Task 10 ----------
+//
+// The overview's old "Models" card is gone; a provider's models now render
+// as `kind: "model"` `plugin_tools` entries in the Tools tab, alongside any
+// tool/skill entries (see `PluginToolsList.test.tsx` for that grouping's own
+// coverage — this file only proves the wiring: the RPC is called for the
+// mounted id, its entries land in the tab, and the overview card never
+// comes back).
+
+test("a provider's models come from plugin_tools and render in the Tools tab, not on Overview", async () => {
+  pluginToolsFixtures.ollama = {
+    live: true,
+    entries: [
+      { name: "llama3", description: "", kind: "model", writes: null },
+      { name: "mistral", description: "", kind: "model", writes: null },
+    ],
+  };
   render(<PluginDetailView id="ollama" />);
   await screen.findByText("Ollama");
+  await waitFor(() => expect(pluginTools).toHaveBeenCalledWith(LOCAL_RUNNER, "ollama"));
 
-  // Models stays on Overview (Task 10 moves it into the Tools tab).
-  expect(screen.getByText("Models")).toBeTruthy();
-  expect(screen.getByText("llama3")).toBeTruthy();
+  // The overview Models card is gone entirely — no stray "Models" text and
+  // no model names leak onto the default (Overview) tab.
+  expect(screen.queryByText("Models")).toBeNull();
+  expect(screen.queryByText("llama3")).toBeNull();
+
+  const toolsTabButton = await screen.findByRole("button", { name: /Tools \(2\)/ });
+  fireEvent.click(toolsTabButton);
+  expect(await screen.findByText("llama3")).toBeTruthy();
   expect(screen.getByText("mistral")).toBeTruthy();
 
-  // The declared settings field moved into the Settings tab.
+  // The declared settings field still lives on the Settings tab.
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
   expect(screen.getByText("Base URL")).toBeTruthy();
   expect(screen.getByPlaceholderText("Optional — not set")).toBeTruthy();
 });
 
-test("omits the Models card for non-provider plugins", async () => {
+test("a plugin with no plugin_tools entries and no manifest tools gets no Tools tab, and no Models card either", async () => {
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
+  await waitFor(() => expect(pluginTools).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
 
+  expect(screen.queryByRole("button", { name: /Tools/ })).toBeNull();
   expect(screen.queryByText("Models")).toBeNull();
+});
+
+test("a component's declared manifest tools render as the pre-install Tools tab fallback, with the declared-list hint", async () => {
+  // Keeps `plugin_tools` from ever resolving for this id, so the fallback
+  // (derived from `pluginReleaseDetail`'s already-loaded manifest) stays the
+  // resolved source for the whole test — see `pluginToolsPendingIds`'s doc.
+  pluginToolsPendingIds.add("atlassian");
+  componentReleaseFixtures.atlassian = {
+    pluginId: "atlassian",
+    activeVersion: null,
+    releases: [],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.atlassian.com"],
+      oauthProfiles: [],
+      tools: [{ name: "jira_search", description: "Search Jira issues", writes: false }],
+    },
+  };
+  render(<PluginDetailView id="atlassian" />);
+  await screen.findByText("atlassian");
+
+  const toolsTabButton = await screen.findByRole("button", { name: /Tools \(1\)/ });
+  fireEvent.click(toolsTabButton);
+  expect(await screen.findByText("jira_search")).toBeTruthy();
+  expect(screen.getByText("Search Jira issues")).toBeTruthy();
+  expect(screen.getByText("Declared by the plugin — final list may differ after install.")).toBeTruthy();
 });
 
 test("disables the enable switch for experimental plugins", async () => {

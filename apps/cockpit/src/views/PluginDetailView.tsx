@@ -28,12 +28,14 @@ import {
   type ComponentReleaseInfo,
   type ExtensionStatusEntry,
   type PluginDetail,
+  type PluginToolEntry,
 } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
 import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
+import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { useNav } from "@/store-nav";
 import { usePlugins } from "@/store-plugins";
@@ -408,6 +410,9 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     loadDoctor,
     installComponentPlugin,
     rollbackComponentPlugin,
+    toolsById,
+    toolsLiveById,
+    loadTools,
   } = usePlugins();
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -480,6 +485,14 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   useEffect(() => {
     if (!doctorLoaded) void loadDoctor();
   }, [doctorLoaded, loadDoctor]);
+
+  // Tools & Skills tab — Task 10. Fetches on mount and whenever `id` changes;
+  // the store caches by id (`toolsById`/`toolsLiveById`), so navigating back
+  // to a previously viewed plugin re-fetches rather than trusting a stale
+  // cache (matches `pluginReleaseDetail`'s own no-staleness-guard behavior).
+  useEffect(() => {
+    void loadTools(id);
+  }, [id, loadTools]);
 
   // Extension (Track D "code plugin") status — DT8. `extension_status` is a
   // params-free rpc returning every plugin's entries (mirrors `catalog_status`),
@@ -678,7 +691,30 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const hasAuthTab = (!!detail.auth && detail.auth.kind !== "none") || hasComponentOauth;
   const hasSettingsTab = detail.settings.length > 0 || detail.mcp.length > 0;
   const hasHealthTab = isExtensionPlugin || idFindings.length > 0;
-  const hasToolsTab = (info.toolCount ?? 0) > 0 || (releaseDetail?.activeManifest?.tools?.length ?? 0) > 0;
+
+  // Tools & Skills tab — Task 10. `fallbackTools` is the pre-install case: a
+  // component-backed plugin's declared manifest tools (Task 2), mapped to the
+  // same `PluginToolEntry` shape `plugin_tools` returns, so `PluginToolsList`
+  // never needs to branch on which source it came from. Once the store's
+  // `loadTools(id)` resolves (even to an empty list), its cache wins over the
+  // fallback — `id in toolsById` is the "has this id's fetch completed" gate
+  // (an empty array is falsy under `??`, so a plain `toolsById[id] ??
+  // fallbackTools` would wrongly keep showing the fallback after a real
+  // fetch resolved to zero entries).
+  const toolsLoaded = id in toolsById;
+  const fallbackTools: PluginToolEntry[] = (releaseDetail?.activeManifest?.tools ?? []).map((t) => ({
+    name: t.name,
+    description: t.description,
+    kind: "tool",
+    writes: t.writes,
+  }));
+  const resolvedTools = toolsLoaded ? (toolsById[id] ?? []) : fallbackTools;
+  const resolvedToolsLive = toolsLoaded ? (toolsLiveById[id] ?? false) : false;
+  // A provider whose models only ever arrive via `plugin_tools` (`toolCount`
+  // is null, no manifest tools) must still get a Tools tab once that fetch
+  // resolves with entries — hence the `resolvedTools.length > 0` arm below,
+  // not just the two pre-load signals.
+  const hasToolsTab = (info.toolCount ?? 0) > 0 || fallbackTools.length > 0 || resolvedTools.length > 0;
   const tabs = visibleTabs({
     installed: info.installed,
     hasTools: hasToolsTab,
@@ -688,9 +724,13 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     hasHealth: hasHealthTab,
   });
   const activeTab: DetailTab = tabs.includes(tab) ? tab : "overview";
+  // Before the store's fetch resolves and there's no manifest fallback
+  // either, the label falls back to the list's own pre-fetch estimate
+  // (`info.toolCount`) rather than flashing "(0)".
+  const toolsTabCount = toolsLoaded || fallbackTools.length > 0 ? resolvedTools.length : (info.toolCount ?? 0);
   const TAB_LABEL: Record<DetailTab, string> = {
     overview: "Overview",
-    tools: `Tools (${info.toolCount ?? 0})`,
+    tools: `Tools (${toolsTabCount})`,
     settings: "Settings",
     versions: "Versions",
     health: "Health",
@@ -983,33 +1023,16 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
                 </div>
               </Card>
             )}
-
-            {info.capabilities.includes("provider") && (
-              <Card>
-                <CardHeader>
-                  <CardTitle>Models</CardTitle>
-                  <CardHint>{detail.models.length} available</CardHint>
-                </CardHeader>
-                {detail.models.length === 0 ? (
-                  <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">No models detected.</div>
-                ) : (
-                  detail.models.map((m) => (
-                    <CardRow key={m}>
-                      <span className="flex-1 truncate font-mono text-xs">{m}</span>
-                    </CardRow>
-                  ))
-                )}
-              </Card>
-            )}
           </div>
         )}
 
         {activeTab === "tools" && (
           <div data-testid="tab-panel-tools">
-            {/* Task 10 wires the real `plugin_tools`-backed list — for now
-                the tab exists (with its manifest-declared count) but the body
-                is an honest placeholder. */}
-            <Card className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">No tools listed yet.</Card>
+            {/* Task 10: the real `plugin_tools`-backed list, grouped by kind
+                (Tools/Skills/Models) — a provider's models moved here from
+                the old Overview "Models" card, so this is now the ONE place
+                a provider's model list shows. */}
+            <PluginToolsList entries={resolvedTools} live={resolvedToolsLive} />
           </div>
         )}
 
