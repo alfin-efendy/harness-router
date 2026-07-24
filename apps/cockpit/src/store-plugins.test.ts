@@ -69,6 +69,11 @@ const builtin: PluginInfo = {
   catalogVersion: null,
   componentBacked: false,
   blockedReason: null,
+  status: "ok",
+  statusDetail: null,
+  authKind: "none",
+  toolCount: null,
+  skillCount: null,
 };
 
 const github: PluginInfo = {
@@ -97,6 +102,11 @@ const github: PluginInfo = {
   catalogVersion: null,
   componentBacked: false,
   blockedReason: null,
+  status: "ok",
+  statusDetail: null,
+  authKind: "none",
+  toolCount: null,
+  skillCount: null,
 };
 
 const skillPack: PluginInfo = {

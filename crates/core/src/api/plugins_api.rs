@@ -445,6 +445,55 @@ fn installed_flag(
     }
 }
 
+/// Single-source status for a PluginInfo row. Priority: blocked >
+/// not-installed > disabled > attach-failed > needs-setup >
+/// update-available > ok. Pure so it stays unit-testable.
+pub(crate) fn derive_plugin_status(
+    installed: bool,
+    enabled: bool,
+    blocked: bool,
+    auth_kind: &str,
+    configured: bool,
+    attach_failed: Option<&str>,
+    update_available: bool,
+) -> (&'static str, Option<String>) {
+    if blocked {
+        return ("blocked", None);
+    }
+    if !installed {
+        return ("not-installed", None);
+    }
+    if !enabled {
+        return ("disabled", None);
+    }
+    if let Some(reason) = attach_failed {
+        return ("attach-failed", Some(reason.to_string()));
+    }
+    if auth_kind != "none" && !configured {
+        return (
+            "needs-setup",
+            Some("authentication not configured".to_string()),
+        );
+    }
+    if update_available {
+        return ("update-available", None);
+    }
+    ("ok", None)
+}
+
+/// Coarse 3-way auth kind for `PluginInfo.auth_kind` / `derive_plugin_status`'s
+/// needs-setup gate (spec §6: `none` | `token` | `oauth`). Distinct from
+/// `auth_kind_label`'s 4-way `PluginAuthInfo.kind` label — `api-key` and
+/// `token` both collapse to `"token"` here, since the status derivation only
+/// cares whether SOME credential is required, not which shape.
+fn plugin_info_auth_kind(auth: Option<&AuthSpec>) -> &'static str {
+    match auth.map(|a| a.kind) {
+        None | Some(AuthKind::None) => "none",
+        Some(AuthKind::Oauth) => "oauth",
+        Some(AuthKind::ApiKey) | Some(AuthKind::Token) => "token",
+    }
+}
+
 /// Ledger-derived `PluginInfo` fields (`pinned`, `sourceSpec`,
 /// `resolvedCommit`, `installedAt`, `updatedAt`, `trustTier`) drawn from an
 /// optional `plugin_installs` row — `None` leaves them at their "no ledger
@@ -487,14 +536,30 @@ impl InstallLedgerFields {
 }
 
 /// Enrichment inputs `plugin_info` needs beyond the plugin itself: the
-/// install ledger row, the cached remote-catalog row, and whether this
-/// plugin currently owns its manifest-claimed `slot` (Feature C2). Bundled
-/// into one struct so `plugin_info` doesn't creep past clippy's
-/// too-many-arguments lint as fields get added over time.
+/// install ledger row, the cached remote-catalog row, whether this plugin
+/// currently owns its manifest-claimed `slot` (Feature C2), the last recorded
+/// attach failure (Task 3), the active component-release version (Task 3),
+/// and the installed skill count for skill-pack rows (Task 3). Bundled into
+/// one struct so `plugin_info` doesn't creep past clippy's too-many-arguments
+/// lint as fields get added over time.
 struct PluginInfoContext<'a> {
     install: Option<&'a crate::store::PluginInstallRecord>,
     remote: Option<&'a RemoteCatalogRow>,
     owns_slot: bool,
+    /// Secret-free reason from the last recorded attach failure
+    /// (`plugin_attach_status.outcome == "failed"`) — `None` when the last
+    /// attach succeeded or none was ever recorded. Mirrors the doctor's
+    /// `attach-failed` predicate (`doctor.rs:177-191`).
+    attach_failed: Option<&'a str>,
+    /// The currently active `component_plugin_releases` version for this
+    /// plugin id, compared against `catalog_version` to derive
+    /// `update_available`. `None` when never installed via the release
+    /// pipeline.
+    active_version: Option<&'a str>,
+    /// Installed-skill-pack size (`InstalledSkillInfo.skill_count`) — only
+    /// meaningful for `kind == "skill-pack"` rows; `plugin_info` ignores it
+    /// (forces `None`) for every other kind.
+    skill_count: Option<u32>,
 }
 
 fn plugin_info(
@@ -509,6 +574,22 @@ fn plugin_info(
     let ledger = InstallLedgerFields::from_option(ctx.install);
     let remote = ctx.remote;
     let owns_slot = ctx.owns_slot;
+    let blocked_reason = remote.and_then(|r| r.blocked_reason.clone());
+    let catalog_version = remote.map(|r| r.version.clone());
+    let component_backed = crate::plugins::component_catalog::is_component_bundle(&m.id);
+    let auth_kind = plugin_info_auth_kind(m.auth.as_ref());
+    let update_available = component_backed
+        && catalog_version.is_some()
+        && catalog_version.as_deref() != ctx.active_version;
+    let (status, status_detail) = derive_plugin_status(
+        installed,
+        enabled,
+        blocked_reason.is_some(),
+        auth_kind,
+        configured,
+        ctx.attach_failed,
+        update_available,
+    );
     PluginInfo {
         id: m.id.clone(),
         name: m.name.clone(),
@@ -536,11 +617,16 @@ fn plugin_info(
         installed_at: ledger.installed_at,
         updated_at: ledger.updated_at,
         trust_tier: ledger.trust_tier,
-        component_backed: crate::plugins::component_catalog::is_component_bundle(
-            &plugin.manifest.id,
-        ),
-        catalog_version: remote.map(|r| r.version.clone()),
-        blocked_reason: remote.and_then(|r| r.blocked_reason.clone()),
+        component_backed,
+        catalog_version,
+        blocked_reason,
+        status: status.to_string(),
+        status_detail,
+        auth_kind: auth_kind.to_string(),
+        tool_count: component_backed
+            .then(|| crate::plugins::component_catalog::declared_tool_count(&m.id))
+            .flatten(),
+        skill_count: (kind == "skill-pack").then_some(ctx.skill_count).flatten(),
     }
 }
 
@@ -1272,11 +1358,51 @@ async fn remote_catalog_index(store: &Store) -> anyhow::Result<HashMap<String, R
         .collect())
 }
 
+/// Fetch every `plugin_attach_status` row ONCE and index it by plugin id,
+/// keeping only entries whose last recorded outcome was a failure — mirrors
+/// [`install_ledger_index`]'s O(1)-round-trip shape and the doctor's
+/// `attach-failed` predicate (`doctor.rs:177-191`). `plugin_id` is the
+/// table's primary key (see `Store::record_plugin_attach`'s upsert), so there
+/// is at most one row per id already.
+async fn attach_failed_index(store: &Store) -> anyhow::Result<HashMap<String, String>> {
+    Ok(store
+        .list_plugin_attach()
+        .await?
+        .into_iter()
+        .filter(|a| a.outcome == "failed")
+        .map(|a| {
+            let reason = a
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("{} failed to attach", a.plugin_id));
+            (a.plugin_id, reason)
+        })
+        .collect())
+}
+
+/// The currently active `component_plugin_releases` version for every plugin
+/// id that has at least one row in that ledger, indexed by plugin id — built
+/// from [`Store::list_component_release_plugin_ids`] plus the same
+/// [`Store::active_component_release`] accessor `plugin_release_detail` uses,
+/// so list assembly's `update_available` derivation reads the identical
+/// source of truth as the release-management surface.
+async fn active_release_version_index(store: &Store) -> anyhow::Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for id in store.list_component_release_plugin_ids().await? {
+        if let Some(rec) = store.active_component_release(&id).await? {
+            out.insert(id, rec.version);
+        }
+    }
+    Ok(out)
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let ctx = installed_ctx(cp.store()).await?;
     let installs = install_ledger_index(cp.store()).await?;
     let remote = remote_catalog_index(cp.store()).await?;
+    let attach_failed = attach_failed_index(cp.store()).await?;
+    let active_releases = active_release_version_index(cp.store()).await?;
     let mut out = Vec::new();
     for plugin in cp.plugins().list() {
         let Some(kind) = derive_kind(&plugin) else {
@@ -1301,6 +1427,17 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             .slot
             .as_deref()
             .is_some_and(|s| cp.plugins().slot_owner(s) == Some(plugin.manifest.id.as_str()));
+        let skill_count = (kind == "skill-pack")
+            .then(|| {
+                ctx.installed_skills
+                    .iter()
+                    .find(|s| {
+                        s.plugin_id.as_deref() == Some(plugin.manifest.id.as_str())
+                            || s.id == plugin.manifest.id
+                    })
+                    .map(|s| s.skill_count as u32)
+            })
+            .flatten();
         out.push(plugin_info(
             &plugin,
             enabled,
@@ -1311,6 +1448,9 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
                 install: record,
                 remote: remote_row,
                 owns_slot,
+                attach_failed: attach_failed.get(&plugin.manifest.id).map(String::as_str),
+                active_version: active_releases.get(&plugin.manifest.id).map(String::as_str),
+                skill_count,
             },
         ));
     }
@@ -1355,6 +1495,14 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             component_backed: false,
             catalog_version: None,
             blocked_reason: None,
+            // Synthesized rows have no manifest-backed status machinery
+            // (`enabled`/`configured` are meaningless here too, see above) —
+            // always the Browse-tile default per Task 3's spec.
+            status: "not-installed".to_string(),
+            status_detail: None,
+            auth_kind: "none".to_string(),
+            tool_count: None,
+            skill_count: None,
         });
     }
     Ok(out)
@@ -1394,6 +1542,24 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
         .as_deref()
         .is_some_and(|s| cp.plugins().slot_owner(s) == Some(id));
 
+    // Same single-plugin-lookup shape as `record`/`remote_row` above — a
+    // detail view only ever resolves one id, so there is no index to build.
+    let attach = cp.store().get_plugin_attach(id).await?;
+    let attach_failed = attach.as_ref().filter(|a| a.outcome == "failed").map(|a| {
+        a.reason
+            .clone()
+            .unwrap_or_else(|| format!("{id} failed to attach"))
+    });
+    let active_release = cp.store().active_component_release(id).await?;
+    let skill_count = (kind == "skill-pack")
+        .then(|| {
+            ctx.installed_skills
+                .iter()
+                .find(|s| s.plugin_id.as_deref() == Some(id) || s.id == id)
+                .map(|s| s.skill_count as u32)
+        })
+        .flatten();
+
     Ok(PluginDetail {
         info: plugin_info(
             &plugin,
@@ -1405,6 +1571,9 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
                 install: record.as_ref(),
                 remote: remote_row.as_ref(),
                 owns_slot,
+                attach_failed: attach_failed.as_deref(),
+                active_version: active_release.as_ref().map(|r| r.version.as_str()),
+                skill_count,
             },
         ),
         auth,
@@ -2317,6 +2486,47 @@ mod tests {
         ));
     }
 
+    // ---------- derive_plugin_status ----------
+
+    #[test]
+    fn derive_plugin_status_priority_order() {
+        // (installed, enabled, blocked, auth_kind, configured, attach_failed, update_available)
+        let s =
+            |i, e, b, a: &str, c, af: Option<&str>, u| derive_plugin_status(i, e, b, a, c, af, u);
+        assert_eq!(
+            s(false, false, true, "none", false, None, false).0,
+            "blocked"
+        );
+        assert_eq!(
+            s(false, false, false, "none", false, None, false).0,
+            "not-installed"
+        );
+        assert_eq!(
+            s(true, false, false, "none", true, None, false).0,
+            "disabled"
+        );
+        let (st, detail) = s(
+            true,
+            true,
+            false,
+            "oauth",
+            true,
+            Some("token rejected"),
+            false,
+        );
+        assert_eq!(st, "attach-failed");
+        assert_eq!(detail.as_deref(), Some("token rejected"));
+        assert_eq!(
+            s(true, true, false, "oauth", false, None, false).0,
+            "needs-setup"
+        );
+        assert_eq!(
+            s(true, true, false, "none", true, None, true).0,
+            "update-available"
+        );
+        assert_eq!(s(true, true, false, "token", true, None, false).0, "ok");
+    }
+
     #[test]
     fn provider_family_falls_back_to_id() {
         assert_eq!(provider_family("anthropic-oauth"), "anthropic");
@@ -2446,6 +2656,9 @@ mod tests {
             install: None,
             remote: None,
             owns_slot,
+            attach_failed: None,
+            active_version: None,
+            skill_count: None,
         }
     }
 
@@ -2497,6 +2710,113 @@ mod tests {
             "the claim itself is still reported even when the plugin lost arbitration"
         );
         assert!(!loser.owns_slot);
+    }
+
+    // ---------- status/statusDetail/authKind/counts (Task 3) ----------
+
+    #[test]
+    fn plugin_info_status_ok_for_enabled_configured_builtin() {
+        let plugin = harness_only("native");
+        let info = plugin_info(&plugin, true, true, "integration", true, no_ctx(false));
+        assert_eq!(info.status, "ok");
+        assert!(info.status_detail.is_none());
+        assert_eq!(info.auth_kind, "none");
+    }
+
+    #[test]
+    fn plugin_info_status_not_installed_for_not_installed_catalog_row() {
+        // `gateway_only` is `PluginSource::Component`-sourced — a
+        // component-catalog row not yet installed.
+        let plugin = gateway_only("acme-catalog");
+        let info = plugin_info(&plugin, false, false, "gateway", false, no_ctx(false));
+        assert_eq!(info.status, "not-installed");
+        assert!(info.status_detail.is_none());
+    }
+
+    #[test]
+    fn plugin_info_status_attach_failed_carries_reason_through_context() {
+        let plugin = connector_only("acme-connector");
+        let ctx = PluginInfoContext {
+            attach_failed: Some("token rejected"),
+            ..no_ctx(false)
+        };
+        let info = plugin_info(&plugin, true, true, "integration", true, ctx);
+        assert_eq!(info.status, "attach-failed");
+        assert_eq!(info.status_detail.as_deref(), Some("token rejected"));
+    }
+
+    #[test]
+    fn plugin_info_status_needs_setup_when_auth_required_and_unconfigured() {
+        let plugin = auth_connector("acme-oauth", AuthKind::Oauth, None);
+        let info = plugin_info(&plugin, true, false, "integration", true, no_ctx(false));
+        assert_eq!(info.status, "needs-setup");
+        assert_eq!(info.auth_kind, "oauth");
+    }
+
+    #[test]
+    fn plugin_info_tool_count_reads_embedded_manifest_for_component_backed_rows() {
+        let mut plugin = connector_only("github");
+        plugin.source = PluginSource::Component;
+        let info = plugin_info(&plugin, true, true, "integration", true, no_ctx(false));
+        assert!(info.component_backed);
+        assert_eq!(info.tool_count, Some(12));
+
+        // Non-component-backed rows never get a tool count.
+        let native = harness_only("native");
+        let native_info = plugin_info(&native, true, true, "integration", true, no_ctx(false));
+        assert!(!native_info.component_backed);
+        assert!(native_info.tool_count.is_none());
+    }
+
+    #[test]
+    fn plugin_info_skill_count_only_applies_to_skill_pack_kind() {
+        // Already `PluginSource::SkillPack(_)`-sourced by default.
+        let plugin = connector_only("acme-pack");
+        let ctx = PluginInfoContext {
+            skill_count: Some(7),
+            ..no_ctx(false)
+        };
+        let info = plugin_info(&plugin, false, false, "skill-pack", true, ctx);
+        assert_eq!(info.skill_count, Some(7));
+
+        // Same `skill_count` supplied, but a non-skill-pack kind ignores it.
+        let ctx2 = PluginInfoContext {
+            skill_count: Some(7),
+            ..no_ctx(false)
+        };
+        let info2 = plugin_info(&plugin, false, false, "integration", true, ctx2);
+        assert!(info2.skill_count.is_none());
+    }
+
+    #[test]
+    fn plugin_info_update_available_only_for_component_backed_rows_with_newer_catalog_version() {
+        let mut plugin = connector_only("github");
+        plugin.source = PluginSource::Component;
+        let remote = RemoteCatalogRow {
+            id: "github".to_string(),
+            manifest_toml: String::new(),
+            version: "2.0.0".to_string(),
+            sequence: 1,
+            blocked: false,
+            blocked_reason: None,
+            fetched_at: 0,
+        };
+        let ctx = PluginInfoContext {
+            remote: Some(&remote),
+            active_version: Some("1.0.0"),
+            ..no_ctx(false)
+        };
+        let info = plugin_info(&plugin, true, true, "integration", true, ctx);
+        assert_eq!(info.status, "update-available");
+
+        // Same catalog version as active — no update available, status is ok.
+        let ctx_same = PluginInfoContext {
+            remote: Some(&remote),
+            active_version: Some("2.0.0"),
+            ..no_ctx(false)
+        };
+        let info_same = plugin_info(&plugin, true, true, "integration", true, ctx_same);
+        assert_eq!(info_same.status, "ok");
     }
 
     // ---------- remote-catalog enrichment (assemble_list) ----------

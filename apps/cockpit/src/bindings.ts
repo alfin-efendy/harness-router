@@ -2606,7 +2606,44 @@ catalogVersion: string | null;
  * Set when the remote catalog's signed feed blocked (revoked) this id —
  * mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
  */
-blockedReason: string | null }
+blockedReason: string | null;
+/**
+ * Single-source daemon-computed health/setup status (spec §6):
+ * `ok | disabled | needs-setup | attach-failed | update-available |
+ * blocked | not-installed`. Derived by `derive_plugin_status` from this
+ * row's own `installed`/`enabled`/`configured`/`blocked_reason` plus the
+ * last recorded attach outcome and whether a newer catalog version is
+ * available. (`unchecked` is MCP-app-only and mapped frontend-side, never
+ * emitted here.)
+ */
+status: string;
+/**
+ * Secret-free human-readable detail for `status` — currently populated
+ * for `attach-failed` (the recorded attach reason) and `needs-setup`
+ * (a generic "authentication not configured" message). `None` for every
+ * other status.
+ */
+statusDetail: string | null;
+/**
+ * Coarse auth requirement for this row: `none` | `token` | `oauth` —
+ * collapses the SDK's 4-way `AuthKind` (`api-key`/`token` both become
+ * `"token"`) since only "is a credential required at all" matters for
+ * `derive_plugin_status`'s needs-setup gate.
+ */
+authKind: string;
+/**
+ * Declared tool count for component-backed rows (the embedded bundle
+ * manifest's `tools.len()`, Task 1) — `None` for non-component rows and
+ * for component-backed ids with no embedded manifest here (e.g. a
+ * provider bundle represented by its builtin row).
+ */
+toolCount: number | null;
+/**
+ * Installed skill count for `skill-pack` rows (`InstalledSkillInfo.
+ * skill_count`) — `None` for every other kind, and for a synthesized
+ * curated pack not yet installed.
+ */
+skillCount: number | null }
 export type PluginInstallBeginResult = {
 /**
  * `none` | `api-key` | `token` | `oauth`.

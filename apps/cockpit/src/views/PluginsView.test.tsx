@@ -30,11 +30,19 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "ok",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
     ...over,
   };
 }
 
-const github = plugin("github", ["vcs", "issues"]);
+// The canonical not-installed Browse-tab row (see "browse lists only
+// not-installed entries" below) — `status` mirrors the real
+// `derive_plugin_status` "not installed always wins" rule.
+const github = plugin("github", ["vcs", "issues"], { status: "not-installed" });
 const notion = plugin("notion", ["docs"], { installed: true });
 const anthropic = plugin("anthropic", ["model-provider"], { kind: "provider", family: "anthropic", source: "builtin" });
 const superpowers = plugin("superpowers", ["skills"], { kind: "skill-pack", source: "skill-pack" });

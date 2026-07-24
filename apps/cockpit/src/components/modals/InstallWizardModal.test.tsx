@@ -75,6 +75,12 @@ function detailFixture(
       catalogVersion: null,
       componentBacked: false,
       blockedReason: null,
+      // Every wizard fixture is a not-yet-installed Browse-tab plugin.
+      status: "not-installed",
+      statusDetail: null,
+      authKind: overrides.auth?.kind ?? "none",
+      toolCount: null,
+      skillCount: null,
     },
     auth: overrides.auth ?? null,
     settings: overrides.settings ?? [],
