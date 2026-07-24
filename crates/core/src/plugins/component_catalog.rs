@@ -245,7 +245,7 @@ mod tests {
     // you'll get" before the bundle is ever installed (Task 1).
     #[test]
     fn first_party_connector_manifests_declare_tools() {
-        for id in ["github", "discord", "atlassian", "bitbucket"] {
+        for id in ["github", "atlassian", "bitbucket"] {
             let (_, src) = COMPONENT_BUNDLE_MANIFESTS
                 .iter()
                 .find(|(got, _)| *got == id)
@@ -258,5 +258,17 @@ mod tests {
             names.dedup();
             assert_eq!(names.len(), m.tools.len(), "{id} tool names must be unique");
         }
+
+        // Discord is a gateway component with no agent-facing tools; slash commands are not tools.
+        let (_, src) = COMPONENT_BUNDLE_MANIFESTS
+            .iter()
+            .find(|(got, _)| *got == "discord")
+            .unwrap_or_else(|| panic!("`discord` must be an embedded component manifest"));
+        let m: PluginBundleManifest =
+            toml::from_str(src).unwrap_or_else(|e| panic!("discord manifest failed to parse: {e}"));
+        assert!(
+            m.tools.is_empty(),
+            "discord gateway must declare no agent tools"
+        );
     }
 }

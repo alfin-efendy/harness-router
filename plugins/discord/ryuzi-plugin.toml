@@ -30,28 +30,3 @@ network = ["gateway.discord.gg", "*.discord.gg", "discord.com", "*.discord.com",
 #   - `plugin.discord.token`   bot token, injected into IDENTIFY + `Authorization: Bot` (secret).
 #   - `plugin.discord.app_id`  application id, for slash-command registration.
 #   - `plugin.discord.guild_id` guild the slash commands are registered in.
-
-# This component is a gateway, not a connector — it has no `tool_definitions()`
-# in the connector sense. Its only agent/user-visible registered capabilities
-# are the four Discord slash commands it registers on `start`
-# (`plugins/discord/src/logic.rs::build_commands`); name/description copied
-# verbatim from there. `writes = true` marks the three that mutate a session
-# (start/end/interrupt a run); `status` is a read-only query.
-[[tools]]
-name = "connect"
-description = "Connect a repo (new folder by name, or clone a git URL) to a new channel"
-writes = true
-
-[[tools]]
-name = "end"
-description = "End the session in this thread (removes its worktree)"
-writes = true
-
-[[tools]]
-name = "stop"
-description = "Stop the running turn in this thread"
-writes = true
-
-[[tools]]
-name = "status"
-description = "Show harness status"
