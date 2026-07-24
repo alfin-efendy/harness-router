@@ -2867,6 +2867,106 @@ mod tests {
         );
     }
 
+    // A real failed-attach row in `plugin_attach_status` for an
+    // installed+enabled component-backed plugin must surface as
+    // `attach-failed` with the recorded reason on the SAME list entry —
+    // exercising the `attach_failed_index` lookup `assemble_list` builds
+    // once, not a hand-built `PluginInfoContext`. `github` is `test_cp`'s
+    // first-party component bundle (`PluginSource::Component`, no auth), so
+    // flipping its `plugin.github.enabled` setting is enough to make it
+    // installed+enabled without any other ledger row.
+    #[tokio::test]
+    async fn assemble_list_marks_attach_failed_from_store_attach_status() {
+        let cp = test_cp().await;
+        let settings = SettingsStore::new(cp.store().clone());
+        settings.set("plugin.github.enabled", "true").await.unwrap();
+
+        cp.store()
+            .record_plugin_attach(&crate::store::PluginAttachStatus {
+                plugin_id: "github".to_string(),
+                last_attach_at: crate::paths::now_ms(),
+                outcome: "failed".to_string(),
+                reason: Some("token rejected".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let list = assemble_list(&cp).await.unwrap();
+        let github = list
+            .iter()
+            .find(|p| p.id == "github")
+            .expect("github present in the list");
+        assert_eq!(github.status, "attach-failed");
+        assert_eq!(github.status_detail.as_deref(), Some("token rejected"));
+    }
+
+    // A component-backed plugin whose cached remote-catalog version differs
+    // from the ACTIVE row in `component_plugin_releases` must report
+    // `update-available` on the SAME list entry — exercising the real
+    // `active_release_version_index` lookup (not a hand-built
+    // `PluginInfoContext.active_version`). Once the active release is
+    // reactivated to match the catalog version, the same plugin must fall
+    // back to `ok`.
+    #[tokio::test]
+    async fn assemble_list_marks_update_available_from_component_release_ledger() {
+        let cp = test_cp().await;
+        let settings = SettingsStore::new(cp.store().clone());
+        settings.set("plugin.github.enabled", "true").await.unwrap();
+
+        cp.store()
+            .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
+                id: "github".to_string(),
+                manifest_toml: String::new(),
+                version: "2.0.0".to_string(),
+                sequence: 1,
+                blocked: false,
+                blocked_reason: None,
+                fetched_at: 0,
+            }])
+            .await
+            .unwrap();
+
+        for version in ["1.0.0", "2.0.0"] {
+            cp.store()
+                .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
+                    plugin_id: "github".to_string(),
+                    version: version.to_string(),
+                    source_url: format!("https://feed.test/github/{version}"),
+                    sha256: "0".repeat(64),
+                    signing_key_id: "first-party".to_string(),
+                    installed_at: crate::paths::now_ms(),
+                    active: false,
+                    revoked: false,
+                    revocation_reason: None,
+                })
+                .await
+                .unwrap();
+        }
+        cp.store()
+            .set_active_component_release("github", "1.0.0")
+            .await
+            .unwrap();
+
+        let stale = assemble_list(&cp).await.unwrap();
+        let github_stale = stale
+            .iter()
+            .find(|p| p.id == "github")
+            .expect("github present in the list");
+        assert_eq!(github_stale.status, "update-available");
+
+        cp.store()
+            .set_active_component_release("github", "2.0.0")
+            .await
+            .unwrap();
+
+        let current = assemble_list(&cp).await.unwrap();
+        let github_current = current
+            .iter()
+            .find(|p| p.id == "github")
+            .expect("github present in the list");
+        assert_eq!(github_current.status, "ok");
+    }
+
     // ---------- auth_kind_label / auth_configured ----------
 
     #[test]
