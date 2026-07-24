@@ -1336,26 +1336,19 @@ mod tests {
     use crate::api::types::AgentPersonalityInfo;
     use crate::api::{
         dispatch,
-        tests_support::{state, state_with_agents},
+        tests_support::{state, state_with_agents, TestConfigRootGuard},
     };
     use crate::domain::{PermMode, Project};
     use crate::llm_router::connections;
     use serde_json::{json, Value};
-    use std::sync::{Mutex, MutexGuard};
-
-    static INSTALLED_SKILL_ENV: Mutex<()> = Mutex::new(());
 
     struct InstalledSkillGuard {
         _temp_dir: tempfile::TempDir,
-        previous_config_root: Option<std::ffi::OsString>,
-        _env_guard: MutexGuard<'static, ()>,
+        _config_root: TestConfigRootGuard,
     }
 
     impl InstalledSkillGuard {
         fn new() -> Self {
-            let env_guard = INSTALLED_SKILL_ENV
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let temp_dir = tempfile::tempdir().unwrap();
             let skill_dir = temp_dir.path().join("skills/requesting-code-review");
             std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1370,21 +1363,14 @@ mod tests {
             )
             .unwrap();
 
-            let previous_config_root = std::env::var_os("RYUZI_TEST_CONFIG_ROOT");
-            std::env::set_var("RYUZI_TEST_CONFIG_ROOT", temp_dir.path());
+            // Set the env var AFTER the fixture is fully written to disk —
+            // `TestConfigRootGuard::set` takes `TEST_CONFIG_ROOT_ENV`, so once
+            // this returns the fixture is guaranteed visible before any other
+            // guarded test can observe `RYUZI_TEST_CONFIG_ROOT`.
+            let config_root = TestConfigRootGuard::set(temp_dir.path());
             Self {
                 _temp_dir: temp_dir,
-                previous_config_root,
-                _env_guard: env_guard,
-            }
-        }
-    }
-
-    impl Drop for InstalledSkillGuard {
-        fn drop(&mut self) {
-            match self.previous_config_root.take() {
-                Some(value) => std::env::set_var("RYUZI_TEST_CONFIG_ROOT", value),
-                None => std::env::remove_var("RYUZI_TEST_CONFIG_ROOT"),
+                _config_root: config_root,
             }
         }
     }

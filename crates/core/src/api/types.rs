@@ -1402,6 +1402,36 @@ pub struct ComponentBootstrapStatus {
     pub message: Option<String>,
 }
 
+/// One entry `plugin_tools` lists for a plugin: an agent-facing tool, an
+/// installed skill, or a provider's model — `kind` discriminates which.
+/// `writes` is only meaningful (`Some`) for `kind == "tool"`, mirroring
+/// [`ComponentToolInfo::writes`]; skills and models never modify state
+/// through this listing, so they carry `None`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginToolEntry {
+    pub name: String,
+    pub description: String,
+    /// `"tool"` | `"skill"` | `"model"`.
+    pub kind: String,
+    pub writes: Option<bool>,
+}
+
+/// `plugin_tools` RPC result: everything a plugin currently offers — live
+/// extension tools, a WASM component's declared tools, a skill pack's
+/// skills, or a provider's model list (see `plugins_api::plugin_tools`'s doc
+/// for the resolution order between those sources; exactly one applies per
+/// plugin id).
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginToolsResult {
+    pub plugin_id: String,
+    /// True when `entries` came from a live enumeration of a currently
+    /// running extension; false when they are declared/manifest/model data.
+    pub live: bool,
+    pub entries: Vec<PluginToolEntry>,
+}
+
 /// `plugin_profile_begin_pkce` RPC result. Mirror of
 /// `crate::plugins::capabilities::oauth::PkceStart`. `verifier` is returned to
 /// the caller (Cockpit) so it can complete the token exchange; it must never

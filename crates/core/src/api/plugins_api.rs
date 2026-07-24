@@ -58,6 +58,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "complete_plugin_oauth",
     "disconnect_plugin_oauth",
     "plugin_models",
+    "plugin_tools",
     "uninstall_plugin",
     "begin_plugin_install",
     "set_plugin_oauth_client_id",
@@ -230,6 +231,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "plugin_models" => {
             let a: IdP = params(p)?;
             ok(providers::list_models(cp.store(), &a.id).await?)
+        }
+        "plugin_tools" => {
+            let a: PluginIdP = params(p)?;
+            ok(plugin_tools(cp, &a.plugin_id).await?)
         }
         "uninstall_plugin" => {
             let a: IdP = params(p)?;
@@ -1583,6 +1588,161 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
         homepage: m.homepage.clone(),
         publisher: m.publisher.clone(),
     })
+}
+
+/// `plugin_tools` RPC: everything a plugin currently offers — an agent-facing
+/// tool, an installed skill, or a provider's model — as one flat list.
+/// Exactly one of the sources below applies per plugin id (first match
+/// wins):
+///
+/// 1. **Live extension tools** — this plugin declares the `extension`
+///    capability AND the host has at least one `Running` instance spawned
+///    for it right now. Tool defs come from the same source `extension_status`
+///    counts (`ExtensionSnapshot::tools`, raw `Value`s captured at
+///    `extension/initialize`), parsed through the typed
+///    [`crate::plugins::extension::tools::parse_tool_def`] accessor
+///    `harness::native` uses to wrap a live tool — a malformed def is
+///    skipped, never an error. `live: true`.
+/// 2. **Declared component tools** — `id` is a first-party WASM bundle
+///    ([`crate::plugins::component_catalog::is_component_bundle`]). Prefers
+///    the currently-*installed* release's on-disk manifest (same read
+///    `plugin_release_detail` performs) so a post-install listing reflects
+///    the running release; falls back to the embedded manifest
+///    ([`crate::plugins::component_catalog::declared_tools`]) so a bundle
+///    not yet installed still shows "what you'll get". `live: false`.
+/// 3. **Skill packs** — `id` is an installed skill pack
+///    ([`crate::skills_install::get_installed_skill_pack`]): one entry per
+///    installed skill, description-less (a skill's prose lives in its own
+///    `SKILL.md`, not surfaced here). `live: false`.
+/// 4. **Providers** — `id`'s effective model list, via the same
+///    [`providers::list_models`] internals `plugin_models` uses. This also
+///    covers "anything else": `list_models` never errors for a non-provider
+///    id, it just returns an empty list, so a known plugin id that matches
+///    none of the branches above still resolves to an empty, well-formed
+///    result rather than an error. `live: false`.
+///
+/// Unknown id -> the same `unknown plugin: {id}` `ApiError` `plugin_detail`
+/// (`assemble_detail`) uses.
+async fn plugin_tools(cp: &ControlPlane, id: &str) -> Result<PluginToolsResult, ApiError> {
+    let plugin = cp
+        .plugins()
+        .get(id)
+        .ok_or_else(|| ApiError::not_found(format!("unknown plugin: {id}")))?;
+
+    // 1. Live extension tools.
+    if plugin.extension.is_some() {
+        let snapshots = cp.extension_host().get(id).await;
+        let running: Vec<_> = snapshots
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    crate::plugins::extension::ExtensionStatus::Running
+                )
+            })
+            .collect();
+        if !running.is_empty() {
+            let mut entries = Vec::new();
+            for snap in running {
+                for raw in &snap.tools {
+                    if let Some(def) = crate::plugins::extension::tools::parse_tool_def(raw) {
+                        entries.push(PluginToolEntry {
+                            name: def.name,
+                            description: def.description,
+                            kind: "tool".to_string(),
+                            writes: None,
+                        });
+                    }
+                }
+            }
+            return Ok(PluginToolsResult {
+                plugin_id: id.to_string(),
+                live: true,
+                entries,
+            });
+        }
+    }
+
+    // 2. Declared component tools.
+    if crate::plugins::component_catalog::is_component_bundle(id) {
+        let entries = declared_component_tool_entries(cp, id).await?;
+        return Ok(PluginToolsResult {
+            plugin_id: id.to_string(),
+            live: false,
+            entries,
+        });
+    }
+
+    // 3. Skill packs.
+    if let Some(pack) = crate::skills_install::get_installed_skill_pack(id) {
+        let entries = pack
+            .skills
+            .into_iter()
+            .map(|s| PluginToolEntry {
+                name: s.name,
+                description: String::new(),
+                kind: "skill".to_string(),
+                writes: None,
+            })
+            .collect();
+        return Ok(PluginToolsResult {
+            plugin_id: id.to_string(),
+            live: false,
+            entries,
+        });
+    }
+
+    // 4. Providers (and, by `list_models`'s own never-errors-just-empty
+    // contract, every other "known but nothing to list" id — step 5).
+    let entries = providers::list_models(cp.store(), id)
+        .await?
+        .into_iter()
+        .map(|model_id| PluginToolEntry {
+            name: model_id,
+            description: String::new(),
+            kind: "model".to_string(),
+            writes: None,
+        })
+        .collect();
+    Ok(PluginToolsResult {
+        plugin_id: id.to_string(),
+        live: false,
+        entries,
+    })
+}
+
+/// Step 2's tool source for [`plugin_tools`]: prefer the currently-active
+/// installed bundle's on-disk manifest, falling back to the embedded
+/// first-party manifest. Mirrors `plugin_release_detail`'s own
+/// active-release-then-disk read exactly (including gating the disk read on
+/// the store actually recording an active release), so the two RPCs can
+/// never disagree about which manifest is "the" active one.
+async fn declared_component_tool_entries(
+    cp: &ControlPlane,
+    id: &str,
+) -> anyhow::Result<Vec<PluginToolEntry>> {
+    let has_active_release = cp.store().active_component_release(id).await?.is_some();
+    let installed_tools = if has_active_release {
+        let root = crate::plugins::bundle::installed_bundle_root();
+        crate::plugins::bundle::load_active_bundles(&root, cp.store())
+            .await
+            .ok()
+            .and_then(|bundles| bundles.into_iter().find(|b| b.manifest.id == id))
+            .map(|b| b.manifest.tools)
+    } else {
+        None
+    };
+    let tools =
+        installed_tools.unwrap_or_else(|| crate::plugins::component_catalog::declared_tools(id));
+    Ok(tools
+        .into_iter()
+        .map(|t| PluginToolEntry {
+            name: t.name,
+            description: t.description,
+            kind: "tool".to_string(),
+            writes: Some(t.writes),
+        })
+        .collect())
 }
 
 /// Same semantics as `ryuzi plugins enable/disable` — delegates to the shared
@@ -4417,5 +4577,211 @@ writes = true
             .await
             .unwrap();
         assert_eq!(out["pending"], json!(false));
+    }
+
+    // ---------- plugin_tools (Task 4) ----------
+
+    // No registry, no plugins — `plugin_tools`' initial existence gate must
+    // reject an id `cp.plugins()` has never heard of, with the exact same
+    // error `plugin_detail` (`assemble_detail`) gives that same id, so the
+    // two RPCs never disagree about what "known" means.
+    #[tokio::test]
+    async fn plugin_tools_unknown_id_errors() {
+        let cp = test_cp().await;
+        match plugin_tools(&cp, "nope").await {
+            Ok(_) => panic!("expected an error for an unknown plugin id"),
+            Err(e) => assert_eq!(e.message, "unknown plugin: nope"),
+        }
+    }
+
+    // `install_builtins` registers every embedded component bundle
+    // (`component_catalog::component_catalog_plugins`), github included, with
+    // no release ever installed and no running extension — so this must fall
+    // all the way through to branch 2's embedded-manifest fallback.
+    #[tokio::test]
+    async fn plugin_tools_falls_back_to_declared_manifest_tools() {
+        let cp = test_cp().await;
+        let res = plugin_tools(&cp, "github").await.unwrap();
+        assert!(!res.live);
+        assert!(!res.entries.is_empty());
+        assert!(res.entries.iter().all(|e| e.kind == "tool"));
+        assert!(res.entries.iter().all(|e| e.writes.is_some()));
+    }
+
+    // Discord is a gateway component that declares zero agent-facing tools
+    // (Task 1) — a known, component-backed id with nothing to list must
+    // still resolve to an empty, well-formed result, never an error.
+    #[tokio::test]
+    async fn plugin_tools_discord_component_has_no_declared_tools() {
+        let cp = test_cp().await;
+        let res = plugin_tools(&cp, "discord").await.unwrap();
+        assert!(!res.live);
+        assert!(res.entries.is_empty());
+    }
+
+    // "kiro" is a CATALOG provider with seeded models and no bundle/component
+    // backing (`is_component_bundle("kiro")` is false) — branch 4 must surface
+    // its effective model list, the same one `plugin_models` returns.
+    #[tokio::test]
+    async fn plugin_tools_provider_lists_models() {
+        let cp = test_cp().await;
+        let models = providers::list_models(cp.store(), "kiro").await.unwrap();
+        assert!(!models.is_empty(), "fixture assumption: kiro seeds models");
+        let res = plugin_tools(&cp, "kiro").await.unwrap();
+        assert!(!res.live);
+        assert_eq!(res.entries.len(), models.len());
+        assert!(res.entries.iter().all(|e| e.kind == "model"));
+        assert!(res.entries.iter().all(|e| e.writes.is_none()));
+        let names: Vec<&str> = res.entries.iter().map(|e| e.name.as_str()).collect();
+        for model in &models {
+            assert!(names.contains(&model.as_str()));
+        }
+    }
+
+    /// Like `api::tests_support::state`, but with `install_builtins` run
+    /// against the `Registries` first (that helper deliberately starts from
+    /// an empty registry — see its own doc — so a dispatch test that needs a
+    /// real component/provider id, like `plugin_tools`' camelCase wire
+    /// check below, builds its own `ApiState` this way instead).
+    async fn state_with_builtins() -> ApiState {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let mut regs = Registries::new();
+        regs.add_plugin(crate::harness::native::native_plugin());
+        crate::plugins::install_builtins(&mut regs);
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = ControlPlane::new(store, regs, persistence.clone()).await;
+        std::mem::forget(tmp);
+        ApiState {
+            router_server: Arc::new(crate::llm_router::server::RouterServer::new(
+                cp.store().clone(),
+            )),
+            cp,
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
+            control_token: "t".into(),
+        }
+    }
+
+    // Wire-level check: dispatch decodes the RPC's snake_case `plugin_id`
+    // param (matching every other handler in this family — see
+    // `plugins_cmd.rs`'s proxies, which all send `{ "plugin_id": ... }`) and
+    // encodes the camelCase response DTO on the way out.
+    #[tokio::test]
+    async fn plugin_tools_dispatches_and_encodes_camel_case() {
+        let s = state_with_builtins().await;
+        let out = dispatch(&s, "plugin_tools", json!({ "plugin_id": "github" }))
+            .await
+            .unwrap();
+        assert_eq!(out["pluginId"], json!("github"));
+        assert_eq!(out["live"], json!(false));
+        assert!(out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| { e.get("name").is_some() && e.get("kind") == Some(&json!("tool")) }));
+    }
+
+    /// Test-only guard: stamps a `plugins/<pack_id>` manifest directory (so
+    /// `load_skill_pack_plugins_from` registers it as a `CorePlugin`) plus
+    /// N materialized skill directories sharing that `plugin_id` under a
+    /// tempdir `skills/` (so `skills_install::get_installed_skill_pack` finds
+    /// them via `RYUZI_TEST_CONFIG_ROOT`) — mirrors both
+    /// `plugins::load_skill_pack_plugins_tests`' manifest/stamp fixture and
+    /// `agent_api::tests::InstalledSkillGuard`'s env-var isolation, combined
+    /// since `plugin_tools`' skill-pack branch needs both halves to line up.
+    /// Uses the crate-shared [`crate::api::tests_support::TestConfigRootGuard`]
+    /// so this can never race `agent_api`'s own installed-skill fixture (or
+    /// any other test) over the same process-wide env var.
+    struct SkillPackFixture {
+        temp_dir: tempfile::TempDir,
+        _config_root: crate::api::tests_support::TestConfigRootGuard,
+    }
+
+    impl SkillPackFixture {
+        fn install(pack_id: &str, skill_names: &[&str]) -> Self {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let plugin_dir = temp_dir.path().join("plugins").join(pack_id);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("ryuzi-plugin.toml"),
+                format!("contract = 1\nid = \"{pack_id}\"\nname = \"{pack_id}\"\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                plugin_dir.join(".ryuzi-skill.json"),
+                format!(
+                    r#"{{"source":"https://example.test/{pack_id}","plugin_id":"{pack_id}","installed_at":"2026-01-01T00:00:00.000Z"}}"#
+                ),
+            )
+            .unwrap();
+            for name in skill_names {
+                let skill_dir = temp_dir
+                    .path()
+                    .join("skills")
+                    .join(format!("{pack_id}--{name}"));
+                std::fs::create_dir_all(&skill_dir).unwrap();
+                std::fs::write(
+                    skill_dir.join("SKILL.md"),
+                    format!("---\nname: {name}\ndescription: test skill\n---\nbody"),
+                )
+                .unwrap();
+                std::fs::write(
+                    skill_dir.join(".ryuzi-skill.json"),
+                    format!(
+                        r#"{{"source":"https://example.test/{pack_id}","plugin_id":"{pack_id}","installed_at":"2026-01-01T00:00:00.000Z"}}"#
+                    ),
+                )
+                .unwrap();
+            }
+            // Set the env var AFTER the fixture is fully written to disk —
+            // see `InstalledSkillGuard`'s matching comment for why.
+            let config_root = crate::api::tests_support::TestConfigRootGuard::set(temp_dir.path());
+            Self {
+                temp_dir,
+                _config_root: config_root,
+            }
+        }
+
+        fn plugins_root(&self) -> std::path::PathBuf {
+            self.temp_dir.path().join("plugins")
+        }
+
+        fn skills_root(&self) -> std::path::PathBuf {
+            self.temp_dir.path().join("skills")
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_tools_skill_pack_lists_skills() {
+        let fixture = SkillPackFixture::install("acme-pack", &["triage", "review"]);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        let mut regs = Registries::new();
+        regs.add_plugin(crate::harness::native::native_plugin());
+        crate::plugins::install_builtins(&mut regs);
+        crate::plugins::load_skill_pack_plugins_from(
+            &mut regs,
+            &fixture.plugins_root(),
+            &fixture.skills_root(),
+        );
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = ControlPlane::new(store, regs, persistence).await;
+
+        let res = plugin_tools(&cp, "acme-pack").await.unwrap();
+        assert_eq!(res.entries.len(), 2);
+        assert!(!res.live);
+        assert!(res.entries.iter().all(|e| e.kind == "skill"));
+        assert!(res.entries.iter().all(|e| e.writes.is_none()));
+        assert!(res.entries.iter().all(|e| e.description.is_empty()));
+        let names: Vec<&str> = res.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"triage"));
+        assert!(names.contains(&"review"));
     }
 }

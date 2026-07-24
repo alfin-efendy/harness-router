@@ -24,7 +24,7 @@
 //!   [`is_component_bundle`], so Cockpit can offer release management for it
 //!   against whichever row won.
 
-use ryuzi_plugin_sdk::bundle::PluginBundleManifest;
+use ryuzi_plugin_sdk::bundle::{DeclaredTool, PluginBundleManifest};
 use ryuzi_plugin_sdk::{PluginManifest, CONTRACT_VERSION};
 
 use super::host::{CorePlugin, PluginSource};
@@ -141,6 +141,21 @@ pub fn declared_tool_count(id: &str) -> Option<u32> {
         .find(|(got, _)| *got == id)
         .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
         .map(|m| m.tools.len() as u32)
+}
+
+/// The full declared-tool detail (name, description, writes) `id`'s embedded
+/// first-party bundle manifest declares (Task 1) — the same lookup
+/// [`declared_tool_count`] uses, but the tools themselves rather than just
+/// the count. Feeds `plugin_tools`' (Task 4) declared-manifest fallback.
+/// Empty (never an error) when `id` has no embedded manifest here or its
+/// embedded TOML fails to parse — same fallback `declared_tool_count` uses.
+pub fn declared_tools(id: &str) -> Vec<DeclaredTool> {
+    COMPONENT_BUNDLE_MANIFESTS
+        .iter()
+        .find(|(got, _)| *got == id)
+        .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
+        .map(|m| m.tools)
+        .unwrap_or_default()
 }
 
 /// Every embedded component bundle as a manifest-only plugin. A manifest that
@@ -297,5 +312,18 @@ mod tests {
         // No embedded manifest here (represented by its builtin provider row).
         assert_eq!(declared_tool_count("anthropic"), None);
         assert_eq!(declared_tool_count("nope"), None);
+    }
+
+    // Task 4: `plugin_tools`' declared-manifest fallback reads through this
+    // lookup for component-backed rows with no live extension/running
+    // instance.
+    #[test]
+    fn declared_tools_matches_the_embedded_manifest_and_is_empty_for_unknown_ids() {
+        assert_eq!(declared_tools("github").len(), 12);
+        assert_eq!(declared_tools("atlassian").len(), 10);
+        assert_eq!(declared_tools("bitbucket").len(), 9);
+        assert!(declared_tools("discord").is_empty());
+        assert!(declared_tools("anthropic").is_empty());
+        assert!(declared_tools("nope").is_empty());
     }
 }

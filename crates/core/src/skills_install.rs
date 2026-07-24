@@ -234,6 +234,18 @@ pub fn list_installed_skills() -> Result<Vec<InstalledSkillInfo>> {
     list_installed_skills_in(&roots)
 }
 
+/// One installed pack's full detail (including its individual
+/// [`InstalledSkillEntry`] list — [`InstalledSkillInfo`]'s `skill_count`
+/// alone can't name them), by pack id. Feeds `plugin_tools`' (Task 4)
+/// skill-pack branch. `None` — never an error — when `id` is not an
+/// installed pack, or the on-disk scan fails for any reason: this is
+/// best-effort display data, same discipline `plugin_release_detail` gives
+/// its own best-effort disk reads.
+pub fn get_installed_skill_pack(id: &str) -> Option<InstalledSkillPack> {
+    let roots = InstallRoots::for_user().ok()?;
+    read_installed_pack(&roots, id).ok()
+}
+
 pub fn remove_installed_skill(id: &str) -> Result<()> {
     let roots = InstallRoots::for_user()?;
     remove_installed_skill_in(&roots, id)

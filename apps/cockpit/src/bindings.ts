@@ -1530,6 +1530,20 @@ async pluginModels(runnerId: string | null, id: string) : Promise<Result<string[
 }
 },
 /**
+ * Everything a plugin currently offers — live extension tools, a WASM
+ * component's declared tools, a skill pack's skills, or a provider's model
+ * list (see `plugin_tools`'s doc in `ryuzi_core::api::plugins_api` for the
+ * resolution order). Read-only; safe to call for any known plugin id.
+ */
+async pluginTools(runnerId: string | null, pluginId: string) : Promise<Result<PluginToolsResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_tools", { runnerId, pluginId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The install wizard's entry point. The daemon (steps 1-6) resolves the auth
  * kind, discovers / registers OAuth endpoints, builds the authorize URL,
  * stores the PKCE flow state, and emits `CoreEvent::PluginOauthAuthorizeUrl`
@@ -2704,6 +2718,31 @@ export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: st
  * to the user once and must never be written to durable telemetry.
  */
 export type PluginProfileDeviceFlowStart = { deviceCode: string; userCode: string; verificationUri: string; verificationUriComplete: string | null; intervalSecs: number; expiresAt: number }
+/**
+ * One entry `plugin_tools` lists for a plugin: an agent-facing tool, an
+ * installed skill, or a provider's model — `kind` discriminates which.
+ * `writes` is only meaningful (`Some`) for `kind == "tool"`, mirroring
+ * [`ComponentToolInfo::writes`]; skills and models never modify state
+ * through this listing, so they carry `None`.
+ */
+export type PluginToolEntry = { name: string; description: string;
+/**
+ * `"tool"` | `"skill"` | `"model"`.
+ */
+kind: string; writes: boolean | null }
+/**
+ * `plugin_tools` RPC result: everything a plugin currently offers — live
+ * extension tools, a WASM component's declared tools, a skill pack's
+ * skills, or a provider's model list (see `plugins_api::plugin_tools`'s doc
+ * for the resolution order between those sources; exactly one applies per
+ * plugin id).
+ */
+export type PluginToolsResult = { pluginId: string;
+/**
+ * True when `entries` came from a live enumeration of a currently
+ * running extension; false when they are declared/manifest/model data.
+ */
+live: boolean; entries: PluginToolEntry[] }
 /**
  * Identifies the plugin an approvable action originates from — attribution
  * only, so an operator can see "this MCP tool belongs to plugin X" instead
