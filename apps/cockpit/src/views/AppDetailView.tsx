@@ -19,7 +19,7 @@ import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Chip, StatusDot } from "@/components/common/bits";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { NATIVE_AGENT } from "@/constants";
-import { statusPresentation, type HubStatus } from "@/lib/plugin-hub";
+import { appStatusToHubStatus, statusPresentation } from "@/lib/plugin-hub";
 import { agentAllowed, appById, useApps } from "@/store-apps";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
@@ -29,16 +29,6 @@ import { useNav } from "@/store-nav";
 import { visibleTabs, type DetailTab } from "./PluginDetailView";
 
 const rowLabel = "w-[120px] shrink-0 text-[13px] font-medium";
-
-// `AppInfo.status` is the app-side `connected|error|unknown` vocabulary —
-// the same one `plugin-hub.ts`'s `appToHubItem` already translates onto the
-// shared `HubStatus` union for the hero status pill on the hub list, so the
-// detail page's pill speaks the same language as the row it was opened from.
-const APP_STATUS_MAP: Record<string, HubStatus> = {
-  connected: "ok",
-  error: "attach-failed",
-  unknown: "unchecked",
-};
 
 const TAB_LABEL: Record<DetailTab, string> = {
   overview: "Overview",
@@ -63,7 +53,7 @@ export function AppDetailView({ id }: { id: string }) {
   if (!app) return null;
 
   const isProbing = probing === app.id;
-  const presentation = statusPresentation(APP_STATUS_MAP[app.status] ?? "unchecked");
+  const presentation = statusPresentation(appStatusToHubStatus(app.status));
 
   // An MCP app is always "installed" the moment it's added (there is no
   // separate install step), it has no auth-tab concept of its own (auth

@@ -92,6 +92,14 @@ const APP_STATUS_MAP: Record<string, HubStatus> = {
   unknown: "unchecked",
 };
 
+/** Translates the app-side `connected|error|unknown` vocabulary onto the shared
+ *  `HubStatus` union. Used by `appToHubItem` (hub rows) and `AppDetailView`'s
+ *  status pill to ensure both speak the same language. Unmapped statuses default
+ *  to "unchecked". */
+export function appStatusToHubStatus(status: string): HubStatus {
+  return APP_STATUS_MAP[status] ?? "unchecked";
+}
+
 function appToHubItem(app: AppInfo): HubItem {
   return {
     rowKey: `app:${app.id}`,
@@ -106,7 +114,7 @@ function appToHubItem(app: AppInfo): HubItem {
     experimental: false,
     pinned: false,
     installed: true,
-    status: APP_STATUS_MAP[app.status] ?? "unchecked",
+    status: appStatusToHubStatus(app.status),
     statusDetail: app.statusDetail,
     countsLabel: app.tools.length > 0 ? `${app.tools.length} tools` : null,
     toolNames: app.tools.map((t) => t.name),

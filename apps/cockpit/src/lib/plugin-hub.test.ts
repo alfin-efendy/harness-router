@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { AppInfo, InstalledSkillInfo, PluginInfo } from "../bindings";
 import {
+  appStatusToHubStatus,
   buildHubItems,
   featuredItems,
   filterHubItems,
@@ -201,6 +202,28 @@ describe("buildHubItems: app mapping", () => {
     const [item] = buildHubItems({ plugins: [], apps: [app], skills: [] });
     expect(item.countsLabel).toBeNull();
     expect(item.toolNames).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// appStatusToHubStatus — shared status translator
+// ---------------------------------------------------------------------------
+
+describe("appStatusToHubStatus", () => {
+  test("maps connected → ok", () => {
+    expect(appStatusToHubStatus("connected")).toBe("ok");
+  });
+
+  test("maps error → attach-failed", () => {
+    expect(appStatusToHubStatus("error")).toBe("attach-failed");
+  });
+
+  test("maps unknown → unchecked", () => {
+    expect(appStatusToHubStatus("unknown")).toBe("unchecked");
+  });
+
+  test("unmapped status (e.g. 'weird') → unchecked fallback", () => {
+    expect(appStatusToHubStatus("weird")).toBe("unchecked");
   });
 });
 
