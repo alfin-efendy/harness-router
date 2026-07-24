@@ -2146,7 +2146,11 @@ lifecycle: string;
  * The outbound network allowlist ("domains") — bare or `*.`-wildcard
  * hostnames the component may reach.
  */
-domains: string[]; oauthProfiles: ComponentOauthProfileInfo[] }
+domains: string[]; oauthProfiles: ComponentOauthProfileInfo[];
+/**
+ * The tools this component declares it exposes to agents.
+ */
+tools: ComponentToolInfo[] }
 /**
  * One OAuth profile a component bundle's manifest declares — id + scopes
  * only (no client id/secret/endpoint: Task 12 renders declared metadata,
@@ -2203,6 +2207,11 @@ export type ComponentReleaseInfo = { pluginId: string; version: string; sourceUr
  * trust check can never drift.
  */
 firstParty: boolean }
+/**
+ * A tool a component bundle's manifest declares — name, description, and
+ * whether it modifies state (writes). Mirror of `ryuzi_plugin_sdk::DeclaredTool`.
+ */
+export type ComponentToolInfo = { name: string; description: string; writes: boolean }
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**
  * OAuth connections only: true once refresh has failed terminally and

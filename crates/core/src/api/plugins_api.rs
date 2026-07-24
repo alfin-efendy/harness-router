@@ -3702,6 +3702,33 @@ client-id = "Iv1.public"
         assert!(!p.connected, "pure From cannot see the store");
     }
 
+    // The pure manifest -> `ComponentManifestInfo` conversion must carry the
+    // declared tools (name, description, writes) from the bundle manifest.
+    #[test]
+    fn component_manifest_info_carries_tools() {
+        let manifest = ryuzi_plugin_sdk::PluginBundleManifest::from_toml(
+            r#"
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "per-call"
+component = "github.wasm"
+
+[[tools]]
+name = "create_issue"
+description = "Open an issue"
+writes = true
+"#,
+        )
+        .unwrap();
+        let info = ComponentManifestInfo::from(manifest);
+        assert_eq!(info.tools.len(), 1);
+        assert_eq!(info.tools[0].name, "create_issue");
+        assert_eq!(info.tools[0].description, "Open an issue");
+        assert!(info.tools[0].writes);
+    }
+
     // Store enrichment: a usable stored token flips `connected`; a stored client
     // id flips `client_id_configured` for a profile the manifest did not bake
     // one into; a `reconnect_required` token is NOT connected; per-profile rows
@@ -3755,6 +3782,7 @@ client-id = "Iv1.public"
                 profile("custom", false),
                 profile("unset", false),
             ],
+            tools: vec![],
         };
 
         enrich_oauth_profile_status(store, "github", &mut manifest).await;
@@ -3806,6 +3834,7 @@ client-id = "Iv1.public"
                 connected: false,
                 client_id_configured: true,
             }],
+            tools: vec![],
         };
         enrich_oauth_profile_status(store, "github", &mut manifest).await;
         assert!(

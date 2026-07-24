@@ -1266,6 +1266,16 @@ pub struct ComponentOauthProfileInfo {
     pub client_id_configured: bool,
 }
 
+/// A tool a component bundle's manifest declares — name, description, and
+/// whether it modifies state (writes). Mirror of `ryuzi_plugin_sdk::DeclaredTool`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentToolInfo {
+    pub name: String,
+    pub description: String,
+    pub writes: bool,
+}
+
 /// Task 12 cross-layer addition: the currently ACTIVE version's bundle
 /// manifest metadata a component plugin's permission-confirmation summary
 /// needs to render (publisher, description, lifecycle, network allowlist
@@ -1294,6 +1304,8 @@ pub struct ComponentManifestInfo {
     /// hostnames the component may reach.
     pub domains: Vec<String>,
     pub oauth_profiles: Vec<ComponentOauthProfileInfo>,
+    /// The tools this component declares it exposes to agents.
+    pub tools: Vec<ComponentToolInfo>,
 }
 
 fn lifecycle_label(l: ryuzi_plugin_sdk::PluginLifecycle) -> &'static str {
@@ -1322,6 +1334,15 @@ impl From<ryuzi_plugin_sdk::PluginBundleManifest> for ComponentManifestInfo {
                     device_authorization_url: p.device_authorization_url,
                     connected: false,
                     client_id_configured: p.client_id.is_some(),
+                })
+                .collect(),
+            tools: m
+                .tools
+                .into_iter()
+                .map(|t| ComponentToolInfo {
+                    name: t.name,
+                    description: t.description,
+                    writes: t.writes,
                 })
                 .collect(),
         }
