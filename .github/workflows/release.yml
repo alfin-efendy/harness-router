@@ -243,7 +243,7 @@ jobs:
   # bundles, dual descriptor stems + one <id>.wasm each). Artifacts publish
   # under this release's own immutable tag URL: release builds pin their
   # unversioned fetches to it via RYUZI_RELEASE_TAG, while the catalog feed's
-  # update flow fetches versioned stems from `latest`. Unlike catalog-feed
+  # update flow fetches versioned stems from `latest`. Like catalog-feed,
   # this job is REQUIRED: a missing FIRST_PARTY_PRIVATE_KEY fails the release
   # rather than shipping apps whose pinned URLs would 404.
   plugins:

@@ -1862,13 +1862,14 @@ keypair's public key, and assert a single tampered byte or an unrelated
 keypair fails verification.
 
 The release workflow's `catalog-feed` job (`.github/workflows/release.yml`)
-runs on every CLI release: guarded on the `CATALOG_FEED_PRIVATE_KEY` secret
-being present (a no-op, not a failure, when it isn't — mirroring
-`cockpit-release.yml`'s optional Apple codesigning), it runs
-`bun scripts/catalog/build-feed.ts` and uploads `catalog.json` +
-`catalog.json.sig` onto the release via `gh release upload`, matching the
-asset-upload pattern the `cockpit-release.yml` `publish` job and the
-`docker`/`npm` jobs already use.
+runs on every CLI release and is REQUIRED: a missing `CATALOG_FEED_PRIVATE_KEY`
+secret fails the release outright — the feed is the revocation channel, and
+`finalize` asserts `catalog.json` + `catalog.json.sig` are present. The job
+runs `bun scripts/catalog/build-feed.ts`, verifies the built feed against the
+compiled-in `CATALOG_FEED_PUBKEY` (`verify-plugin-artifacts catalog`), and
+uploads `catalog.json` + `catalog.json.sig` onto the release via
+`gh release upload`, matching the asset-upload pattern the
+`cockpit-release.yml` `publish` job and the `docker`/`npm` jobs already use.
 
 **Known limitation:** the workflow does not commit the incremented
 `scripts/catalog/sequence.txt` back to `main` — like `scripts/npm/
