@@ -728,7 +728,10 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
                 model: profile.model.clone(),
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
-                    mode: crate::domain::PermMode::AcceptEdits,
+                    native: std::collections::BTreeMap::from([(
+                        "read".into(),
+                        crate::agents::types::NativeToolDecision::Allow,
+                    )]),
                     rules: vec![],
                 },
                 // Skills must resolve in the live catalog for the primary to
@@ -738,7 +741,6 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
                 // covered by the adapter unit tests in harness/native/mod.rs.
                 skills: vec![],
                 tools: crate::agents::types::AgentTools {
-                    native: vec!["read".into()],
                     plugins: vec![],
                     apps: vec![],
                 },
@@ -785,9 +787,18 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
         );
         assert_eq!(primary_turns[0].agent.profile.name, "Renamed primary");
         assert_eq!(primary_turns[0].agent.profile.model, profile.model);
+        // TODO(Task 2): profile no longer carries a permission mode at all
+        // (perm_mode becomes session-owned, threaded through
+        // `primary_turn_config`'s new argument); this checks that the
+        // updated native-decision map propagated instead, the closest
+        // still-meaningful analog of this test's original intent.
         assert_eq!(
-            primary_turns[0].agent.profile.permissions.mode,
-            crate::domain::PermMode::AcceptEdits
+            primary_turns[0]
+                .agent
+                .profile
+                .permissions
+                .native_decision("read"),
+            crate::agents::types::NativeToolDecision::Allow
         );
         assert_eq!(primary_turns[0].allowed_skills, None);
         // FakeSession::refresh_primary_turn records the PrimaryTurnConfig as
@@ -1405,7 +1416,6 @@ async fn start_rejects_an_invalid_primary_before_persisting_session_or_root_run(
                 permissions: profile.permissions,
                 skills: profile.skills,
                 tools: crate::agents::types::AgentTools {
-                    native: profile.tools.native,
                     plugins: vec!["unimplemented.plugin_tool".into()],
                     apps: Vec::new(),
                 },
@@ -1480,7 +1490,6 @@ async fn continue_rejects_a_native_incompatible_primary_before_queuing_or_persis
                 permissions: profile.permissions,
                 skills: profile.skills,
                 tools: crate::agents::types::AgentTools {
-                    native: profile.tools.native,
                     plugins: vec!["unimplemented.plugin_tool".into()],
                     apps: Vec::new(),
                 },
@@ -1545,7 +1554,9 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
             branch: None,
             title: None,
             status: SessionStatus::Interrupted,
-            perm_mode: primary.profile.permissions.mode,
+            // TODO(Task 2): profile no longer carries a permission mode;
+            // this session row's mode is a plain default now.
+            perm_mode: PermMode::Default,
             started_by: Some("test".into()),
             created_at: Some(now),
             last_active: Some(now),
@@ -1572,7 +1583,6 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
                 permissions: profile.permissions,
                 skills: profile.skills,
                 tools: crate::agents::types::AgentTools {
-                    native: profile.tools.native,
                     plugins: vec!["unimplemented.plugin_tool".into()],
                     apps: Vec::new(),
                 },

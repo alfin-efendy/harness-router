@@ -9,8 +9,8 @@ use crate::agents::learning_queue::{LearningEventPayload, RollbackEvent};
 use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, KnowledgeScope};
 use crate::agents::personality::{AgentPersonality, PersonalityPreset};
 use crate::agents::types::{
-    AgentAvatar, AgentModel, AgentMutationInput, AgentPermissionMode, AgentPermissions,
-    AgentRegistrySnapshot, AgentSnapshot, AgentTools, PermissionDecision, PermissionRule,
+    AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentRegistrySnapshot,
+    AgentSnapshot, AgentTools, PermissionDecision, PermissionRule,
 };
 use crate::api::types::{
     AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
@@ -189,25 +189,14 @@ impl TryFrom<AgentModelInfo> for AgentModel {
     }
 }
 
-/// The YAML permission-mode vocabulary as the wire strings the DTOs carry.
-/// Mirrors `AgentPermissionMode`'s serde names exactly.
-fn parse_permission_mode(value: &str) -> Result<PermMode, ApiError> {
-    serde_json::from_value::<AgentPermissionMode>(Value::String(value.trim().to_owned()))
-        .map(AgentPermissionMode::runtime_mode)
-        .map_err(|_| {
-            ApiError::bad_request(format!(
-                "unknown permission mode `{value}` (expected ask, accept_edits, full, or plan)"
-            ))
-        })
-}
-
-fn permission_mode_string(mode: PermMode) -> String {
-    match serde_json::to_value(AgentPermissionMode::from_runtime(mode)) {
-        Ok(Value::String(value)) => value,
-        _ => "ask".to_owned(),
-    }
-}
-
+// TODO(Task 3): `AgentSummaryInfo`/`AgentMutationInfo.permission_mode` and
+// `.native_tools: Vec<String>` are deleted/reshaped into
+// `NativeToolDecisionInfo` per the plan brief. Until then this mechanical
+// patch (a) ignores the wire `permission_mode` string entirely on mutation
+// (AgentPermissionMode, the type it decoded through, no longer exists) and
+// (b) reports it as a constant placeholder on read, and (c) derives
+// `native_tools` from the enabled (non-`Off`) keys of the new
+// `permissions.native` decision map.
 fn parse_permission_decision(value: &str) -> Result<PermissionDecision, ApiError> {
     match value {
         "allow" => Ok(PermissionDecision::Allow),
@@ -289,7 +278,6 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
         if description.is_empty() {
             return Err(ApiError::bad_request("agent description cannot be blank"));
         }
-        let mode = parse_permission_mode(&info.permission_mode)?;
         let rules = info
             .permission_rules
             .into_iter()
@@ -323,10 +311,17 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
             },
             model: info.model.try_into()?,
             personality: parse_personality(info.personality)?,
-            permissions: AgentPermissions { mode, rules },
+            // TODO(Task 3): `native_tools` decodes into
+            // `NativeToolDecisionInfo` entries per the plan brief instead of
+            // being dropped; `permission_mode` is gone entirely (no v2
+            // replacement input — the caller edits the decision map
+            // directly).
+            permissions: AgentPermissions {
+                native: std::collections::BTreeMap::new(),
+                rules,
+            },
             skills: clean_references("skills", info.skills)?,
             tools: AgentTools {
-                native: clean_references("native tools", info.native_tools)?,
                 plugins: clean_references("plugin tools", info.plugin_tools)?,
                 apps: clean_references("apps", info.apps)?,
             },
@@ -341,12 +336,15 @@ fn summary_info(
     catalog: &AgentConfigurationCatalog,
 ) -> AgentSummaryInfo {
     let profile = &snapshot.profile;
-    let tool_count = profile
-        .tools
+    let enabled_native = profile
+        .permissions
         .native
         .iter()
-        .chain(&profile.tools.plugins)
-        .chain(&profile.tools.apps)
+        .filter(|(_, decision)| decision.enabled())
+        .map(|(id, _)| id.as_str());
+    let tool_count = enabled_native
+        .chain(profile.tools.plugins.iter().map(String::as_str))
+        .chain(profile.tools.apps.iter().map(String::as_str))
         .collect::<std::collections::HashSet<_>>()
         .len() as u32;
     let mut merged_validation = snapshot.validation.clone();
@@ -360,7 +358,9 @@ fn summary_info(
         description: profile.description.clone(),
         avatar_color: profile.avatar.color.clone(),
         model: profile.model.clone().into(),
-        permission_mode: permission_mode_string(profile.permissions.mode),
+        // TODO(Task 3): field deleted from `AgentSummaryInfo` per the plan
+        // brief; placeholder until then.
+        permission_mode: "ask".to_owned(),
         skill_count: profile.skills.len() as u32,
         tool_count,
         knowledge_count,
@@ -506,11 +506,21 @@ fn detail_info_from_enrichment(
             command_prefix: rule.command_prefix,
         })
         .collect();
+    // TODO(Task 3): `native_tools: Vec<String>` becomes
+    // `Vec<NativeToolDecisionInfo>` (explicit map entries only) per the plan
+    // brief; this mechanical patch reports the enabled (non-`Off`) keys.
+    let native_tools = profile
+        .permissions
+        .native
+        .iter()
+        .filter(|(_, decision)| decision.enabled())
+        .map(|(id, _)| id.clone())
+        .collect();
     AgentDetailInfo {
         summary,
         permission_rules: rules,
         skills: profile.skills,
-        native_tools: profile.tools.native,
+        native_tools,
         plugin_tools: profile.tools.plugins,
         apps: profile.tools.apps,
         model_info,
@@ -1449,7 +1459,10 @@ mod tests {
     #[test]
     fn summary_info_marks_unavailable_native_tool_as_not_executable() {
         let mut snapshot = fixture_snapshot_with(PersonalityPreset::Helpful);
-        snapshot.profile.tools.native = vec!["missing".to_string()];
+        snapshot.profile.permissions.native = std::collections::BTreeMap::from([(
+            "missing".to_string(),
+            crate::agents::types::NativeToolDecision::Allow,
+        )]);
 
         let summary = super::summary_info(
             &snapshot,

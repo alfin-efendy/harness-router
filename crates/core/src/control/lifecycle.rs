@@ -243,7 +243,10 @@ impl ControlPlane {
             branch,
             title: Some(title),
             status: SessionStatus::Running,
-            perm_mode: primary_agent.profile.permissions.mode,
+            // TODO(Task 2): perm_mode is a session-owned concept now; the
+            // profile no longer carries one. `PermMode::Default` matches the
+            // pre-migration bootstrap default (Ryuzi's YAML `mode: ask`).
+            perm_mode: PermMode::Default,
             started_by: Some(started_by.to_string()),
             created_at: Some(now),
             last_active: Some(now),
@@ -1629,7 +1632,16 @@ impl ControlPlane {
         let run_id = primary_turn.run_id;
         let root_run_id = primary_turn.root_run_id;
         let (model, effort) = agent_model_parts(&primary_agent.profile.model);
-        let perm_mode = primary_agent.profile.permissions.mode;
+        // TODO(Task 2): thread perm_mode through `primary_turn_config`
+        // properly (`ctx.perm_mode` per the plan brief) instead of
+        // recomputing it here. The profile no longer carries a mode at all,
+        // so this falls back to the persisted session row's mode (the real
+        // session-owned value) and only defaults when that row is missing
+        // (a not-yet-persisted resume path).
+        let perm_mode = session_row
+            .as_ref()
+            .map(|s| s.perm_mode)
+            .unwrap_or(PermMode::Default);
         let kind = kind_override.unwrap_or_else(|| {
             session_row
                 .as_ref()

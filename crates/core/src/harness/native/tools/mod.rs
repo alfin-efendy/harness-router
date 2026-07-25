@@ -571,6 +571,13 @@ impl ToolRegistry {
         Self::from_complete_list(Self::builtin_list())
     }
 
+    /// The registry ids of every built-in tool, without building per-session
+    /// availability state. Used by agent profile schema migration/defaults
+    /// and their tests.
+    pub fn builtin_ids() -> Vec<String> {
+        Self::builtin().names()
+    }
+
     /// The built-ins plus a set of extra (e.g. MCP) tools.
     pub fn with_extra(extra: Vec<Arc<dyn Tool>>) -> Self {
         let mut list = Self::builtin_list();

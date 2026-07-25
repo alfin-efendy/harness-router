@@ -96,7 +96,7 @@ impl AgentConfigurationCatalog {
     ) -> Vec<AgentValidationIssue> {
         validate_references(
             &input.skills,
-            &input.tools.native,
+            &enabled_native_ids(&input.permissions.native),
             &input.tools.plugins,
             &input.tools.apps,
             &input.permissions.rules,
@@ -110,13 +110,28 @@ impl AgentConfigurationCatalog {
     ) -> Vec<AgentValidationIssue> {
         validate_references(
             &profile.skills,
-            &profile.tools.native,
+            &enabled_native_ids(&profile.permissions.native),
             &profile.tools.plugins,
             &profile.tools.apps,
             &profile.permissions.rules,
             catalog,
         )
     }
+}
+
+// TODO(Task 3): this derives an allow-list Vec<String> from the per-tool
+// decision map purely as a mechanical bridge so `validate_references` (which
+// predates the decision map) keeps compiling; Task 3 owns reworking this
+// validator (and its "tools.native" issue field name) to validate the
+// decision map's keys directly per its brief.
+fn enabled_native_ids(
+    native: &std::collections::BTreeMap<String, crate::agents::types::NativeToolDecision>,
+) -> Vec<String> {
+    native
+        .iter()
+        .filter(|(_, decision)| decision.enabled())
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 pub async fn build_live_catalog(
@@ -278,12 +293,13 @@ pub fn native(id: &str, label: &str) -> CatalogEntry {
 mod tests {
     use super::*;
     use crate::agents::personality::AgentPersonality;
-    use crate::agents::types::{AgentAvatar, AgentModel, AgentPermissions, AgentTools};
-    use crate::PermMode;
+    use crate::agents::types::{
+        AgentAvatar, AgentModel, AgentPermissions, AgentTools, NativeToolDecision,
+    };
 
     fn base_profile(native_tools: Vec<String>, rules: Vec<PermissionRule>) -> AgentProfile {
         AgentProfile {
-            schema_version: 1,
+            schema_version: 2,
             id: "test-agent".to_string(),
             name: "Test Agent".to_string(),
             description: String::new(),
@@ -295,12 +311,14 @@ mod tests {
             },
             personality: AgentPersonality::default_profile(),
             permissions: AgentPermissions {
-                mode: PermMode::Default,
+                native: native_tools
+                    .into_iter()
+                    .map(|id| (id, NativeToolDecision::Allow))
+                    .collect(),
                 rules,
             },
             skills: Vec::new(),
             tools: AgentTools {
-                native: native_tools,
                 plugins: Vec::new(),
                 apps: Vec::new(),
             },

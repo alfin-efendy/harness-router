@@ -5662,12 +5662,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::Default,
+                    native: std::collections::BTreeMap::new(),
                     rules: vec![],
                 },
                 skills: vec![],
                 tools: AgentTools {
-                    native: vec![],
                     plugins: vec![],
                     apps: vec![],
                 },
@@ -6031,12 +6030,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
@@ -12096,12 +12094,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: crate::agents::types::AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
@@ -12196,12 +12193,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
@@ -12274,12 +12270,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
@@ -12400,12 +12395,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
@@ -12478,12 +12472,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
@@ -12632,7 +12625,10 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::from([(
+                        "write".into(),
+                        crate::agents::types::NativeToolDecision::Allow,
+                    )]),
                     rules: vec![PermissionRule {
                         id: "parent-rule".into(),
                         tool: "write".into(),
@@ -12642,7 +12638,6 @@ mod tests {
                 },
                 skills: vec!["parent-skill".into()],
                 tools: AgentTools {
-                    native: vec!["write".into()],
                     plugins: vec![],
                     apps: vec![],
                 },
@@ -12662,7 +12657,20 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::from([
+                        (
+                            "read".into(),
+                            crate::agents::types::NativeToolDecision::Allow,
+                        ),
+                        (
+                            "bash".into(),
+                            crate::agents::types::NativeToolDecision::Allow,
+                        ),
+                        (
+                            "app_projects".into(),
+                            crate::agents::types::NativeToolDecision::Allow,
+                        ),
+                    ]),
                     rules: vec![PermissionRule {
                         id: "target-rule".into(),
                         tool: "read".into(),
@@ -12672,7 +12680,6 @@ mod tests {
                 },
                 skills: vec!["target-skill".into()],
                 tools: AgentTools {
-                    native: vec!["read".into(), "bash".into(), "app_projects".into()],
                     plugins: vec!["github.search".into(), "lint.check".into()],
                     apps: vec!["slack".into()],
                 },
@@ -12881,12 +12888,14 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    mode: PermMode::BypassPermissions,
+                    native: std::collections::BTreeMap::from([(
+                        "read".into(),
+                        crate::agents::types::NativeToolDecision::Allow,
+                    )]),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: AgentTools {
-                    native: vec!["read".into()],
                     plugins: vec!["github.search".into()],
                     apps: vec!["slack".into()],
                 },

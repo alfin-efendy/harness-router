@@ -53,20 +53,30 @@ struct AdaptedPrimary {
     allowed_skills: Option<Vec<String>>,
 }
 
+// TODO(Task 2): replaced wholesale per the plan brief (per-tool decision map
+// semantics, `wasm__` namespace, deleted `ToolFilter::All` shortcut). This
+// mechanical patch only swaps the deleted `profile.tools.native: Vec<String>`
+// allow-list for the enabled (non-`Off`) keys of the new
+// `profile.permissions.native` decision map so the crate keeps compiling.
 fn tool_filter_for_profile(
     profile: &crate::agents::types::AgentProfile,
     available: &[String],
 ) -> agents::ToolFilter {
-    if profile.tools.native.is_empty()
+    let native_enabled: Vec<String> = profile
+        .permissions
+        .native
+        .iter()
+        .filter(|(_, decision)| decision.enabled())
+        .map(|(id, _)| id.clone())
+        .collect();
+    if native_enabled.is_empty()
         && profile.tools.plugins.is_empty()
         && profile.tools.apps.is_empty()
     {
         return agents::ToolFilter::All;
     }
 
-    let mut configured = profile
-        .tools
-        .native
+    let mut configured = native_enabled
         .iter()
         .filter(|name| {
             available
@@ -147,7 +157,9 @@ pub(crate) fn primary_turn_config(
         crate::agents::types::AgentModel::Route { route } => (Some(route.clone()), None),
     };
     Ok(crate::harness::PrimaryTurnConfig {
-        perm_mode: agent.profile.permissions.mode,
+        // TODO(Task 2): perm_mode becomes a session-owned argument threaded
+        // in by the caller; the profile no longer carries one at all.
+        perm_mode: crate::domain::PermMode::Default,
         agent,
         run_id,
         root_run_id,
@@ -727,11 +739,28 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::types::NativeToolDecision;
     use crate::approval::ApprovalHub;
     use crate::domain::PermMode;
     use crate::llm_router::client::AnthropicEvent;
     use crate::store::Store;
+    use std::collections::BTreeMap;
     use tokio::sync::broadcast;
+
+    /// Test-only mechanical bridge (Task 1): builds a
+    /// `permissions.native` decision map where every listed tool is `Allow`,
+    /// standing in for the deleted `AgentTools.native: Vec<String>`
+    /// allow-list these fixtures used to assign directly. NOTE: unlike the
+    /// old allow-list, tools NOT in this map are `Ask` (still enabled), not
+    /// excluded — several tests below assert on the old "only these tools"
+    /// semantics and are expected to fail until Task 2 reworks
+    /// `tool_filter_for_profile`'s absent-entry handling (see task report).
+    fn allow_map(tools: &[&str]) -> BTreeMap<String, NativeToolDecision> {
+        tools
+            .iter()
+            .map(|tool| (tool.to_string(), NativeToolDecision::Allow))
+            .collect()
+    }
 
     /// A factory that hands every session the same scripted conversation.
     struct ScriptedFactory {
@@ -909,7 +938,7 @@ mod tests {
     #[test]
     fn durable_primary_adapter_still_filters_skills_without_build_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
-        profile.tools.native = vec!["read".into()];
+        profile.permissions.native = allow_map(&["read"]);
         profile.skills = vec!["release".into()];
         let adapted = adapt_primary_profile(&profile).unwrap();
 
@@ -939,7 +968,7 @@ mod tests {
         let mut target = (*ctx.primary_agent).clone();
         target.profile.id = "mentioned-target".into();
         target.profile.name = "Mentioned target".into();
-        target.profile.tools.native = vec!["read".into(), "app_projects".into()];
+        target.profile.permissions.native = allow_map(&["read", "app_projects"]);
         target.profile.tools.plugins.clear();
         target.profile.tools.apps.clear();
         ctx.primary_agent = Arc::new(target);
@@ -1015,7 +1044,7 @@ mod tests {
         let mut target = (*ctx.primary_agent).clone();
         target.profile.id = "mentioned-target".into();
         target.profile.name = "Mentioned target".into();
-        target.profile.tools.native.clear();
+        target.profile.permissions.native.clear();
         target.profile.tools.plugins = vec!["github.search".into()];
         target.profile.tools.apps = vec!["slack".into()];
         ctx.primary_agent = Arc::new(target);
@@ -1067,7 +1096,7 @@ mod tests {
         let mut ctx = ctx_for(store, work_dir.path().to_path_buf()).await;
         let mut primary = (*ctx.primary_agent).clone();
         primary.profile.id = "plugin-app-only".into();
-        primary.profile.tools.native.clear();
+        primary.profile.permissions.native.clear();
         primary.profile.tools.plugins = vec!["github.search".into()];
         primary.profile.tools.apps = vec!["slack".into()];
         ctx.primary_agent = Arc::new(primary);
@@ -1219,7 +1248,7 @@ mod tests {
         let mut primary = (*ctx.primary_agent).clone();
         primary.profile.id = "plugin-bound-target".into();
         primary.profile.name = "Plugin bound target".into();
-        primary.profile.tools.native = vec!["read".into()];
+        primary.profile.permissions.native = allow_map(&["read"]);
         primary.profile.tools.plugins = vec!["github.search".into()];
         ctx.primary_agent = Arc::new(primary);
         ctx.main_agent_id = "plugin-bound-target".into();
@@ -1281,7 +1310,7 @@ mod tests {
     #[test]
     fn profile_tool_filter_resolves_native_plugin_and_app_tools_without_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
-        profile.tools.native = vec!["read".into()];
+        profile.permissions.native = allow_map(&["read"]);
         profile.tools.plugins = vec!["github.search".into(), "lint.check".into()];
         profile.tools.apps = vec!["slack".into()];
         let available = vec![
@@ -1302,7 +1331,7 @@ mod tests {
             ])
         );
 
-        profile.tools.native = vec!["missing-native".into()];
+        profile.permissions.native = allow_map(&["missing-native"]);
         profile.tools.plugins = vec!["missing.tool".into()];
         profile.tools.apps = vec!["missing-app".into()];
         assert_eq!(

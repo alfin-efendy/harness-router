@@ -1,12 +1,13 @@
+use std::collections::BTreeMap;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::agents::personality::AgentPersonality;
-use crate::PermMode;
 
 pub type AgentId = String;
-pub const AGENT_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentIndex {
@@ -42,30 +43,15 @@ pub enum PermissionDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AgentPermissionMode {
+pub enum NativeToolDecision {
+    Allow,
     Ask,
-    AcceptEdits,
-    Full,
-    Plan,
+    Off,
 }
 
-impl AgentPermissionMode {
-    pub fn runtime_mode(self) -> PermMode {
-        match self {
-            Self::Ask => PermMode::Default,
-            Self::AcceptEdits => PermMode::AcceptEdits,
-            Self::Full => PermMode::BypassPermissions,
-            Self::Plan => PermMode::Plan,
-        }
-    }
-
-    pub fn from_runtime(mode: PermMode) -> Self {
-        match mode {
-            PermMode::Default => Self::Ask,
-            PermMode::AcceptEdits => Self::AcceptEdits,
-            PermMode::BypassPermissions => Self::Full,
-            PermMode::Plan => Self::Plan,
-        }
+impl NativeToolDecision {
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
     }
 }
 
@@ -79,13 +65,23 @@ pub struct PermissionRule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPermissions {
-    pub mode: PermMode,
+    /// Per-tool native decision, keyed by the tool's registry id. An absent
+    /// entry means [`NativeToolDecision::Ask`].
+    pub native: BTreeMap<String, NativeToolDecision>,
     pub rules: Vec<PermissionRule>,
+}
+
+impl AgentPermissions {
+    pub fn native_decision(&self, tool: &str) -> NativeToolDecision {
+        self.native
+            .get(tool)
+            .copied()
+            .unwrap_or(NativeToolDecision::Ask)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTools {
-    pub native: Vec<String>,
     pub plugins: Vec<String>,
     pub apps: Vec<String>,
 }

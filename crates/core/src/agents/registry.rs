@@ -800,7 +800,10 @@ pub fn validate_agent_id(value: &str) -> Result<(), AgentValidationIssue> {
 pub async fn validate_profile(store: &Store, profile: &AgentProfile) -> Vec<AgentValidationIssue> {
     let mut issues = Vec::new();
     if profile.schema_version != AGENT_SCHEMA_VERSION {
-        issues.push(issue("schema_version", "schema version must be 1"));
+        issues.push(issue(
+            "schema_version",
+            format!("schema version must be {AGENT_SCHEMA_VERSION}"),
+        ));
     }
     if let Err(value) = validate_agent_id(&profile.id) {
         issues.push(value);
@@ -838,7 +841,14 @@ pub async fn validate_profile(store: &Store, profile: &AgentProfile) -> Vec<Agen
         }
     }
     validate_references(&mut issues, "skills", &profile.skills);
-    validate_references(&mut issues, "tools.native", &profile.tools.native);
+    for tool in profile.permissions.native.keys() {
+        if tool.trim().is_empty() {
+            issues.push(issue(
+                "permissions.native",
+                "stable reference cannot be blank",
+            ));
+        }
+    }
     validate_references(&mut issues, "tools.plugins", &profile.tools.plugins);
     validate_references(&mut issues, "tools.apps", &profile.tools.apps);
     issues.extend(validate_model(store, &profile.model).await);
@@ -868,12 +878,15 @@ pub async fn validate_registry_candidate(
 
     let mut registry_issues = Vec::new();
     if index.schema_version != AGENT_SCHEMA_VERSION {
-        registry_issues.push(issue("index.schema_version", "schema version must be 1"));
+        registry_issues.push(issue(
+            "index.schema_version",
+            format!("schema version must be {AGENT_SCHEMA_VERSION}"),
+        ));
     }
     if subagents.schema_version != AGENT_SCHEMA_VERSION {
         registry_issues.push(issue(
             "subagents.schema_version",
-            "schema version must be 1",
+            format!("schema version must be {AGENT_SCHEMA_VERSION}"),
         ));
     }
     let mut order_ids = HashSet::new();
@@ -1044,12 +1057,11 @@ fn recover_minimal_profile(raw: &str, directory_id: &str) -> Option<AgentProfile
         },
         personality: crate::agents::personality::AgentPersonality::default_profile(),
         permissions: AgentPermissions {
-            mode: crate::PermMode::Default,
+            native: std::collections::BTreeMap::new(),
             rules: Vec::new(),
         },
         skills: Vec::new(),
         tools: AgentTools {
-            native: Vec::new(),
             plugins: Vec::new(),
             apps: Vec::new(),
         },
@@ -1384,12 +1396,11 @@ mod tests {
             },
             personality: crate::agents::personality::AgentPersonality::default_profile(),
             permissions: AgentPermissions {
-                mode: crate::PermMode::Default,
+                native: std::collections::BTreeMap::new(),
                 rules: Vec::new(),
             },
             skills: Vec::new(),
             tools: AgentTools {
-                native: vec!["read".into()],
                 plugins: Vec::new(),
                 apps: Vec::new(),
             },
@@ -2091,12 +2102,11 @@ mod tests {
             },
             personality: crate::agents::personality::AgentPersonality::default_profile(),
             permissions: AgentPermissions {
-                mode: crate::PermMode::Default,
+                native: std::collections::BTreeMap::new(),
                 rules: Vec::new(),
             },
             skills: Vec::new(),
             tools: AgentTools {
-                native: vec!["read".into()],
                 plugins: Vec::new(),
                 apps: Vec::new(),
             },
@@ -2128,12 +2138,11 @@ mod tests {
             },
             personality: crate::agents::personality::AgentPersonality::default_profile(),
             permissions: AgentPermissions {
-                mode: crate::PermMode::Default,
+                native: std::collections::BTreeMap::new(),
                 rules: Vec::new(),
             },
             skills: Vec::new(),
             tools: AgentTools {
-                native: vec!["read".into()],
                 plugins: Vec::new(),
                 apps: Vec::new(),
             },

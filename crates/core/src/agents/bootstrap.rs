@@ -143,8 +143,9 @@ pub async fn initialize_agent_persistence(
     })
 }
 
-/// The built-in Ryuzi profile template. YAML permission mode `ask` is the
-/// runtime `PermMode::Default`; empty native tools mean runtime defaults.
+/// The built-in Ryuzi profile template: every built-in native tool is
+/// explicitly `Allow`, matching the old runtime's unrestricted native
+/// harness behavior for the built-in agent.
 pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
     AgentProfile {
         schema_version: AGENT_SCHEMA_VERSION,
@@ -159,12 +160,14 @@ pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
         },
         personality: crate::agents::personality::AgentPersonality::default_profile(),
         permissions: AgentPermissions {
-            mode: crate::PermMode::Default,
+            native: crate::harness::native::tools::ToolRegistry::builtin_ids()
+                .into_iter()
+                .map(|id| (id, NativeToolDecision::Allow))
+                .collect(),
             rules: Vec::new(),
         },
         skills: Vec::new(),
         tools: AgentTools {
-            native: Vec::new(),
             plugins: Vec::new(),
             apps: Vec::new(),
         },
@@ -1049,10 +1052,14 @@ mod tests {
                 route: "free".into()
             }
         );
-        assert_eq!(agent.profile.permissions.mode, PermMode::Default);
+        for id in crate::harness::native::tools::ToolRegistry::builtin_ids() {
+            assert_eq!(
+                agent.profile.permissions.native_decision(&id),
+                crate::agents::types::NativeToolDecision::Allow
+            );
+        }
         assert!(agent.profile.permissions.rules.is_empty());
         assert!(agent.profile.skills.is_empty());
-        assert!(agent.profile.tools.native.is_empty());
         assert!(agent.profile.tools.plugins.is_empty());
         assert!(agent.profile.tools.apps.is_empty());
         assert_eq!(
@@ -1180,6 +1187,17 @@ mod tests {
             profile.personality,
             crate::agents::personality::AgentPersonality::default_profile()
         );
+    }
+
+    #[test]
+    fn default_ryuzi_profile_allows_every_builtin_native() {
+        let p = default_ryuzi_profile("ryuzi".into());
+        for id in crate::harness::native::tools::ToolRegistry::builtin_ids() {
+            assert_eq!(
+                p.permissions.native_decision(&id),
+                crate::agents::types::NativeToolDecision::Allow
+            );
+        }
     }
 
     #[tokio::test]

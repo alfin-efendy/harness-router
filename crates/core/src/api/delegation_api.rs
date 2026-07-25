@@ -417,12 +417,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
-                    mode: PermMode::Default,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: crate::agents::types::AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
@@ -601,12 +600,11 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
-                    mode: PermMode::Default,
+                    native: std::collections::BTreeMap::new(),
                     rules: Vec::new(),
                 },
                 skills: Vec::new(),
                 tools: crate::agents::types::AgentTools {
-                    native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
