@@ -111,11 +111,6 @@ fn tool_filter_for_profile(
 fn adapt_primary_profile(
     profile: &crate::agents::types::AgentProfile,
 ) -> anyhow::Result<AdaptedPrimary> {
-    let tools = if profile.tools.native.is_empty() {
-        agents::ToolFilter::All
-    } else {
-        agents::ToolFilter::Only(profile.tools.native.clone())
-    };
     Ok(AdaptedPrimary {
         agent: agents::Agent {
             name: profile.id.clone(),
@@ -123,7 +118,14 @@ fn adapt_primary_profile(
             mode: agents::AgentMode::Primary,
             prompt: None,
             identity_prompt: Some(profile.personality.prompt()?.to_owned()),
-            tools,
+            // Fail-closed placeholder: a registry-blind config cannot express
+            // the profile's plugin/app bindings, so every consumer that
+            // reaches a model rebuilds this against the live registry via
+            // `tool_filter_for_profile` (`primary_turn_config_with_tools` at
+            // session/dispatch build time, `refresh_primary_turn` at prompt
+            // time). If a new consumer forgets, every tool is blocked —
+            // loudly visible — instead of silently overgranting.
+            tools: agents::ToolFilter::Only(Vec::new()),
             permission_rules: profile.permissions.rules.clone(),
             can_delegate: false,
             builtin: false,
@@ -614,12 +616,20 @@ impl HarnessSession for NativeSession {
         // `RunnerDeps` snapshot until it completes.
         let _turn = self.turn_lock.lock().await;
         let mut deps = self.deps.lock().unwrap();
+        // The control plane builds this config registry-blind (it has no tool
+        // registry), so its ToolFilter cannot express plugin/app bindings.
+        // Rebuild the filter against the live registry — the same resolution
+        // `start_session` uses — so bound plugin/app tools survive every
+        // follow-up prompt instead of collapsing to All (natives empty) or
+        // Only(natives) (natives set).
+        let mut agent_tools = primary.agent_tools;
+        agent_tools.tools = tool_filter_for_profile(&primary.agent.profile, &deps.tools.names());
         deps.primary_agent = primary.agent;
         deps.run_id = primary.run_id;
         deps.root_run_id = primary.root_run_id;
         deps.model = primary.model;
         deps.perm_mode = Arc::new(std::sync::Mutex::new(primary.perm_mode));
-        deps.agent = primary.agent_tools;
+        deps.agent = agent_tools;
         deps.allowed_skills = primary.allowed_skills;
     }
 
@@ -884,25 +894,30 @@ mod tests {
     }
 
     #[test]
-    fn durable_primary_adapter_uses_the_profile_id_and_native_tools() {
+    fn durable_primary_adapter_uses_the_profile_id_and_a_fail_closed_tool_placeholder() {
         let profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
         let adapted = adapt_primary_profile(&profile).unwrap();
 
         assert_eq!(adapted.agent.name, "ryuzi");
-        assert!(adapted.agent.tools.allows("bash"));
+        // adapt_primary_profile is registry-blind, so it can no longer derive
+        // a real filter from profile.tools.native; it emits the fail-closed
+        // placeholder and leaves rebuilding to tool_filter_for_profile.
+        assert_eq!(adapted.agent.tools, agents::ToolFilter::Only(Vec::new()));
         assert_eq!(adapted.allowed_skills, None);
     }
 
     #[test]
-    fn durable_primary_adapter_filters_profile_tools_and_skills_without_build_fallback() {
+    fn durable_primary_adapter_still_filters_skills_without_build_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
         profile.tools.native = vec!["read".into()];
         profile.skills = vec!["release".into()];
         let adapted = adapt_primary_profile(&profile).unwrap();
 
         assert_eq!(adapted.agent.name, "ryuzi");
-        assert!(adapted.agent.tools.allows("read"));
-        assert!(!adapted.agent.tools.allows("bash"));
+        // Tools are always the fail-closed placeholder regardless of
+        // profile.tools.native; only the registry-independent skills mapping
+        // is exercised here.
+        assert_eq!(adapted.agent.tools, agents::ToolFilter::Only(Vec::new()));
         assert_eq!(adapted.allowed_skills, Some(vec!["release".into()]));
     }
 
@@ -1035,6 +1050,232 @@ mod tests {
             advertised.is_empty(),
             "unattached configured tools must not overgrant native tools: {advertised:?}"
         );
+    }
+
+    /// A plugin/app-only profile (no natives bound) must keep advertising ZERO
+    /// native tools on the SECOND prompt. The control plane refreshes every
+    /// follow-up prompt with a registry-blind config (`PrimaryTurn::config()`
+    /// → `refresh_primary_turn`); before the fix that clobbered the filter to
+    /// `ToolFilter::All` and advertised the whole native registry.
+    #[tokio::test]
+    async fn refresh_primary_turn_rebuilds_bindings_against_live_registry() {
+        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let profile_db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(profile_db.path()).await.unwrap());
+        let mut ctx = ctx_for(store, work_dir.path().to_path_buf()).await;
+        let mut primary = (*ctx.primary_agent).clone();
+        primary.profile.id = "plugin-app-only".into();
+        primary.profile.tools.native.clear();
+        primary.profile.tools.plugins = vec!["github.search".into()];
+        primary.profile.tools.apps = vec!["slack".into()];
+        ctx.primary_agent = Arc::new(primary);
+        ctx.main_agent_id = "plugin-app-only".into();
+        ctx.isolated_target = true;
+        let refresh_agent = ctx.primary_agent.clone();
+        let run_id = ctx.run_id.clone();
+        let root_run_id = ctx.root_run_id.clone();
+
+        let turn = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![turn.clone(), turn]));
+        struct TwoTurnFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for TwoTurnFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let harness = NativeHarness::with_llm_factory(Arc::new(TwoTurnFactory(llm.clone())));
+        let session = harness.start_session(ctx).await.unwrap();
+        session
+            .send_prompt(TurnPrompt::text("first", "first"))
+            .await
+            .unwrap();
+
+        // Exactly what `continue_session_with_primary_turn` does per prompt:
+        // build a registry-blind config and push it at the live session.
+        let registry_blind = primary_turn_config(refresh_agent, run_id, root_run_id).unwrap();
+        session.refresh_primary_turn(registry_blind).await;
+        session
+            .send_prompt(TurnPrompt::text("second", "second"))
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let advertised = |i: usize| -> Vec<String> {
+            bodies[i]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        assert!(
+            advertised(0).is_empty(),
+            "start-path guard (already correct today): {:?}",
+            advertised(0)
+        );
+        assert!(
+            advertised(1).is_empty(),
+            "a prompt-time refresh must not clobber plugin/app bindings into ToolFilter::All: {:?}",
+            advertised(1)
+        );
+    }
+
+    /// The positive direction of the refresh fix: a BOUND plugin tool that is
+    /// live in the registry must still be advertised on the second prompt,
+    /// alongside a non-empty native tool list (the two `tools.native` shapes
+    /// the design spec calls out: empty and populated). Task 1's test alone
+    /// would pass under a wrong fix that collapses the refresh filter to
+    /// `Only(natives)`; this one fails under both that and the original
+    /// `All` clobber. `#[cfg(unix)]`: the fake extension is an `sh -c`
+    /// subprocess, like the DT6 extension test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_primary_turn_keeps_bound_plugin_tools_advertised() {
+        use crate::plugins::extension::{
+            ExtensionCtx as ExtCtx, ExtensionFactory, ExtensionHost, ExtensionSpec, ExtensionTools,
+        };
+        use crate::plugins::host::PluginHost;
+        use crate::settings::SettingsStore;
+        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+        use std::collections::BTreeSet;
+        use std::time::Duration;
+
+        struct FakeExtFactory {
+            spec: ExtensionSpec,
+        }
+        #[async_trait]
+        impl ExtensionFactory for FakeExtFactory {
+            async fn extensions(&self, _ctx: &ExtCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
+                Ok(vec![self.spec.clone()])
+            }
+        }
+
+        let manifest = PluginManifest {
+            contract: 1,
+            id: "github-plugin".into(),
+            name: "GitHub Plugin".into(),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            mcp: vec![],
+            extensions: vec![],
+            skills: vec![],
+            provider: None,
+        };
+        // Acks `extension/initialize` with one tool def ("search"), then
+        // blocks on a second read for the extension's lifetime (the model
+        // never calls the tool in this test; only ADVERTISEMENT matters).
+        let body = "IFS= read -r line; \
+             id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
+             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true,\"events\":[],\"tools\":[{\"name\":\"search\",\"description\":\"search github\"}]}}\\n' \"$id\"; \
+             IFS= read -r line2";
+        let spec = ExtensionSpec {
+            name: "github".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), body.into()],
+            events: vec![],
+            provides_tools: true,
+            timeout: Duration::from_millis(500),
+            env: vec![],
+        };
+        let mut plugin_host = PluginHost::new();
+        plugin_host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: Some(Arc::new(FakeExtFactory { spec })),
+            provider: None,
+            source: PluginSource::Builtin,
+        });
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let profile_db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(profile_db.path()).await.unwrap());
+        store
+            .set_setting_raw("plugin.github-plugin.enabled", "true")
+            .await
+            .unwrap();
+        let mut ctx = ctx_for(store.clone(), work_dir.path().to_path_buf()).await;
+        let settings = SettingsStore::new(store);
+        let ext_host = Arc::new(ExtensionHost::new());
+        ext_host.spawn_all(&plugin_host, &ExtCtx { settings }).await;
+        ctx.extension_tools = Some(ext_host.clone() as Arc<dyn ExtensionTools>);
+
+        let mut primary = (*ctx.primary_agent).clone();
+        primary.profile.id = "plugin-bound-target".into();
+        primary.profile.name = "Plugin bound target".into();
+        primary.profile.tools.native = vec!["read".into()];
+        primary.profile.tools.plugins = vec!["github.search".into()];
+        ctx.primary_agent = Arc::new(primary);
+        ctx.main_agent_id = "plugin-bound-target".into();
+        ctx.isolated_target = true;
+        let refresh_agent = ctx.primary_agent.clone();
+        let run_id = ctx.run_id.clone();
+        let root_run_id = ctx.root_run_id.clone();
+
+        let turn = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![turn.clone(), turn]));
+        struct TwoTurnFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for TwoTurnFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let harness = NativeHarness::with_llm_factory(Arc::new(TwoTurnFactory(llm.clone())));
+        let session = harness.start_session(ctx).await.unwrap();
+        session
+            .send_prompt(TurnPrompt::text("first", "first"))
+            .await
+            .unwrap();
+        let registry_blind = primary_turn_config(refresh_agent, run_id, root_run_id).unwrap();
+        session.refresh_primary_turn(registry_blind).await;
+        session
+            .send_prompt(TurnPrompt::text("second", "second"))
+            .await
+            .unwrap();
+
+        let expected: BTreeSet<String> = ["read", "ext__github__search"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        {
+            let bodies = llm.bodies.lock().unwrap();
+            let advertised = |i: usize| -> BTreeSet<String> {
+                bodies[i]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                    .collect()
+            };
+            assert_eq!(advertised(0), expected, "start-path guard");
+            assert_eq!(
+                advertised(1),
+                expected,
+                "a bound plugin tool and a bound native tool must both survive the prompt-time refresh"
+            );
+        }
+
+        ext_host.shutdown_all(Duration::from_millis(200)).await;
     }
 
     #[test]
