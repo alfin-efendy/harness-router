@@ -38,7 +38,6 @@ pub struct SlashCatalog {
     commands: CommandRegistry,
     skills: SkillRegistry,
     allowed_skills: Option<Vec<String>>,
-    has_project: bool,
 }
 
 impl SlashCatalog {
@@ -54,7 +53,6 @@ impl SlashCatalog {
             commands,
             skills,
             allowed_skills: allowed_skills.map(<[String]>::to_vec),
-            has_project: project_dir.is_some(),
         }
     }
 
@@ -72,13 +70,14 @@ impl SlashCatalog {
     }
 
     /// Merged autocomplete entries. Command sources come through unchanged
-    /// (including shadowed ones, for the Automation tab); listed skills are
-    /// appended unless a command already owns the name. Without a project,
-    /// builtins are omitted from the LISTING (nothing home-visible exists
-    /// outside a project), but the collision set below still spans the FULL
-    /// registry (builtins included) — `resolve()` always consults the full
-    /// registry via `self.commands.get`, so a name a builtin owns must never
-    /// list as a skill even when the builtin itself isn't listed here.
+    /// (including shadowed ones, for the Automation tab) — builtins are
+    /// always listed, project or not; it's the callers that decide what's
+    /// home-visible without a project (Home's client-side filters combine
+    /// surface + requiresProject, see `matchSlashEntries`), not this API.
+    /// Listed skills are appended unless a command already owns the name;
+    /// the collision set spans the FULL registry (builtins included) —
+    /// `resolve()` always consults the full registry via `self.commands.get`,
+    /// so a name a builtin owns must never list as a skill either.
     pub fn entries(&self) -> Vec<SlashEntry> {
         let command_names: BTreeSet<String> = self
             .commands
@@ -90,7 +89,6 @@ impl SlashCatalog {
             .commands
             .catalog()
             .into_iter()
-            .filter(|entry| self.has_project || entry.origin == CommandOrigin::Global)
             .map(|entry| {
                 command_entry(
                     &entry.command,
@@ -357,11 +355,32 @@ mod tests {
     }
 
     #[test]
-    fn no_project_load_lists_only_global_commands_and_bound_global_skills() {
+    fn no_project_load_lists_global_and_builtin_commands() {
+        // Builtins are always listed, project or not — Home's client-side
+        // filters (surface + requiresProject) are what hide them with no
+        // project attached, so the API itself doesn't need to.
         let catalog = SlashCatalog::load(None, None);
-        assert!(catalog
-            .entries()
+        let entries = catalog.entries();
+        let builtin = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name && e.kind == SlashKind::Command)
+                .unwrap_or_else(|| panic!("missing builtin command entry: {name}"))
+        };
+        let init = builtin("init");
+        assert_eq!(init.origin, CommandOrigin::Builtin);
+        assert!(init.surfaces.home && init.surfaces.session && init.requires_project);
+        let review = builtin("review");
+        assert_eq!(review.origin, CommandOrigin::Builtin);
+        assert!(!review.surfaces.home && review.surfaces.session);
+        let compact = builtin("compact");
+        assert_eq!(compact.origin, CommandOrigin::Builtin);
+        assert!(!compact.surfaces.home && compact.surfaces.session);
+        // Every non-builtin command entry has nowhere to come from but the
+        // global command directory (no project => no Project origin).
+        assert!(entries
             .iter()
+            .filter(|e| e.kind == SlashKind::Command && e.origin != CommandOrigin::Builtin)
             .all(|e| e.origin == CommandOrigin::Global));
     }
 
@@ -372,9 +391,9 @@ mod tests {
     /// skills root, both `SkillOrigin::Global` per Task 2). Covers both the
     /// "bound global skills" half of the name above (a skill lists once
     /// bound) AND the Issue-1 regression (a bound global skill whose name
-    /// collides with a BUILTIN command — invisible in a has_project-filtered
-    /// listing, but still present in the full registry `resolve()` uses —
-    /// must be dropped from the listing, and the builtin must still win at
+    /// collides with a BUILTIN command — present in the full registry
+    /// `resolve()` uses, and now also listed as a Command entry — must be
+    /// dropped from the SKILL listing, and the builtin must still win at
     /// resolve time).
     #[test]
     fn no_project_load_binds_global_skills_and_drops_ones_colliding_with_builtins() {
@@ -395,7 +414,6 @@ mod tests {
             commands: CommandRegistry::load_without_project(),
             skills,
             allowed_skills: Some(vec!["triage".into(), "init".into()]),
-            has_project: false,
         };
         let entries = catalog.entries();
         assert!(entries.iter().any(|e| e.name == "triage"
@@ -409,6 +427,15 @@ mod tests {
         // The builtin still resolves and wins — the skill never shadows it.
         let resolved = catalog.resolve("/init").unwrap();
         assert!(resolved.prompt.contains("Analyze this codebase"));
-        assert!(entries.iter().all(|e| e.origin == CommandOrigin::Global));
+        // "init" now also lists as a builtin Command entry (Issue 1: builtins
+        // are no longer hidden without a project) — every other entry still
+        // has nowhere to come from but the global command/skill sources.
+        assert!(entries.iter().any(|e| e.name == "init"
+            && e.kind == SlashKind::Command
+            && e.origin == CommandOrigin::Builtin));
+        assert!(entries
+            .iter()
+            .filter(|e| e.origin != CommandOrigin::Builtin)
+            .all(|e| e.origin == CommandOrigin::Global));
     }
 }

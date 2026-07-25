@@ -72,6 +72,13 @@ export function TemplateTextarea({
   const projectAgents = useNative((state) => (projectId ? state.agentsByProject[projectId] : undefined));
   const searchSerial = useRef(0);
 
+  // Nothing else loads `agentsByProject` for a hint project that hasn't been
+  // visited elsewhere (e.g. no session opened in it yet) — without this, the
+  // "@" agent popup would stay permanently empty for such a project.
+  useEffect(() => {
+    if (projectId) void useNative.getState().loadAgents(LOCAL_RUNNER, projectId);
+  }, [projectId]);
+
   const trackCaret = (target: HTMLTextAreaElement) => setCaret(target.selectionStart ?? target.value.length);
 
   const lineSlash = useMemo(() => activeLineSlashQuery(value, caret), [value, caret]);
@@ -175,6 +182,10 @@ export function TemplateTextarea({
           if (!open) return;
           if (event.key === "Escape") {
             event.preventDefault();
+            // Contain it here — otherwise it bubbles to the enclosing
+            // Dialog (CommandsTab's editor Modal), which treats Escape as
+            // "close the whole modal", discarding the draft.
+            event.stopPropagation();
             dismiss();
             return;
           }
