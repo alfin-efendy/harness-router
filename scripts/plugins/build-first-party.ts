@@ -4,14 +4,20 @@
 //   bun scripts/plugins/build-first-party.ts keygen      # generate a dev signing keypair
 //
 // Reproducibly builds the first-party provider *components* (plugins/mimo,
-// plugins/opencode), then emits — per component — the four release artifacts the
+// plugins/opencode), then emits — per component — the seven release artifacts the
 // engine's signed install pipeline fetches (crates/core/src/plugins/remote_catalog.rs
 // `install_component_release`):
 //
-//   <id>.ryuzi-plugin.toml    (the committed manifest, verbatim)
-//   <id>.wasm                 (the compiled component, `component_url` points here)
-//   <id>.release.json         (a `ryuzi_plugin_sdk::PluginRelease` descriptor)
-//   <id>.release.json.sig     (the `plugin.sig` envelope: JSON {key_id, signature})
+//   <id>.ryuzi-plugin.toml         (the committed manifest, verbatim)
+//   <id>.release.json              (a `ryuzi_plugin_sdk::PluginRelease` descriptor)
+//   <id>.release.json.sig          (the `plugin.sig` envelope: JSON {key_id, signature})
+//   <id>.wasm                      (the compiled component, `component_url` points here)
+//   <id>-<version>.ryuzi-plugin.toml (pinned-stem alias, byte-identical)
+//   <id>-<version>.release.json    (pinned-stem alias, byte-identical)
+//   <id>-<version>.release.json.sig (pinned-stem alias, byte-identical)
+//
+// Each of the three descriptor files is additionally published under the pinned stem
+// `<id>-<version>.*` (byte-identical); the wasm is published once.
 //
 // The signature is an ed25519 signature over `release.json`'s EXACT raw bytes,
 // base64url-no-pad, wrapped in the JSON envelope `plugins::bundle::verify_bundle`
@@ -108,6 +114,26 @@ export interface PluginReleaseJson {
   component_sha256: string;
   size_bytes?: number;
   published_at?: string;
+}
+
+/**
+ * The artifact filenames one signed component release publishes. The three
+ * descriptor files exist under BOTH stems — `<id>.*` (what an unversioned
+ * `release_stem` fetch resolves) and `<id>-<version>.*` (what a pinned fetch
+ * resolves) — as byte-identical copies of the same signed bytes. The wasm is
+ * published ONCE under `component`: both stems' release.json point at it
+ * absolutely via `component_url`, so it needs no versioned alias.
+ */
+export function artifactNames(id: string, version: string, component: string): string[] {
+  return [
+    `${id}.ryuzi-plugin.toml`,
+    `${id}.release.json`,
+    `${id}.release.json.sig`,
+    component,
+    `${id}-${version}.ryuzi-plugin.toml`,
+    `${id}-${version}.release.json`,
+    `${id}-${version}.release.json.sig`,
+  ];
 }
 
 /** Lowercase-hex SHA-256 of `bytes` (matches `plugins::bundle`'s `format!("{:x}", Sha256::digest(..))`). */
@@ -249,7 +275,11 @@ async function processComponent(
   await materializeDeps(spec.dir);
   buildComponent(spec.dir);
 
-  const wasmPath = `${spec.dir}/target/${WASM_TARGET}/release/${spec.crateWasmStem}.wasm`;
+  // CI shares one target dir across all 18 standalone bundle workspaces via
+  // CARGO_TARGET_DIR (dep crates compile once, wasm stems never collide);
+  // cargo honors it over the per-workspace `target/`, so the output path must too.
+  const targetRoot = process.env.CARGO_TARGET_DIR ?? `${spec.dir}/target`;
+  const wasmPath = `${targetRoot}/${WASM_TARGET}/release/${spec.crateWasmStem}.wasm`;
   const wasmBytes = new Uint8Array(await Bun.file(wasmPath).arrayBuffer());
   const sha256 = await sha256Hex(wasmBytes);
 
@@ -264,10 +294,19 @@ async function processComponent(
   const releaseBytes = serializeRelease(release);
   const signatureEnvelope = await buildSignatureEnvelope(releaseBytes, privateKeySeedBase64);
 
-  await Bun.write(`${outDir}/${spec.id}.ryuzi-plugin.toml`, await Bun.file(`${spec.dir}/ryuzi-plugin.toml`).arrayBuffer());
-  await Bun.write(`${outDir}/${manifest.component}`, wasmBytes);
-  await Bun.write(`${outDir}/${spec.id}.release.json`, releaseBytes);
-  await Bun.write(`${outDir}/${spec.id}.release.json.sig`, signatureEnvelope);
+  const manifestBytes = new Uint8Array(await Bun.file(`${spec.dir}/ryuzi-plugin.toml`).arrayBuffer());
+  const [manifestName, releaseName, sigName, componentName, pinnedManifestName, pinnedReleaseName, pinnedSigName] =
+    artifactNames(spec.id, manifest.version, manifest.component);
+  await Bun.write(`${outDir}/${manifestName}`, manifestBytes);
+  await Bun.write(`${outDir}/${componentName}`, wasmBytes);
+  await Bun.write(`${outDir}/${releaseName}`, releaseBytes);
+  await Bun.write(`${outDir}/${sigName}`, signatureEnvelope);
+  // Pinned-stem aliases: BYTE-IDENTICAL copies of the same signed bytes — the
+  // signature is over release.json's exact bytes, so aliasing (not
+  // re-serializing) is load-bearing.
+  await Bun.write(`${outDir}/${pinnedManifestName}`, manifestBytes);
+  await Bun.write(`${outDir}/${pinnedReleaseName}`, releaseBytes);
+  await Bun.write(`${outDir}/${pinnedSigName}`, signatureEnvelope);
 
   return release;
 }

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { COMPONENTS } from "./build-first-party.ts";
+import { artifactNames, COMPONENTS } from "./build-first-party.ts";
 
 // Repo root relative to this file (scripts/plugins/), so the test is
 // cwd-independent — it resolves plugins/ the same way regardless of where
@@ -68,4 +68,20 @@ test("each COMPONENTS entry's crateWasmStem matches its crate's [package] name",
     expect(typeof crateName).toBe("string");
     expect(spec.crateWasmStem).toBe((crateName as string).replaceAll("-", "_"));
   }
+});
+
+// The published-name contract: 3 descriptor files under BOTH stems (unversioned
+// for latest installs, `<id>-<version>` for pinned `release_stem` fetches) and
+// the wasm exactly ONCE — `component_url` names it absolutely, so a versioned
+// wasm alias would be dead weight (and MBs of duplicate release assets).
+test("artifactNames publishes descriptors under both stems and the wasm once", () => {
+  expect(artifactNames("github", "0.1.1", "github.wasm")).toEqual([
+    "github.ryuzi-plugin.toml",
+    "github.release.json",
+    "github.release.json.sig",
+    "github.wasm",
+    "github-0.1.1.ryuzi-plugin.toml",
+    "github-0.1.1.release.json",
+    "github-0.1.1.release.json.sig",
+  ]);
 });
