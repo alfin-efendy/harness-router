@@ -189,16 +189,14 @@ jobs:
     secrets: inherit
 
   # Builds and ed25519-signs the remote plugin catalog feed (catalog.json +
-  # catalog.json.sig — scripts/catalog/build-feed.ts) and uploads it onto
-  # this release, so the engine's RemoteCatalogManager
-  # (crates/core/src/plugins/remote_catalog.rs) has a feed to fetch. Optional
-  # and best-effort like Cockpit's Apple codesigning (cockpit-release.yml):
-  # CATALOG_FEED_PRIVATE_KEY is a one-time-generated secret (see
-  # scripts/catalog/keygen.ts) that doesn't exist yet on this repo, so this
-  # step is a no-op — not a failure — until an operator runs keygen.ts,
-  # stores the private key as this secret, and pastes the matching pubkey
-  # into crates/core/src/plugins/catalog_feed_key.rs (see
-  # docs/development/plugins.md#remote-catalog).
+  # catalog.json.sig — scripts/catalog/build-feed.ts), VERIFIES the signature
+  # against the compiled-in CATALOG_FEED_PUBKEY, and uploads both onto this
+  # release, so the engine's RemoteCatalogManager
+  # (crates/core/src/plugins/remote_catalog.rs) has a feed to fetch. This job
+  # is REQUIRED, like `plugins` below: the feed is the ONLY revocation
+  # channel (it is how a compromised/broken integration gets blocked without
+  # a binary release), so a release that can't ship a verifiable feed must
+  # fail here rather than silently leave revocation unusable in the field.
   catalog-feed:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
@@ -210,7 +208,10 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.14
-      - name: Build + sign the feed (skipped when CATALOG_FEED_PRIVATE_KEY isn't set)
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false"
+      - name: Build + sign the feed
         env:
           CATALOG_FEED_PRIVATE_KEY: ${{ secrets.CATALOG_FEED_PRIVATE_KEY }}
           # Monotonic across releases (increments every workflow run) so each
@@ -220,19 +221,20 @@ jobs:
           CATALOG_FEED_SEQUENCE: ${{ github.run_number }}
         run: |
           if [ -z "$CATALOG_FEED_PRIVATE_KEY" ]; then
-            echo "No CATALOG_FEED_PRIVATE_KEY secret — skipping the remote catalog feed."
-            echo "See scripts/catalog/keygen.ts and docs/development/plugins.md#remote-catalog."
-            exit 0
+            echo "::error::CATALOG_FEED_PRIVATE_KEY secret is not set — the release cannot ship without a verifiable catalog feed (it is the revocation channel)"
+            exit 1
           fi
           bun scripts/catalog/build-feed.ts
+      - name: Verify the feed against the compiled-in CATALOG_FEED_PUBKEY
+        run: cargo run --locked -p ryuzi-core --bin verify-plugin-artifacts -- catalog catalog.json catalog.json.sig
       - name: Upload catalog.json + catalog.json.sig to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           if [ ! -f catalog.json ] || [ ! -f catalog.json.sig ]; then
-            echo "no catalog feed built — nothing to upload"
-            exit 0
+            echo "::error::no catalog feed built — the release cannot ship without a verifiable catalog feed (it is the revocation channel)"
+            exit 1
           fi
           gh release upload "$TAG" --repo "${{ github.repository }}" --clobber catalog.json catalog.json.sig
 
@@ -307,6 +309,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
       - name: Verify the release carries every artifact family
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -88,6 +88,17 @@ fn verify_with(feed_bytes: &[u8], sig_bytes: &[u8], pubkey: &[u8; 32]) -> bool {
     vk.verify_strict(feed_bytes, &sig).is_ok()
 }
 
+/// Verify a built catalog feed (`catalog.json` bytes + raw detached `.sig`
+/// bytes) against the COMPILED-IN [`CATALOG_FEED_PUBKEY`], through the same
+/// `verify_with` choke point the fetch pipeline uses. CI's release and
+/// rehearsal jobs call this via the `verify-plugin-artifacts` bin so a
+/// mispaired `CATALOG_FEED_PRIVATE_KEY`/pubkey ships a failed release, not a
+/// silently-rejected feed (the feed is the revocation channel — a broken one
+/// is discovered exactly when it's needed).
+pub fn verify_catalog_feed_signature(feed_bytes: &[u8], sig_bytes: &[u8]) -> bool {
+    verify_with(feed_bytes, sig_bytes, &CATALOG_FEED_PUBKEY)
+}
+
 /// Verify the detached signature over `feed_bytes`, then parse, then enforce
 /// schema + anti-rollback. Returns the parsed feed only when fully trusted.
 /// Takes an explicit `pubkey` so tests can sign with a throwaway keypair;
@@ -1444,6 +1455,29 @@ mod tests {
         let sig = sign(&bytes);
         let pubkey = test_keypair().verifying_key().to_bytes();
         assert!(verify_with(&bytes, &sig, &pubkey));
+    }
+
+    // `verify_catalog_feed_signature` is the thin pub wrapper the
+    // `verify-plugin-artifacts catalog` CI subcommand calls; it must delegate
+    // to the same `verify_with` choke point over the compiled-in production
+    // `CATALOG_FEED_PUBKEY`, not a test key. A feed signed with the
+    // throwaway `test_keypair` (not the real `CATALOG_FEED_PRIVATE_KEY`) must
+    // therefore be rejected. A `true` case can't be exercised here without
+    // the real production private key — that proof IS the CI verify step
+    // running against a build actually signed with `CATALOG_FEED_PRIVATE_KEY`.
+    #[test]
+    fn verify_catalog_feed_signature_rejects_test_key_signed_feed() {
+        let bytes = feed_json(5).into_bytes();
+        let sig = sign(&bytes);
+        assert!(!verify_catalog_feed_signature(&bytes, &sig));
+    }
+
+    #[test]
+    fn verify_catalog_feed_signature_rejects_garbage_and_empty_sig() {
+        let bytes = feed_json(5).into_bytes();
+        assert!(!verify_catalog_feed_signature(&bytes, &[]));
+        assert!(!verify_catalog_feed_signature(&bytes, &[0u8; 64]));
+        assert!(!verify_catalog_feed_signature(&bytes, &[0xffu8; 64]));
     }
 
     struct FakeHttp {
