@@ -1315,41 +1315,41 @@ async sessionTodos(runnerId: string | null, sessionPk: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
-async listProjectCommands(runnerId: string | null, projectId: string) : Promise<Result<ProjectCommandInfo[], CmdError>> {
+async globalCommandList(runnerId: string | null) : Promise<Result<CommandFileInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_project_commands", { runnerId, projectId }) };
+    return { status: "ok", data: await TAURI_INVOKE("global_command_list", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async readProjectCommand(runnerId: string | null, projectId: string, name: string) : Promise<Result<ProjectCommandInfo, CmdError>> {
+async globalCommandRead(runnerId: string | null, name: string) : Promise<Result<CommandFileInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("read_project_command", { runnerId, projectId, name }) };
+    return { status: "ok", data: await TAURI_INVOKE("global_command_read", { runnerId, name }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async createProjectCommand(runnerId: string | null, projectId: string, input: ProjectCommandInputDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+async globalCommandCreate(runnerId: string | null, input: CommandFileInputDto) : Promise<Result<CommandFileInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("create_project_command", { runnerId, projectId, input }) };
+    return { status: "ok", data: await TAURI_INVOKE("global_command_create", { runnerId, input }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string, input: ProjectCommandMutationDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+async globalCommandUpdate(runnerId: string | null, name: string, revision: string, input: CommandFileMutationDto) : Promise<Result<CommandFileInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_project_command", { runnerId, projectId, name, revision, input }) };
+    return { status: "ok", data: await TAURI_INVOKE("global_command_update", { runnerId, name, revision, input }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async deleteProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string) : Promise<Result<null, CmdError>> {
+async globalCommandDelete(runnerId: string | null, name: string, revision: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("delete_project_command", { runnerId, projectId, name, revision }) };
+    return { status: "ok", data: await TAURI_INVOKE("global_command_delete", { runnerId, name, revision }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2115,6 +2115,16 @@ export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
+/**
+ * A command file and the revision that must accompany update or delete.
+ */
+export type CommandFileInfo = { name: string; description: string; template: string; agent: string | null; model: string | null; subtask: boolean; revision: string }
+export type CommandFileInputDto = ({ description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }) & { name: string }
+/**
+ * Editable fields for a global slash command. The command name is
+ * supplied separately for updates so a save cannot rename a file by accident.
+ */
+export type CommandFileMutationDto = { description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }
 export type CommandOriginInfo = "builtin" | "global" | "project"
 /**
  * `component_bootstrap_status` RPC result (Task 11a): whether the first-party
@@ -2761,16 +2771,6 @@ export type Project = { projectId: string; name: string; workdir: string; source
  * NOT a DB column. Self-corrects if the user later runs `git init`.
  */
 isGit: boolean }
-/**
- * A project command and the revision that must accompany update or delete.
- */
-export type ProjectCommandInfo = { name: string; description: string; template: string; agent: string | null; model: string | null; subtask: boolean; revision: string }
-export type ProjectCommandInputDto = ({ description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }) & { name: string }
-/**
- * Editable fields for a project-owned slash command. The command name is
- * supplied separately for updates so a save cannot rename a file by accident.
- */
-export type ProjectCommandMutationDto = { description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }
 export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaCapability = "claude" | "codex"

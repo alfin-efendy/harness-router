@@ -1433,10 +1433,32 @@ mod tests {
     async fn live_session_resolves_project_command_created_updated_and_deleted_after_start() {
         use crate::domain::Project;
         use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
-        use commands::{delete_project_command, write_project_command, ProjectCommandInput};
         use runner::testutil::{
             input_json_delta, message_delta, message_stop, text_delta, tool_use_start, RecordingLlm,
         };
+
+        // Project command CRUD is gone from core (commands are now
+        // global-only); write the `.ryuzi/commands` file directly to
+        // exercise the registry's still-supported project-file discovery.
+        fn write_project_command_file(
+            work_dir: &std::path::Path,
+            template: &str,
+            agent: Option<&str>,
+            model: Option<&str>,
+            subtask: bool,
+        ) {
+            let dir = work_dir.join(".ryuzi/commands");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut frontmatter = "---\ndescription: Ship a release\n".to_string();
+            if let Some(agent) = agent {
+                frontmatter.push_str(&format!("agent: {agent}\n"));
+            }
+            if let Some(model) = model {
+                frontmatter.push_str(&format!("model: {model}\n"));
+            }
+            frontmatter.push_str(&format!("subtask: {subtask}\n---\n{template}"));
+            std::fs::write(dir.join("ship.md"), frontmatter).unwrap();
+        }
 
         let _guard = StateDirGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -1544,19 +1566,13 @@ mod tests {
         ctx.kind = crate::domain::SessionKind::Project;
         let session = harness.start_session(ctx).await.unwrap();
 
-        let created = write_project_command(
+        write_project_command_file(
             &canonical_workdir,
-            ProjectCommandInput {
-                name: "ship".into(),
-                description: "Ship a release".into(),
-                template: "Ship v1 $ARGUMENTS".into(),
-                agent: Some("reviewer".into()),
-                model: None,
-                subtask: false,
-            },
+            "Ship v1 $ARGUMENTS",
+            Some("reviewer"),
             None,
-        )
-        .unwrap();
+            false,
+        );
         assert!(canonical_workdir.join(".ryuzi/commands/ship.md").exists());
         assert!(
             !active_worktree.join(".ryuzi/commands/ship.md").exists(),
@@ -1567,43 +1583,31 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = write_project_command(
+        write_project_command_file(
             &canonical_workdir,
-            ProjectCommandInput {
-                name: "ship".into(),
-                description: "Ship a release".into(),
-                template: "Ship v2 $ARGUMENTS".into(),
-                agent: Some("reviewer".into()),
-                model: None,
-                subtask: false,
-            },
-            Some(&created.revision),
-        )
-        .unwrap();
+            "Ship v2 $ARGUMENTS",
+            Some("reviewer"),
+            None,
+            false,
+        );
         session
             .send_prompt(TurnPrompt::text("/ship release", "/ship release"))
             .await
             .unwrap();
 
-        let canonical = write_project_command(
+        write_project_command_file(
             &canonical_workdir,
-            ProjectCommandInput {
-                name: "ship".into(),
-                description: "Ship a release".into(),
-                template: "Ship canonical $ARGUMENTS".into(),
-                agent: None,
-                model: Some("canonical-model".into()),
-                subtask: true,
-            },
-            Some(&updated.revision),
-        )
-        .unwrap();
+            "Ship canonical $ARGUMENTS",
+            None,
+            Some("canonical-model"),
+            true,
+        );
         session
             .send_prompt(TurnPrompt::text("/ship release", "/ship release"))
             .await
             .unwrap();
 
-        delete_project_command(&canonical_workdir, "ship", &canonical.revision).unwrap();
+        std::fs::remove_file(canonical_workdir.join(".ryuzi/commands/ship.md")).unwrap();
         session
             .send_prompt(TurnPrompt::text("/ship release", "/ship release"))
             .await

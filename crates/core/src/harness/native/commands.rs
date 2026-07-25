@@ -324,49 +324,6 @@ impl CommandRegistry {
     }
 }
 
-fn project_command_root(
-    work_dir: &Path,
-    create: bool,
-) -> Result<Option<PathBuf>, CommandFileError> {
-    let ryuzi_dir = work_dir.join(".ryuzi");
-    if !ensure_real_directory(&ryuzi_dir, create, ".ryuzi directory")? {
-        return Ok(None);
-    }
-
-    let commands_dir = ryuzi_dir.join("commands");
-    if !ensure_real_directory(&commands_dir, create, "commands directory")? {
-        return Ok(None);
-    }
-    canonical_command_root(work_dir, &ryuzi_dir, &commands_dir).map(Some)
-}
-
-fn ensure_real_directory(
-    path: &Path,
-    create: bool,
-    description: &str,
-) -> Result<bool, CommandFileError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(CommandFileError::InvalidName(format!(
-                    "{description} must be a real directory"
-                )));
-            }
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::create_dir(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-            ensure_real_directory(path, false, description)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn read_project_command_dir(work_dir: &Path) -> Vec<Command> {
     let ryuzi_dir = work_dir.join(".ryuzi");
     if ryuzi_dir
@@ -482,32 +439,82 @@ fn is_builtin_command_name(name: &str) -> bool {
         .any(|(builtin, _)| *builtin == name)
 }
 
-/// List every readable project command file, including its content revision.
-pub fn list_project_commands(work_dir: &Path) -> Result<Vec<ProjectCommandRead>, CommandFileError> {
-    let Some(root) = project_command_root(work_dir, false)? else {
-        return Ok(Vec::new());
+/// The root directory for global commands (`~/.config/ryuzi/commands`),
+/// resolved and canonicalized. `create` controls whether the directory is
+/// created if missing; when `false` and the directory does not exist, `None`
+/// is returned (an empty catalog, not an error).
+fn global_command_root(create: bool) -> Result<Option<PathBuf>, CommandFileError> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(None);
     };
+    let dir = home.join(".config/ryuzi/commands");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(CommandFileError::InvalidName(
+                    "global commands directory must be a real directory".into(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !create {
+                return Ok(None);
+            }
+            std::fs::create_dir_all(&dir)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(dir.canonicalize()?))
+}
+
+/// List every readable global command file, including its content revision.
+pub fn list_global_commands() -> Result<Vec<ProjectCommandRead>, CommandFileError> {
+    match global_command_root(false)? {
+        Some(root) => list_commands_at(&root),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Read one global command by its validated name.
+pub fn read_global_command(name: &str) -> Result<ProjectCommandRead, CommandFileError> {
+    let validated = validate_project_command_path_name(name)?;
+    let Some(root) = global_command_root(false)? else {
+        return Err(CommandFileError::NotFound(validated.as_str().to_string()));
+    };
+    read_project_command_at(&root, &validated)
+}
+
+/// Atomically create or update a global command file.
+pub fn write_global_command(
+    input: ProjectCommandInput,
+    expected_revision: Option<&str>,
+) -> Result<ProjectCommandRead, CommandFileError> {
+    let root = global_command_root(true)?.expect("global command root was created");
+    write_command_at(&root, input, expected_revision)
+}
+
+/// Delete a global command only when its current content revision matches.
+pub fn delete_global_command(name: &str, expected_revision: &str) -> Result<(), CommandFileError> {
+    let validated = validate_project_command_path_name(name)?;
+    let Some(root) = global_command_root(false)? else {
+        return Err(CommandFileError::NotFound(validated.as_str().to_string()));
+    };
+    delete_command_at(&root, &validated, expected_revision)
+}
+
+/// List every readable command file under an arbitrary, already-resolved
+/// command root.
+fn list_commands_at(root: &Path) -> Result<Vec<ProjectCommandRead>, CommandFileError> {
     let mut commands = Vec::new();
-    list_project_commands_recursive(&root, &root, &mut commands)?;
+    list_project_commands_recursive(root, root, &mut commands)?;
     commands.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(commands)
 }
 
-/// Read one project command by its validated name.
-pub fn read_project_command(
-    work_dir: &Path,
-    name: &str,
-) -> Result<ProjectCommandRead, CommandFileError> {
-    let name = validate_project_command_path_name(name)?;
-    let Some(root) = project_command_root(work_dir, false)? else {
-        return Err(CommandFileError::NotFound(name.0));
-    };
-    read_project_command_at(&root, &name)
-}
-
-/// Atomically create or update a project command file.
-pub fn write_project_command(
-    work_dir: &Path,
+/// Atomically create or update a command file under an arbitrary,
+/// already-resolved command root.
+fn write_command_at(
+    root: &Path,
     input: ProjectCommandInput,
     expected_revision: Option<&str>,
 ) -> Result<ProjectCommandRead, CommandFileError> {
@@ -517,11 +524,10 @@ pub fn write_project_command(
             "built-in commands cannot be created or updated".into(),
         ));
     }
-    let root = project_command_root(work_dir, true)?.expect("command root was created");
-    let mut lock = command_root_lock(&root)?;
+    let mut lock = command_root_lock(root)?;
     let _guard = lock.write()?;
-    verify_locked_command_root(work_dir, &root)?;
-    let path = project_command_path(&root, &name)?;
+    verify_locked_command_root(root)?;
+    let path = project_command_path(root, &name)?;
     if !path.exists() && is_builtin_command_name(name.as_str()) {
         return Err(CommandFileError::InvalidName(
             "built-in commands cannot be created or updated".into(),
@@ -529,10 +535,10 @@ pub fn write_project_command(
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        reject_symlink_path(&root, parent)?;
+        reject_symlink_path(root, parent)?;
     }
     if path.exists() {
-        let current = read_project_command_at(&root, &name)?;
+        let current = read_project_command_at(root, &name)?;
         if expected_revision != Some(current.revision.as_str()) {
             return Err(CommandFileError::RevisionConflict);
         }
@@ -547,29 +553,26 @@ pub fn write_project_command(
     temp.as_file().sync_all()?;
     temp.persist(&path)
         .map_err(|error| CommandFileError::Io(error.error))?;
-    read_project_command_at(&root, &name)
+    read_project_command_at(root, &name)
 }
 
-/// Delete a project command only when its current content revision matches.
-pub fn delete_project_command(
-    work_dir: &Path,
-    name: &str,
+/// Delete a command file under an arbitrary, already-resolved command root,
+/// only when its current content revision matches.
+fn delete_command_at(
+    root: &Path,
+    name: &ValidatedCommandName,
     expected_revision: &str,
 ) -> Result<(), CommandFileError> {
-    let name = validate_project_command_path_name(name)?;
-    let Some(root) = project_command_root(work_dir, false)? else {
-        return Err(CommandFileError::NotFound(name.0));
-    };
-    let mut lock = command_root_lock(&root)?;
+    let mut lock = command_root_lock(root)?;
     let _guard = lock.write()?;
-    verify_locked_command_root(work_dir, &root)?;
-    let current = read_project_command_at(&root, &name)?;
+    verify_locked_command_root(root)?;
+    let current = read_project_command_at(root, name)?;
     if current.revision != expected_revision {
         return Err(CommandFileError::RevisionConflict);
     }
-    let path = project_command_path(&root, &name)?;
+    let path = project_command_path(root, name)?;
     std::fs::remove_file(&path)?;
-    remove_empty_command_parents(&root, path.parent());
+    remove_empty_command_parents(root, path.parent());
     Ok(())
 }
 
@@ -583,29 +586,13 @@ fn command_root_lock(root: &Path) -> Result<fd_lock::RwLock<File>, CommandFileEr
     Ok(fd_lock::RwLock::new(file))
 }
 
-fn canonical_command_root(
-    work_dir: &Path,
-    ryuzi_dir: &Path,
-    commands_dir: &Path,
-) -> Result<PathBuf, CommandFileError> {
-    ensure_real_directory(ryuzi_dir, false, ".ryuzi directory")?;
-    ensure_real_directory(commands_dir, false, "commands directory")?;
-    let work_dir = work_dir.canonicalize()?;
-    let ryuzi_dir = ryuzi_dir.canonicalize()?;
-    let commands_dir = commands_dir.canonicalize()?;
-    if ryuzi_dir.parent() != Some(work_dir.as_path()) || commands_dir.parent() != Some(&ryuzi_dir) {
-        return Err(CommandFileError::InvalidName(
-            "command paths escaped the project directory".into(),
-        ));
-    }
-    Ok(commands_dir)
-}
-
-fn verify_locked_command_root(work_dir: &Path, root: &Path) -> Result<(), CommandFileError> {
-    let ryuzi_dir = work_dir.join(".ryuzi");
-    let commands_dir = ryuzi_dir.join("commands");
-    let canonical_root = canonical_command_root(work_dir, &ryuzi_dir, &commands_dir)?;
-    if canonical_root != root {
+/// Re-derive `root`'s canonical path fresh (live, following any current
+/// symlinks in every component) and confirm it still matches. This guards
+/// against a race where an ancestor directory was swapped for a symlink
+/// between the pre-lock path resolution and lock acquisition — a generic
+/// check that works for any command root, project or global.
+fn verify_locked_command_root(root: &Path) -> Result<(), CommandFileError> {
+    if root.canonicalize()?.as_path() != root {
         return Err(CommandFileError::InvalidName(
             "commands directory changed while acquiring its lock".into(),
         ));
@@ -902,52 +889,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn project_command_crud_rejects_symlinked_ryuzi_ancestor_without_mutating_outside() {
-        use std::os::unix::fs::symlink;
-
-        let work_dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside_commands = outside.path().join("commands");
-        let outside_command = outside_commands.join("ship.md");
-        let outside_content = "---\ndescription: Outside\n---\nDo not change";
-        std::fs::create_dir_all(&outside_commands).unwrap();
-        std::fs::write(&outside_command, outside_content).unwrap();
-        symlink(outside.path(), work_dir.path().join(".ryuzi")).unwrap();
-
-        let input = ProjectCommandInput {
-            name: "new-command".into(),
-            description: "Must not be created outside the project".into(),
-            template: "Do not write".into(),
-            agent: None,
-            model: None,
-            subtask: false,
-        };
-
-        let listed = list_project_commands(work_dir.path());
-        let read = read_project_command(work_dir.path(), "ship");
-        let write = write_project_command(work_dir.path(), input, None);
-        let deleted = delete_project_command(
-            work_dir.path(),
-            "ship",
-            &revision(outside_content.as_bytes()),
-        );
-
-        assert!(listed.is_err(), "listing must reject a symlinked .ryuzi");
-        assert!(read.is_err(), "reading must reject a symlinked .ryuzi");
-        assert!(write.is_err(), "writing must reject a symlinked .ryuzi");
-        assert!(deleted.is_err(), "deleting must reject a symlinked .ryuzi");
-        assert_eq!(
-            std::fs::read_to_string(&outside_command).unwrap(),
-            outside_content
-        );
-        assert!(
-            !outside_commands.join("new-command.md").exists(),
-            "writing through a symlinked .ryuzi must not create outside files"
-        );
-    }
-
     #[test]
     fn reads_nested_command_and_optional_model_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -1019,13 +960,14 @@ mod tests {
     }
 
     #[test]
-    fn existing_builtin_named_project_command_is_listed_and_mutable_but_cannot_be_created() {
+    fn existing_builtin_named_command_is_listed_and_mutable_but_cannot_be_created() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".ryuzi/commands");
+        let root = dir.path().join("commands");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("init.md"), "external project init").unwrap();
+        let root = root.canonicalize().unwrap();
 
-        let existing = list_project_commands(dir.path()).unwrap();
+        let existing = list_commands_at(&root).unwrap();
         assert_eq!(
             existing
                 .iter()
@@ -1034,8 +976,8 @@ mod tests {
             ["init"]
         );
 
-        let updated = write_project_command(
-            dir.path(),
+        let updated = write_command_at(
+            &root,
             ProjectCommandInput {
                 name: "init".into(),
                 description: "External project init".into(),
@@ -1048,11 +990,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.template, "Updated init");
-        delete_project_command(dir.path(), "init", &updated.revision).unwrap();
+        let name = validate_project_command_path_name("init").unwrap();
+        delete_command_at(&root, &name, &updated.revision).unwrap();
 
-        let fresh = tempfile::tempdir().unwrap();
-        let error = write_project_command(
-            fresh.path(),
+        let fresh_root = tempfile::tempdir().unwrap();
+        let fresh_root = fresh_root.path().canonicalize().unwrap();
+        let error = write_command_at(
+            &fresh_root,
             ProjectCommandInput {
                 name: "init".into(),
                 description: String::new(),
@@ -1066,14 +1010,15 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, CommandFileError::InvalidName(_)));
         assert!(
-            !fresh.path().join(".ryuzi").exists(),
-            "rejecting a new reserved command must not create command directories"
+            !fresh_root.join("init.md").exists(),
+            "rejecting a new reserved command must not create a command file"
         );
     }
 
     #[test]
     fn writes_atomically_and_rejects_stale_revision() {
         let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
         let input = ProjectCommandInput {
             name: "review/security".into(),
             description: "Security review".into(),
@@ -1082,12 +1027,12 @@ mod tests {
             model: Some("openai/gpt-4.1".into()),
             subtask: true,
         };
-        let created = write_project_command(dir.path(), input.clone(), None).unwrap();
+        let created = write_command_at(&root, input.clone(), None).unwrap();
         assert_eq!(created.revision.len(), 64);
         assert_eq!(created.name, "review/security");
 
-        let error = write_project_command(
-            dir.path(),
+        let error = write_command_at(
+            &root,
             ProjectCommandInput {
                 template: "changed".into(),
                 ..input
@@ -1096,6 +1041,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, CommandFileError::RevisionConflict));
+    }
+
+    #[test]
+    fn global_style_crud_operates_on_an_arbitrary_root() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let input = ProjectCommandInput {
+            name: "ship".into(),
+            description: "Ship".into(),
+            template: "Ship $ARGUMENTS".into(),
+            agent: None,
+            model: None,
+            subtask: false,
+        };
+        let created = write_command_at(&root, input.clone(), None).unwrap();
+        assert_eq!(created.revision.len(), 64);
+        let listed = list_commands_at(&root).unwrap();
+        assert_eq!(listed.len(), 1);
+        let stale = write_command_at(
+            &root,
+            ProjectCommandInput {
+                template: "changed".into(),
+                ..input
+            },
+            Some("stale"),
+        );
+        assert!(matches!(
+            stale.unwrap_err(),
+            CommandFileError::RevisionConflict
+        ));
+        let name = validate_project_command_name("ship").unwrap();
+        delete_command_at(&root, &name, &created.revision).unwrap();
+        assert!(list_commands_at(&root).unwrap().is_empty());
     }
 
     #[test]
