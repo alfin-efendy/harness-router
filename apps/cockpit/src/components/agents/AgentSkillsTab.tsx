@@ -95,6 +95,9 @@ export function AgentSkillsTab({ detail }: { detail: AgentDetailInfo }) {
         groups.map((group) => {
           const ids = group.entries.map((entry) => entry.id);
           const enabledCount = ids.filter((id) => detail.skills.includes(id)).length;
+          // Bulk actions only ever touch AVAILABLE entries — mirroring the
+          // row-level toggle, which refuses unavailable ones.
+          const availableIds = group.entries.filter((entry) => entry.available).map((entry) => entry.id);
           return (
             <div key={group.name} data-testid={`skill-group-${group.name}`}>
               <SettingsCard>
@@ -105,10 +108,10 @@ export function AgentSkillsTab({ detail }: { detail: AgentDetailInfo }) {
                       {enabledCount}/{ids.length}
                     </span>
                   </span>
-                  <Button variant="outline" size="sm" disabled={saving} onClick={() => enableAll(ids)}>
+                  <Button variant="outline" size="sm" disabled={saving} onClick={() => enableAll(availableIds)}>
                     Enable all
                   </Button>
-                  <Button variant="outline" size="sm" disabled={saving} onClick={() => disableAll(ids)}>
+                  <Button variant="outline" size="sm" disabled={saving} onClick={() => disableAll(availableIds)}>
                     Disable all
                   </Button>
                 </div>

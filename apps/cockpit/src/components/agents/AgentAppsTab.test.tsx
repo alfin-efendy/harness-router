@@ -3,15 +3,18 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import type { AgentDetailInfo, AgentMutationInfo } from "@/bindings";
 import { useAgentConfigurationCatalog } from "@/store-agent-catalog";
 
+// Realistic fixture shape: `build_live_catalog` emits ONE pluginTools entry
+// per installed plugin, id = the bare plugin manifest id (single-segment,
+// never "provider.tool"), and apps (MCP servers) are an independent
+// registry — so "lint" below is an enabled plugin with no matching app.
 const getAgentConfigurationCatalog = mock(async () => ({
   status: "ok" as const,
   data: {
     skills: [],
     nativeTools: [],
     pluginTools: [
-      { id: "github.search", label: "Search", description: "Search GitHub", available: true, commandScoped: false, pack: null },
-      { id: "github.issues", label: "Issues", description: "GitHub issues", available: true, commandScoped: false, pack: null },
-      { id: "notion.pages", label: "Pages", description: "Notion pages", available: true, commandScoped: false, pack: null },
+      { id: "github", label: "GitHub tools", description: "GitHub plugin tools", available: true, commandScoped: false, pack: null },
+      { id: "lint", label: "Lint", description: "Lint plugin", available: true, commandScoped: false, pack: null },
     ],
     apps: [
       { id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false, pack: null },
@@ -44,7 +47,7 @@ const reviewerDetail: AgentDetailInfo = {
   permissionRules: [],
   skills: [],
   nativeTools: [],
-  pluginTools: ["github.search"],
+  pluginTools: ["github"],
   apps: ["github"],
   modelInfo: null,
   personality: { preset: "helpful", custom: null },
@@ -61,39 +64,41 @@ afterEach(() => {
   useAgentConfigurationCatalog.setState({ catalog: null, loading: false, error: null });
 });
 
-test("renders one card per catalog app with nested plugin tool rows grouped by provider", async () => {
+test("renders one card per catalog app; plugin tools nest under a matching app card and never leak across cards", async () => {
   render(<AgentAppsTab detail={reviewerDetail} />);
 
   const github = await screen.findByTestId("app-card-github");
   expect(within(github).getByText("GitHub")).toBeTruthy();
-  expect(within(github).getByText("Search")).toBeTruthy();
-  expect(within(github).getByText("Issues")).toBeTruthy();
+  expect(within(github).getByText("GitHub tools")).toBeTruthy();
 
   const notion = screen.getByTestId("app-card-notion");
   expect(within(notion).getByText("Notion")).toBeTruthy();
-  expect(within(notion).getByText("Pages")).toBeTruthy();
-  expect(within(notion).queryByText("Search")).toBeNull();
+  expect(within(notion).queryByText("GitHub tools")).toBeNull();
+  expect(within(notion).queryByText("Lint")).toBeNull();
 });
 
-test("master toggle enabling an app adds the app and unions in all of its catalog plugin tools", async () => {
+test("plugins with no matching app render as flat rows in a Plugins section, not under any app card", async () => {
   render(<AgentAppsTab detail={reviewerDetail} />);
-  const notion = await screen.findByTestId("app-card-notion");
 
-  fireEvent.click(within(notion).getByRole("switch", { name: "Enable app notion" }));
+  const plugins = await screen.findByTestId("plugins-section");
+  expect(within(plugins).getByText("Lint")).toBeTruthy();
+  expect(within(screen.getByTestId("app-card-github")).queryByText("Lint")).toBeNull();
+  expect(within(screen.getByTestId("app-card-notion")).queryByText("Lint")).toBeNull();
+});
+
+test("master toggle enabling an app adds the app and unions in its plugin tools", async () => {
+  render(<AgentAppsTab detail={{ ...reviewerDetail, apps: [], pluginTools: [] }} />);
+  const github = await screen.findByTestId("app-card-github");
+
+  fireEvent.click(within(github).getByRole("switch", { name: "Enable app github" }));
 
   await waitFor(() =>
-    expect(updateAgent).toHaveBeenCalledWith(
-      "reviewer",
-      expect.objectContaining({
-        apps: expect.arrayContaining(["github", "notion"]),
-        pluginTools: expect.arrayContaining(["github.search", "notion.pages"]),
-      }),
-    ),
+    expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ apps: ["github"], pluginTools: ["github"] })),
   );
 });
 
 test("master toggle disabling an app removes the app and all of its plugin tool ids", async () => {
-  render(<AgentAppsTab detail={{ ...reviewerDetail, pluginTools: ["github.search", "github.issues"] }} />);
+  render(<AgentAppsTab detail={reviewerDetail} />);
   const github = await screen.findByTestId("app-card-github");
 
   fireEvent.click(within(github).getByRole("switch", { name: "Enable app github" }));
@@ -102,35 +107,38 @@ test("master toggle disabling an app removes the app and all of its plugin tool 
 });
 
 test("nested tool toggle fires update changing only that tool, independent of the app master switch", async () => {
-  render(<AgentAppsTab detail={reviewerDetail} />);
+  render(<AgentAppsTab detail={{ ...reviewerDetail, pluginTools: [] }} />);
   const github = await screen.findByTestId("app-card-github");
 
-  fireEvent.click(within(github).getByRole("switch", { name: "Enable plugin tool github.issues" }));
+  fireEvent.click(within(github).getByRole("switch", { name: "Enable plugin tool github" }));
 
   await waitFor(() =>
-    expect(updateAgent).toHaveBeenCalledWith(
-      "reviewer",
-      expect.objectContaining({
-        apps: ["github"],
-        pluginTools: expect.arrayContaining(["github.search", "github.issues"]),
-      }),
-    ),
+    expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ apps: ["github"], pluginTools: ["github"] })),
   );
 });
 
-test("nested tool toggle off fires update removing only that tool", async () => {
+test("flat plugin row toggle fires update adding that plugin id, leaving apps untouched", async () => {
   render(<AgentAppsTab detail={reviewerDetail} />);
-  const github = await screen.findByTestId("app-card-github");
+  const plugins = await screen.findByTestId("plugins-section");
 
-  fireEvent.click(within(github).getByRole("switch", { name: "Enable plugin tool github.search" }));
+  fireEvent.click(within(plugins).getByRole("switch", { name: "Enable plugin tool lint" }));
 
-  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ pluginTools: [] })));
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ apps: ["github"], pluginTools: ["github", "lint"] })),
+  );
+});
+
+test("flat plugin row toggle off fires update removing only that plugin id", async () => {
+  render(<AgentAppsTab detail={{ ...reviewerDetail, pluginTools: ["github", "lint"] }} />);
+  const plugins = await screen.findByTestId("plugins-section");
+
+  fireEvent.click(within(plugins).getByRole("switch", { name: "Enable plugin tool lint" }));
+
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ pluginTools: ["github"] })));
 });
 
 test("unavailable app entries keep the remove affordance, and removing clears the app and its orphaned plugin tools", async () => {
-  render(
-    <AgentAppsTab detail={{ ...reviewerDetail, apps: ["github", "retired-app"], pluginTools: ["github.search", "retired-app.tool"] }} />,
-  );
+  render(<AgentAppsTab detail={{ ...reviewerDetail, apps: ["github", "retired-app"], pluginTools: ["github", "retired-app.tool"] }} />);
 
   const retired = await screen.findByTestId("app-card-retired-app");
   expect(within(retired).getByText("Unavailable")).toBeTruthy();
@@ -140,17 +148,30 @@ test("unavailable app entries keep the remove affordance, and removing clears th
   fireEvent.click(within(retired).getByRole("button", { name: "Remove unavailable app retired-app" }));
 
   await waitFor(() =>
-    expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ apps: ["github"], pluginTools: ["github.search"] })),
+    expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ apps: ["github"], pluginTools: ["github"] })),
   );
 });
 
-test("no update fires from a master or nested toggle while a save is already in flight", async () => {
+test("an enabled plugin id missing from the catalog with no matching app stays visible and removable in the Plugins section", async () => {
+  render(<AgentAppsTab detail={{ ...reviewerDetail, pluginTools: ["github", "ghost"] }} />);
+
+  const plugins = await screen.findByTestId("plugins-section");
+  expect(within(plugins).getByText(/ghost \(unavailable\)/)).toBeTruthy();
+
+  fireEvent.click(within(plugins).getByRole("button", { name: "Remove unavailable plugin tool ghost" }));
+
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ pluginTools: ["github"] })));
+});
+
+test("no update fires from a master, nested, or flat toggle while a save is already in flight", async () => {
   render(<AgentAppsTab detail={reviewerDetail} />);
   const github = await screen.findByTestId("app-card-github");
+  const plugins = screen.getByTestId("plugins-section");
   useAgents.setState({ saving: true });
 
   fireEvent.click(within(github).getByRole("switch", { name: "Enable app github" }));
-  fireEvent.click(within(github).getByRole("switch", { name: "Enable plugin tool github.issues" }));
+  fireEvent.click(within(github).getByRole("switch", { name: "Enable plugin tool github" }));
+  fireEvent.click(within(plugins).getByRole("switch", { name: "Enable plugin tool lint" }));
 
   expect(updateAgent).not.toHaveBeenCalled();
 });

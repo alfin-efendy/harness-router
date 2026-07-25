@@ -127,6 +127,23 @@ test("Enable all fires update with every group id unioned into skills", async ()
   expect(mutation.skills).toHaveLength(2);
 });
 
+test("Enable all fires exactly one update excluding unavailable entries in the group", async () => {
+  render(<AgentSkillsTab detail={reviewerDetail} />);
+  const debug = await screen.findByTestId("skill-group-Debug Pack");
+
+  fireEvent.click(within(debug).getByRole("button", { name: "Enable all" }));
+
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(
+      "reviewer",
+      expect.objectContaining({ skills: ["requesting-code-review", "systematic-debugging"] }),
+    ),
+  );
+  expect(updateAgent).toHaveBeenCalledTimes(1);
+  const [, mutation] = updateAgent.mock.calls[0] as [string, AgentMutationInfo];
+  expect(mutation.skills).not.toContain("legacy-debugging");
+});
+
 test("Disable all fires update with every group id removed from skills, leaving unrelated skills untouched", async () => {
   render(<AgentSkillsTab detail={{ ...reviewerDetail, skills: ["requesting-code-review", "receiving-code-review", "another-skill"] }} />);
   const codeReview = await screen.findByTestId("skill-group-Code Review Pack");
@@ -134,6 +151,16 @@ test("Disable all fires update with every group id removed from skills, leaving 
   fireEvent.click(within(codeReview).getByRole("button", { name: "Disable all" }));
 
   await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ skills: ["another-skill"] })));
+});
+
+test("Disable all leaves an unavailable entry's id in skills untouched", async () => {
+  render(<AgentSkillsTab detail={{ ...reviewerDetail, skills: ["systematic-debugging", "legacy-debugging"] }} />);
+  const debug = await screen.findByTestId("skill-group-Debug Pack");
+
+  fireEvent.click(within(debug).getByRole("button", { name: "Disable all" }));
+
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ skills: ["legacy-debugging"] })));
+  expect(updateAgent).toHaveBeenCalledTimes(1);
 });
 
 test("toggling an individual skill row fires update adding just that id", async () => {

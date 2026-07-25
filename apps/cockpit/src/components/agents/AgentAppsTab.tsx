@@ -1,19 +1,55 @@
 import { useEffect } from "react";
 import { Trash2 } from "lucide-react";
-import { Button, SettingsCard, Switch } from "@ryuzi/ui";
+import { Button, SettingsCard, SettingsCardTitle, Switch } from "@ryuzi/ui";
 import type { AgentDetailInfo, CatalogEntryInfo } from "@/bindings";
 import { useAgents } from "@/store-agents";
 import { useAgentConfigurationCatalog } from "@/store-agent-catalog";
 import { mutationFromDetail } from "./agentMutation";
 
-// A plugin tool's id is `provider.tool` (see `tool_filter_for_profile` in
-// the native harness, which splits on the first '.' to resolve
+// `detail.pluginTools` ids resolve against installed plugins by their
+// provider segment (see `tool_filter_for_profile` in the native harness,
+// which splits on the first '.' to match
 // `mcp__provider__tool`/`ext__provider__tool`/`wasm__provider__tool`
-// names). The Apps & MCP card for a given app nests every plugin tool whose
-// provider segment matches that app's id.
+// names). Catalog pluginTools entries themselves carry the BARE plugin
+// manifest id (one entry per installed plugin — `build_live_catalog`), so
+// for those the provider is simply the id.
 function providerOf(id: string): string {
   const dot = id.indexOf(".");
   return dot === -1 ? id : id.slice(0, dot);
+}
+
+type ToolRowProps = {
+  tool: CatalogEntryInfo;
+  on: boolean;
+  saving: boolean;
+  onToggle: () => void;
+  onRemove: () => void;
+};
+
+function PluginToolRow({ tool, on, saving, onToggle, onRemove }: ToolRowProps) {
+  return (
+    <div data-testid={`app-tool-row-${tool.id}`} className="flex items-center gap-3 border-t border-border/60 py-2.5 pr-[18px]">
+      <span className="min-w-0 flex-1">
+        <span className={`block text-[12.5px] font-medium${tool.available ? "" : " text-destructive"}`}>
+          {tool.available ? tool.label : `${tool.label} (unavailable)`}
+        </span>
+        <span className="block truncate text-[11px] text-muted-foreground">{tool.description || tool.id}</span>
+      </span>
+      {tool.available ? (
+        <Switch on={on} label={`Enable plugin tool ${tool.id}`} onToggle={onToggle} />
+      ) : (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label={`Remove unavailable plugin tool ${tool.id}`}
+          disabled={saving}
+          onClick={onRemove}
+        >
+          <Trash2 aria-hidden size={14} />
+        </Button>
+      )}
+    </div>
+  );
 }
 
 export function AgentAppsTab({ detail }: { detail: AgentDetailInfo }) {
@@ -63,6 +99,14 @@ export function AgentAppsTab({ detail }: { detail: AgentDetailInfo }) {
 
   const appById = new Map(catalog.apps.map((app) => [app.id, app]));
   const appIds = Array.from(new Set([...catalog.apps.map((app) => app.id), ...detail.apps]));
+  // Plugins are their own registry — an installed plugin's tools entry has
+  // no matching app unless an MCP server happens to share its id. Anything
+  // grouped under a provider that ISN'T an app card renders as a flat row
+  // in the trailing "Plugins" section so it can't silently disappear.
+  const appIdSet = new Set(appIds);
+  const flatTools = Array.from(toolsByProvider.entries())
+    .filter(([provider]) => !appIdSet.has(provider))
+    .flatMap(([, entries]) => entries);
 
   const setAppEnabled = (id: string, on: boolean) => {
     // Read the store directly rather than closing over the `saving` prop —
@@ -99,79 +143,82 @@ export function AgentAppsTab({ detail }: { detail: AgentDetailInfo }) {
 
   return (
     <div className="flex flex-col gap-3">
-      {appIds.length === 0 ? (
+      {appIds.length === 0 && flatTools.length === 0 ? (
         <SettingsCard>
           <p className="m-0 px-[18px] py-5 text-xs text-muted-foreground">No apps available.</p>
         </SettingsCard>
-      ) : (
-        appIds.map((id) => {
-          const app = appById.get(id);
-          const available = app !== undefined && app.available;
-          const enabled = detail.apps.includes(id);
-          const tools = toolsByProvider.get(id) ?? [];
-          return (
-            <div key={id} data-testid={`app-card-${id}`}>
-              <SettingsCard>
-                <div className="flex items-center gap-3 border-b border-border px-[18px] py-3.5">
-                  <span className="min-w-0 flex-1">
-                    <span className={`block text-[13px] font-medium${available ? "" : " text-destructive"}`}>
-                      {available ? app.label : "Unavailable"}
-                    </span>
-                    <span className="block truncate text-[11px] text-muted-foreground">{available ? app.description || id : id}</span>
+      ) : null}
+      {appIds.map((id) => {
+        const app = appById.get(id);
+        const available = app !== undefined && app.available;
+        const enabled = detail.apps.includes(id);
+        const tools = toolsByProvider.get(id) ?? [];
+        return (
+          <div key={id} data-testid={`app-card-${id}`}>
+            <SettingsCard>
+              <div className="flex items-center gap-3 border-b border-border px-[18px] py-3.5">
+                <span className="min-w-0 flex-1">
+                  <span className={`block text-[13px] font-medium${available ? "" : " text-destructive"}`}>
+                    {available ? app.label : "Unavailable"}
                   </span>
-                  {available ? (
-                    <Switch on={enabled} label={`Enable app ${id}`} onToggle={() => setAppEnabled(id, !enabled)} />
-                  ) : (
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={`Remove unavailable app ${id}`}
-                      disabled={saving}
-                      onClick={() => removeApp(id)}
-                    >
-                      <Trash2 aria-hidden size={14} />
-                    </Button>
-                  )}
+                  <span className="block truncate text-[11px] text-muted-foreground">{available ? app.description || id : id}</span>
+                </span>
+                {available ? (
+                  <Switch on={enabled} label={`Enable app ${id}`} onToggle={() => setAppEnabled(id, !enabled)} />
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`Remove unavailable app ${id}`}
+                    disabled={saving}
+                    onClick={() => removeApp(id)}
+                  >
+                    <Trash2 aria-hidden size={14} />
+                  </Button>
+                )}
+              </div>
+              {tools.length > 0 ? (
+                <div className="pl-[46px]">
+                  {tools.map((tool) => (
+                    <PluginToolRow
+                      key={tool.id}
+                      tool={tool}
+                      on={detail.pluginTools.includes(tool.id)}
+                      saving={saving}
+                      onToggle={() => setToolEnabled(tool.id, !detail.pluginTools.includes(tool.id))}
+                      onRemove={() => setToolEnabled(tool.id, false)}
+                    />
+                  ))}
                 </div>
-                {tools.length > 0 ? (
-                  <div className="pl-[46px]">
-                    {tools.map((tool) => {
-                      const toolOn = detail.pluginTools.includes(tool.id);
-                      return (
-                        <div
-                          key={tool.id}
-                          data-testid={`app-tool-row-${tool.id}`}
-                          className="flex items-center gap-3 border-t border-border/60 py-2.5 pr-[18px]"
-                        >
-                          <span className="min-w-0 flex-1">
-                            <span className={`block text-[12.5px] font-medium${tool.available ? "" : " text-destructive"}`}>
-                              {tool.available ? tool.label : `${tool.label} (unavailable)`}
-                            </span>
-                            <span className="block truncate text-[11px] text-muted-foreground">{tool.description || tool.id}</span>
-                          </span>
-                          {tool.available ? (
-                            <Switch on={toolOn} label={`Enable plugin tool ${tool.id}`} onToggle={() => setToolEnabled(tool.id, !toolOn)} />
-                          ) : (
-                            <Button
-                              variant="ghost"
-                              size="icon-sm"
-                              aria-label={`Remove unavailable plugin tool ${tool.id}`}
-                              disabled={saving}
-                              onClick={() => setToolEnabled(tool.id, false)}
-                            >
-                              <Trash2 aria-hidden size={14} />
-                            </Button>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </SettingsCard>
+              ) : null}
+            </SettingsCard>
+          </div>
+        );
+      })}
+      {flatTools.length > 0 ? (
+        <div data-testid="plugins-section">
+          <SettingsCard>
+            <div className="flex items-center gap-3 border-b border-border px-[18px] py-3.5">
+              <span className="min-w-0 flex-1">
+                <SettingsCardTitle>Plugins</SettingsCardTitle>
+                <span className="block text-[11px] text-muted-foreground">Installed plugins without a matching app</span>
+              </span>
             </div>
-          );
-        })
-      )}
+            <div className="pl-[18px]">
+              {flatTools.map((tool) => (
+                <PluginToolRow
+                  key={tool.id}
+                  tool={tool}
+                  on={detail.pluginTools.includes(tool.id)}
+                  saving={saving}
+                  onToggle={() => setToolEnabled(tool.id, !detail.pluginTools.includes(tool.id))}
+                  onRemove={() => setToolEnabled(tool.id, false)}
+                />
+              ))}
+            </div>
+          </SettingsCard>
+        </div>
+      ) : null}
     </div>
   );
 }
