@@ -43,9 +43,14 @@ const gateway: GatewayInfo = {
 const ok = (data: JobInfo[]): Result<JobInfo[], CmdError> => ({ status: "ok", data });
 const listJobs = mock(async () => ok(jobs));
 const toggleJob = mock(async () => ok(jobs));
+// The Commands tab is global-only now — it loads regardless of which
+// project (if any) is selected, so it needs its own mocks even in a test
+// that otherwise only cares about tab switching.
+const globalCommandList = mock(async () => ({ status: "ok" as const, data: [] }));
+const slashCatalog = mock(async () => ({ status: "ok" as const, data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { listJobs, toggleJob },
+  commands: { listJobs, toggleJob, globalCommandList, slashCatalog },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 
@@ -77,7 +82,7 @@ test("initializes the requested Hooks tab and changes tabs locally", async () =>
 
   expect(await screen.findByRole("heading", { name: "Hooks" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Commands" }));
-  expect(screen.getByText("Select a project to manage project commands")).toBeTruthy();
+  expect(await screen.findByText("Global commands are available in every project. Built-in commands are read-only.")).toBeTruthy();
 });
 
 test("uses the requested initial tab after a keyed route change", async () => {
