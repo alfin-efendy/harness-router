@@ -1463,12 +1463,14 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
         if cp.plugins().get(pack.id).is_some() || out.iter().any(|p| p.id == pack.id) {
             continue;
         }
-        let installed = ctx
+        let installed_skill = ctx
             .installed_skills
             .iter()
-            .any(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+            .find(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+        let installed = installed_skill.is_some();
+        let skill_count = installed_skill.map(|s| s.skill_count as u32);
         let ledger = InstallLedgerFields::from_option(installs.get(pack.id));
-        out.push(curated_pack_row(pack, installed, ledger));
+        out.push(curated_pack_row(pack, installed, skill_count, ledger));
     }
     Ok(out)
 }
@@ -1478,9 +1480,22 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
 /// `assemble_list`'s curated-pack loop (a Browse tile before install) and
 /// `assemble_detail`'s not-a-registered-plugin fallback (Task 5), so the two
 /// surfaces can never drift.
+///
+/// This row bypasses `derive_plugin_status` by design (there is no manifest
+/// to derive from) — `status`/`skill_count` are set directly from `installed`
+/// / `skill_count` instead (Finding 4, final-review fix): a curated pack the
+/// caller reports as already installed must read `"ok"`, not the hardcoded
+/// `"not-installed"` the Browse-tile default used to send back even for an
+/// installed pack — Cockpit's Install/Open split reads `status`, so the
+/// installed case wrongly kept offering an Install button. `skill_count`
+/// mirrors the same field's derivation on a normal skill-pack `PluginInfo`
+/// row (`assemble_list`/`assemble_detail`'s own `(kind == "skill-pack")`
+/// lookups against `ctx.installed_skills`), populated by both call sites only
+/// when `installed` is true.
 fn curated_pack_row(
     pack: &crate::skills_install::CuratedSkillPack,
     installed: bool,
+    skill_count: Option<u32>,
     ledger: InstallLedgerFields,
 ) -> PluginInfo {
     PluginInfo {
@@ -1516,13 +1531,15 @@ fn curated_pack_row(
         catalog_version: None,
         blocked_reason: None,
         // Synthesized rows have no manifest-backed status machinery
-        // (`enabled`/`configured` are meaningless here too, see above) —
-        // always the Browse-tile default per Task 3's spec.
-        status: "not-installed".to_string(),
+        // (`enabled`/`configured` are meaningless here too, see above), so
+        // this bypasses `derive_plugin_status` entirely: `"ok"` once
+        // installed (Finding 4), else the Browse-tile default per Task 3's
+        // spec.
+        status: if installed { "ok" } else { "not-installed" }.to_string(),
         status_detail: None,
         auth_kind: "none".to_string(),
         tool_count: None,
-        skill_count: None,
+        skill_count: installed.then_some(skill_count).flatten(),
     }
 }
 
@@ -1619,14 +1636,16 @@ async fn curated_pack_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<Plug
         anyhow::bail!("unknown plugin: {id}");
     };
     let ctx = installed_ctx(cp.store()).await?;
-    let installed = ctx
+    let installed_skill = ctx
         .installed_skills
         .iter()
-        .any(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+        .find(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+    let installed = installed_skill.is_some();
+    let skill_count = installed_skill.map(|s| s.skill_count as u32);
     let record = cp.store().get_plugin_install(id).await?;
     let ledger = InstallLedgerFields::from_option(record.as_ref());
     Ok(PluginDetail {
-        info: curated_pack_row(pack, installed, ledger),
+        info: curated_pack_row(pack, installed, skill_count, ledger),
         auth: None,
         settings: vec![],
         mcp: vec![],
@@ -3582,17 +3601,98 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_list_excludes_runtimes_and_synthesizes_curated_packs() {
+        // `installed_ctx` reads `RYUZI_TEST_CONFIG_ROOT` via
+        // `InstallRoots::for_user` (see `skills_install.rs`), a process-wide
+        // env var — an empty-but-guarded root keeps this deterministic
+        // against a concurrently-running test that points it at a fixture
+        // WITH an installed "superpowers" pack (`InstalledCuratedPackFixture`
+        // below), and against whatever the real machine's home directory
+        // happens to have installed when no guard is held at all.
+        let empty_root = tempfile::tempdir().unwrap();
+        let _config_root = crate::api::tests_support::TestConfigRootGuard::set(empty_root.path());
         let cp = test_cp().await;
         let list = assemble_list(&cp).await.unwrap();
         assert!(list
             .iter()
             .all(|p| p.id != "native" && p.id != "claude-code"));
-        assert!(list
+        let superpowers = list
             .iter()
-            .any(|p| p.kind == "skill-pack" && p.id == "superpowers"));
+            .find(|p| p.kind == "skill-pack" && p.id == "superpowers")
+            .expect("curated pack row");
+        // Finding 4 baseline: an uninstalled curated pack still reports the
+        // Browse-tile default, not the installed row's "ok"/skill_count.
+        assert_eq!(superpowers.status, "not-installed");
+        assert!(superpowers.skill_count.is_none());
         let anthropic = list.iter().find(|p| p.id == "anthropic").expect("provider");
         assert_eq!(anthropic.kind, "provider");
         assert_eq!(anthropic.family.as_deref(), Some("anthropic"));
+    }
+
+    /// Test-only guard: simulates an INSTALLED curated skill pack
+    /// (`superpowers`) with no registered `CorePlugin`/manifest — a single
+    /// materialized skill directory under a tempdir `skills/` whose
+    /// provenance `source` matches `CuratedSkillPack::repo`, the same shape a
+    /// real git-clone install of a repo with no `ryuzi-plugin.toml` of its
+    /// own leaves on disk. `test_cp()`/`test_cp_with` never scan
+    /// `RYUZI_TEST_CONFIG_ROOT`'s `plugins/` dir (only `install_builtins`
+    /// registers plugins for them), so this can never accidentally register
+    /// "superpowers" as a real plugin — `curated_pack_row`'s synthesized-row
+    /// path keeps applying, only now with `installed: true`. Mirrors
+    /// `SkillPackFixture` above, minus the plugin-manifest write.
+    struct InstalledCuratedPackFixture {
+        _temp_dir: tempfile::TempDir,
+        _config_root: crate::api::tests_support::TestConfigRootGuard,
+    }
+
+    impl InstalledCuratedPackFixture {
+        fn install() -> Self {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let skill_dir = temp_dir.path().join("skills").join("superpowers");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: superpowers\ndescription: Curated workflow and development skills\n---\nbody",
+            )
+            .unwrap();
+            std::fs::write(
+                skill_dir.join(".ryuzi-skill.json"),
+                r#"{"source":"https://github.com/obra/superpowers","plugin_id":null,"installed_at":"2026-01-01T00:00:00.000Z"}"#,
+            )
+            .unwrap();
+            // Set the env var AFTER the fixture is fully written to disk —
+            // see `SkillPackFixture`'s matching comment for why.
+            let config_root = crate::api::tests_support::TestConfigRootGuard::set(temp_dir.path());
+            Self {
+                _temp_dir: temp_dir,
+                _config_root: config_root,
+            }
+        }
+    }
+
+    // Finding 4 (final-review fix): an INSTALLED curated pack must report
+    // `status: "ok"` (not the hardcoded `"not-installed"` the Browse-tile
+    // default used to send back regardless of `installed`) and a populated
+    // `skill_count` — both `assemble_list` (this test) and `assemble_detail`
+    // (`detail_resolves_installed_curated_skill_pack_...` below) synthesize
+    // this row through the same `curated_pack_row`, so both call sites must
+    // agree.
+    #[tokio::test]
+    async fn assemble_list_reports_installed_curated_pack_as_ok_with_skill_count() {
+        let _fixture = InstalledCuratedPackFixture::install();
+        let cp = test_cp().await;
+        assert!(
+            cp.plugins().get("superpowers").is_none(),
+            "precondition: still no registered CorePlugin for the curated pack"
+        );
+        let list = assemble_list(&cp).await.unwrap();
+        let superpowers = list
+            .iter()
+            .find(|p| p.id == "superpowers")
+            .expect("curated pack row");
+        assert_eq!(superpowers.kind, "skill-pack");
+        assert!(superpowers.installed);
+        assert_eq!(superpowers.status, "ok");
+        assert_eq!(superpowers.skill_count, Some(1));
     }
 
     #[tokio::test]
@@ -3612,6 +3712,13 @@ mod tests {
     /// Navigating into that tile must resolve, not 500.
     #[tokio::test]
     async fn detail_resolves_uninstalled_curated_skill_pack() {
+        // See the matching comment on
+        // `assemble_list_excludes_runtimes_and_synthesizes_curated_packs` —
+        // an empty-but-guarded config root keeps `installed_ctx`'s read
+        // deterministic against a concurrently-running installed-pack
+        // fixture (same "superpowers" id) elsewhere in this test binary.
+        let empty_root = tempfile::tempdir().unwrap();
+        let _config_root = crate::api::tests_support::TestConfigRootGuard::set(empty_root.path());
         let cp = test_cp().await;
         assert!(
             cp.plugins().get("superpowers").is_none(),
@@ -3633,6 +3740,24 @@ mod tests {
             detail.homepage.as_deref(),
             Some("https://github.com/obra/superpowers")
         );
+    }
+
+    // Finding 4 (final-review fix): the detail-view sibling of
+    // `assemble_list_reports_installed_curated_pack_as_ok_with_skill_count`
+    // — `curated_pack_detail` must resolve the same `"ok"`/`skill_count` shape
+    // for an installed curated pack, not just `assemble_list`'s row.
+    #[tokio::test]
+    async fn detail_resolves_installed_curated_skill_pack_as_ok_with_skill_count() {
+        let _fixture = InstalledCuratedPackFixture::install();
+        let cp = test_cp().await;
+        let detail = assemble_detail(&cp, "superpowers")
+            .await
+            .expect("installed curated skill pack should resolve");
+        assert_eq!(detail.info.id, "superpowers");
+        assert_eq!(detail.info.kind, "skill-pack");
+        assert!(detail.info.installed);
+        assert_eq!(detail.info.status, "ok");
+        assert_eq!(detail.info.skill_count, Some(1));
     }
 
     #[tokio::test]
