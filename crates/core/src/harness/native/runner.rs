@@ -12733,14 +12733,14 @@ mod tests {
                     // `natives_only`: every other builtin is `Off`, so the
                     // target keeps its original narrow advertisement (the
                     // `!advertised.contains("write")` guard below) under the
-                    // absent=Ask=enabled model. `read` is `Ask` (not `Allow`):
-                    // the native decision is checked BEFORE profile rules, and
-                    // `Allow` would short-circuit straight past `target-rule`'s
-                    // deny below; `Ask` still advertises/enables the tool but
-                    // defers the verdict to the rule, matching this test's
-                    // asserted "the target profile's deny rule applies".
+                    // absent=Ask=enabled model. `read`'s base decision is
+                    // `Allow`: a matching scoped prefix rule (`target-rule`
+                    // below) applies ON TOP OF the base decision and is
+                    // consulted BEFORE it, so the rule's `Deny` still wins —
+                    // matching this test's asserted "the target profile's
+                    // deny rule applies even to a plan-safe read".
                     native: natives_only(&[
-                        ("read", crate::agents::types::NativeToolDecision::Ask),
+                        ("read", crate::agents::types::NativeToolDecision::Allow),
                         ("bash", crate::agents::types::NativeToolDecision::Allow),
                         (
                             "app_projects",

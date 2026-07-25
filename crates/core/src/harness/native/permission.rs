@@ -62,11 +62,13 @@ impl SessionPermOverrides {
 /// Everything one permission check needs. Borrowed from `RunnerDeps` at the
 /// dispatch site so the check itself stays a pure function of its inputs.
 pub struct PermGate<'a> {
-    /// Order (top wins): Plan hard-deny → native per-tool decision (`Allow`/
-    /// `Off` only; `Ask` falls through) → profile rules → session overrides →
-    /// project `tool_policies` (allowAlways AND rejectAlways) → mode
-    /// auto-allow → prompt. Plan sits above every other rule so no
-    /// profile/session choice can punch through Plan's read-only guarantee.
+    /// Order (top wins): Plan hard-deny → profile rules (a matching scoped
+    /// prefix rule always wins, even over a `Allow`/`Off` base decision) →
+    /// native per-tool decision (`Allow`/`Off` only; `Ask` falls through) →
+    /// session overrides → project `tool_policies` (allowAlways AND
+    /// rejectAlways) → mode auto-allow → prompt. Plan sits above every other
+    /// rule so no profile/session choice can punch through Plan's read-only
+    /// guarantee.
     pub permission_rules: &'a [crate::agents::types::PermissionRule],
     /// The active profile's per-tool native decision map (`AgentPermissions::
     /// native`), keyed by the tool's registry id (the same lowercase key
@@ -137,10 +139,12 @@ fn profile_rule_decision(
 
 /// Decide whether a native tool call may proceed.
 ///
-/// Order (top wins): Plan hard-deny → session overrides → project
-/// `tool_policies` (allowAlways AND rejectAlways) → mode auto-allow → prompt.
-/// Plan sits above the session sets so "allow for this session" can never
-/// punch through Plan's read-only guarantee.
+/// Order (top wins): Plan hard-deny → profile rules (a matching scoped
+/// prefix rule always wins over the tool's base decision) → native per-tool
+/// decision → session overrides → project `tool_policies` (allowAlways AND
+/// rejectAlways) → mode auto-allow → prompt. Plan sits above the session
+/// sets so "allow for this session" can never punch through Plan's
+/// read-only guarantee.
 pub async fn evaluate(
     spec: &PermissionSpec,
     input: &serde_json::Value,
@@ -149,6 +153,14 @@ pub async fn evaluate(
     let tool = key_to_policy_tool(&spec.key);
     if gate.perm_mode == PermMode::Plan && !is_safe_tool(tool) {
         return PermDecision::Deny;
+    }
+    // A matching scoped prefix rule applies ON TOP OF the tool's base
+    // decision, so it must be consulted before the base-decision check
+    // below — otherwise a tool whose base decision is `Allow` could bypass
+    // its own scoped `Deny` rule (e.g. `bash` base=Allow with a `rm `-prefix
+    // Deny rule must still deny `rm -rf`).
+    if let Some(decision) = profile_rule_decision(gate.permission_rules, &spec.key, input) {
+        return decision;
     }
     if !is_namespaced_tool_key(&spec.key) {
         match gate
@@ -165,9 +177,6 @@ pub async fn evaluate(
             NativeToolDecision::Off => return PermDecision::Deny,
             NativeToolDecision::Ask => {}
         }
-    }
-    if let Some(decision) = profile_rule_decision(gate.permission_rules, &spec.key, input) {
-        return decision;
     }
     match gate.overrides.lock().unwrap().decision_for(tool) {
         Some(true) => return PermDecision::Allow,
@@ -322,6 +331,64 @@ mod tests {
             ..f.gate(PermMode::Default, None)
         };
         let d = evaluate(&spec("bash"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn matching_prefix_deny_rule_wins_over_base_allow_decision() {
+        // Base decision Allow + a matching scoped prefix rule Deny: the rule
+        // applies ON TOP OF the base decision, so the deny must win — a tool
+        // whose base decision is Allow must not bypass its own scoped
+        // prefix rules (e.g. `bash` base=Allow with `rm ` → Deny must still
+        // deny `rm -rf`).
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("bash".to_string(), NativeToolDecision::Allow)]);
+        let rules = [crate::agents::types::PermissionRule {
+            id: "rm-deny".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Deny,
+            command_prefix: Some("rm ".into()),
+        }];
+        let gate = PermGate {
+            native_decisions: &native,
+            permission_rules: &rules,
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "rm -rf /"}),
+            &gate,
+        )
+        .await;
+        assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn non_matching_prefix_deny_rule_falls_through_to_base_allow_decision() {
+        // Base decision Allow + a Deny rule that does NOT match this
+        // command's prefix: the rule doesn't apply, so the base Allow
+        // decision governs.
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("bash".to_string(), NativeToolDecision::Allow)]);
+        let rules = [crate::agents::types::PermissionRule {
+            id: "rm-deny".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Deny,
+            command_prefix: Some("rm ".into()),
+        }];
+        let gate = PermGate {
+            native_decisions: &native,
+            permission_rules: &rules,
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "git status"}),
+            &gate,
+        )
+        .await;
         assert_eq!(d, PermDecision::Allow);
         assert!(!f.approvals.has_pending());
     }
