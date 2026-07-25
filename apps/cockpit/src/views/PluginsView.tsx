@@ -13,11 +13,9 @@ import { summarizeUpdateAll, usePlugins } from "@/store-plugins";
 import { useSkills } from "@/store-skills";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { AddAppModal } from "@/components/modals/AddAppModal";
-import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
 import { SkillInstallModal } from "@/components/modals/SkillInstallModal";
 import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
 import { useNav } from "@/store-nav";
-import { useConnections } from "@/store-connections";
 import { buildHubItems, featuredItems, filterHubItems, type HubItem, type RailFilter } from "@/lib/plugin-hub";
 
 const WARN = "#F59E0B";
@@ -49,7 +47,6 @@ export function PluginsView() {
     loadComponentBootstrapStatus,
     retryComponentBootstrap,
   } = usePlugins();
-  const installProvider = useConnections((s) => s.installProvider);
   const skills = useSkills((s) => s.skills);
   const refreshSkills = useSkills((s) => s.refresh);
 
@@ -57,7 +54,6 @@ export function PluginsView() {
   const [filter, setFilter] = useState<RailFilter>({ state: "all", kind: null, category: null });
   const [addAppOpen, setAddAppOpen] = useState(false);
   const [skillInstall, setSkillInstall] = useState<{ initialSource?: string } | null>(null);
-  const [installingPlugin, setInstallingPlugin] = useState<{ id: string; name: string; icon: string | null } | null>(null);
   const [updatingAll, setUpdatingAll] = useState(false);
   const [doctorOpen, setDoctorOpen] = useState(false);
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
@@ -90,31 +86,19 @@ export function PluginsView() {
     [items],
   );
 
-  // Task 14: a component-backed row's Install opens the universal wizard;
-  // everything else keeps its existing path unchanged (providers into the
-  // installed set, skill packs through the trust flow, classic connectors
-  // through `InstallWizardModal` — Task 15 migrates that last one).
+  // Task 15: every kind's Install now opens the universal wizard — the
+  // provider/skill-pack/connector adapters (`steps-provider.tsx`/
+  // `steps-skillpack.tsx`/`steps-connector.tsx`) each know how to run their
+  // own install action from inside it. `SkillInstallModal` stays for the
+  // ONE path that isn't a Browse-tile install: "+ Add ▾ → Add skill source"
+  // manual entry (`setSkillInstall({})`, below), where there's no catalog
+  // `HubItem`/plugin id yet for the wizard to fetch a detail for.
   const [wizardPluginId, setWizardPluginId] = useState<string | null>(null);
-  const installBusy = installingPlugin !== null || skillInstall !== null || wizardPluginId !== null;
+  const installBusy = skillInstall !== null || wizardPluginId !== null;
 
   const startInstall = (item: HubItem) => {
     if (installBusy) return;
-    if (item.kind === "provider") {
-      // Providers install into the persisted set (visibility only); adding an
-      // account is a separate step from the provider's detail view. Re-fetch
-      // the plugins list so the row moves from Discover to Installed.
-      const family = item.nav.kind === "providerDetail" ? item.nav.provider : item.id;
-      void installProvider(family).then((ok) => ok && void loadPlugins());
-    } else if (item.kind === "skill-pack") {
-      // Curated catalog packs resolve `completed: true` immediately; the
-      // trust step only ever shows up for arbitrary sources — same
-      // two-phase gate either way (see `SkillInstallModal`'s doc comment).
-      setSkillInstall({ initialSource: item.id });
-    } else if (item.componentBacked) {
-      setWizardPluginId(item.id);
-    } else {
-      setInstallingPlugin({ id: item.id, name: item.name, icon: item.icon });
-    }
+    setWizardPluginId(item.id);
   };
 
   const openItem = (item: HubItem, tab?: "settings" | "health" | "versions") => {
@@ -243,20 +227,16 @@ export function PluginsView() {
           }}
         />
       )}
-      {installingPlugin && (
-        <InstallWizardModal
-          pluginId={installingPlugin.id}
-          pluginName={installingPlugin.name}
-          pluginIcon={installingPlugin.icon}
-          onClose={() => setInstallingPlugin(null)}
-        />
-      )}
       {wizardPluginId && (
         <UniversalInstallWizard
           pluginId={wizardPluginId}
           onClose={() => {
             setWizardPluginId(null);
             void loadPlugins();
+            // A skill-pack install closes through this same path now (Task
+            // 15) — refresh skills too, same as `SkillInstallModal`'s onClose
+            // used to, so a fresh pack's rows show up without a manual reload.
+            void refreshSkills();
           }}
         />
       )}

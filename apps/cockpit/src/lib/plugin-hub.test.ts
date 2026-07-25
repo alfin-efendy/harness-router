@@ -114,10 +114,10 @@ describe("buildHubItems: plugin mapping", () => {
     expect(item.toolNames).toEqual([]);
   });
 
-  // Task 14: the hub's Install launch point reads `componentBacked` straight
-  // off the row (rather than looking the plugin back up by id in a separate
-  // store) to decide whether Install opens the universal wizard or the
-  // classic modal — this is the passthrough that seam depends on.
+  // Every kind's Install now opens the universal wizard (Task 15), which
+  // reads `componentBacked` off the fetched `PluginDetail` (not this row) to
+  // pick its component adapter over the classic connector one — this is
+  // still the passthrough the hub row's own copy of the flag depends on.
   test("componentBacked passes through from PluginInfo; apps and skill sources are never component-backed", () => {
     const [pluginItem] = buildHubItems({ plugins: [mkPlugin({ componentBacked: true })], apps: [], skills: [] });
     expect(pluginItem.componentBacked).toBe(true);

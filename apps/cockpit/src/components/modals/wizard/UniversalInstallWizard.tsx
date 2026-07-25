@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
-import { commands, type ComponentReleaseDetail, type PluginDetail } from "@/bindings";
+import { commands, type ComponentReleaseDetail, type PluginDetail, type PluginInstallBeginResult, type TrustPromptDto } from "@/bindings";
 import { IconChip } from "@/components/common/bits";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { ConnectStep, DoneStep, InstallComponentStep, OverviewStep, PermissionsStep, SettingsStep } from "./steps-component";
+import { ConnectorConnectStep, InstallConnectorStep } from "./steps-connector";
+import { InstallSkillPackStep, SkillTrustStep } from "./steps-skillpack";
+import { InstallProviderStep, ProviderConnectStep } from "./steps-provider";
 import { planWizardSteps, stepLabel, type WizardStepId } from "./wizard-steps";
 
 // Steps whose body can be deferred without blocking install — Skip only
@@ -27,7 +30,23 @@ const SKIPPABLE_STEPS: ReadonlySet<WizardStepId> = new Set(["connect", "settings
  *  in particular `InstallComponentStep` deliberately does NOT use this: it
  *  guards its own re-entrancy via a mounted-ref instead (see that file), so
  *  a stray manual Continue click during install is a no-op once install
- *  finishes rather than something that needs blocking up front. */
+ *  finishes rather than something that needs blocking up front.
+ *
+ *  Task 15 adds two more cross-step handoffs, one per non-component adapter
+ *  that needs to hand a mutating call's result to the step immediately
+ *  after it in the plan:
+ *  - `skillTrust`/`setSkillTrust`: `steps-skillpack.tsx`'s install step
+ *    stashes `beginSkillInstall`'s trust prompt here (`null` for a curated,
+ *    already-trusted pack). The shell's own `plan` reads it back as
+ *    `trustRequired` — setting it non-null on a curated-by-default source is
+ *    what makes the permissions step appear reactively, without the shell
+ *    ever hardcoding `trustRequired: false` again.
+ *  - `connectorBegin`/`setConnectorBegin`: a classic (non-component)
+ *    connector's install step stashes `beginPluginInstall`'s structured
+ *    result here so the connect step can branch on it (token/manual-client-
+ *    id/oauth-wait) without re-resolving it — though the connect step
+ *    re-fetches it lazily itself if entered directly (the setup checklist's
+ *    "Connect" resume jumps straight to this step, skipping install). */
 export type WizardCtx = {
   pluginId: string;
   detail: PluginDetail | null;
@@ -35,14 +54,34 @@ export type WizardCtx = {
   plan: WizardStepId[];
   refresh: () => Promise<void>;
   setContinueDisabled: (v: boolean) => void;
+  skillTrust: TrustPromptDto | null;
+  setSkillTrust: (v: TrustPromptDto | null) => void;
+  connectorBegin: PluginInstallBeginResult | null;
+  setConnectorBegin: (v: PluginInstallBeginResult | null) => void;
 };
+
+/** Which per-kind adapter set owns this plugin's steps (Task 15). A
+ *  component bundle wins first (its own release/manifest drives overview's
+ *  tool list and permissions' summary regardless of what `kind` string the
+ *  manifest declares); skill-pack and provider are the two other kinds with
+ *  their own install/connect mechanics; everything else is a classic
+ *  (pre-component, catalog-manifest) connector — integrations, gateways,
+ *  and any future kind this switch doesn't know about yet. */
+function wizardKind(detail: PluginDetail | null): "component" | "connector" | "skill-pack" | "provider" {
+  if (!detail) return "connector";
+  if (detail.info.componentBacked) return "component";
+  if (detail.info.kind === "skill-pack") return "skill-pack";
+  if (detail.info.kind === "provider") return "provider";
+  return "connector";
+}
 
 // Universal install wizard shell (spec §5). Fetches plugin/release detail
 // once on mount to build a WizardPlanInput, plans the step sequence via
 // planWizardSteps, and renders a segmented-progress shell around whichever
-// step is current. Task 14 launch points (component-backed rows/hero/
-// checklist) are the first UI to reach this component; Task 15 wires the
-// skill-pack (trustRequired) adapter in.
+// step is current. Every install path now reaches this one component (Task
+// 15 retired the classic catalog install modal): component-backed, classic
+// connector, skill-pack, and provider all resolve through
+// `wizardKind`/`StepBody`'s per-kind dispatch below.
 export function UniversalInstallWizard({
   pluginId,
   onClose,
@@ -62,6 +101,9 @@ export function UniversalInstallWizard({
   const [loading, setLoading] = useState(true);
   // The one shell mechanism a step can use to gate Continue — see `WizardCtx`'s doc.
   const [continueDisabled, setContinueDisabled] = useState(false);
+  // Task 15 cross-step handoffs — see `WizardCtx`'s doc for what each feeds.
+  const [skillTrust, setSkillTrust] = useState<TrustPromptDto | null>(null);
+  const [connectorBegin, setConnectorBegin] = useState<PluginInstallBeginResult | null>(null);
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -69,6 +111,35 @@ export function UniversalInstallWizard({
       mountedRef.current = false;
     };
   }, []);
+
+  // Task 15 (ported from the retired catalog install modal's `close()`/
+  // unmount effect): a classic connector's oauth sign-in may still be
+  // pending when the wizard closes — cancel it so the backend's loopback
+  // listener / flow-map entry doesn't leak. Read via a ref (kept fresh every render)
+  // rather than closing over `detail`/`connectorBegin` directly so the
+  // unmount cleanup below always sees the latest values without
+  // re-subscribing on every change. `cancel_plugin_install` is a no-op when
+  // nothing is pending (including after a completed flow), so firing this on
+  // every close — component-backed or not, oauth or not — is harmless.
+  const closeStateRef = useRef({ pluginId, detail, connectorBegin });
+  closeStateRef.current = { pluginId, detail, connectorBegin };
+  const cancelPendingConnectorOauth = useCallback(() => {
+    const { pluginId: pid, detail: d, connectorBegin: begin } = closeStateRef.current;
+    if (!d || wizardKind(d) !== "connector") return;
+    const authKind = begin?.authKind ?? d.auth?.kind ?? null;
+    if (authKind === "oauth") {
+      void commands.cancelPluginInstall(LOCAL_RUNNER, pid, begin?.oauthBegin?.stateToken ?? null);
+    }
+  }, []);
+  const handleClose = useCallback(() => {
+    cancelPendingConnectorOauth();
+    onClose();
+  }, [cancelPendingConnectorOauth, onClose]);
+  useEffect(() => {
+    return () => {
+      cancelPendingConnectorOauth();
+    };
+  }, [cancelPendingConnectorOauth]);
 
   // Shared by the mount effect below and every step's `ctx.refresh()` — a
   // mutating step action (install/connect/settings save) calls this so the
@@ -96,9 +167,12 @@ export function UniversalInstallWizard({
     };
   }, [refresh]);
 
-  // trustRequired is always false from this shell — Task 15's skill-pack
-  // adapter is the one caller that knows a pack's source isn't curated and
-  // passes true through its own wizard entry point.
+  // trustRequired reflects `skillTrust` (Task 15): null until the skill-pack
+  // install step's `beginSkillInstall` comes back with a trust prompt (a
+  // curated, already-trusted pack never sets it) — recomputing the plan the
+  // moment it's set is what makes the permissions step appear reactively,
+  // without the currently-mounted install step needing to call `onNext()`
+  // itself (see `WizardCtx`'s doc).
   const plan = useMemo<WizardStepId[]>(() => {
     if (!detail) return ["overview"];
     return planWizardSteps({
@@ -106,10 +180,10 @@ export function UniversalInstallWizard({
       componentBacked: detail.info.componentBacked,
       authKind: detail.auth?.kind ?? "none",
       hasSettings: detail.settings.length > 0,
-      trustRequired: false,
+      trustRequired: skillTrust != null,
       hasOauthProfiles: (releaseDetail?.activeManifest?.oauthProfiles.length ?? 0) > 0,
     });
-  }, [detail, releaseDetail]);
+  }, [detail, releaseDetail, skillTrust]);
 
   // Checklist-resume hook (Task 14): once the real plan is known, jump to
   // initialStep's position in it. A step the plan skips falls back to 0
@@ -149,25 +223,37 @@ export function UniversalInstallWizard({
     const idx = clampedIndexRef.current;
     const count = stepCountRef.current;
     if (idx >= count - 1) {
-      onClose();
+      handleClose();
       return;
     }
     setStepIndex(idx + 1);
-  }, [onClose]);
+  }, [handleClose]);
 
-  // `setContinueDisabled` (a `useState` setter) is excluded from the dep
-  // array on purpose — React guarantees its identity is stable forever, so
-  // biome's exhaustive-deps rule flags it as unnecessary.
+  // `setContinueDisabled`/`setSkillTrust`/`setConnectorBegin` (`useState`
+  // setters) are excluded from the dep array on purpose — React guarantees
+  // their identity is stable forever, so biome's exhaustive-deps rule flags
+  // them as unnecessary.
   const ctx = useMemo<WizardCtx>(
-    () => ({ pluginId, detail, releaseDetail, plan, refresh, setContinueDisabled }),
-    [pluginId, detail, releaseDetail, plan, refresh],
+    () => ({
+      pluginId,
+      detail,
+      releaseDetail,
+      plan,
+      refresh,
+      setContinueDisabled,
+      skillTrust,
+      setSkillTrust,
+      connectorBegin,
+      setConnectorBegin,
+    }),
+    [pluginId, detail, releaseDetail, plan, refresh, skillTrust, connectorBegin],
   );
 
   const name = detail?.info.name ?? pluginId;
   const Icon = pluginIcon(detail?.info.icon ?? null);
 
   return (
-    <Modal onClose={onClose} width={480}>
+    <Modal onClose={handleClose} width={480}>
       <ModalHeader
         leading={<IconChip icon={Icon} size={28} />}
         title={`Install ${name}`}
@@ -204,21 +290,41 @@ export function UniversalInstallWizard({
   );
 }
 
-// Dispatches the current step id to its real per-kind component (Task 14).
-// A flat switch over the closed `WizardStepId` union — TypeScript proves
-// this is exhaustive without a `default`, but one stays as a defensive
-// runtime fallback (never reachable given `plan` only ever contains these
-// six ids).
+// Dispatches the current step id to its real per-kind component (Task 14
+// component-backed pilot; Task 15 fills in connector/skill-pack/provider).
+// "overview"/"settings"/"done" stay kind-agnostic (shared components from
+// `steps-component.tsx`); "permissions" branches only for the skill-pack
+// trust prompt (every other gated case — component permissions — uses the
+// shared summary-rows view); "install"/"connect" are the two steps whose
+// underlying mechanics genuinely differ per kind, so those branch on
+// `wizardKind(ctx.detail)`.
 function StepBody({ step, ctx, onNext }: { step: WizardStepId; ctx: WizardCtx; onNext: () => void }) {
+  const kind = wizardKind(ctx.detail);
   switch (step) {
     case "overview":
       return <OverviewStep ctx={ctx} onNext={onNext} />;
     case "permissions":
-      return <PermissionsStep ctx={ctx} onNext={onNext} />;
+      return ctx.skillTrust ? <SkillTrustStep ctx={ctx} onNext={onNext} /> : <PermissionsStep ctx={ctx} onNext={onNext} />;
     case "install":
-      return <InstallComponentStep ctx={ctx} onNext={onNext} />;
+      switch (kind) {
+        case "connector":
+          return <InstallConnectorStep ctx={ctx} onNext={onNext} />;
+        case "skill-pack":
+          return <InstallSkillPackStep ctx={ctx} onNext={onNext} />;
+        case "provider":
+          return <InstallProviderStep ctx={ctx} onNext={onNext} />;
+        default:
+          return <InstallComponentStep ctx={ctx} onNext={onNext} />;
+      }
     case "connect":
-      return <ConnectStep ctx={ctx} onNext={onNext} />;
+      switch (kind) {
+        case "connector":
+          return <ConnectorConnectStep ctx={ctx} onNext={onNext} />;
+        case "provider":
+          return <ProviderConnectStep ctx={ctx} onNext={onNext} />;
+        default:
+          return <ConnectStep ctx={ctx} onNext={onNext} />;
+      }
     case "settings":
       return <SettingsStep ctx={ctx} onNext={onNext} />;
     case "done":

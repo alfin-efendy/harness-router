@@ -29,8 +29,10 @@ import type { WizardCtx } from "./UniversalInstallWizard";
 /** True only for the duration this component instance stays mounted — every
  *  step's async continuation checks it before touching state, so navigating
  *  away mid-fetch (Back/Continue/Skip, or the wizard closing) never fires a
- *  stale setState. */
-function useMountedRef() {
+ *  stale setState. Exported (Task 15) so the connector/skill-pack/provider
+ *  adapters (`steps-connector.tsx`/`steps-skillpack.tsx`/`steps-provider.tsx`)
+ *  share the same guard instead of redeclaring it. */
+export function useMountedRef() {
   const ref = useRef(true);
   useEffect(() => {
     ref.current = true;
@@ -154,9 +156,9 @@ export function InstallComponentStep({ ctx, onNext }: { ctx: WizardCtx; onNext: 
 /** Top-level plugin OAuth (non-component `detail.auth.kind === "oauth"`):
  *  begins the browser flow on mount, listens for the loopback callback's
  *  completion event (same `pluginOauthCompletedMsg` `PluginDetailView` and
- *  `InstallWizardModal` already listen for) and auto-advances once it lands
- *  ok; a manual paste-code fallback covers the case the loopback never
- *  fires. */
+ *  the connector adapter's own oauth-wait sub-state, `steps-connector.tsx`,
+ *  also listen for) and auto-advances once it lands ok; a manual paste-code
+ *  fallback covers the case the loopback never fires. */
 function PluginOauthConnect({ ctx, onNext }: { ctx: WizardCtx; onNext: () => void }) {
   const [authorizeUrl, setAuthorizeUrl] = useState("");
   const [redirectUri, setRedirectUri] = useState("");
@@ -260,8 +262,10 @@ function PluginOauthConnect({ ctx, onNext }: { ctx: WizardCtx; onNext: () => voi
 }
 
 /** Token/api-key auth (non-oauth `detail.auth.setting`): one `FieldRow`,
- *  same shape the Settings tab's own credential row uses. */
-function TokenConnect({ ctx, auth }: { ctx: WizardCtx; auth: NonNullable<PluginDetail["auth"]> }) {
+ *  same shape the Settings tab's own credential row uses. Exported (Task 15)
+ *  so `steps-connector.tsx`'s `ConnectorConnectStep` reuses it verbatim for
+ *  a classic connector's token/api-key sub-state, instead of duplicating it. */
+export function TokenConnect({ ctx, auth }: { ctx: WizardCtx; auth: NonNullable<PluginDetail["auth"]> }) {
   const [value, setValue] = useState("");
   const [saving, setSaving] = useState(false);
   const mountedRef = useMountedRef();
@@ -385,12 +389,29 @@ export function DoneStep({ ctx, onNext }: { ctx: WizardCtx; onNext: () => void }
   const toolsById = usePlugins((s) => s.toolsById);
   const toolsLiveById = usePlugins((s) => s.toolsLiveById);
   const startedRef = useRef(false);
+  const enableStartedRef = useRef(false);
 
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
     void loadTools(ctx.pluginId);
   }, [ctx.pluginId, loadTools]);
+
+  // Task 15: a classic (non-component) connector's install commits here —
+  // ported from the retired catalog install modal's own done-effect
+  // (`setPluginEnabled` unless experimental). Component/provider/skill-pack
+  // installs already enable (or have no such concept — see
+  // `curated_pack_row`'s doc) as part of their own install call, so this
+  // stays scoped to the one kind that never otherwise flips it.
+  const info = ctx.detail?.info;
+  const isClassicConnector = !!info && !info.componentBacked && info.kind !== "provider" && info.kind !== "skill-pack";
+  useEffect(() => {
+    if (!isClassicConnector || enableStartedRef.current || info?.experimental) return;
+    enableStartedRef.current = true;
+    void commands.setPluginEnabled(LOCAL_RUNNER, ctx.pluginId, true).then((res) => {
+      if (res.status === "error") toast.error(res.error.message);
+    });
+  }, [isClassicConnector, info, ctx.pluginId]);
 
   const entries = toolsById[ctx.pluginId] ?? [];
   const live = toolsLiveById[ctx.pluginId] ?? false;

@@ -1,0 +1,493 @@
+import { Loader2 } from "lucide-react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { useConnections } from "@/store-connections";
+import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
+import { Chip } from "@/components/common/bits";
+import { Button, ChoiceCard, Combobox, FormField, Input, ModalBody, ModalFooter, RadioGroup } from "@ryuzi/ui";
+import {
+  DEVICE_SIGNIN_ACTION,
+  KIRO_DEVICE_CODE_HINT,
+  KIRO_IMPORT_HINT,
+  KIRO_IMPORT_SUCCESS,
+  KIRO_SIGNIN_ACTION,
+  KIRO_SIGNIN_SUBTITLE,
+  KIRO_WAITING_HINT,
+  PROVIDER_DEVICE_SUBTITLE,
+  PROVIDER_RISK_NOTICE,
+} from "@/constants";
+import { usesDeviceSignin } from "@/components/modals/deviceSignin";
+
+type DeviceStep = "form" | "waiting";
+type SignInFlow = "device" | "oauth" | "apiKey" | "free";
+
+const BASE_URL_PLACEHOLDERS: Record<string, string> = {
+  "cloudflare-ai": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+};
+
+type MimoRegion = { id: string; label: string; baseUrl: string };
+// The MiMo Token Plan is region-specific: the picker sets the connection's
+// base_url_override to the chosen cluster host (sgp is the default).
+const MIMO_REGIONS: MimoRegion[] = [
+  { id: "sgp", label: "Singapore (sgp)", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1" },
+  { id: "cn", label: "China (cn)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" },
+  { id: "ams", label: "Amsterdam (ams)", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1" },
+];
+
+/** Where to obtain the subscription credential, by member id. */
+const KEY_SOURCE_HINTS: Record<string, string> = {
+  mimo: "Get a Token Plan key (starts with tp-) at mimo.xiaomi.com.",
+  opencode: "Get a Go plan key at opencode.ai/auth.",
+};
+
+function signInFlow(entry: CatalogEntry): SignInFlow {
+  if (usesDeviceSignin(entry)) return "device";
+  if (entry.category === "oauth") return "oauth";
+  if (entry.category === "free") return "free";
+  return "apiKey";
+}
+
+function authMethodLabel(entry: CatalogEntry): string {
+  switch (signInFlow(entry)) {
+    case "device":
+      return "Device sign-in";
+    case "oauth":
+      return "Subscription";
+    case "free":
+      return "Free tier";
+    case "apiKey":
+      // An API-key member that joins another family's head (its id differs from
+      // its family) is a paid upgrade to that free tier — a "Subscription"
+      // (e.g. MiMo Token Plan, OpenCode Go). Standalone API-key providers, whose
+      // id equals their family, keep the plain "API Key" label.
+      return entry.id !== entry.family ? "Subscription" : "API Key";
+  }
+}
+
+export type ConnectionMethodFormHandle = { cancel: () => void };
+
+// The account-creation form for one provider family (Task 15) — extracted
+// from `AddConnectionModal` so the universal install wizard's provider
+// adapter (`steps-provider.tsx`) can embed the exact same method chooser/
+// oauth/device/apiKey logic inline in its own "connect" step, instead of
+// nesting a second `Modal`. `AddConnectionModal` is now a thin `Modal`
+// wrapper around this component (its own doc has the details).
+//
+// No `open` concept here on purpose: the caller mounts/unmounts this
+// component to show/hide it (the wizard does so naturally via its step
+// switch; `AddConnectionModal` does so via its own `if (!open) return null`)
+// — every reset that used to key off `[open, family]` now keys off `family`
+// alone, and a REAL unmount handles the rest (the effect's cleanup bumps
+// `operationRef`, so a stale in-flight promise from before the unmount can
+// never wrongly call `onDone` after remounting fresh). `cancel` (exposed via
+// `ref`) is the one path that must invalidate the SAME in-flight operation
+// WITHOUT necessarily unmounting — `AddConnectionModal` calls it from the
+// outer `Modal`'s own dismiss handler (X / backdrop / Escape), which is
+// wired above this component and can't reach its internal state any other
+// way.
+export const ConnectionMethodForm = forwardRef<
+  ConnectionMethodFormHandle,
+  {
+    family: string;
+    onDone: () => void;
+    onBusyChange?: (busy: boolean) => void;
+    onSelectedChange?: (entry: CatalogEntry | null) => void;
+  }
+>(function ConnectionMethodForm({ family, onDone, onBusyChange, onSelectedChange }, ref) {
+  const {
+    catalog,
+    add,
+    connectOauth,
+    addFree,
+    setCustomProviderFormat,
+    startKiroDevice,
+    awaitKiroDevice,
+    importKiro,
+    startDeviceFlow,
+    awaitDeviceFlow,
+  } = useConnections();
+  const members = useMemo(() => catalog.filter((entry) => entry.family === family), [catalog, family]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [label, setLabel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  // OpenAI-/Anthropic-compatible choice for custom providers (chosen per
+  // account and persisted onto the provider before the connection is added).
+  const [compat, setCompat] = useState<"openai" | "anthropic">("openai");
+  const [saving, setSaving] = useState(false);
+  const [oauthWaiting, setOauthWaiting] = useState(false);
+  const [oauthAuthorizeUrl, setOauthAuthorizeUrl] = useState("");
+  const [deviceStep, setDeviceStep] = useState<DeviceStep>("form");
+  const [deviceInfo, setDeviceInfo] = useState<DeviceFlowInfo | null>(null);
+  const selected =
+    members.find((entry) => entry.id === selectedId) ?? members.find((entry) => entry.category === "api_key") ?? members[0] ?? null;
+  const selectedRef = useRef<CatalogEntry | null>(selected);
+  const operationRef = useRef(0);
+
+  useEffect(() => {
+    selectedRef.current = selected;
+    onSelectedChange?.(selected);
+  }, [selected, onSelectedChange]);
+
+  // Resets the form whenever the family changes (including on mount) and
+  // invalidates whatever operation was pending under the PREVIOUS family —
+  // `operationRef` bumps regardless of whether this instance goes on to be
+  // unmounted (a family change while still open, no remount) or really is
+  // about to unmount (its cleanup below bumps it once more, harmlessly).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: family change resets the form and invalidates its pending operation; `members` (derived from `family` + the catalog) is intentionally excluded so an unrelated catalog refresh doesn't reset an in-progress form.
+  useEffect(() => {
+    operationRef.current += 1;
+    setSelectedId(null);
+    setLabel("");
+    setApiKey("");
+    // The default-selected member (api-key member, else the first) drives the
+    // initial base URL; MiMo's Token Plan defaults to its sgp region host.
+    const defaultMember = members.find((entry) => entry.category === "api_key") ?? members[0] ?? null;
+    setBaseUrl(defaultMember?.id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
+    setCompat((defaultMember?.format as "openai" | "anthropic") ?? "openai");
+    setSaving(false);
+    setOauthWaiting(false);
+    setOauthAuthorizeUrl("");
+    setDeviceStep("form");
+    setDeviceInfo(null);
+
+    return () => {
+      operationRef.current += 1;
+    };
+  }, [family]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void events.oauthAuthorizeUrlMsg
+      .listen((event) => {
+        if (!active || selectedRef.current?.id !== event.payload.provider) return;
+        setOauthAuthorizeUrl(event.payload.authorizeUrl);
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  const beginOperation = () => {
+    operationRef.current += 1;
+    return operationRef.current;
+  };
+  const operationIsCurrent = (operation: number) => operationRef.current === operation;
+
+  const close = () => {
+    operationRef.current += 1;
+    setLabel("");
+    setApiKey("");
+    setBaseUrl("");
+    setSaving(false);
+    setOauthWaiting(false);
+    setOauthAuthorizeUrl("");
+    setDeviceStep("form");
+    setDeviceInfo(null);
+    onDone();
+  };
+
+  useImperativeHandle(ref, () => ({ cancel: close }));
+
+  const flow = selected ? signInFlow(selected) : null;
+  const isCustom = selected?.id.startsWith("custom-") ?? false;
+  const baseUrlMissing = flow === "apiKey" && !!selected?.requiresBaseUrl && baseUrl.trim().length === 0;
+  const canSubmit = !!selected && !saving && !baseUrlMissing;
+  const shortCommitBusy = saving && (flow === "apiKey" || flow === "free");
+
+  useEffect(() => {
+    onBusyChange?.(shortCommitBusy);
+  }, [shortCommitBusy, onBusyChange]);
+
+  const selectMethod = (id: string) => {
+    if (shortCommitBusy || id === selected?.id) return;
+    operationRef.current += 1;
+    setSelectedId(id);
+    setBaseUrl(id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
+    setCompat((members.find((entry) => entry.id === id)?.format as "openai" | "anthropic") ?? "openai");
+    setSaving(false);
+    setOauthWaiting(false);
+    setOauthAuthorizeUrl("");
+    setDeviceStep("form");
+    setDeviceInfo(null);
+  };
+
+  const submitApiKey = async () => {
+    if (!selected || !canSubmit) return;
+    const target = selected;
+    const operation = beginOperation();
+    setSaving(true);
+    // Persist the OpenAI-/Anthropic-compatible choice onto the custom provider
+    // (re-registers its wire format/auth) before the connection is added.
+    if (isCustom && compat !== target.format) {
+      await setCustomProviderFormat(target.id, compat);
+    }
+    const ok = await add(target.id, label.trim() || target.name, apiKey, baseUrl.trim() || null);
+    if (!operationIsCurrent(operation)) return;
+    setSaving(false);
+    if (ok) close();
+  };
+
+  const submitFree = async () => {
+    if (!selected || !canSubmit) return;
+    const target = selected;
+    const operation = beginOperation();
+    setSaving(true);
+    const ok = await addFree(target.id, label.trim() || target.name);
+    if (!operationIsCurrent(operation)) return;
+    setSaving(false);
+    if (ok) close();
+  };
+
+  const connectBrowser = async () => {
+    if (!selected || saving) return;
+    const target = selected;
+    const operation = beginOperation();
+    setSaving(true);
+    setOauthWaiting(true);
+    setOauthAuthorizeUrl("");
+    const ok = await connectOauth(target.id, label.trim() || target.name);
+    if (!operationIsCurrent(operation)) return;
+    setSaving(false);
+    if (ok) close();
+    else setOauthWaiting(false);
+  };
+
+  const copyAuthorizeUrl = () => {
+    if (oauthAuthorizeUrl) void navigator.clipboard.writeText(oauthAuthorizeUrl);
+  };
+
+  const startDevice = async () => {
+    if (!selected || saving) return;
+    const target = selected;
+    const operation = beginOperation();
+    setSaving(true);
+    const info = target.usesDeviceGrant ? await startDeviceFlow(target.id) : await startKiroDevice();
+    if (!operationIsCurrent(operation)) return;
+    if (!info) {
+      setSaving(false);
+      return;
+    }
+    setDeviceInfo(info);
+    setDeviceStep("waiting");
+    const signinLabel = label.trim() || target.name;
+    const ok = target.usesDeviceGrant
+      ? await awaitDeviceFlow(target.id, signinLabel, info.flowId)
+      : await awaitKiroDevice(signinLabel, info.flowId);
+    if (!operationIsCurrent(operation)) return;
+    setSaving(false);
+    if (ok) close();
+    else {
+      setDeviceInfo(null);
+      setDeviceStep("form");
+    }
+  };
+
+  const importFromIde = async () => {
+    if (!selected || saving) return;
+    const target = selected;
+    const operation = beginOperation();
+    setSaving(true);
+    const ok = await importKiro(label.trim() || target.name);
+    if (!operationIsCurrent(operation)) return;
+    setSaving(false);
+    if (ok) {
+      toast.success(KIRO_IMPORT_SUCCESS);
+      close();
+    }
+  };
+
+  const copyDeviceCode = () => {
+    if (!deviceInfo) return;
+    void navigator.clipboard.writeText(deviceInfo.userCode);
+    toast.success("Copied");
+  };
+
+  return (
+    <>
+      <ModalBody>
+        {members.length > 1 && (
+          <RadioGroup
+            aria-label="Sign-in method"
+            value={selected?.id ?? ""}
+            onValueChange={selectMethod}
+            disabled={shortCommitBusy}
+            className="grid-cols-2"
+          >
+            {members.map((entry) => (
+              <ChoiceCard
+                key={entry.id}
+                value={entry.id}
+                title={authMethodLabel(entry)}
+                description={entry.name}
+                leading={<Chip initial={entry.initial} color={entry.color} size={32} />}
+              />
+            ))}
+          </RadioGroup>
+        )}
+
+        {selected?.riskNotice && (
+          <p className="mt-3 rounded-md border border-border px-3 py-2 text-[11.5px] text-amber-500">{PROVIDER_RISK_NOTICE}</p>
+        )}
+
+        {flow === "oauth" && selected && (
+          <div className="mt-3.5 flex flex-col gap-3">
+            <FormField label="Label">
+              <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
+            </FormField>
+            {oauthWaiting && (
+              <>
+                <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2.5 text-[12.5px] text-muted-foreground">
+                  <Loader2 aria-hidden className="shrink-0 animate-spin" />
+                  Waiting for your browser... complete the login, then return here.
+                </div>
+                {oauthAuthorizeUrl && (
+                  <FormField label="Login URL">
+                    <Input
+                      readOnly
+                      value={oauthAuthorizeUrl}
+                      onFocus={(event) => event.currentTarget.select()}
+                      className="font-mono text-[11.5px]"
+                    />
+                  </FormField>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {flow === "device" && selected && deviceStep === "form" && (
+          <div className="mt-3.5 flex flex-col gap-3">
+            <FormField label="Label">
+              <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
+            </FormField>
+            <p className="text-[11.5px] text-muted-foreground">
+              {selected.id === "kiro"
+                ? KIRO_SIGNIN_SUBTITLE
+                : (PROVIDER_DEVICE_SUBTITLE[selected.id] ?? "Sign in with your provider account.")}
+            </p>
+            {selected.id === "kiro" && <p className="text-[11.5px] text-muted-foreground">{KIRO_IMPORT_HINT}</p>}
+          </div>
+        )}
+
+        {flow === "device" && deviceStep === "waiting" && deviceInfo && (
+          <div className="mt-3.5 flex flex-col items-center gap-3 rounded-md border border-border px-4 py-4 text-center">
+            <p className="text-[12.5px] text-muted-foreground">{KIRO_DEVICE_CODE_HINT}</p>
+            <span className="font-mono text-lg font-semibold tracking-[0.08em]">{deviceInfo.userCode}</span>
+            <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+              <Loader2 aria-hidden className="shrink-0 animate-spin" />
+              {KIRO_WAITING_HINT}
+            </div>
+            {deviceInfo.verificationUri && (
+              <p className="break-all text-[11px] text-muted-foreground">
+                or visit <span className="font-mono">{deviceInfo.verificationUri}</span>
+              </p>
+            )}
+          </div>
+        )}
+
+        {(flow === "apiKey" || flow === "free") && selected && (
+          <div className="mt-3.5 flex flex-col gap-3">
+            <FormField label="Label">
+              <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
+            </FormField>
+            {flow === "apiKey" && (
+              <>
+                {isCustom && (
+                  <RadioGroup
+                    aria-label="Compatibility"
+                    value={compat}
+                    onValueChange={(value) => setCompat(value as "openai" | "anthropic")}
+                    className="grid-cols-2"
+                  >
+                    <ChoiceCard value="openai" title="OpenAI-compatible" description="/chat/completions, Bearer key" />
+                    <ChoiceCard value="anthropic" title="Anthropic-compatible" description="/messages, x-api-key" />
+                  </RadioGroup>
+                )}
+                {KEY_SOURCE_HINTS[selected.id] && <p className="text-xs text-muted-foreground">{KEY_SOURCE_HINTS[selected.id]}</p>}
+                <FormField label="API Key">
+                  <Input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-..." />
+                </FormField>
+                {selected.id === "mimo" ? (
+                  <FormField label="Region">
+                    <Combobox
+                      aria-label="Region"
+                      value={MIMO_REGIONS.find((region) => region.baseUrl === baseUrl)?.id ?? MIMO_REGIONS[0].id}
+                      onValueChange={(regionId) =>
+                        setBaseUrl(MIMO_REGIONS.find((region) => region.id === regionId)?.baseUrl ?? MIMO_REGIONS[0].baseUrl)
+                      }
+                      options={MIMO_REGIONS.map((region) => ({ value: region.id, label: region.label }))}
+                    />
+                  </FormField>
+                ) : (
+                  <FormField
+                    label={
+                      selected.requiresBaseUrl ? (
+                        "Base URL"
+                      ) : (
+                        <>
+                          Base URL override<span className="font-normal text-muted-foreground"> - optional</span>
+                        </>
+                      )
+                    }
+                  >
+                    <Input
+                      value={baseUrl}
+                      onChange={(event) => setBaseUrl(event.target.value)}
+                      placeholder={BASE_URL_PLACEHOLDERS[selected.id] ?? "https://host/v1"}
+                    />
+                  </FormField>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </ModalBody>
+
+      <ModalFooter>
+        {oauthWaiting && oauthAuthorizeUrl && (
+          <Button variant="outline" onClick={copyAuthorizeUrl}>
+            Copy login URL
+          </Button>
+        )}
+        {deviceStep === "waiting" && deviceInfo && (
+          <Button variant="outline" onClick={copyDeviceCode}>
+            Copy code
+          </Button>
+        )}
+        {flow === "device" && deviceStep === "form" && selected?.id === "kiro" && (
+          <Button variant="outline" disabled={saving} onClick={() => void importFromIde()}>
+            Import from Kiro IDE
+          </Button>
+        )}
+        <div className="flex-1" />
+        <Button variant="outline" disabled={shortCommitBusy} onClick={close}>
+          Cancel
+        </Button>
+        {flow === "oauth" && !oauthWaiting && (
+          <Button disabled={saving} onClick={() => void connectBrowser()}>
+            {saving ? "Opening..." : "Connect with browser"}
+          </Button>
+        )}
+        {flow === "device" && deviceStep === "form" && (
+          <Button disabled={saving} onClick={() => void startDevice()}>
+            {saving ? "Opening..." : selected?.id === "kiro" ? KIRO_SIGNIN_ACTION : DEVICE_SIGNIN_ACTION}
+          </Button>
+        )}
+        {(flow === "apiKey" || flow === "free") && (
+          <Button disabled={!canSubmit} onClick={() => void (flow === "free" ? submitFree() : submitApiKey())}>
+            {saving ? "Adding..." : "Add account"}
+          </Button>
+        )}
+      </ModalFooter>
+    </>
+  );
+});

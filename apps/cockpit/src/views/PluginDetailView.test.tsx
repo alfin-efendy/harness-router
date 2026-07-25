@@ -546,13 +546,34 @@ const pluginTools = mock((_runnerId: string, id: string) => {
   if (pluginToolsPendingIds.has(id)) return new Promise<never>(() => {});
   return ok({ pluginId: id, live: pluginToolsFixtures[id]?.live ?? false, entries: pluginToolsFixtures[id]?.entries ?? [] });
 });
-// Task 9: the pre-install hero's Install action opens `InstallWizardModal`
-// for a non-component plugin — these are its own mount-time RPCs (a full
-// happy-path stub, matching `InstallWizardModal.test.tsx`'s own baseline),
-// mocked here just enough that it mounts without throwing; the wizard's own
-// behavior is that file's job, not this view's.
-const beginPluginInstall = mock((_runnerId: string, _pluginId: string) =>
-  ok({
+// Task 9/15: the pre-install hero's Install action (and the checklist's
+// Connect resume) opens the universal wizard, whose classic-connector
+// adapter (`steps-connector.tsx`) resolves via `beginPluginInstall` — these
+// are its own mount-time RPCs, mostly mocked here just enough that it mounts
+// without throwing (the wizard's own exhaustive behavior is
+// `UniversalInstallWizard.test.tsx`'s job, not this view's); `acme-oauth`
+// gets its own oauth-available shape since the checklist's "Connect" resume
+// test below depends on the connect step actually staying put on it.
+const beginPluginInstall = mock((_runnerId: string, pluginId: string) => {
+  if (pluginId === "acme-oauth") {
+    return ok({
+      authKind: "oauth",
+      envVarPresent: false,
+      envVarName: null,
+      oauthAvailable: true,
+      oauthExternal: false,
+      needsClientId: false,
+      dcrSucceeded: true,
+      callbackMode: "auto",
+      oauthBegin: {
+        stateToken: "state-456",
+        authorizeUrl: "https://acme.example.com/oauth/authorize?client_id=acme-client",
+        redirectUri: "http://127.0.0.1:8976/plugin-oauth/acme-oauth/callback",
+      },
+      dcrError: null,
+    });
+  }
+  return ok({
     authKind: "none",
     envVarPresent: false,
     envVarName: null,
@@ -563,8 +584,8 @@ const beginPluginInstall = mock((_runnerId: string, _pluginId: string) =>
     callbackMode: "manual",
     oauthBegin: null,
     dcrError: null,
-  }),
-);
+  });
+});
 const cancelPluginInstall = mock((_runnerId: string, _pluginId: string, _stateToken: string | null) => ok(null));
 const setPluginOauthClientId = mock((_runnerId: string, _pluginId: string, _clientId: string) => ok(null));
 const openUrl = mock(async (_url: string) => {});
@@ -1551,6 +1572,12 @@ test("pre-install (never enabled/configured, non-experimental, non-component) sh
   expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
 
   fireEvent.click(screen.getByRole("button", { name: "Install" }));
+
+  // Task 15: the hero's Install action opens the universal wizard (starting
+  // on Overview) for every kind now — `beginPluginInstall` is the classic
+  // connector adapter's "install" step, one Continue click away.
+  expect(await screen.findByRole("dialog", { name: "Install Acme Fresh" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-fresh"));
 });
 

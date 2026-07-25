@@ -1,13 +1,22 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import type { CmdError, ComponentReleaseDetail, PluginDetail, PluginFieldInfo, Result } from "@/bindings";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type {
+  CatalogEntry,
+  CmdError,
+  ComponentReleaseDetail,
+  PluginDetail,
+  PluginFieldInfo,
+  PluginInstallBeginResult,
+  Result,
+  TrustPromptDto,
+} from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The shell talks only to the Tauri IPC boundary (`@/bindings`) plus the
-// `usePlugins`/`useNav` stores — mock bindings (same pattern as
-// `InstallWizardModal.test.tsx`), and reset the REAL stores around each test
-// (same pattern `PluginDetailView.test.tsx` uses) since the step components
-// (Task 14) now drive real store actions instead of a scaffold placeholder.
+// `usePlugins`/`useNav`/`useConnections` stores — mock bindings, and reset
+// the REAL stores around each test (same pattern `PluginDetailView.test.tsx`
+// uses) since the step components (Task 14, extended to every kind by Task
+// 15) drive real store actions instead of a scaffold placeholder.
 
 function field(key: string, label: string): PluginFieldInfo {
   return { key, label, help: "", secret: false, required: false, valueSet: false, kind: "string", options: [], default: null };
@@ -183,11 +192,81 @@ function tokenAuthDetailFixture(authOverrides: Partial<NonNullable<PluginDetail[
   };
 }
 
+// Task 15: a skill-pack fixture (kind "skill-pack", componentBacked false,
+// no top-level auth/settings — mirrors the curated `superpowers` pack's
+// synthesized `PluginDetail`, see `curated_pack_row`/`curated_pack_detail`).
+function skillPackDetailFixture(): PluginDetail {
+  return {
+    info: {
+      id: "superpowers",
+      name: "Superpowers",
+      description: "Curated workflow and development skills",
+      icon: "sparkles",
+      categories: ["skills"],
+      slot: null,
+      ownsSlot: false,
+      verified: true,
+      experimental: false,
+      enabled: false,
+      configured: false,
+      source: "skill-pack",
+      capabilities: [],
+      kind: "skill-pack",
+      installed: false,
+      family: null,
+      pinned: false,
+      sourceSpec: null,
+      resolvedCommit: null,
+      installedAt: null,
+      updatedAt: null,
+      trustTier: null,
+      catalogVersion: null,
+      componentBacked: false,
+      blockedReason: null,
+      status: "not-installed",
+      statusDetail: null,
+      authKind: "none",
+      toolCount: null,
+      skillCount: null,
+    },
+    auth: null,
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: null,
+    publisher: "Superpowers",
+  };
+}
+
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 const err = (message: string) => Promise.resolve({ status: "error" as const, error: { message } });
 
 let detailData: PluginDetail = detailFixture();
 let releaseData: ComponentReleaseDetail = releaseFixture();
+// Task 15: `steps-connector.tsx`'s `InstallConnectorStep`/`ConnectorConnectStep`
+// mutable begin-result fixture — mirrors the retired
+// `InstallWizardModal.test.tsx`'s own `beginData` pattern (tests swap it
+// between the mount call and a later re-begin to simulate DCR/oauth
+// progressing).
+let beginData: PluginInstallBeginResult = {
+  authKind: "token",
+  envVarPresent: false,
+  envVarName: null,
+  oauthAvailable: false,
+  oauthExternal: false,
+  needsClientId: false,
+  dcrSucceeded: false,
+  callbackMode: "auto",
+  oauthBegin: null,
+  dcrError: null,
+};
+// Task 15: `steps-skillpack.tsx`'s `InstallSkillPackStep` mutable
+// begin-result fixture.
+let skillBeginData: { completed: boolean; trust: TrustPromptDto | null; plugin: { id: string; name: string } | null } = {
+  completed: true,
+  trust: null,
+  plugin: { id: "superpowers", name: "Superpowers" },
+};
 
 const pluginDetail = mock((_runnerId: string | null, _id: string): Promise<Result<PluginDetail, CmdError>> => ok(detailData));
 const pluginReleaseDetail = mock(
@@ -205,8 +284,13 @@ const toastSuccess = mock((_message: string) => {});
 // completeness even though only the dedicated device-flow test below
 // exercises that branch (`OauthProfileConnections` calls them on its own
 // Connect click, which none of these tests trigger).
-const installComponentPlugin = mock((_runnerId: string, id: string, _version: string | null) =>
-  ok({ pluginId: id, releases: [], activeVersion: "1.0.0", activeManifest: null }),
+// Pre-existing gap (unrelated to Task 15): explicit return type widens this
+// to the same `Result<T, CmdError>` union `pluginDetail`/`pluginReleaseDetail`
+// already declare, so a test's `mockImplementationOnce(() => err(...))` (the
+// failed-install Retry test below) typechecks against an error variant too.
+const installComponentPlugin = mock(
+  (_runnerId: string, id: string, _version: string | null): Promise<Result<ComponentReleaseDetail, CmdError>> =>
+    ok({ pluginId: id, releases: [], activeVersion: "1.0.0", activeManifest: null }),
 );
 const beginPluginOauth = mock((_runnerId: string, _pluginId: string) =>
   ok({ stateToken: "state-1", authorizeUrl: "https://notion.example/authorize", redirectUri: "http://127.0.0.1:8976/callback" }),
@@ -229,6 +313,31 @@ const pluginProfilePollDeviceFlow = mock(
 );
 const pluginProfileDisconnect = mock((_runnerId: string, _pluginId: string, _profileId: string) => ok(null));
 
+// Task 15: the connector adapter's `beginPluginInstall`/`cancelPluginInstall`/
+// `setPluginOauthClientId` (its own `runBegin`/manual-client-id/oauth-wait
+// machinery) and the shared `DoneStep`'s connector enable-commit
+// (`setPluginEnabled`) — same shape the retired `InstallWizardModal.test.tsx`
+// mocked.
+const beginPluginInstall = mock(
+  (_runnerId: string, _pluginId: string): Promise<Result<PluginInstallBeginResult, CmdError>> => ok(beginData),
+);
+const cancelPluginInstall = mock((_runnerId: string, _pluginId: string, _stateToken: string | null) => ok(null));
+const setPluginOauthClientId = mock((_runnerId: string, _pluginId: string, _clientId: string) => ok(null));
+const setPluginEnabled = mock((_runnerId: string, _id: string, _enabled: boolean) => ok(null));
+// Task 15: the skill-pack adapter's two-phase `beginSkillInstall`/`confirmSkillInstall`,
+// plus the trio `usePlugins().load` (its own post-install `loadPlugins()`
+// call) fetches — `listPlugins`/`pluginsRestartRequired`/`catalogStatus`.
+const beginSkillInstall = mock((_runnerId: string, _source: string) => ok(skillBeginData));
+const listPlugins = mock(() => ok([] as unknown[]));
+const pluginsRestartRequired = mock(() => ok(false));
+const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
+const confirmSkillInstall = mock((_runnerId: string, _token: string) => ok({ id: "superpowers", name: "Superpowers" }));
+// Task 15: the provider adapter's `installProvider` (via the REAL
+// `useConnections` store) and `ConnectionMethodForm`'s own oauth-authorize-url
+// listener (mounted unconditionally by the provider connect step).
+const installProvider = mock((_runnerId: string, _family: string) => ok(["openai"]));
+const oauthAuthorizeUrlMsgListen = mock(async (_cb: (event: { payload: { provider: string; authorizeUrl: string } }) => void) => () => {});
+
 const pluginOauthCompletedMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; ok: boolean; error: string | null } }) => void) => () => {},
 );
@@ -246,9 +355,20 @@ mock.module("@/bindings", () => ({
     pluginProfileBeginDeviceFlow,
     pluginProfilePollDeviceFlow,
     pluginProfileDisconnect,
+    beginPluginInstall,
+    cancelPluginInstall,
+    setPluginOauthClientId,
+    setPluginEnabled,
+    beginSkillInstall,
+    confirmSkillInstall,
+    installProvider,
+    listPlugins,
+    pluginsRestartRequired,
+    catalogStatus,
   },
   events: {
     pluginOauthCompletedMsg: { listen: pluginOauthCompletedMsgListen },
+    oauthAuthorizeUrlMsg: { listen: oauthAuthorizeUrlMsgListen },
   },
 }));
 mock.module("sonner", () => ({
@@ -260,11 +380,18 @@ mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
 const { UniversalInstallWizard } = await import("./UniversalInstallWizard");
 const { usePlugins } = await import("@/store-plugins");
 const { useNav } = await import("@/store-nav");
+const { useConnections } = await import("@/store-connections");
 
 const onClose = mock(() => {});
 
-async function renderWizard(initialStep?: Parameters<typeof UniversalInstallWizard>[0]["initialStep"]) {
-  const result = render(<UniversalInstallWizard pluginId="notion" onClose={onClose} initialStep={initialStep} />);
+// `pluginId` is the prop `ctx.pluginId` resolves to everywhere (the id every
+// install/connect RPC in this file is keyed on) — independent of whatever id
+// `detailData`'s own fixture happens to carry (`pluginDetail`'s mock ignores
+// the requested id and just returns `detailData` regardless, so the two can
+// drift harmlessly UNLESS a test asserts an RPC call by id, in which case it
+// must pass the matching `pluginId` here).
+async function renderWizard(initialStep?: Parameters<typeof UniversalInstallWizard>[0]["initialStep"], pluginId = "notion") {
+  const result = render(<UniversalInstallWizard pluginId={pluginId} onClose={onClose} initialStep={initialStep} />);
   await act(async () => {});
   return result;
 }
@@ -285,9 +412,44 @@ function resetPluginsStore() {
   });
 }
 
+// A single api-key member so `ConnectionMethodForm` (the provider adapter's
+// "connect" step) has something concrete to render — mirrors
+// `AddConnectionModal.test.tsx`'s own single-member fixtures.
+const openaiCatalogEntry: CatalogEntry = {
+  id: "openai",
+  name: "OpenAI",
+  family: "openai",
+  color: "#10a37f",
+  initial: "O",
+  category: "api_key",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: [],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+
+function resetConnectionsStore() {
+  useConnections.setState({ catalog: [openaiCatalogEntry], customProviders: [], connections: [], installedProviders: [], loaded: true });
+}
+
 beforeEach(() => {
   detailData = detailFixture();
   releaseData = releaseFixture();
+  beginData = {
+    authKind: "token",
+    envVarPresent: false,
+    envVarName: null,
+    oauthAvailable: false,
+    oauthExternal: false,
+    needsClientId: false,
+    dcrSucceeded: false,
+    callbackMode: "auto",
+    oauthBegin: null,
+    dcrError: null,
+  };
+  skillBeginData = { completed: true, trust: null, plugin: { id: "superpowers", name: "Superpowers" } };
   pluginDetail.mockClear();
   pluginReleaseDetail.mockClear();
   installComponentPlugin.mockClear();
@@ -298,18 +460,31 @@ beforeEach(() => {
   pluginProfileBeginDeviceFlow.mockClear();
   pluginProfilePollDeviceFlow.mockClear();
   pluginProfileDisconnect.mockClear();
+  beginPluginInstall.mockClear();
+  cancelPluginInstall.mockClear();
+  setPluginOauthClientId.mockClear();
+  setPluginEnabled.mockClear();
+  beginSkillInstall.mockClear();
+  confirmSkillInstall.mockClear();
+  installProvider.mockClear();
+  listPlugins.mockClear();
+  pluginsRestartRequired.mockClear();
+  catalogStatus.mockClear();
+  oauthAuthorizeUrlMsgListen.mockClear();
   pluginOauthCompletedMsgListen.mockClear();
   openUrl.mockClear();
   toastError.mockClear();
   toastSuccess.mockClear();
   onClose.mockClear();
   resetPluginsStore();
+  resetConnectionsStore();
   useNav.setState({ history: { back: [], current: { kind: "plugins" }, forward: [] } });
 });
 
 afterEach(() => {
   cleanup();
   resetPluginsStore();
+  resetConnectionsStore();
   useNav.setState({ history: { back: [], current: { kind: "home" }, forward: [] } });
 });
 
@@ -503,7 +678,7 @@ test("renders a shortened 4-step plan for a provider with no settings or permiss
   // call alone would consume, leaving the refresh to fall through to
   // whatever the OTHER tests' `detailData` last left behind).
   detailData = providerDetailFixture();
-  await renderWizard();
+  await renderWizard(undefined, "openai");
 
   const dialog = screen.getByRole("dialog", { name: "Install OpenAI" });
   expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
@@ -513,13 +688,15 @@ test("renders a shortened 4-step plan for a provider with no settings or permiss
   expect(within(dialog).queryByText("Settings")).toBeNull();
 
   // install (position 2) auto-advances to connect once the (default,
-  // successful) installComponentPlugin mock resolves — nothing in this test
-  // needs to observe the transient "Installing…" body, only that the plan
-  // still lands correctly on the other side of it.
+  // successful) installProvider mock resolves — nothing in this test needs
+  // to observe the transient "Installing…" body, only that the plan still
+  // lands correctly on the other side of it (Task 15: the provider adapter's
+  // own install step, `steps-provider.tsx`, not `InstallComponentStep`).
   act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
   await act(async () => {});
   await act(async () => {});
   expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "openai");
   expect(within(dialog).queryByText("Permissions")).toBeNull();
   expect(within(dialog).queryByText("Settings")).toBeNull();
 
@@ -721,6 +898,159 @@ test("Connect step's TokenConnect Save calls setPluginSetting, disables while sa
   expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
   expect((within(dialog).getByLabelText("Credential *") as HTMLInputElement).value).toBe("");
   expect(within(dialog).getByPlaceholderText("●●●● saved")).toBeTruthy();
+});
+
+// ---------- Task 15: connector / skill-pack / provider adapters ----------
+
+// Port of the retired `InstallWizardModal.test.tsx`'s token path: the
+// classic connector adapter's "install" step resolves via
+// `beginPluginInstall` (not `installComponentPlugin`), lands on "connect"'s
+// `TokenConnect` sub-state, and the done-commit (`setPluginEnabled` unless
+// experimental) fires once Continue reaches "done".
+test("classic connector token path: beginPluginInstall resolves, TokenConnect saves, and done enables the plugin", async () => {
+  detailData = tokenAuthDetailFixture();
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+  expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github");
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+
+  fireEvent.change(within(dialog).getByLabelText("Credential *"), { target: { value: "ghp_abc123" } });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.github.token", "ghp_abc123"));
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 4 of 4 — Done")).toBeTruthy();
+  await waitFor(() => expect(setPluginEnabled).toHaveBeenCalledWith(LOCAL_RUNNER, "github", true));
+});
+
+// Port of the retired `InstallWizardModal.test.tsx`'s oauth-event/cancel
+// path: closing the wizard while a classic connector's browser sign-in is
+// still pending must cancel it (the backend's loopback listener otherwise
+// leaks until the flow's own timeout) — same behavior the old modal's
+// `close()` had, now scoped to `wizardKind(detail) === "connector"`.
+test("closing during a connector's pending oauth flow cancels the pending install", async () => {
+  detailData = tokenAuthDetailFixture({ kind: "oauth" });
+  beginData = {
+    authKind: "oauth",
+    envVarPresent: false,
+    envVarName: null,
+    oauthAvailable: true,
+    oauthExternal: false,
+    needsClientId: false,
+    dcrSucceeded: true,
+    callbackMode: "auto",
+    oauthBegin: {
+      stateToken: "state-999",
+      authorizeUrl: "https://github.example.com/oauth/authorize",
+      redirectUri: "http://127.0.0.1:8976/callback",
+    },
+    dcrError: null,
+  };
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Browser opened — finish signing in there.")).toBeTruthy();
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github", "state-999"));
+  expect(onClose).toHaveBeenCalled();
+});
+
+// Skill-pack trust path: `beginSkillInstall` returns a trust prompt (an
+// arbitrary or curated-but-code-running source) — the plan reactively grows
+// a "permissions" step right before "install" the moment `ctx.skillTrust` is
+// set (see `WizardCtx`'s doc), accepting it re-enters "install" for the
+// `confirmSkillInstall` pass, and the plan shrinks back once that clears
+// `skillTrust`, landing on "done" without this step ever calling `onNext()`.
+test("skill-pack trust path: the permissions step shows the trust prompt, and accepting confirms the install", async () => {
+  detailData = skillPackDetailFixture();
+  skillBeginData = {
+    completed: false,
+    trust: {
+      token: "trust-token-1",
+      sourceSpec: "https://github.com/acme/pack",
+      ownerRepo: "acme/pack",
+      resolvedCommit: "deadbeefcafe1234",
+      skills: ["triage", "review"],
+      hookScripts: [],
+      totalBytes: 2048,
+      runsCode: false,
+      curated: false,
+    },
+    plugin: null,
+  };
+  await renderWizard(undefined, "superpowers");
+  const dialog = screen.getByRole("dialog", { name: "Install Superpowers" });
+  expect(within(dialog).getByText("Step 1 of 3 — Overview")).toBeTruthy();
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(beginSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers");
+  expect(within(dialog).getByText("Step 2 of 4 — Permissions")).toBeTruthy();
+  expect(within(dialog).getByText(/isn't a curated pack/)).toBeTruthy();
+  expect(within(dialog).getByText("acme/pack")).toBeTruthy();
+
+  let continueButton = within(dialog).getByRole("button", { name: "Continue" }) as HTMLButtonElement;
+  expect(continueButton.disabled).toBe(true);
+  fireEvent.click(within(dialog).getByRole("switch", { name: "Accept permissions" }));
+  continueButton = within(dialog).getByRole("button", { name: "Continue" }) as HTMLButtonElement;
+  expect(continueButton.disabled).toBe(false);
+
+  act(() => continueButton.click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(confirmSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "trust-token-1");
+  // The plan shrank back to 3 steps once `confirmSkillInstall` cleared
+  // `ctx.skillTrust` — "done" is index 2 of 3 here, not 3 of 4.
+  expect(within(dialog).getByText("Step 3 of 3 — Done")).toBeTruthy();
+});
+
+// A curated pack (no trust prompt at all) never grows a permissions step —
+// `beginSkillInstall` resolving `completed: true` advances straight to done.
+test("a curated skill pack's install completes immediately with no permissions step", async () => {
+  detailData = skillPackDetailFixture();
+  skillBeginData = { completed: true, trust: null, plugin: { id: "superpowers", name: "Superpowers" } };
+  await renderWizard(undefined, "superpowers");
+  const dialog = screen.getByRole("dialog", { name: "Install Superpowers" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(beginSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers");
+  expect(confirmSkillInstall).not.toHaveBeenCalled();
+  expect(within(dialog).getByText("Step 3 of 3 — Done")).toBeTruthy();
+});
+
+// Provider path: install registers the family into the connections store,
+// connect renders the extracted `ConnectionMethodForm` inline, and Skip
+// (connect is skippable) reaches Done without adding an account.
+test("provider path: install registers the family, connect renders the account form, and Skip reaches Done", async () => {
+  detailData = providerDetailFixture();
+  await renderWizard(undefined, "openai");
+  const dialog = screen.getByRole("dialog", { name: "Install OpenAI" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "openai");
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  // `ConnectionMethodForm`'s own account-form content — proves the provider
+  // adapter's connect step actually rendered it, not a placeholder.
+  expect(within(dialog).getByRole("button", { name: "Add account" })).toBeTruthy();
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "Skip" }));
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 4 of 4 — Done")).toBeTruthy();
 });
 
 test("Settings step renders a FieldRow per declared setting and saves via setPluginSetting", async () => {

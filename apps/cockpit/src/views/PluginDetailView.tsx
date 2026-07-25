@@ -33,7 +33,6 @@ import {
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
-import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
 import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
 import type { WizardStepId } from "@/components/modals/wizard/wizard-steps";
 import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
@@ -462,14 +461,11 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   // snaps back to "overview" when the raw value isn't currently visible —
   // covers both a stale deep link and data that hasn't loaded yet.
   const [tab, setTab] = useState<DetailTab>(initialTab ?? "overview");
-  // Pre-install hero action for a non-component plugin — reuses the
-  // existing catalog wizard (Task 15 migrates classic connectors onto the
-  // universal one too).
-  const [installWizardOpen, setInstallWizardOpen] = useState(false);
-  // Task 14: the universal install wizard for component-backed plugins —
-  // launched from the hero Install action, the checklist's connect/settings
-  // actions (resuming at that step), and the Versions tab's never-installed
-  // "Install with wizard…" button. `null` when closed.
+  // Task 14: the universal install wizard — launched from the hero Install
+  // action (every kind, since Task 15 retired the classic catalog install
+  // modal and its componentBacked/otherwise branch), the checklist's
+  // connect/settings actions (resuming at that step), and the Versions tab's
+  // never-installed "Install with wizard…" button. `null` when closed.
   const [universalWizard, setUniversalWizard] = useState<{ initialStep?: WizardStepId } | null>(null);
 
   const load = useCallback(async () => {
@@ -805,12 +801,11 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     await load();
   };
 
-  // Task 14: a component-backed plugin's fresh install goes through the
-  // universal wizard (starting at Overview); a non-component plugin keeps
-  // the existing catalog wizard (Task 15 migrates that path too).
+  // Task 15: every kind's fresh install goes through the universal wizard,
+  // starting at Overview — the classic-install-modal/componentBacked branch
+  // this used to need is retired.
   const onInstallClick = () => {
-    if (info.componentBacked) setUniversalWizard({});
-    else setInstallWizardOpen(true);
+    setUniversalWizard({});
   };
 
   // `install` reuses the SAME hero handler above (not a duplicate branch);
@@ -1359,18 +1354,6 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
         )}
       </div>
 
-      {installWizardOpen && (
-        <InstallWizardModal
-          pluginId={id}
-          pluginName={info.name}
-          pluginIcon={info.icon}
-          onClose={() => {
-            setInstallWizardOpen(false);
-            void load();
-            void reloadPlugins();
-          }}
-        />
-      )}
       {universalWizard && (
         <UniversalInstallWizard
           pluginId={id}

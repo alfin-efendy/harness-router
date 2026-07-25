@@ -39,9 +39,10 @@ export type HubItem = {
   pinned: boolean;
   installed: boolean;
   /** `PluginInfo.componentBacked` (apps/skill sources are never
-   *  component-backed) — Task 14's launch points read this to decide
-   *  whether a not-yet-installed row's Install action opens the universal
-   *  wizard (component-backed) or the classic `InstallWizardModal`. */
+   *  component-backed). Every kind's Install action opens the universal
+   *  wizard now (Task 15 retired the classic catalog install modal) — the
+   *  wizard's own `wizardKind` reads this (via `pluginDetail`, not this
+   *  row) to pick the component adapter over the classic connector one. */
   componentBacked: boolean;
   status: HubStatus;
   statusDetail: string | null;

@@ -216,7 +216,28 @@ const wizardBegin: PluginInstallBeginResult = {
   oauthBegin: null,
   dcrError: null,
 };
-const pluginDetail = mock(async (_runnerId: string, _id: string) => ({ status: "ok" as const, data: wizardDetail }));
+// Task 15: providers and skill packs now open the SAME wizard as classic
+// connectors, so `pluginDetail` needs id-aware fixtures for them too — a
+// provider always gets a "connect" step (`kind === "provider"`), a skill
+// pack's "install" step drives `beginSkillInstall`, not `beginPluginInstall`.
+const anthropicProviderDetail: PluginDetail = {
+  ...wizardDetail,
+  info: { ...wizardDetail.info, id: "anthropic", name: "Anthropic", kind: "provider", family: "anthropic" },
+};
+const superpowersWizardDetail: PluginDetail = {
+  ...wizardDetail,
+  info: { ...wizardDetail.info, id: "superpowers", name: "Superpowers", kind: "skill-pack" },
+};
+const wizardDetailById: Record<string, PluginDetail> = {
+  anthropic: anthropicProviderDetail,
+  superpowers: superpowersWizardDetail,
+};
+// The install wizard's own `ctx.refresh()` re-fetches `pluginDetail` after a
+// mutating step action succeeds (install/connect/settings) — a one-shot
+// `mockImplementationOnce` override would only cover the mount fetch and
+// fall back to the wrong (github-shaped) fixture on that second call, so
+// this stays a persistent, id-aware implementation instead.
+const pluginDetail = mock(async (_runnerId: string, id: string) => ({ status: "ok" as const, data: wizardDetailById[id] ?? wizardDetail }));
 const beginPluginInstall = mock(async (_runnerId: string, _pluginId: string) => ({ status: "ok" as const, data: wizardBegin }));
 const setPluginOauthClientId = mock(async (_runnerId: string, _pluginId: string, _clientId: string) => ({
   status: "ok" as const,
@@ -232,6 +253,12 @@ const completePluginOauth = mock(async (_runnerId: string, _pluginId: string, _c
 }));
 const setPluginSetting = mock(async (_runnerId: string, _key: string, _value: string) => ({ status: "ok" as const, data: null }));
 const setPluginEnabled = mock(async (_runnerId: string, _id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
+// The wizard's shared `DoneStep` fetches this on mount (Task 14/15) — every
+// launch point here can now reach "done".
+const pluginTools = mock(async (_runnerId: string, id: string) => ({
+  status: "ok" as const,
+  data: { pluginId: id, live: false, entries: [] as unknown[] },
+}));
 
 function emptyReleaseDetail(id: string) {
   return { pluginId: id, releases: [] as unknown[], activeVersion: null as string | null, activeManifest: null };
@@ -280,6 +307,7 @@ mock.module("@/bindings", () => ({
     completePluginOauth,
     setPluginSetting,
     setPluginEnabled,
+    pluginTools,
     componentBootstrapStatus,
     pluginReleaseDetail,
     installComponentPlugin,
@@ -359,6 +387,7 @@ beforeEach(() => {
   completePluginOauth.mockClear();
   setPluginSetting.mockClear();
   setPluginEnabled.mockClear();
+  pluginTools.mockClear();
   pluginOauthCompletedMsgListen.mockClear();
   oauthAuthorizeUrlMsgListen.mockClear();
   toastSuccess.mockClear();
@@ -543,19 +572,23 @@ test("a pinned installed plugin shows the Pinned pill", async () => {
 
 // ---------- Install action ----------
 
-test("installing a not-installed integration opens the install wizard", async () => {
+test("installing a not-installed integration opens the install wizard, which resolves its config via beginPluginInstall", async () => {
   pluginsFixture = [githubPlugin];
   await renderView();
   await screen.findByText("GitHub");
 
   fireEvent.click(screen.getByRole("button", { name: "Install GitHub" }));
 
-  expect(await screen.findByText("Install GitHub", { selector: "h2" })).toBeTruthy();
+  expect(await screen.findByRole("dialog", { name: "Install GitHub" })).toBeTruthy();
+  // The wizard opens on Overview — `beginPluginInstall` is the classic
+  // connector adapter's "install" step, one Continue click away.
+  expect(beginPluginInstall).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
 });
 
-// Task 14: a component-backed row's Install opens the universal wizard
-// instead — the mocked `pluginDetail` otherwise always resolves the fixed
+// Task 14: a component-backed row's Install opens the universal wizard —
+// the mocked `pluginDetail` otherwise always resolves the fixed
 // `wizardDetail` (github-shaped, componentBacked false), so this override
 // gives the wizard a componentBacked detail for its own plan/title.
 const atlassianComponentDetail: PluginDetail = {
@@ -563,7 +596,7 @@ const atlassianComponentDetail: PluginDetail = {
   info: { ...wizardDetail.info, id: "atlassian", name: "Atlassian", componentBacked: true },
 };
 
-test("installing a not-installed component-backed row opens the universal wizard instead of the classic modal", async () => {
+test("installing a not-installed component-backed row's install step never calls beginPluginInstall (the classic connector's own RPC)", async () => {
   const componentPlugin = plugin("atlassian", ["issues"], { name: "Atlassian", status: "not-installed", componentBacked: true });
   pluginsFixture = [componentPlugin];
   pluginDetail.mockImplementationOnce(async () => ({ status: "ok" as const, data: atlassianComponentDetail }));
@@ -576,24 +609,31 @@ test("installing a not-installed component-backed row opens the universal wizard
   expect(beginPluginInstall).not.toHaveBeenCalled();
 });
 
-test("installing a not-installed provider adds it to the installed set instead of opening a modal", async () => {
+// Task 15: every kind now opens the SAME wizard — a provider's "install"
+// step registers it into the connections store's installed set from
+// INSIDE the wizard (`steps-provider.tsx`), not from `startInstall` itself.
+test("installing a not-installed provider opens the wizard, which installs it via the connections store", async () => {
   pluginsFixture = [anthropicPlugin];
   await renderView();
   await screen.findByText("Anthropic");
 
   fireEvent.click(screen.getByRole("button", { name: "Install Anthropic" }));
 
+  expect(await screen.findByRole("dialog", { name: "Install Anthropic" })).toBeTruthy();
+  expect(installProviderMock).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
   await waitFor(() => expect(installProviderMock).toHaveBeenCalledWith("anthropic"));
-  expect(screen.queryByText("Install Anthropic", { selector: "h2" })).toBeNull();
 });
 
-test("installing a not-installed skill pack routes through the two-phase trust flow (beginSkillInstall)", async () => {
+test("installing a not-installed skill pack opens the wizard, which routes through the two-phase trust flow (beginSkillInstall)", async () => {
   pluginsFixture = [superpowersPlugin];
   await renderView();
   await screen.findByText("Superpowers");
 
   fireEvent.click(screen.getByRole("button", { name: "Install Superpowers" }));
 
+  expect(await screen.findByRole("dialog", { name: "Install Superpowers" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
   await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers"));
 });
 
