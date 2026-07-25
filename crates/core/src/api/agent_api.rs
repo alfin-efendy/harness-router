@@ -10,14 +10,15 @@ use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, K
 use crate::agents::personality::{AgentPersonality, PersonalityPreset};
 use crate::agents::types::{
     AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentRegistrySnapshot,
-    AgentSnapshot, AgentTools, PermissionDecision, PermissionRule,
+    AgentSnapshot, AgentTools, NativeToolDecision, PermissionDecision, PermissionRule,
 };
 use crate::api::types::{
     AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
     AgentMutationInfo, AgentPersonalityInfo, AgentRecoveryInfo, AgentRegistryInfo,
     AgentSkillUsageInfo, AgentSummaryInfo, AgentValidationInfo, CuratorHistorySnapshotInfo,
     CuratorStateInfo, InvalidKnowledgeConceptInfo, JourneyMilestoneInfo, KnowledgeConceptInfo,
-    KnowledgeConceptMutationInfo, LearningReviewInfo, PermissionRuleInfo, SessionRuntimeInfo,
+    KnowledgeConceptMutationInfo, LearningReviewInfo, NativeToolDecisionInfo, PermissionRuleInfo,
+    SessionRuntimeInfo,
 };
 use crate::llm_router::model_effort::{
     self, EffectiveEffortSource, ModelDefaultSource, ModelPreferenceKey, ProjectRuntimeInfo,
@@ -29,6 +30,13 @@ use chrono::SecondsFormat;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::Value;
+
+/// The id of the synthetic, non-editable Fresh Agent row (`fresh_agent_summary`
+/// / `fresh_agent_detail`) — an ephemeral memoryless worker, not a registry
+/// agent. Every mutation RPC (`update_agent`/`delete_agent`/
+/// `set_default_agent`/`duplicate_agent`) rejects this id before touching the
+/// registry.
+const FRESH_AGENT_ID: &str = "fresh";
 
 pub(crate) const HANDLES: &[&str] = &[
     "list_selectable_models",
@@ -189,14 +197,26 @@ impl TryFrom<AgentModelInfo> for AgentModel {
     }
 }
 
-// TODO(Task 3): `AgentSummaryInfo`/`AgentMutationInfo.permission_mode` and
-// `.native_tools: Vec<String>` are deleted/reshaped into
-// `NativeToolDecisionInfo` per the plan brief. Until then this mechanical
-// patch (a) ignores the wire `permission_mode` string entirely on mutation
-// (AgentPermissionMode, the type it decoded through, no longer exists) and
-// (b) reports it as a constant placeholder on read, and (c) derives
-// `native_tools` from the enabled (non-`Off`) keys of the new
-// `permissions.native` decision map.
+fn parse_native_tool_decision(value: &str) -> Result<NativeToolDecision, ApiError> {
+    match value {
+        "allow" => Ok(NativeToolDecision::Allow),
+        "ask" => Ok(NativeToolDecision::Ask),
+        "off" => Ok(NativeToolDecision::Off),
+        other => Err(ApiError::bad_request(format!(
+            "unknown native tool decision `{other}` (expected allow, ask, or off)"
+        ))),
+    }
+}
+
+fn native_tool_decision_string(decision: NativeToolDecision) -> String {
+    match decision {
+        NativeToolDecision::Allow => "allow",
+        NativeToolDecision::Ask => "ask",
+        NativeToolDecision::Off => "off",
+    }
+    .to_owned()
+}
+
 fn parse_permission_decision(value: &str) -> Result<PermissionDecision, ApiError> {
     match value {
         "allow" => Ok(PermissionDecision::Allow),
@@ -303,6 +323,17 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let native = info
+            .native_tools
+            .into_iter()
+            .map(|entry| {
+                let tool = entry.tool.trim().to_owned();
+                if tool.is_empty() {
+                    return Err(ApiError::bad_request("native tool id cannot be blank"));
+                }
+                Ok((tool, parse_native_tool_decision(&entry.decision)?))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
         Ok(AgentMutationInput {
             name,
             description,
@@ -311,15 +342,7 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
             },
             model: info.model.try_into()?,
             personality: parse_personality(info.personality)?,
-            // TODO(Task 3): `native_tools` decodes into
-            // `NativeToolDecisionInfo` entries per the plan brief instead of
-            // being dropped; `permission_mode` is gone entirely (no v2
-            // replacement input — the caller edits the decision map
-            // directly).
-            permissions: AgentPermissions {
-                native: std::collections::BTreeMap::new(),
-                rules,
-            },
+            permissions: AgentPermissions { native, rules },
             skills: clean_references("skills", info.skills)?,
             tools: AgentTools {
                 plugins: clean_references("plugin tools", info.plugin_tools)?,
@@ -329,6 +352,24 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
     }
 }
 
+/// `tool_count` for a real (registry-backed) agent: every catalog-known
+/// native tool whose resolved decision (`native_decision`, absent = `Ask` =
+/// enabled) is not `Off`, plus every bound plugin tool. Apps are
+/// intentionally excluded — they are not gateable by the native decision map
+/// (see Task 2's concern #4) and never were part of this count's "tools the
+/// agent can act with" semantics beyond native + plugin.
+fn tool_count(
+    profile: &crate::agents::types::AgentProfile,
+    catalog: &AgentConfigurationCatalog,
+) -> u32 {
+    let enabled_natives = catalog
+        .native_tools
+        .iter()
+        .filter(|entry| profile.permissions.native_decision(&entry.id).enabled())
+        .count();
+    (enabled_natives + profile.tools.plugins.len()) as u32
+}
+
 fn summary_info(
     snapshot: &AgentSnapshot,
     registry: &AgentRegistrySnapshot,
@@ -336,17 +377,6 @@ fn summary_info(
     catalog: &AgentConfigurationCatalog,
 ) -> AgentSummaryInfo {
     let profile = &snapshot.profile;
-    let enabled_native = profile
-        .permissions
-        .native
-        .iter()
-        .filter(|(_, decision)| decision.enabled())
-        .map(|(id, _)| id.as_str());
-    let tool_count = enabled_native
-        .chain(profile.tools.plugins.iter().map(String::as_str))
-        .chain(profile.tools.apps.iter().map(String::as_str))
-        .collect::<std::collections::HashSet<_>>()
-        .len() as u32;
     let mut merged_validation = snapshot.validation.clone();
     merged_validation.extend(AgentConfigurationCatalog::validate_profile_references(
         &snapshot.profile,
@@ -358,11 +388,9 @@ fn summary_info(
         description: profile.description.clone(),
         avatar_color: profile.avatar.color.clone(),
         model: profile.model.clone().into(),
-        // TODO(Task 3): field deleted from `AgentSummaryInfo` per the plan
-        // brief; placeholder until then.
-        permission_mode: "ask".to_owned(),
+        builtin: false,
         skill_count: profile.skills.len() as u32,
-        tool_count,
+        tool_count: tool_count(profile, catalog),
         knowledge_count,
         executable: merged_validation.is_empty(),
         validation: merged_validation
@@ -374,6 +402,53 @@ fn summary_info(
             .collect(),
         is_default: registry.default_agent_id == profile.id,
     }
+}
+
+/// The synthetic Fresh Agent row: an ephemeral, memoryless worker dispatched
+/// for delegated tasks, not a registry-backed agent. Appended LAST to every
+/// agent listing (`registry_info_from_counts`); its model always mirrors the
+/// registry's current subagent model, since subagent-model updates are the
+/// only way to change what it runs as (`update_subagent_model` — no
+/// dedicated mutation path for this row per the plan brief).
+fn fresh_agent_summary(registry: &AgentRegistrySnapshot) -> AgentSummaryInfo {
+    AgentSummaryInfo {
+        id: FRESH_AGENT_ID.to_owned(),
+        name: "Fresh Agent".to_owned(),
+        description: "Ephemeral, memoryless worker dispatched for delegated tasks.".to_owned(),
+        avatar_color: "slate".to_owned(),
+        model: registry.subagent_model.clone().into(),
+        builtin: true,
+        skill_count: 0,
+        tool_count: 0,
+        knowledge_count: 0,
+        executable: true,
+        validation: Vec::new(),
+        is_default: false,
+    }
+}
+
+/// `get_agent("fresh")`'s detail: everything but the summary/model is empty
+/// so the frontend renders a model-only view (per the plan brief). `model_info`
+/// is enriched the same way a concrete-model agent's would be, so a concrete
+/// subagent model still gets its provider metadata.
+async fn fresh_agent_detail(
+    state: &ApiState,
+    registry: &AgentRegistrySnapshot,
+) -> Result<AgentDetailInfo, ApiError> {
+    let model_info = agent_model_info(state, &registry.subagent_model).await?;
+    Ok(AgentDetailInfo {
+        summary: fresh_agent_summary(registry),
+        permission_rules: Vec::new(),
+        skills: Vec::new(),
+        native_tools: Vec::new(),
+        plugin_tools: Vec::new(),
+        apps: Vec::new(),
+        model_info,
+        personality: AgentPersonalityInfo {
+            preset: "helpful".to_owned(),
+            custom: None,
+        },
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -506,15 +581,17 @@ fn detail_info_from_enrichment(
             command_prefix: rule.command_prefix,
         })
         .collect();
-    // TODO(Task 3): `native_tools: Vec<String>` becomes
-    // `Vec<NativeToolDecisionInfo>` (explicit map entries only) per the plan
-    // brief; this mechanical patch reports the enabled (non-`Off`) keys.
+    // Explicit map entries only — a tool absent from `permissions.native`
+    // defaults to `ask` UI-side against the configuration catalog, per the
+    // plan brief.
     let native_tools = profile
         .permissions
         .native
         .iter()
-        .filter(|(_, decision)| decision.enabled())
-        .map(|(id, _)| id.clone())
+        .map(|(id, decision)| NativeToolDecisionInfo {
+            tool: id.clone(),
+            decision: native_tool_decision_string(*decision),
+        })
         .collect();
     AgentDetailInfo {
         summary,
@@ -533,7 +610,7 @@ fn registry_info_from_counts(
     knowledge_counts: &std::collections::HashMap<String, u32>,
     catalog: &AgentConfigurationCatalog,
 ) -> AgentRegistryInfo {
-    let agents = snapshot
+    let mut agents: Vec<AgentSummaryInfo> = snapshot
         .agents
         .iter()
         .map(|agent| {
@@ -548,6 +625,10 @@ fn registry_info_from_counts(
             )
         })
         .collect();
+    // Fresh Agent is a synthetic, non-registry row — always appended last so
+    // it never displaces a real agent's position (e.g. index-0 lookups in
+    // existing callers/tests keep resolving to a real agent).
+    agents.push(fresh_agent_summary(&snapshot));
     AgentRegistryInfo {
         agents,
         default_agent_id: snapshot.default_agent_id,
@@ -1147,6 +1228,9 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let registry = state.agents.snapshot().await;
+            if agent_id == FRESH_AGENT_ID {
+                return ok(fresh_agent_detail(state, &registry).await?);
+            }
             let snapshot = registry
                 .agents
                 .iter()
@@ -1177,6 +1261,9 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "update_agent" => {
             let a: UpdateAgentP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
+            if agent_id == FRESH_AGENT_ID {
+                return Err(ApiError::conflict("fresh agent is built-in"));
+            }
             let input: AgentMutationInput = a.input.try_into()?;
             let catalog = agent_configuration_catalog(state).await?;
             let issues = AgentConfigurationCatalog::validate_mutation_references(&input, &catalog);
@@ -1196,6 +1283,9 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "duplicate_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
+            if agent_id == FRESH_AGENT_ID {
+                return Err(ApiError::conflict("fresh agent is built-in"));
+            }
             let snapshot = state.agents.duplicate(&agent_id).await?;
             let registry = state.agents.snapshot().await;
             let catalog = agent_configuration_catalog(state).await?;
@@ -1204,6 +1294,9 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "delete_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
+            if agent_id == FRESH_AGENT_ID {
+                return Err(ApiError::conflict("fresh agent is built-in"));
+            }
             let snapshot = state.agents.delete(&agent_id).await?;
             let catalog = agent_configuration_catalog(state).await?;
             ok(post_commit_registry_info(state, snapshot, &catalog).await)
@@ -1211,6 +1304,9 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "set_default_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
+            if agent_id == FRESH_AGENT_ID {
+                return Err(ApiError::conflict("fresh agent is built-in"));
+            }
             let snapshot = state.agents.set_default(&agent_id).await?;
             let catalog = agent_configuration_catalog(state).await?;
             ok(post_commit_registry_info(state, snapshot, &catalog).await)
@@ -1392,10 +1488,13 @@ mod tests {
             "avatarColor": "violet",
             "model": {"kind":"route","route":"free"},
             "personality": {"preset": "helpful", "custom": null},
-            "permissionMode": "ask",
             "permissionRules": [],
             "skills": ["requesting-code-review"],
-            "nativeTools": ["read", "grep", "bash"],
+            "nativeTools": [
+                {"tool": "read", "decision": "allow"},
+                {"tool": "grep", "decision": "allow"},
+                {"tool": "bash", "decision": "allow"}
+            ],
             "pluginTools": [],
             "apps": []
         })
@@ -1475,7 +1574,7 @@ mod tests {
         assert!(summary
             .validation
             .iter()
-            .any(|issue| issue.field == "tools.native"));
+            .any(|issue| issue.field == "permissions.native"));
     }
 
     #[tokio::test]
@@ -1760,23 +1859,47 @@ mod tests {
     async fn get_agent_returns_full_detail() {
         let _skill_guard = InstalledSkillGuard::new();
         let s = state_with_agents().await;
-        let created = dispatch(
-            &s,
-            "create_agent",
-            json!({"input": reviewer_input("Reviewer")}),
-        )
-        .await
-        .unwrap();
+        let catalog = dispatch(&s, "get_agent_configuration_catalog", json!({}))
+            .await
+            .unwrap();
+        let native_tool_count = catalog["nativeTools"].as_array().unwrap().len() as u64;
+
+        let mut input = reviewer_input("Reviewer");
+        input["nativeTools"] = json!([
+            {"tool": "read", "decision": "allow"},
+            {"tool": "grep", "decision": "allow"},
+            {"tool": "bash", "decision": "off"}
+        ]);
+        let created = dispatch(&s, "create_agent", json!({"input": input}))
+            .await
+            .unwrap();
         let id = created["summary"]["id"].as_str().unwrap();
         let detail = dispatch(&s, "get_agent", json!({"agent_id": id}))
             .await
             .unwrap();
         assert_eq!(detail["summary"]["id"], *id);
-        assert_eq!(detail["summary"]["permissionMode"], "ask");
+        assert_eq!(detail["summary"]["builtin"], false);
+        assert!(
+            detail["summary"].get("permissionMode").is_none(),
+            "permissionMode was deleted from AgentSummaryInfo"
+        );
         assert_eq!(detail["summary"]["skillCount"], 1);
-        assert_eq!(detail["summary"]["toolCount"], 3);
+        // Every catalog native tool defaults to "on" (absent = ask = on)
+        // except the one explicit `off` entry; zero plugin tools.
+        assert_eq!(
+            detail["summary"]["toolCount"].as_u64().unwrap(),
+            native_tool_count - 1
+        );
         assert_eq!(detail["skills"], json!(["requesting-code-review"]));
-        assert_eq!(detail["nativeTools"], json!(["read", "grep", "bash"]));
+        // Explicit map entries only, sorted by tool id.
+        assert_eq!(
+            detail["nativeTools"],
+            json!([
+                {"tool": "bash", "decision": "off"},
+                {"tool": "grep", "decision": "allow"},
+                {"tool": "read", "decision": "allow"}
+            ])
+        );
         // Route models carry no concrete model metadata.
         assert!(detail["modelInfo"].is_null());
     }
@@ -1795,7 +1918,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            // The one real agent, plus the always-appended synthetic Fresh
+            // Agent row.
+            2
         );
     }
 
@@ -2429,7 +2554,7 @@ mod tests {
         let before = s.agents.snapshot().await;
 
         let mut input = reviewer_input("Unknown Native Tool Reviewer");
-        input["nativeTools"] = json!(["missing"]);
+        input["nativeTools"] = json!([{"tool": "missing", "decision": "allow"}]);
         let error = dispatch(&s, "create_agent", json!({"input": input}))
             .await
             .unwrap_err();
@@ -2472,14 +2597,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_rejects_unknown_permission_mode() {
+    async fn mutation_rejects_unknown_native_tool_decision() {
         let s = state_with_agents().await;
         let mut input = reviewer_input("Reviewer");
-        input["permissionMode"] = json!("bypassPermissions");
+        input["nativeTools"] = json!([{"tool": "bash", "decision": "bypassPermissions"}]);
         let error = dispatch(&s, "create_agent", json!({"input": input}))
             .await
             .unwrap_err();
         assert_eq!(error.status, 400);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mutation_round_trips_native_tool_decisions() {
+        let _skill_guard = InstalledSkillGuard::new();
+        let s = state_with_agents().await;
+        let mut input = reviewer_input("Reviewer");
+        input["nativeTools"] = json!([
+            {"tool": "bash", "decision": "ask"},
+            {"tool": "edit", "decision": "off"},
+            {"tool": "read", "decision": "allow"}
+        ]);
+        let created = dispatch(&s, "create_agent", json!({"input": input}))
+            .await
+            .unwrap();
+        assert_eq!(
+            created["nativeTools"],
+            json!([
+                {"tool": "bash", "decision": "ask"},
+                {"tool": "edit", "decision": "off"},
+                {"tool": "read", "decision": "allow"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_row_is_appended_last_and_reflects_subagent_model() {
+        let s = state_with_agents().await;
+        let list = dispatch(&s, "list_agents", json!({})).await.unwrap();
+        let agents = list["agents"].as_array().unwrap();
+        assert!(
+            agents.len() >= 2,
+            "expected at least one real agent plus fresh"
+        );
+        let fresh = agents.last().unwrap();
+        assert_eq!(fresh["id"], "fresh");
+        assert_eq!(fresh["name"], "Fresh Agent");
+        assert_eq!(
+            fresh["description"],
+            "Ephemeral, memoryless worker dispatched for delegated tasks."
+        );
+        assert_eq!(fresh["avatarColor"], "slate");
+        assert_eq!(fresh["builtin"], true);
+        assert_eq!(fresh["executable"], true);
+        assert_eq!(fresh["isDefault"], false);
+        assert_eq!(fresh["skillCount"], 0);
+        assert_eq!(fresh["toolCount"], 0);
+        assert_eq!(fresh["knowledgeCount"], 0);
+        let subagent_model = dispatch(&s, "get_subagent_model", json!({})).await.unwrap();
+        assert_eq!(fresh["model"], subagent_model);
+        // Never anywhere but last.
+        assert!(agents[..agents.len() - 1]
+            .iter()
+            .all(|agent| agent["id"] != "fresh"));
+    }
+
+    #[tokio::test]
+    async fn get_fresh_agent_returns_model_only_detail() {
+        let s = state_with_agents().await;
+        let detail = dispatch(&s, "get_agent", json!({"agent_id": "fresh"}))
+            .await
+            .unwrap();
+        assert_eq!(detail["summary"]["id"], "fresh");
+        assert_eq!(detail["summary"]["builtin"], true);
+        let subagent_model = dispatch(&s, "get_subagent_model", json!({})).await.unwrap();
+        assert_eq!(detail["summary"]["model"], subagent_model);
+        assert_eq!(detail["skills"], json!([]));
+        assert_eq!(detail["nativeTools"], json!([]));
+        assert_eq!(detail["pluginTools"], json!([]));
+        assert_eq!(detail["apps"], json!([]));
+        assert_eq!(detail["permissionRules"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_guards_reject_update_delete_set_default_and_duplicate() {
+        let s = state_with_agents().await;
+        for (method, params) in [
+            (
+                "update_agent",
+                json!({"agent_id": "fresh", "input": reviewer_input("Fresh")}),
+            ),
+            ("delete_agent", json!({"agent_id": "fresh"})),
+            ("set_default_agent", json!({"agent_id": "fresh"})),
+            ("duplicate_agent", json!({"agent_id": "fresh"})),
+        ] {
+            let error = dispatch(&s, method, params).await.unwrap_err();
+            assert_eq!(error.status, 409, "{method} should reject the fresh agent");
+            assert_eq!(error.message, "fresh agent is built-in");
+        }
     }
 
     #[tokio::test]
