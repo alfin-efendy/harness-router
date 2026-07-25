@@ -640,11 +640,31 @@ test("agents: manage a non-default agent and start a chat session for it", async
   await expect(page.getByText("Built-in", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Actions for Fresh Agent" })).toHaveCount(0);
 
+  // Fresh Agent detail: no editable identity/tabs, just the shared subagent
+  // model editor (Task 8's model-only builtin branch).
+  await page.getByRole("button", { name: "Open Fresh Agent" }).click();
+  await expect(page.getByRole("heading", { name: "Fresh Agent" })).toBeVisible();
+  await expect(page.getByTestId("agent-detail-tabs")).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: "Agent model" })).toBeVisible();
+  // Scoped to "main": the app shell has its own unrelated "Back" control
+  // elsewhere in the layout with the same accessible name.
+  await page.getByRole("main").getByRole("button", { name: "Back" }).click();
+
   await page.getByRole("button", { name: "Open Reviewer" }).click();
   const tabs = page.getByTestId("agent-detail-tabs");
-  for (const label of ["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]) {
+  for (const label of ["Overview", "Model", "Permissions", "Skills", "Apps & MCP", "Learning", "Advanced"]) {
     await expect(tabs.getByText(label, { exact: true })).toBeVisible();
   }
+
+  // Permissions tab: a native-tool row renders with the Off/Ask/Allow
+  // segmented control, reflecting the fixture's saved "allow" decision.
+  await tabs.getByRole("button", { name: "Permissions", exact: true }).click();
+  const readFileRow = page.getByTestId("tool-row-read_file");
+  await expect(readFileRow).toBeVisible();
+  for (const label of ["Off", "Ask", "Allow"]) {
+    await expect(readFileRow.getByRole("button", { name: label, exact: true })).toBeVisible();
+  }
+  await expect(readFileRow.getByRole("button", { name: "Allow", exact: true })).toHaveAttribute("aria-pressed", "true");
 
   // Only the action menu drives "Start chat" — no separate start button.
   await page.getByRole("button", { name: "Actions for Reviewer" }).click();

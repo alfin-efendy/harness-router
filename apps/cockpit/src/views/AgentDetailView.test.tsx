@@ -7,6 +7,7 @@ import type {
   AgentMutationInfo,
   AgentRegistryInfo,
   AgentConfigurationCatalogInfo,
+  AgentSummaryInfo,
   CmdError,
   Result,
   SelectableModelInfo,
@@ -398,7 +399,7 @@ test("model transitions preserve supported effort, clear unsupported effort, and
   );
 });
 
-test("reselecting the current model or effort fires no update", async () => {
+test("reselecting the current model or effort fires no update; a genuine change fires exactly one", async () => {
   const concrete = detail({
     summary: { ...detail().summary, model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
     modelInfo: opusInfo,
@@ -409,11 +410,28 @@ test("reselecting the current model or effort fires no update", async () => {
 
   fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
   fireEvent.click(await screen.findByRole("option", { name: opusInfo.requestValue }));
-  expect(updateAgent).not.toHaveBeenCalled();
 
   fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
   fireEvent.click(await screen.findByRole("option", { name: "High" }));
-  expect(updateAgent).not.toHaveBeenCalled();
+
+  // The store queues the actual `commands.updateAgent` call on a microtask
+  // (store-agents.ts's `enqueueMutation`: `mutationTail.then(operation, ...)`),
+  // so asserting `not.toHaveBeenCalled()` synchronously right after the two
+  // no-op reselects above can't tell a correctly-guarded no-op from a broken
+  // guard whose deferred save just hasn't landed yet — both read as "not
+  // called yet". Fire one GENUINE effort change and assert the call COUNT
+  // once it lands: if either no-op above had (wrongly) queued a save, the
+  // count would be 2 or 3 instead of 1, and the no-ops are proven innocent
+  // only by that count staying at exactly 1.
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Max" }));
+
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
+  expect(updateAgent).toHaveBeenCalledWith(
+    LOCAL_RUNNER,
+    "reviewer",
+    expect.objectContaining({ model: { kind: "concrete", name: opusInfo.requestValue, effort: "max" } }),
+  );
 });
 
 test("Overview loads owned sessions and opens a selected session", async () => {
@@ -464,7 +482,11 @@ test("Learning renders the selected agent's Learning tab", () => {
   expect(screen.getByText("No memory concepts yet.")).toBeTruthy();
 });
 
-function freshDetail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
+function freshDetail(overrides: Omit<Partial<AgentDetailInfo>, "summary"> & { summary?: Partial<AgentSummaryInfo> } = {}): AgentDetailInfo {
+  // `summary` is merged field-by-field (not overwritten wholesale) so a
+  // caller can override just e.g. `model` without having to repeat every
+  // fresh-specific base field (id/name/builtin/…) itself.
+  const { summary: summaryOverrides, ...rest } = overrides;
   return detail({
     summary: {
       ...detail().summary,
@@ -477,6 +499,7 @@ function freshDetail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo 
       toolCount: 0,
       knowledgeCount: 0,
       isDefault: false,
+      ...summaryOverrides,
     },
     permissionRules: [],
     skills: [],
@@ -484,7 +507,7 @@ function freshDetail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo 
     pluginTools: [],
     apps: [],
     personality: { preset: "helpful", custom: null },
-    ...overrides,
+    ...rest,
   });
 }
 
@@ -513,5 +536,34 @@ test("Fresh Agent model change autosaves via updateSubagentModel, not updateAgen
   await waitFor(() =>
     expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, { kind: "concrete", name: miniInfo.requestValue, effort: null }),
   );
+  expect(updateAgent).not.toHaveBeenCalled();
+});
+
+test("reselecting the Fresh Agent's current model or effort fires no updateSubagentModel; a genuine change fires exactly one", async () => {
+  seed(
+    freshDetail({
+      summary: { model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
+      modelInfo: opusInfo,
+    }),
+  );
+  render(<AgentDetailView agentId="fresh" />);
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
+  fireEvent.click(await screen.findByRole("option", { name: opusInfo.requestValue }));
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "High" }));
+
+  // Same count-hardened pattern as the regular-agent Model tab test above: a
+  // synchronous "not called" check right after the no-op reselects can't
+  // distinguish a correctly-guarded no-op from a broken guard whose deferred
+  // `updateSubagentModel` call just hasn't landed yet (store-agents.ts queues
+  // it via the same `enqueueMutation` microtask as `update`). Fire a genuine
+  // change and assert the call count once it lands.
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Max" }));
+
+  await waitFor(() => expect(updateSubagentModel).toHaveBeenCalledTimes(1));
+  expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, { kind: "concrete", name: opusInfo.requestValue, effort: "max" });
   expect(updateAgent).not.toHaveBeenCalled();
 });
