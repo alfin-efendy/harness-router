@@ -321,11 +321,86 @@ mod tests {
         let entries: Vec<crate::api::types::SlashEntryInfo> = serde_json::from_value(out).unwrap();
         let init = entries.iter().find(|e| e.name == "init").unwrap();
         assert!(init.home && init.session && init.requires_project);
+        assert!(init.origin == crate::api::types::CommandOriginInfo::Builtin && init.effective);
         let review = entries.iter().find(|e| e.name == "review").unwrap();
         assert!(!review.home && review.session);
-        assert!(entries
+        let pdf = entries
             .iter()
-            .any(|e| e.name == "pdf" && e.kind == crate::api::types::SlashKindInfo::Skill));
+            .find(|e| e.name == "pdf" && e.kind == crate::api::types::SlashKindInfo::Skill)
+            .unwrap();
+        assert_eq!(pdf.origin, crate::api::types::CommandOriginInfo::Project);
+    }
+
+    #[test]
+    fn slash_entry_info_maps_kind_origin_and_precedence_flags() {
+        use crate::api::types::{CommandOriginInfo, SlashKindInfo};
+        use crate::harness::native::commands::{CommandOrigin, CommandSurfaces};
+        use crate::harness::native::slash_catalog::{SlashEntry, SlashKind};
+
+        // (a) builtin command, effective, not shadowed — also covers the
+        // surfaces->home/session and requires_project passthrough.
+        let builtin_command = SlashEntry {
+            name: "init".into(),
+            description: "d".into(),
+            kind: SlashKind::Command,
+            origin: CommandOrigin::Builtin,
+            surfaces: CommandSurfaces {
+                home: true,
+                session: false,
+            },
+            requires_project: true,
+            effective: true,
+            shadows_global: false,
+            agent: None,
+            model: None,
+            subtask: false,
+        };
+        let info = super::slash_entry_info(builtin_command);
+        assert_eq!(info.kind, SlashKindInfo::Command);
+        assert_eq!(info.origin, CommandOriginInfo::Builtin);
+        assert!(info.effective);
+        assert!(!info.shadows_global);
+        assert!(info.home && !info.session);
+        assert!(info.requires_project);
+
+        // (b) project-origin skill.
+        let project_skill = SlashEntry {
+            name: "pdf".into(),
+            description: "d".into(),
+            kind: SlashKind::Skill,
+            origin: CommandOrigin::Project,
+            surfaces: CommandSurfaces::default(),
+            requires_project: false,
+            effective: true,
+            shadows_global: false,
+            agent: None,
+            model: None,
+            subtask: false,
+        };
+        let info = super::slash_entry_info(project_skill);
+        assert_eq!(info.kind, SlashKindInfo::Skill);
+        assert_eq!(info.origin, CommandOriginInfo::Project);
+
+        // (c) global-origin command shadowed by a project command: not
+        // effective, shadows_global true.
+        let shadowed_global = SlashEntry {
+            name: "ship".into(),
+            description: "d".into(),
+            kind: SlashKind::Command,
+            origin: CommandOrigin::Global,
+            surfaces: CommandSurfaces::default(),
+            requires_project: false,
+            effective: false,
+            shadows_global: true,
+            agent: None,
+            model: None,
+            subtask: false,
+        };
+        let info = super::slash_entry_info(shadowed_global);
+        assert_eq!(info.kind, SlashKindInfo::Command);
+        assert_eq!(info.origin, CommandOriginInfo::Global);
+        assert!(!info.effective);
+        assert!(info.shadows_global);
     }
 
     #[tokio::test]
