@@ -20,6 +20,7 @@
 //! manifest per entry. [`install_builtins`] adds them plus the embedded
 //! catalog in one call.
 
+pub mod artifact_verify;
 pub mod bundle;
 pub mod capabilities;
 pub mod catalog_feed_key;

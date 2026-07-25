@@ -1334,15 +1334,17 @@ fetched and verified by `ComponentBundleInstaller`/`install_component_release`
 (`crates/core/src/plugins/{bundle,remote_catalog}.rs`) into
 `installed_bundle_root()` (`~/.config/ryuzi/plugins` by default). This
 mirrors the [remote catalog](#remote-catalog)'s feed-signing design one
-layer down — and, like that feed, **its trusted signing key is still the
-all-zero placeholder** (`FIRST_PARTY_KEY_ID` in
-`crates/core/src/plugins/first_party_key.rs`): `first_party_trusted_keys()`
-returns an EMPTY map while the placeholder is in place, so `verify_bundle`
-trusts nothing and NO first-party component — `mimo`, `opencode`, or any
-connector/gateway — can actually be installed in a real deployment until a
-maintainer completes the same one-time key-rollout step already documented
-under [Signing](#signing) above. This is a deliberate fail-closed default,
-not a bug.
+layer down, with its own independent trusted-signing key
+(`FIRST_PARTY_KEY_ID` in `crates/core/src/plugins/first_party_key.rs`,
+looked up via `first_party_trusted_keys()`). Component installs go live
+with the activation release — the release pipeline described in
+[Release pipeline & key rollout](#release-pipeline--key-rollout) — at which
+point any first-party component (`mimo`, `opencode`, or any
+connector/gateway) can actually be installed in a real deployment. Until a
+build carries the real key, `first_party_trusted_keys()` returns an EMPTY
+map and `verify_bundle` trusts nothing, so nothing installs — the same
+deliberate fail-closed default the [remote catalog's feed key](#signing)
+uses, not a bug.
 
 Two further gaps between "the generic machinery exists and is tested" and
 "a user can turn this on today":
@@ -1692,30 +1694,17 @@ key **compiled into the binary**
 never ships anywhere — it lives only as the `CATALOG_FEED_PRIVATE_KEY` CI
 secret, consumed by the publish tooling below.
 
-`CATALOG_FEED_PUBKEY` currently ships as the **all-zero placeholder**
-(`[0u8; 32]`). That key is a valid *low-order* ed25519 point — a non-strict
-verify could be tricked into accepting a forged signature against it — so the
-engine rejects it two ways: an explicit all-zero guard **plus** `verify_strict`
-(which rejects low-order keys and non-canonical signatures). While the
-placeholder is in place **every fetch is rejected**
-(`CatalogFeedError::BadSignature`); the remote catalog is fail-closed and the
-embedded catalog still loads normally. Going live is a one-time human ops step:
-
-1. Run `bun scripts/catalog/keygen.ts` **once** (a second run makes an
-   unrelated keypair, not a recovery of the first). It prints:
-   - a Rust `[u8; 32]` array literal — the **public** key, safe to commit.
-   - a base64 string — the **private** key seed. Never commit it.
-2. Store the private key as the `CATALOG_FEED_PRIVATE_KEY` repo secret
-   (GitHub Settings → Secrets and variables → Actions).
-3. Paste the public key array into `CATALOG_FEED_PUBKEY`
-   (`catalog_feed_key.rs`) and ship that change in a normal PR.
-4. The next release's `catalog-feed` job (see
-   [Publish flow](#publish-flow) below) builds and uploads a feed the new
-   binary — carrying the new pubkey — can verify. Older, already-shipped
-   binaries keep verifying against whatever pubkey they were built with, so
-   rotating the key later means republishing a fresh signed feed once the
-   new pubkey has actually shipped, or older installs simply stop accepting
-   updates until they upgrade.
+`CATALOG_FEED_PUBKEY` goes live with the activation release; see
+[Release pipeline & key rollout](#release-pipeline--key-rollout) below for
+the rollout mechanics and how a later rotation works. Until then it ships
+as the **all-zero placeholder** (`[0u8; 32]`) — a valid *low-order*
+ed25519 point that a non-strict verify could be tricked into accepting a
+forged signature against — so the engine rejects it two ways, defense in
+depth that stays in place regardless of which key ships: an explicit
+all-zero guard **plus** `verify_strict` (which rejects low-order keys and
+non-canonical signatures). While a placeholder key is in place, every fetch
+is rejected (`CatalogFeedError::BadSignature`) and the remote catalog fails
+closed; the embedded catalog still loads normally either way.
 
 Bun's WebCrypto (`crypto.subtle`, algorithm `"Ed25519"`) is what both
 `keygen.ts` and `build-feed.ts` use — no external signing dependency.
@@ -1873,13 +1862,14 @@ keypair's public key, and assert a single tampered byte or an unrelated
 keypair fails verification.
 
 The release workflow's `catalog-feed` job (`.github/workflows/release.yml`)
-runs on every CLI release: guarded on the `CATALOG_FEED_PRIVATE_KEY` secret
-being present (a no-op, not a failure, when it isn't — mirroring
-`cockpit-release.yml`'s optional Apple codesigning), it runs
-`bun scripts/catalog/build-feed.ts` and uploads `catalog.json` +
-`catalog.json.sig` onto the release via `gh release upload`, matching the
-asset-upload pattern the `cockpit-release.yml` `publish` job and the
-`docker`/`npm` jobs already use.
+runs on every CLI release and is REQUIRED: a missing `CATALOG_FEED_PRIVATE_KEY`
+secret fails the release outright — the feed is the revocation channel, and
+`finalize` asserts `catalog.json` + `catalog.json.sig` are present. The job
+runs `bun scripts/catalog/build-feed.ts`, verifies the built feed against the
+compiled-in `CATALOG_FEED_PUBKEY` (`verify-plugin-artifacts catalog`), and
+uploads `catalog.json` + `catalog.json.sig` onto the release via
+`gh release upload`, matching the asset-upload pattern the
+`cockpit-release.yml` `publish` job and the `docker`/`npm` jobs already use.
 
 **Known limitation:** the workflow does not commit the incremented
 `scripts/catalog/sequence.txt` back to `main` — like `scripts/npm/
@@ -1890,3 +1880,43 @@ release's feed reuses the same `sequence`, which the anti-rollback check
 still accepts (only a *lower* sequence is rejected) but does not usefully
 track feed freshness/generation across releases the way a truly
 monotonically-advancing counter would.
+
+### Release pipeline & key rollout
+
+Every `vX.Y.Z` release publishes the first-party component bundles alongside
+the CLI and Cockpit installers (`release.yml`'s `plugins` job): per bundle,
+`<id>.wasm` plus the three descriptor files under both stems (`<id>.*` and
+`<id>-<version>.*`, byte-identical). `component_url` is tag-absolute, so a
+release's artifacts are immutable and self-contained. The job signs with the
+`FIRST_PARTY_PRIVATE_KEY` repo secret, verifies BEFORE upload and again AFTER
+upload from the public URL via `cargo run -p ryuzi-core --bin
+verify-plugin-artifacts` (the production `verify_bundle` path), and `finalize`
+asserts every bundle's asset set is present — a partial upload fails the
+release.
+
+**URL semantics (pin + latest hybrid).** Released binaries carry
+`RYUZI_RELEASE_TAG` (stamped by `.goreleaser.yaml` and `cockpit-release.yml`,
+read by `option_env!` in `plugins::remote_catalog`). Unversioned fetches
+(bootstrap, first install, repair) default to the build's own tag URL;
+explicit-version fetches (the catalog-feed update flow) and unstamped dev
+builds use `releases/latest/download`. The `component_release_base_url`
+setting overrides both. A versioned fetch can transiently 404 while the feed
+still advertises a version `latest` no longer carries (bounded by the 6h feed
+cadence) — it surfaces as a retryable install error.
+
+**Rehearsal.** `plugins-dry-run.yml` (workflow_dispatch, plus auto on PRs
+touching the signer/key/verifier) runs build → sign → verify without
+publishing.
+
+**Key rotation (overlap-based).** The trust store is a `key_id → pubkey` map
+(`first_party_trusted_keys`): release N adds the new key id alongside the old;
+release N+1 switches CI signing (the signer's `FIRST_PARTY_KEY_ID` + secret);
+a later release drops the old entry. The bundle key and the catalog feed key
+rotate independently. Compromise response is the same procedure compressed,
+plus feed `blocked` entries for anything signed in the exposure window.
+
+**Bad-release runbook.** Publish the fixed version via a normal release AND
+add the bad version to the signed feed's `blocked` list (auto-disable +
+gateway stop, ≤6h propagation); individual installs can also
+`rollback_component_plugin` locally (reactivates the prior ledger version
+before revoking the bad one).

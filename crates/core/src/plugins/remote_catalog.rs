@@ -64,15 +64,17 @@ pub enum CatalogFeedError {
 /// the single choke point every production and test verify path funnels
 /// through.
 ///
-/// Two hard rejections guard the placeholder key. The compiled-in
-/// `CATALOG_FEED_PUBKEY` is all-zero, which is a valid *low-order* Edwards
-/// point; non-strict ed25519 `verify()` does NOT reject low-order public keys,
-/// so an attacker with no private key could forge a `(feed_bytes, signature)`
-/// pair it accepts. We therefore (1) reject the all-zero key outright — so an
-/// accidental future revert to the placeholder can never reintroduce
-/// forgeability, independent of the strict-verify property — and (2) use
-/// `verify_strict`, which rejects low-order `A` and non-canonical `R`/`S`.
-/// Legitimate full-order signatures still verify.
+/// Two hard rejections guard against an all-zero key — a zeroed fork or a
+/// dev build that hasn't been given a real key; the shipped
+/// `CATALOG_FEED_PUBKEY` itself is live, not all-zero. An all-zero key is a
+/// valid *low-order* Edwards point; non-strict ed25519 `verify()` does NOT
+/// reject low-order public keys, so an attacker with no private key could
+/// forge a `(feed_bytes, signature)` pair it accepts. We therefore (1) reject
+/// the all-zero key outright — so a zeroed fork/dev build (or an accidental
+/// future revert to one) can never reintroduce forgeability, independent of
+/// the strict-verify property — and (2) use `verify_strict`, which rejects
+/// low-order `A` and non-canonical `R`/`S`. Legitimate full-order signatures
+/// still verify.
 fn verify_with(feed_bytes: &[u8], sig_bytes: &[u8], pubkey: &[u8; 32]) -> bool {
     use ed25519_dalek::{Signature, VerifyingKey};
     if pubkey == &[0u8; 32] {
@@ -86,6 +88,17 @@ fn verify_with(feed_bytes: &[u8], sig_bytes: &[u8], pubkey: &[u8; 32]) -> bool {
     };
     let sig = Signature::from_bytes(&sig_arr);
     vk.verify_strict(feed_bytes, &sig).is_ok()
+}
+
+/// Verify a built catalog feed (`catalog.json` bytes + raw detached `.sig`
+/// bytes) against the COMPILED-IN [`CATALOG_FEED_PUBKEY`], through the same
+/// `verify_with` choke point the fetch pipeline uses. CI's release and
+/// rehearsal jobs call this via the `verify-plugin-artifacts` bin so a
+/// mispaired `CATALOG_FEED_PRIVATE_KEY`/pubkey ships a failed release, not a
+/// silently-rejected feed (the feed is the revocation channel — a broken one
+/// is discovered exactly when it's needed).
+pub fn verify_catalog_feed_signature(feed_bytes: &[u8], sig_bytes: &[u8]) -> bool {
+    verify_with(feed_bytes, sig_bytes, &CATALOG_FEED_PUBKEY)
 }
 
 /// Verify the detached signature over `feed_bytes`, then parse, then enforce
@@ -408,9 +421,10 @@ impl RemoteCatalogManager {
     }
 
     /// `refresh`, but verifying against an injected key instead of the
-    /// compiled-in `CATALOG_FEED_PUBKEY` — a test-only seam, since that key
-    /// is currently an all-zero placeholder (see `catalog_feed_key`) that no
-    /// test-signed feed can satisfy.
+    /// compiled-in `CATALOG_FEED_PUBKEY` — a test-only seam, since tests sign
+    /// feeds with a throwaway keypair and have no way to sign for the real
+    /// production private key that pairs with the compiled-in pubkey (see
+    /// `catalog_feed_key`).
     #[cfg(test)]
     async fn refresh_with_pubkey(&self, pubkey: &[u8; 32]) -> FetchOutcome {
         self.refresh_verified(pubkey).await
@@ -506,6 +520,36 @@ impl RemoteCatalogManager {
 pub const DEFAULT_COMPONENT_RELEASE_BASE_URL: &str =
     "https://github.com/alfin-efendy/ryuzi/releases/latest/download";
 
+/// The GitHub release-download root pinned bases are derived from (no tag).
+const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/alfin-efendy/ryuzi/releases/download";
+
+/// The release tag CI stamps into official builds via the `RYUZI_RELEASE_TAG`
+/// compile-time env (the goreleaser CLI builds and the cockpit installer build
+/// both export the vX.Y.Z tag being released — see `.goreleaser.yaml` /
+/// `cockpit-release.yml`). `None` in dev and fork builds. The tag is STAMPED
+/// rather than derived from `CARGO_PKG_VERSION` because the release tag tracks
+/// `crates/runner`'s version — neither this crate's own version nor Cockpit's
+/// matches it.
+pub const BUILD_RELEASE_TAG: Option<&str> = option_env!("RYUZI_RELEASE_TAG");
+
+/// The default release base URL for one component fetch (the
+/// `component_release_base_url` setting overrides this at every call site).
+/// Pin + latest hybrid: unversioned fetches from a stamped build pin to this
+/// build's own release tag; versioned fetches (updates) and unstamped builds
+/// use the rolling `latest` URL. See `release_base_url_for` for the rule.
+pub fn default_component_release_base_url_for(version: Option<&str>) -> String {
+    release_base_url_for(BUILD_RELEASE_TAG, version)
+}
+
+/// Pure derivation seam for [`default_component_release_base_url_for`] —
+/// `option_env!` is compile-time, so tests drive this directly.
+fn release_base_url_for(build_tag: Option<&str>, version: Option<&str>) -> String {
+    match (version, build_tag) {
+        (None, Some(tag)) => format!("{RELEASE_DOWNLOAD_ROOT}/{tag}"),
+        _ => DEFAULT_COMPONENT_RELEASE_BASE_URL.to_string(),
+    }
+}
+
 /// Settings key that, once present, marks first-party component bootstrap as
 /// fully completed (every first-party bundle installed or already present).
 /// Mirrors `agents::bootstrap`'s `FREE_PROVIDERS_SEEDED_MARKER`: once set, a
@@ -553,7 +597,7 @@ async fn get_2xx(http: &dyn CatalogHttp, url: &str) -> anyhow::Result<Vec<u8>> {
 /// feed cannot turn the staging step into an arbitrary-file-write primitive.
 /// (`verify_bundle` re-checks containment, but only after the wasm is staged,
 /// so this pre-write guard is the load-bearing one here.)
-fn sanitize_staged_component(name: &str) -> anyhow::Result<()> {
+pub(crate) fn sanitize_staged_component(name: &str) -> anyhow::Result<()> {
     use std::path::{Component, Path};
     if name.is_empty() {
         anyhow::bail!("component filename must not be empty");
@@ -1374,15 +1418,16 @@ mod tests {
         ));
     }
 
-    // The compiled-in `CATALOG_FEED_PUBKEY` is the all-zero placeholder — a
-    // valid LOW-ORDER Edwards point. Non-strict ed25519 `verify()` does NOT
-    // reject low-order public keys, so before this fix an attacker with no
-    // private key could grind a `(bytes, signature)` pair that `verify_with`
-    // accepted against it. `verify_with` now rejects the all-zero key two ways
-    // (an explicit guard AND `verify_strict`), so verification against it is
-    // deterministically `false` for ANY signature. This locks the fail-closed
-    // property: a silent regression (a revert to the placeholder, or a swap
-    // back to non-strict `verify`) can never reintroduce the forgery.
+    // The all-zero placeholder key (shipped before the real
+    // `CATALOG_FEED_PUBKEY`) is a valid LOW-ORDER Edwards point. Non-strict
+    // ed25519 `verify()` does NOT reject low-order public keys, so before
+    // this fix an attacker with no private key could grind a `(bytes,
+    // signature)` pair that `verify_with` accepted against it. `verify_with`
+    // now rejects the all-zero key two ways (an explicit guard AND
+    // `verify_strict`), so verification against it is deterministically
+    // `false` for ANY signature. This locks the fail-closed property: a
+    // silent regression (a revert to the placeholder, or a swap back to
+    // non-strict `verify`) can never reintroduce the forgery.
     #[test]
     fn all_zero_placeholder_key_rejects_every_signature() {
         let bytes = feed_json(5).into_bytes();
@@ -1413,6 +1458,29 @@ mod tests {
         let sig = sign(&bytes);
         let pubkey = test_keypair().verifying_key().to_bytes();
         assert!(verify_with(&bytes, &sig, &pubkey));
+    }
+
+    // `verify_catalog_feed_signature` is the thin pub wrapper the
+    // `verify-plugin-artifacts catalog` CI subcommand calls; it must delegate
+    // to the same `verify_with` choke point over the compiled-in production
+    // `CATALOG_FEED_PUBKEY`, not a test key. A feed signed with the
+    // throwaway `test_keypair` (not the real `CATALOG_FEED_PRIVATE_KEY`) must
+    // therefore be rejected. A `true` case can't be exercised here without
+    // the real production private key — that proof IS the CI verify step
+    // running against a build actually signed with `CATALOG_FEED_PRIVATE_KEY`.
+    #[test]
+    fn verify_catalog_feed_signature_rejects_test_key_signed_feed() {
+        let bytes = feed_json(5).into_bytes();
+        let sig = sign(&bytes);
+        assert!(!verify_catalog_feed_signature(&bytes, &sig));
+    }
+
+    #[test]
+    fn verify_catalog_feed_signature_rejects_garbage_and_empty_sig() {
+        let bytes = feed_json(5).into_bytes();
+        assert!(!verify_catalog_feed_signature(&bytes, &[]));
+        assert!(!verify_catalog_feed_signature(&bytes, &[0u8; 64]));
+        assert!(!verify_catalog_feed_signature(&bytes, &[0xffu8; 64]));
     }
 
     struct FakeHttp {
@@ -1558,12 +1626,10 @@ mod tests {
 
     // `refresh` must fetch+apply a changed feed and, because the cached set
     // actually changed, flip `ControlPlane::plugins_restart_required` — the
-    // signal Cockpit/the daemon use to prompt a restart. The production
-    // `CATALOG_FEED_PUBKEY` is the all-zero placeholder, which `verify_with`
-    // rejects outright (explicit guard + `verify_strict`), so the remote
-    // catalog is fail-closed until a real full-order key ships; this test
-    // therefore drives the manager through the `#[cfg(test)]`-only
-    // `refresh_with_pubkey` seam with a throwaway key. See
+    // signal Cockpit/the daemon use to prompt a restart. This test drives
+    // the manager through the `#[cfg(test)]`-only `refresh_with_pubkey` seam
+    // with a throwaway key — the production `CATALOG_FEED_PUBKEY` can't
+    // verify test-signed feeds. See
     // `all_zero_placeholder_key_rejects_every_signature` for the fail-closed
     // guarantee itself.
     #[tokio::test]
@@ -1690,5 +1756,34 @@ mod tests {
         let visible: Vec<_> = rows.iter().filter(|r| !r.blocked).collect();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "good");
+    }
+
+    // Pin + latest hybrid: an unversioned fetch (bootstrap, first install,
+    // repair) from a stamped release build pins to that release's own
+    // immutable tag — the exact plugin builds shipped and tested with this app
+    // version. Everything else (explicit-version updates advertised by the
+    // catalog feed, unstamped dev/fork builds) stays on the rolling `latest`.
+    #[test]
+    fn release_base_url_pins_unversioned_fetches_to_the_stamped_tag() {
+        assert_eq!(
+            release_base_url_for(Some("v0.8.0"), None),
+            "https://github.com/alfin-efendy/ryuzi/releases/download/v0.8.0"
+        );
+    }
+
+    #[test]
+    fn release_base_url_uses_latest_for_versioned_or_unstamped_fetches() {
+        assert_eq!(
+            release_base_url_for(Some("v0.8.0"), Some("0.1.2")),
+            DEFAULT_COMPONENT_RELEASE_BASE_URL
+        );
+        assert_eq!(
+            release_base_url_for(None, None),
+            DEFAULT_COMPONENT_RELEASE_BASE_URL
+        );
+        assert_eq!(
+            release_base_url_for(None, Some("0.1.2")),
+            DEFAULT_COMPONENT_RELEASE_BASE_URL
+        );
     }
 }

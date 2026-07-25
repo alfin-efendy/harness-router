@@ -60,8 +60,8 @@ fn discord_wasm_path() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// signing helpers (a throwaway TEST key injected as the trusted first-party
-// key — the real FIRST_PARTY_PUBKEY is the fail-closed all-zero placeholder)
+// signing helpers (a throwaway TEST key used as the trusted first-party key
+// — the test injects its own key rather than the production FIRST_PARTY_PUBKEY)
 // ---------------------------------------------------------------------------
 
 fn test_key() -> SigningKey {

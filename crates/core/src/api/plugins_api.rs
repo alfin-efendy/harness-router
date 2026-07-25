@@ -2149,9 +2149,10 @@ async fn enrich_oauth_profile_status(
 /// Install (or update to) a component plugin's signed release via the Task 11a
 /// pipeline (resolve+download+stage+verify_bundle+install+activate), then mark
 /// the host restart-required so the newly activated bundle is picked up.
-/// Returns the release ledger after the install. Fail-closed: with no
-/// first-party signing key yet (the placeholder), this refuses before any
-/// network I/O rather than staging an unverifiable bundle.
+/// Returns the release ledger after the install. Fail-closed: on a build with
+/// no trusted first-party signing key — e.g. a zeroed fork or a dev build
+/// that hasn't been given the real key — this refuses before any network I/O
+/// rather than staging an unverifiable bundle.
 async fn install_component_plugin(
     cp: &ControlPlane,
     plugin_id: &str,
@@ -2169,7 +2170,10 @@ async fn install_component_plugin(
         .await?
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL.to_string()
+            // Unversioned installs pin to this build's own release tag; an
+            // explicit version (the catalog-feed update flow) resolves its
+            // pinned stem against `latest`, where newer releases live.
+            crate::plugins::remote_catalog::default_component_release_base_url_for(version)
         });
     let http = crate::plugins::remote_catalog::ReqwestCatalogHttp::new();
     let installer = crate::plugins::bundle::ComponentBundleInstaller::new(
@@ -4745,18 +4749,38 @@ writes = true
         );
     }
 
-    // With no first-party signing key configured yet (the all-zero
-    // placeholder), an install must refuse fail-closed BEFORE any network I/O
-    // rather than stage an unverifiable bundle.
+    // Key-state-agnostic: with no first-party signing key compiled in this
+    // must refuse with the "disabled until" message BEFORE any network I/O
+    // (the fail-closed guard `install_component_plugin` opens with); with a
+    // real key compiled in that guard is bypassed and the call proceeds to
+    // resolve+download, which we point at a closed local port so the
+    // assertion stays hermetic (no live network dependency, no dependence on
+    // a real "mimo" release existing) rather than reasserting the "no key"
+    // message the live-key build can no longer produce.
     #[tokio::test]
     async fn install_component_plugin_is_fail_closed_without_a_signing_key() {
         let cp = test_cp().await;
+        cp.store()
+            .set_setting_raw("component_release_base_url", "http://127.0.0.1:1")
+            .await
+            .unwrap();
         match install_component_plugin(&cp, "mimo", None).await {
-            Ok(_) => panic!("expected a fail-closed refusal without a signing key"),
-            Err(err) => assert!(
-                err.to_string().contains("disabled until"),
-                "unexpected error: {err}"
+            Ok(_) => panic!(
+                "expected mimo install to fail (no signing key, or nothing listening on the closed port)"
             ),
+            Err(err) => {
+                if crate::plugins::first_party_key::FIRST_PARTY_PUBKEY == [0u8; 32] {
+                    assert!(
+                        err.to_string().contains("disabled until"),
+                        "unexpected error: {err}"
+                    );
+                } else {
+                    assert!(
+                        !err.to_string().contains("disabled until"),
+                        "a real signing key must bypass the fail-closed guard: {err}"
+                    );
+                }
+            }
         }
     }
 

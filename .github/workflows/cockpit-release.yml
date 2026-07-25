@@ -99,6 +99,10 @@ jobs:
             } >> "$GITHUB_ENV"
           done
       - name: Build installers
+        env:
+          # Stamped into crates/core's option_env!("RYUZI_RELEASE_TAG") so the
+          # packaged app pins unversioned plugin fetches to its own release tag.
+          RYUZI_RELEASE_TAG: ${{ inputs.tag }}
         run: bun run --cwd apps/cockpit tauri build ${{ matrix.args }}
       - name: Collect bundles
         shell: bash

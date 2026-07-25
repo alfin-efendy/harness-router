@@ -1,0 +1,68 @@
+name: plugins-dry-run
+# Rehearsal for release.yml's `plugins` AND `catalog-feed` jobs: build + sign
+# every first-party component bundle with the REAL FIRST_PARTY_PRIVATE_KEY
+# secret, and build + sign the remote catalog feed with the REAL
+# CATALOG_FEED_PRIVATE_KEY secret, then verify BOTH against their
+# COMPILED-IN pubkeys through the production verify_bundle /
+# verify_catalog_feed_signature paths — publishing NOTHING. Dispatchable any
+# time; also runs on PRs that touch either signer, either trusted key, or the
+# verifier, so a key activation/rotation PR (and any future signer/key
+# change) proves the whole build→sign→verify pipeline for BOTH keys before
+# merge. NOTE: while a compiled-in pubkey is still the all-zero placeholder,
+# its verify step fails BY DESIGN.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/plugins-dry-run.yml
+      - scripts/plugins/**
+      - scripts/catalog/**
+      - crates/core/src/plugins/first_party_key.rs
+      - crates/core/src/plugins/catalog_feed_key.rs
+      - crates/core/src/plugins/artifact_verify.rs
+      - crates/core/src/bin/verify_plugin_artifacts.rs
+
+permissions:
+  contents: read
+
+jobs:
+  build-sign-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup-bun
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false" # signed artifacts build clean, mirroring the release job
+      - name: Build + sign every component bundle
+        env:
+          FIRST_PARTY_PRIVATE_KEY: ${{ secrets.FIRST_PARTY_PRIVATE_KEY }}
+          FIRST_PARTY_OUT_DIR: dist/plugins
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-plugins
+        run: |
+          if [ -z "$FIRST_PARTY_PRIVATE_KEY" ]; then
+            echo "::error::FIRST_PARTY_PRIVATE_KEY secret is not set — run the signer keygen and add it first (docs/development/plugins.md#release-pipeline)"
+            exit 1
+          fi
+          bun scripts/plugins/build-first-party.ts
+      - name: Verify against the compiled-in pubkey (production verify_bundle path)
+        run: cargo run --locked -p ryuzi-core --bin verify-plugin-artifacts -- dist/plugins
+      - name: Build + sign the catalog feed
+        env:
+          CATALOG_FEED_PRIVATE_KEY: ${{ secrets.CATALOG_FEED_PRIVATE_KEY }}
+          CATALOG_FEED_SEQUENCE: ${{ github.run_number }}
+        run: |
+          if [ -z "$CATALOG_FEED_PRIVATE_KEY" ]; then
+            echo "::error::CATALOG_FEED_PRIVATE_KEY secret is not set — run the feed keygen and add it first (docs/development/plugins.md#remote-catalog)"
+            exit 1
+          fi
+          bun scripts/catalog/build-feed.ts
+      - name: Verify the feed against the compiled-in pubkey
+        run: cargo run --locked -p ryuzi-core --bin verify-plugin-artifacts -- catalog catalog.json catalog.json.sig
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: plugins-dry-run
+          path: dist/plugins/*
+          if-no-files-found: ignore
+          retention-days: 3
