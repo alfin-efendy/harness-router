@@ -1,0 +1,52 @@
+name: plugins-dry-run
+# Rehearsal for release.yml's `plugins` job: build + sign every first-party
+# component bundle with the REAL FIRST_PARTY_PRIVATE_KEY secret, then verify
+# the artifacts against the COMPILED-IN pubkey through the production
+# verify_bundle path — publishing NOTHING. Dispatchable any time; also runs
+# on PRs that touch the signer, the trusted key, or the verifier, so the key
+# activation PR (and any future signer/key change) proves the whole
+# build→sign→verify pipeline before merge. NOTE: while FIRST_PARTY_PUBKEY is
+# still the all-zero placeholder, the verify step fails BY DESIGN.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/plugins-dry-run.yml
+      - scripts/plugins/**
+      - scripts/catalog/ed25519.ts
+      - crates/core/src/plugins/first_party_key.rs
+      - crates/core/src/plugins/artifact_verify.rs
+      - crates/core/src/bin/verify_plugin_artifacts.rs
+
+permissions:
+  contents: read
+
+jobs:
+  build-sign-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup-bun
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false" # signed artifacts build clean, mirroring the release job
+      - name: Build + sign every component bundle
+        env:
+          FIRST_PARTY_PRIVATE_KEY: ${{ secrets.FIRST_PARTY_PRIVATE_KEY }}
+          FIRST_PARTY_OUT_DIR: dist/plugins
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-plugins
+        run: |
+          if [ -z "$FIRST_PARTY_PRIVATE_KEY" ]; then
+            echo "::error::FIRST_PARTY_PRIVATE_KEY secret is not set — run the signer keygen and add it first (docs/development/plugins.md#release-pipeline)"
+            exit 1
+          fi
+          bun scripts/plugins/build-first-party.ts
+      - name: Verify against the compiled-in pubkey (production verify_bundle path)
+        run: cargo run --locked -p ryuzi-core --bin verify-plugin-artifacts -- dist/plugins
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: plugins-dry-run
+          path: dist/plugins/*
+          if-no-files-found: ignore
+          retention-days: 3
