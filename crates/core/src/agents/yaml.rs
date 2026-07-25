@@ -442,7 +442,10 @@ fn profile_from_wire(
 ///   other builtin tool becomes `Off` since it was never exposed at all.
 /// - Whole-tool permission rules (no `command_prefix`) folded into the same
 ///   base decision table (`deny`→`Off`, `allow`→`Allow`, `ask`→`Ask`) and are
-///   dropped; only command-prefix-scoped rules survive as explicit rules.
+///   dropped. Command-prefix-scoped rules survive as explicit rules, except
+///   an `ask`-decision prefix rule: `Ask` was always a runtime no-op (rules
+///   only ever resolved to allow/deny), so those are dropped too rather than
+///   migrated forward as an unrenderable rule.
 fn migrate_v1_permissions(
     profile_id: &str,
     mode: &str,
@@ -491,7 +494,13 @@ fn migrate_v1_permissions(
     let mut kept = Vec::new();
     for rule in old_rules {
         if rule.command_prefix.is_some() {
-            kept.push(rule);
+            // `Ask` was always a runtime no-op (the rules engine only ever
+            // resolved a matching rule to allow/deny); carrying it forward
+            // just leaves an unrenderable rule for the allow/deny-only
+            // Permissions UI. Drop it here instead of migrating it.
+            if rule.decision != PermissionDecision::Ask {
+                kept.push(rule);
+            }
             continue;
         }
         if profile_id == "ryuzi" {
@@ -1140,7 +1149,7 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
 
     #[test]
     fn v1_whole_tool_rules_fold_into_base_decision() {
-        let rules = "  rules:\n    - id: r1\n      tool: bash\n      decision: allow\n    - id: r2\n      tool: read\n      decision: deny\n    - id: r3\n      tool: bash\n      decision: allow\n      command_prefix: \"git \"\n";
+        let rules = "  rules:\n    - id: r1\n      tool: bash\n      decision: allow\n    - id: r2\n      tool: read\n      decision: deny\n    - id: r3\n      tool: bash\n      decision: allow\n      command_prefix: \"git \"\n    - id: r4\n      tool: bash\n      decision: ask\n      command_prefix: \"npm \"\n";
         let profile = parse_agent_profile_document(&v1_doc("ask", &[], rules)).unwrap();
         assert_eq!(
             profile.typed().permissions.native_decision("bash"),
@@ -1153,7 +1162,7 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
         assert_eq!(
             profile.typed().permissions.rules.len(),
             1,
-            "only the prefix rule survives"
+            "only the allow-decision prefix rule survives; the ask-decision prefix rule (r4) is dropped as a runtime no-op"
         );
         // `profile_from_wire` trims every parsed `command_prefix` (pre-existing
         // behavior, unrelated to this migration: `trim_option(rule.command_prefix)`

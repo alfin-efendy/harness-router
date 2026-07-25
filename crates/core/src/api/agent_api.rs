@@ -221,9 +221,8 @@ fn parse_permission_decision(value: &str) -> Result<PermissionDecision, ApiError
     match value {
         "allow" => Ok(PermissionDecision::Allow),
         "deny" => Ok(PermissionDecision::Deny),
-        "ask" => Ok(PermissionDecision::Ask),
         other => Err(ApiError::bad_request(format!(
-            "unknown permission decision `{other}` (expected allow, deny, or ask)"
+            "unknown permission decision `{other}` (expected allow or deny)"
         ))),
     }
 }
@@ -2566,6 +2565,30 @@ mod tests {
             .agents
             .iter()
             .any(|agent| agent.profile.name == "Unknown Native Tool Reviewer"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_agent_rejects_ask_permission_rule_decision_without_mutating_registry() {
+        let _skill_guard = InstalledSkillGuard::new();
+        let s = state_with_agents().await;
+        let before = s.agents.snapshot().await;
+
+        let mut input = reviewer_input("Ask Rule Reviewer");
+        input["permissionRules"] = json!([
+            {"id": "rule-1", "tool": "bash", "decision": "ask", "commandPrefix": null}
+        ]);
+        let error = dispatch(&s, "create_agent", json!({"input": input}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, 400);
+        let after = s.agents.snapshot().await;
+        assert_eq!(after.agents.len(), before.agents.len());
+        assert!(!after
+            .agents
+            .iter()
+            .any(|agent| agent.profile.name == "Ask Rule Reviewer"));
     }
 
     #[tokio::test]

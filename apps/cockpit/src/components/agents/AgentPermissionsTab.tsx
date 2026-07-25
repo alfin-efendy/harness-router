@@ -94,7 +94,7 @@ function ToolRow({
           <span className="block truncate text-[11px] text-muted-foreground">{entry.description || entry.id}</span>
         </span>
         {entry.commandScoped ? <span className="shrink-0 text-[11px] text-muted-foreground">{pluralizeRules(rules.length)}</span> : null}
-        <Segmented options={[...BASE_OPTIONS]} value={decision} onChange={onDecisionChange} size="sm" disabled={!entry.available} />
+        <Segmented options={[...BASE_OPTIONS]} value={decision} onChange={onDecisionChange} size="sm" disabled={!entry.available || saving} />
       </div>
       {isExpanded ? (
         <div className="bg-muted/20 pl-[46px]">
@@ -110,6 +110,7 @@ function ToolRow({
                 value={rule.decision === "deny" ? "deny" : "allow"}
                 onChange={(next) => onRuleDecisionChange(rule.id, next)}
                 size="sm"
+                disabled={saving}
               />
               <Button
                 variant="ghost"

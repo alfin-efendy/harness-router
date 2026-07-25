@@ -71,7 +71,7 @@ test("renders one row per catalog native tool with the right segment selected: e
   expect(within(bashRow).getByRole("button", { name: "Allow" }).getAttribute("aria-pressed")).toBe("true");
 });
 
-test("clicking a segment fires update with the changed decision, preserving unrelated tools and rules", async () => {
+test("clicking a segment fires update with the changed decision, preserving unrelated tools and rules; no update fires while saving", async () => {
   render(<AgentPermissionsTab detail={reviewerDetail} />);
   const readRow = await screen.findByTestId("tool-row-read");
 
@@ -89,6 +89,24 @@ test("clicking a segment fires update with the changed decision, preserving unre
       }),
     ),
   );
+
+  // While a save is in flight, both the base-decision and rule-decision
+  // Segmented controls must be disabled so a rapid click can't race the
+  // in-flight mutation and clobber it.
+  const callsBeforeSaving = updateAgent.mock.calls.length;
+  useAgents.setState({ saving: true });
+  await waitFor(() => expect(within(readRow).getByRole("button", { name: "Ask" }).hasAttribute("disabled")).toBe(true));
+
+  fireEvent.click(within(readRow).getByRole("button", { name: "Ask" }));
+
+  const bashRow = screen.getByTestId("tool-row-bash");
+  fireEvent.click(within(bashRow).getByRole("button", { name: "Expand Bash prefix rules" }));
+  const rule1 = screen.getByTestId("rule-row-rule-1");
+  const denyButton = within(rule1).getByRole("button", { name: "Deny" });
+  expect(denyButton.hasAttribute("disabled")).toBe(true);
+  fireEvent.click(denyButton);
+
+  expect(updateAgent.mock.calls.length).toBe(callsBeforeSaving);
 });
 
 test("expanding Bash shows its prefix rules with their own Allow/Deny control", async () => {
