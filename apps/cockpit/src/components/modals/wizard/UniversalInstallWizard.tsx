@@ -196,8 +196,23 @@ export function UniversalInstallWizard({
   // Checklist-resume hook (Task 14): once the real plan is known, jump to
   // initialStep's position in it. A step the plan skips falls back to 0
   // rather than landing on a mismatched index.
+  //
+  // Finding 3 (final-review fix): `plan`'s identity changes on every
+  // `ctx.refresh()` (a settings save, a token save, a profile connect) — not
+  // just the mount-time fetch this effect was meant for — because `plan` is
+  // recomputed from `detail`/`releaseDetail`/`skillTrust`, and `refresh()`
+  // always calls `setDetail`/`setReleaseDetail` with fresh objects even when
+  // their content is unchanged. Without a guard, this effect re-fires on
+  // every such refresh and yanks the user back to `initialStep`'s position,
+  // discarding any manual navigation they'd done since resuming (e.g.
+  // resume-at-connect -> advance to settings -> save a setting -> snapped
+  // back to connect). `appliedInitialStepRef` makes the jump a one-shot: it
+  // applies exactly once, the first time `detail` is available, and never
+  // again for the rest of this wizard instance's lifetime.
+  const appliedInitialStepRef = useRef(false);
   useEffect(() => {
-    if (!detail || !initialStep) return;
+    if (!detail || !initialStep || appliedInitialStepRef.current) return;
+    appliedInitialStepRef.current = true;
     const idx = plan.indexOf(initialStep);
     setStepIndex(idx >= 0 ? idx : 0);
   }, [detail, plan, initialStep]);

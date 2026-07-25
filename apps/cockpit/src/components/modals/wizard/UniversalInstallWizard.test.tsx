@@ -1036,6 +1036,43 @@ test("classic connector token path: beginPluginInstall resolves, TokenConnect sa
   await waitFor(() => expect(setPluginEnabled).toHaveBeenCalledWith(LOCAL_RUNNER, "github", true));
 });
 
+// Finding 3 (final-review fix): resuming via `initialStep` must apply
+// exactly once. Before the fix, the resume effect's dep array included
+// `plan` itself — and `plan`'s identity changes on EVERY `ctx.refresh()`
+// (here, a settings save), not just the mount-time load — so the effect
+// re-fired and snapped the wizard back to `initialStep`'s position even
+// after the user had since navigated forward by hand (the setup checklist's
+// "Connect" resume is exactly this scenario: resume at connect, wander
+// forward, save something, get yanked back).
+test("initialStep applies once — a later refresh-causing save does not snap the wizard back to the resumed step", async () => {
+  detailData = { ...tokenAuthDetailFixture(), settings: [field("plugin.github.workspace", "Workspace")] };
+  await renderWizard("connect", "github");
+  await act(async () => {});
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+  // Resumed straight to connect — index 2 of overview/install/connect/settings/done (5 steps).
+  expect(within(dialog).getByText("Step 3 of 5 — Connect")).toBeTruthy();
+
+  // Advance past connect (skippable) to settings, by hand.
+  fireEvent.click(within(dialog).getByRole("button", { name: "Skip" }));
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 4 of 5 — Settings")).toBeTruthy();
+
+  // A settings save calls `ctx.refresh()`, which re-fetches `pluginDetail` —
+  // reassign `detailData` to a genuinely NEW object (not just mutate the
+  // existing one) so `setDetail` sees a changed reference and `plan`'s
+  // `useMemo` actually recomputes, the same way a real IPC round trip always
+  // returns a fresh deserialization. Without that, this test can't
+  // distinguish the fix from a no-op (React bails out of a `setState` given
+  // the same reference back, so `plan` would never recompute either way).
+  fireEvent.change(within(dialog).getByLabelText("Workspace"), { target: { value: "acme" } });
+  detailData = { ...tokenAuthDetailFixture(), settings: [{ ...field("plugin.github.workspace", "Workspace"), valueSet: true }] };
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  await act(async () => {});
+
+  expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.github.workspace", "acme");
+  expect(within(dialog).getByText("Step 4 of 5 — Settings")).toBeTruthy();
+});
+
 // Port of the retired `InstallWizardModal.test.tsx`'s oauth-event/cancel
 // path: closing the wizard while a classic connector's browser sign-in is
 // still pending must cancel it (the backend's loopback listener otherwise
