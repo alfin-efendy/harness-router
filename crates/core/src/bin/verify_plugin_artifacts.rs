@@ -22,7 +22,13 @@ fn main() -> ExitCode {
     let mut expect_base = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--expect-base" => expect_base = args.next(),
+            "--expect-base" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--expect-base requires a value");
+                    return ExitCode::FAILURE;
+                };
+                expect_base = Some(value);
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 return ExitCode::FAILURE;
