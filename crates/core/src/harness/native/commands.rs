@@ -13,6 +13,22 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+/// Where a command is offered in "/" autocomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandSurfaces {
+    pub home: bool,
+    pub session: bool,
+}
+
+impl Default for CommandSurfaces {
+    fn default() -> Self {
+        Self {
+            home: true,
+            session: true,
+        }
+    }
+}
+
 /// One slash command.
 #[derive(Debug, Clone)]
 pub struct Command {
@@ -26,6 +42,10 @@ pub struct Command {
     pub model: Option<String>,
     /// Whether this command's turn is a subtask.
     pub subtask: bool,
+    /// Which composer surfaces list this command in "/" autocomplete.
+    pub surfaces: CommandSurfaces,
+    /// Whether the command is meaningful only with a project selected.
+    pub requires_project: bool,
 }
 
 /// A slash command expanded for a particular input.
@@ -135,44 +155,20 @@ impl Command {
     }
 }
 
+// /compact is intercepted as an ACTION in runner::run_turn before command
+// resolution — its asset exists only so UIs list it in autocomplete; its
+// (empty) template is never sent to a model.
+const BUILTIN_COMMAND_ASSETS: &[(&str, &str)] = &[
+    ("init", include_str!("builtin_commands/init.md")),
+    ("review", include_str!("builtin_commands/review.md")),
+    ("compact", include_str!("builtin_commands/compact.md")),
+];
+
 fn builtin_commands() -> Vec<Command> {
-    vec![
-        Command {
-            name: "init".into(),
-            description: "Analyze the codebase and write an AGENTS.md for future agents.".into(),
-            template: "Analyze this codebase (structure, build/test commands, conventions) and \
-                       create or update an AGENTS.md at the repository root that a future agent \
-                       could use to work effectively here. Keep it concise and concrete. \
-                       $ARGUMENTS"
-                .into(),
-            agent: None,
-            model: None,
-            subtask: false,
-        },
-        Command {
-            name: "review".into(),
-            description: "Review the current working changes for bugs and issues.".into(),
-            template: "Review the current working changes (run `git diff` and, if empty, \
-                       `git diff --staged`). Report correctness bugs, risky changes, and \
-                       obvious improvements, grouped by severity. Do not modify files. \
-                       $ARGUMENTS"
-                .into(),
-            agent: Some("plan".into()),
-            model: None,
-            subtask: false,
-        },
-        // /compact is intercepted as an ACTION in runner::run_turn before
-        // command resolution — this entry exists only so UIs list it in
-        // slash-command autocomplete. Its template is never sent to a model.
-        Command {
-            name: "compact".into(),
-            description: "Summarize older history to free context-window space.".into(),
-            template: String::new(),
-            agent: None,
-            model: None,
-            subtask: false,
-        },
-    ]
+    BUILTIN_COMMAND_ASSETS
+        .iter()
+        .map(|(name, text)| parse_command_markdown(name, text))
+        .collect()
 }
 
 /// A command source together with its precedence metadata.
@@ -473,7 +469,7 @@ fn validate_project_command_path_name(
 }
 
 fn is_builtin_command_name(name: &str) -> bool {
-    matches!(name, "init" | "review" | "compact")
+    BUILTIN_COMMAND_ASSETS.iter().any(|(builtin, _)| *builtin == name)
 }
 
 /// List every readable project command file, including its content revision.
@@ -740,12 +736,30 @@ fn parse_command_markdown(name: &str, text: &str) -> Command {
     let mut agent = None;
     let mut model = None;
     let mut subtask = false;
+    let mut surfaces = CommandSurfaces::default();
+    let mut requires_project = false;
     for (key, value) in frontmatter {
         match key.as_str() {
             "description" => description = value,
             "agent" => agent = Some(value),
             "model" => model = Some(value),
             "subtask" => subtask = matches!(value.trim(), "true" | "TRUE" | "True"),
+            "surfaces" => {
+                let (mut home, mut session) = (false, false);
+                for part in value.split(',').map(str::trim) {
+                    match part {
+                        "home" => home = true,
+                        "session" => session = true,
+                        _ => {}
+                    }
+                }
+                if home || session {
+                    surfaces = CommandSurfaces { home, session };
+                }
+            }
+            "requires-project" => {
+                requires_project = matches!(value.trim(), "true" | "TRUE" | "True")
+            }
             _ => {}
         }
     }
@@ -756,6 +770,8 @@ fn parse_command_markdown(name: &str, text: &str) -> Command {
         agent,
         model,
         subtask,
+        surfaces,
+        requires_project,
     }
 }
 
@@ -766,10 +782,30 @@ mod tests {
     #[test]
     fn builtins_present() {
         let reg = CommandRegistry::builtin();
-        assert!(reg.get("init").is_some());
-        assert!(reg.get("review").is_some());
-        assert_eq!(reg.get("review").unwrap().agent.as_deref(), Some("plan"));
-        assert!(reg.get("compact").is_some());
+        let init = reg.get("init").unwrap();
+        assert!(init.template.contains("Analyze this codebase"));
+        assert!(init.surfaces.home && init.surfaces.session);
+        assert!(init.requires_project);
+        let review = reg.get("review").unwrap();
+        assert_eq!(review.agent.as_deref(), Some("plan"));
+        assert!(!review.surfaces.home && review.surfaces.session);
+        let compact = reg.get("compact").unwrap();
+        assert!(compact.template.is_empty());
+        assert!(!compact.surfaces.home && compact.surfaces.session);
+    }
+
+    #[test]
+    fn parses_surfaces_and_requires_project_frontmatter() {
+        let cmd = parse_command_markdown(
+            "ship",
+            "---\ndescription: Ship\nsurfaces: session\nrequires-project: true\n---\nShip it",
+        );
+        assert!(!cmd.surfaces.home && cmd.surfaces.session);
+        assert!(cmd.requires_project);
+        // Absent keys default to both surfaces, no project requirement.
+        let plain = parse_command_markdown("x", "---\ndescription: X\n---\nBody");
+        assert!(plain.surfaces.home && plain.surfaces.session);
+        assert!(!plain.requires_project);
     }
 
     #[test]
@@ -796,6 +832,8 @@ mod tests {
             agent: None,
             model: None,
             subtask: false,
+            surfaces: CommandSurfaces::default(),
+            requires_project: false,
         };
         assert_eq!(
             cmd.expand("Alice Wonderland"),
@@ -1093,3 +1131,8 @@ mod tests {
         assert!(resolved.subtask);
     }
 }
+
+
+
+
+
