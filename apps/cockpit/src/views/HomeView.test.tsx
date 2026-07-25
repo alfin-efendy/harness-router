@@ -5,13 +5,13 @@ import type {
   CatalogEntry,
   ChatContextArg,
   CmdError,
-  CommandInfo,
   ConnectionInfo,
   Project,
   ProjectRuntimeInfo,
   Result,
   SearchEntryInfo,
   Session,
+  SlashEntryInfo,
 } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
@@ -19,8 +19,9 @@ const branchListData: BranchList = { branches: ["main", "develop"], current: "ma
 const listBranches = mock(
   (_runnerId: string, _projectId: string): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }),
 );
-const nativeCommands = mock(
-  (_runnerId: string, _projectId: string): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }),
+const slashCatalog = mock(
+  (_runnerId: string | null, _projectId: string | null, _agentId: string | null): Promise<Result<SlashEntryInfo[], CmdError>> =>
+    Promise.resolve({ status: "ok", data: [] }),
 );
 const searchFiles = mock((): Promise<Result<SearchEntryInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const runtimeInfo: ProjectRuntimeInfo = {
@@ -110,7 +111,7 @@ const listGateways = mock((): Promise<Result<never[], CmdError>> => Promise.reso
 mock.module("@/bindings", () => ({
   commands: {
     listBranches,
-    nativeCommands,
+    slashCatalog,
     searchFiles,
     projectRuntimeInfo,
     startChatSession,
@@ -229,10 +230,10 @@ beforeEach(() => {
   });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
-  useNative.setState({ commandsByProject: {} });
+  useNative.setState({ slashCatalogByKey: {} });
   useNav.setState({ composerBranch: null });
   listBranches.mockClear();
-  nativeCommands.mockClear();
+  slashCatalog.mockClear();
   searchFiles.mockClear();
   startSession.mockClear();
   startChatSession.mockClear();
@@ -250,7 +251,7 @@ afterEach(() => {
   useAgents.setState({ registry: null, models: [] });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
-  useNative.setState({ commandsByProject: {} });
+  useNative.setState({ slashCatalogByKey: {} });
 });
 
 test("git project: branch pill shows and branches are fetched", async () => {
@@ -277,65 +278,85 @@ test("non-git project: no branch pill, no worktree toggle, no list_branches call
   // The whole branch Combobox — trigger pill AND its worktree-Switch footer — is gone.
   expect(screen.queryByRole("combobox", { name: "Branch" })).toBeNull();
   // Let the other mount effect flush so a stray branch fetch would have fired by now.
-  await waitFor(() => expect(nativeCommands).toHaveBeenCalledWith(LOCAL_RUNNER, "p1"));
+  await waitFor(() => expect(slashCatalog).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "ryuzi"));
   expect(listBranches).not.toHaveBeenCalled();
 });
 
 test("only suggests each effective slash command from the catalog", async () => {
-  nativeCommands.mockResolvedValueOnce({
+  slashCatalog.mockResolvedValueOnce({
     status: "ok",
     data: [
       {
         name: "ship",
         description: "Project ship",
+        kind: "command",
+        origin: "project",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: true,
         agent: null,
         model: null,
         subtask: false,
-        origin: "project",
-        effective: true,
-        shadowsGlobal: true,
       },
       {
         name: "ship",
         description: "Global ship",
+        kind: "command",
+        origin: "global",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: false,
+        shadowsGlobal: false,
         agent: null,
         model: null,
         subtask: false,
-        origin: "global",
-        effective: false,
-        shadowsGlobal: false,
       },
       {
         name: "init",
         description: "Project init",
+        kind: "command",
+        origin: "project",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: false,
+        shadowsGlobal: true,
         agent: null,
         model: null,
         subtask: false,
-        origin: "project",
-        effective: false,
-        shadowsGlobal: true,
       },
       {
         name: "init",
         description: "Global init",
+        kind: "command",
+        origin: "global",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: false,
+        shadowsGlobal: false,
         agent: null,
         model: null,
         subtask: false,
-        origin: "global",
-        effective: false,
-        shadowsGlobal: false,
       },
       {
         name: "init",
         description: "Built-in init",
+        kind: "command",
+        origin: "builtin",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: false,
         agent: null,
         model: null,
         subtask: false,
-        origin: "builtin",
-        effective: true,
-        shadowsGlobal: false,
       },
-    ],
+    ] satisfies SlashEntryInfo[],
   });
   render(<HomeView />);
 
@@ -348,6 +369,132 @@ test("only suggests each effective slash command from the catalog", async () => 
   expect(screen.getAllByText("/init")).toHaveLength(1);
   expect(screen.queryByText("Project init")).toBeNull();
   expect(screen.queryByText("Global init")).toBeNull();
+});
+
+test("home, no project selected: lists a global custom command; excludes a project-only command and a session-only command", async () => {
+  useStore.setState({ selectedProjectId: null });
+  localStorage.removeItem("cockpit.lastPrimaryAgentId");
+  slashCatalog.mockResolvedValueOnce({
+    status: "ok",
+    data: [
+      {
+        name: "standup",
+        description: "Daily standup notes",
+        kind: "command",
+        origin: "global",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+      {
+        name: "init",
+        description: "Bootstrap project docs",
+        kind: "command",
+        origin: "builtin",
+        home: true,
+        session: true,
+        requiresProject: true,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+      {
+        name: "review",
+        description: "Review the diff",
+        kind: "command",
+        origin: "builtin",
+        home: false,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+    ] satisfies SlashEntryInfo[],
+  });
+  render(<HomeView />);
+
+  fireEvent.change(screen.getByPlaceholderText("Do anything"), { target: { value: "/" } });
+
+  expect(await screen.findByText("Daily standup notes")).toBeTruthy();
+  // `init` requires a project and none is selected — filtered by requiresProject.
+  expect(screen.queryByText("Bootstrap project docs")).toBeNull();
+  // `review` is session-only (home: false) — filtered by the surface check.
+  expect(screen.queryByText("Review the diff")).toBeNull();
+});
+
+test("home, project selected: /in lists init, /re excludes the session-only review, and a skill entry renders its badge and can be picked", async () => {
+  slashCatalog.mockResolvedValueOnce({
+    status: "ok",
+    data: [
+      {
+        name: "init",
+        description: "Bootstrap project docs",
+        kind: "command",
+        origin: "builtin",
+        home: true,
+        session: true,
+        requiresProject: true,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+      {
+        name: "review",
+        description: "Review the diff",
+        kind: "command",
+        origin: "builtin",
+        home: false,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+      {
+        name: "refactor",
+        description: "Refactor helper skill",
+        kind: "skill",
+        origin: "project",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+    ] satisfies SlashEntryInfo[],
+  });
+  render(<HomeView />);
+
+  const composer = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "/in" } });
+  expect(await screen.findByText("Bootstrap project docs")).toBeTruthy();
+
+  fireEvent.change(composer, { target: { value: "/re" } });
+  expect(await screen.findByText("Refactor helper skill")).toBeTruthy();
+  // `review` matches the "/re" prefix too, but it's session-only (home: false).
+  expect(screen.queryByText("Review the diff")).toBeNull();
+  expect(screen.getByText("Skill")).toBeTruthy();
+
+  // Picking an entry inserts "/name " into the draft.
+  fireEvent.click(screen.getByText("Refactor helper skill"));
+  expect(composer.value).toBe("/refactor ");
 });
 
 test("composer text is read from the persisted draft map (key home:{projectId})", async () => {
