@@ -62,18 +62,23 @@ pub fn first_party_trusted_keys() -> HashMap<String, [u8; 32]> {
 mod tests {
     use super::*;
 
-    // Fail-closed guarantee: while the compiled-in key is the all-zero
-    // placeholder, the trusted set is EMPTY, so `verify_bundle` rejects every
-    // first-party bundle on the untrusted-key check before any crypto. A
-    // silent revert to the placeholder can therefore never make a forged
-    // first-party bundle installable.
+    // Fail-closed guarantee, stated key-state-agnostically: the all-zero
+    // placeholder must NEVER reach verify_bundle (empty trusted set), and a
+    // real compiled-in key must be exposed under exactly FIRST_PARTY_KEY_ID —
+    // so a silent revert to the placeholder can never make a forged bundle
+    // installable, and a live key can never be mislabeled.
     #[test]
-    fn placeholder_key_yields_an_empty_trusted_set() {
-        assert_eq!(FIRST_PARTY_PUBKEY, [0u8; 32], "still the placeholder");
-        assert!(
-            first_party_trusted_keys().is_empty(),
-            "the all-zero placeholder must never be handed to verify_bundle"
-        );
+    fn trusted_keys_fail_closed_on_placeholder_and_expose_a_real_key() {
+        let keys = first_party_trusted_keys();
+        if FIRST_PARTY_PUBKEY == [0u8; 32] {
+            assert!(
+                keys.is_empty(),
+                "the all-zero placeholder must never be handed to verify_bundle"
+            );
+        } else {
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys.get(FIRST_PARTY_KEY_ID), Some(&FIRST_PARTY_PUBKEY));
+        }
     }
 
     // The key id the map WOULD use once a real key ships must match the id

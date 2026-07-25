@@ -1404,15 +1404,16 @@ mod tests {
         ));
     }
 
-    // The compiled-in `CATALOG_FEED_PUBKEY` is the all-zero placeholder — a
-    // valid LOW-ORDER Edwards point. Non-strict ed25519 `verify()` does NOT
-    // reject low-order public keys, so before this fix an attacker with no
-    // private key could grind a `(bytes, signature)` pair that `verify_with`
-    // accepted against it. `verify_with` now rejects the all-zero key two ways
-    // (an explicit guard AND `verify_strict`), so verification against it is
-    // deterministically `false` for ANY signature. This locks the fail-closed
-    // property: a silent regression (a revert to the placeholder, or a swap
-    // back to non-strict `verify`) can never reintroduce the forgery.
+    // The all-zero placeholder key (shipped before the real
+    // `CATALOG_FEED_PUBKEY`) is a valid LOW-ORDER Edwards point. Non-strict
+    // ed25519 `verify()` does NOT reject low-order public keys, so before
+    // this fix an attacker with no private key could grind a `(bytes,
+    // signature)` pair that `verify_with` accepted against it. `verify_with`
+    // now rejects the all-zero key two ways (an explicit guard AND
+    // `verify_strict`), so verification against it is deterministically
+    // `false` for ANY signature. This locks the fail-closed property: a
+    // silent regression (a revert to the placeholder, or a swap back to
+    // non-strict `verify`) can never reintroduce the forgery.
     #[test]
     fn all_zero_placeholder_key_rejects_every_signature() {
         let bytes = feed_json(5).into_bytes();
@@ -1588,12 +1589,10 @@ mod tests {
 
     // `refresh` must fetch+apply a changed feed and, because the cached set
     // actually changed, flip `ControlPlane::plugins_restart_required` — the
-    // signal Cockpit/the daemon use to prompt a restart. The production
-    // `CATALOG_FEED_PUBKEY` is the all-zero placeholder, which `verify_with`
-    // rejects outright (explicit guard + `verify_strict`), so the remote
-    // catalog is fail-closed until a real full-order key ships; this test
-    // therefore drives the manager through the `#[cfg(test)]`-only
-    // `refresh_with_pubkey` seam with a throwaway key. See
+    // signal Cockpit/the daemon use to prompt a restart. This test drives
+    // the manager through the `#[cfg(test)]`-only `refresh_with_pubkey` seam
+    // with a throwaway key — the production `CATALOG_FEED_PUBKEY` can't
+    // verify test-signed feeds. See
     // `all_zero_placeholder_key_rejects_every_signature` for the fail-closed
     // guarantee itself.
     #[tokio::test]
