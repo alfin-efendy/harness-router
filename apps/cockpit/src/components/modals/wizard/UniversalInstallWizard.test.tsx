@@ -1007,6 +1007,47 @@ test("Connect step's TokenConnect Save calls setPluginSetting, disables while sa
   expect(within(dialog).getByPlaceholderText("●●●● saved")).toBeTruthy();
 });
 
+// Finding 5a (final-review fix): TokenConnect lost the retired
+// `InstallWizardModal`'s "Get a token" helpUrl affordance in the Task 14/15
+// rewrite. `tokenAuthDetailFixture` already carries a `helpUrl` —
+// https://github.com/settings/tokens — so this only needed a new assertion,
+// not a new fixture.
+test("Connect step's TokenConnect renders a Get a token button that opens auth.helpUrl", async () => {
+  detailData = tokenAuthDetailFixture();
+  await renderWizard();
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "Get a token" }));
+  expect(openUrl).toHaveBeenCalledWith("https://github.com/settings/tokens");
+});
+
+// Finding 5b (final-review fix): an env-only credential (auth.env set, but
+// NO auth.setting) used to still render TokenConnect's `FieldRow` — a dead
+// field, since `save()` guards on `auth.setting` and silently no-ops without
+// it. Reached via the classic connector adapter's "token" sub-state
+// (`ConnectorConnectStep`), which — unlike `steps-component.tsx`'s own
+// `ConnectStep` — dispatches to `TokenConnect` purely off `begin.authKind`,
+// without checking `auth.setting` first.
+test("Connect step's TokenConnect shows the env-var message instead of a dead field when auth.setting is unset", async () => {
+  detailData = tokenAuthDetailFixture({ setting: null });
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+
+  expect(within(dialog).queryByLabelText("Credential *")).toBeNull();
+  expect(within(dialog).getByText("GITHUB_PERSONAL_ACCESS_TOKEN")).toBeTruthy();
+  expect(dialog.textContent).toContain("reads its credential from the");
+});
+
 // ---------- Task 15: connector / skill-pack / provider adapters ----------
 
 // Port of the retired `InstallWizardModal.test.tsx`'s token path: the
@@ -1180,6 +1221,14 @@ test("connector manualClientId (needsClientId) renders the client-id form", asyn
   expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
   expect(within(dialog).getByText(/doesn't support automatic app registration/)).toBeTruthy();
   expect(within(dialog).getByPlaceholderText("Paste the client ID from the vendor's console")).toBeTruthy();
+
+  // Finding 5c (final-review fix): the retired catalog install modal's
+  // manualClientId step had a "Where do I find this?" helpUrl button —
+  // restored here, scoped to the modal-body slot since the shell's own
+  // Continue button shares this step's label.
+  const body = dialog.querySelector('[data-slot="modal-body"]') as HTMLElement;
+  fireEvent.click(within(body).getByRole("button", { name: "Where do I find this?" }));
+  expect(openUrl).toHaveBeenCalledWith("https://github.com/settings/tokens");
 });
 
 // Fix (Finding 2b): `oauthExternal` also lands on `ManualClientId` (different

@@ -1,5 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { CircleAlert } from "lucide-react";
+import { CircleAlert, ExternalLink } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button, FormField, Input } from "@ryuzi/ui";
@@ -102,7 +102,12 @@ function subStateFor(begin: PluginInstallBeginResult): ConnectSub {
  *  modal's `manualClientId` step/`submitClientId` verbatim: saves the id, then
  *  (unless external-oauth, which brokers sign-in itself at first use)
  *  re-begins so the backend can retry DCR/discovery now that a client id is
- *  on the row. */
+ *  on the row.
+ *
+ *  Finding 5c (final-review fix — restored from the retired modal's own
+ *  `manualClientId` step): a "Where do I find this?" button next to
+ *  Continue, opening `ctx.detail.auth.helpUrl` when the manifest declares
+ *  one — lost in the Task 15 port to this file. */
 function ManualClientId({
   ctx,
   begin,
@@ -117,6 +122,7 @@ function ManualClientId({
   const [clientId, setClientId] = useState("");
   const [busy, setBusy] = useState(false);
   const mountedRef = useMountedRef();
+  const helpUrl = ctx.detail?.auth?.helpUrl ?? null;
 
   const submit = async () => {
     if (clientId.trim().length === 0 || busy) return;
@@ -164,7 +170,15 @@ function ManualClientId({
       <FormField label="OAuth client ID">
         <Input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="Paste the client ID from the vendor's console" />
       </FormField>
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-2">
+        {helpUrl ? (
+          <Button variant="ghost" size="sm" onClick={() => void openUrl(helpUrl)}>
+            <ExternalLink aria-hidden size={12} strokeWidth={2} className="size-3" />
+            Where do I find this?
+          </Button>
+        ) : (
+          <span />
+        )}
         <Button size="sm" disabled={busy || clientId.trim().length === 0} onClick={() => void submit()}>
           {busy ? "Saving…" : "Continue"}
         </Button>

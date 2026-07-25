@@ -1,5 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Check } from "lucide-react";
+import { Check, ExternalLink } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button, FormField, Input, Switch } from "@ryuzi/ui";
@@ -264,7 +264,19 @@ function PluginOauthConnect({ ctx, onNext }: { ctx: WizardCtx; onNext: () => voi
 /** Token/api-key auth (non-oauth `detail.auth.setting`): one `FieldRow`,
  *  same shape the Settings tab's own credential row uses. Exported (Task 15)
  *  so `steps-connector.tsx`'s `ConnectorConnectStep` reuses it verbatim for
- *  a classic connector's token/api-key sub-state, instead of duplicating it. */
+ *  a classic connector's token/api-key sub-state, instead of duplicating it.
+ *
+ *  Finding 5 (final-review fix — restored from the retired
+ *  `InstallWizardModal`'s `tokenInput` step): two affordances this step lost
+ *  in the Task 14/15 rewrite —
+ *  (a) `auth.helpUrl`, when present, renders a "Get a token" button that
+ *      opens it (the old modal's `Get a token at {helpUrl}` footer button);
+ *  (b) `auth.env` set but `auth.setting` NOT set means this plugin ONLY
+ *      reads its credential from that environment variable — there is
+ *      nothing to persist through `setPluginSetting` (its `save()` guard
+ *      above no-ops without `auth.setting`), so rendering the `FieldRow`
+ *      anyway was a dead field: typing into it and clicking Save did
+ *      nothing, silently. Render the old modal's env-var message instead. */
 export function TokenConnect({ ctx, auth }: { ctx: WizardCtx; auth: NonNullable<PluginDetail["auth"]> }) {
   const [value, setValue] = useState("");
   const [saving, setSaving] = useState(false);
@@ -286,17 +298,33 @@ export function TokenConnect({ ctx, auth }: { ctx: WizardCtx; auth: NonNullable<
   };
 
   return (
-    <FieldRow
-      label="Credential"
-      help={auth.env ? `Falls back to the ${auth.env} environment variable if unset.` : undefined}
-      secret
-      required
-      valueSet={auth.configured}
-      value={value}
-      onChange={setValue}
-      onSave={() => void save()}
-      saving={saving}
-    />
+    <div className="flex flex-col gap-3">
+      {auth.setting ? (
+        <FieldRow
+          label="Credential"
+          help={auth.env ? `Falls back to the ${auth.env} environment variable if unset.` : undefined}
+          secret
+          required
+          valueSet={auth.configured}
+          value={value}
+          onChange={setValue}
+          onSave={() => void save()}
+          saving={saving}
+        />
+      ) : (
+        <div className="text-[12.5px] text-muted-foreground">
+          This plugin reads its credential from the <span className="font-mono text-xs">{auth.env}</span> environment variable.
+        </div>
+      )}
+      {auth.helpUrl && (
+        <div className="flex justify-end">
+          <Button variant="outline" size="sm" onClick={() => void openUrl(auth.helpUrl as string)}>
+            <ExternalLink aria-hidden size={12} strokeWidth={2} className="size-3" />
+            Get a token
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 
