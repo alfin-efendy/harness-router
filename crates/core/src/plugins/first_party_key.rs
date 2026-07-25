@@ -51,10 +51,13 @@ pub const FIRST_PARTY_PUBKEY: [u8; 32] = [
 /// [`crate::plugins::bundle::verify_bundle`] in production. Keyed by
 /// [`FIRST_PARTY_KEY_ID`].
 ///
-/// While [`FIRST_PARTY_PUBKEY`] is the all-zero placeholder this returns an
-/// EMPTY map — the fail-closed property described in the module docs: no
-/// bundle can be trusted until a real key ships. Tests never call this; they
-/// inject their own generated verifying key directly.
+/// Empty only when [`FIRST_PARTY_PUBKEY`] is all-zero — a zeroed fork or a dev
+/// build that hasn't been given the real key — the fail-closed property
+/// described in the module docs: no bundle can be trusted until a real key is
+/// compiled in. Most unit tests never call this directly; they inject their
+/// own generated verifying key instead. The `verify-plugin-artifacts` CI bin
+/// DOES call this directly, against the real compiled-in key, as its
+/// production trust root.
 pub fn first_party_trusted_keys() -> HashMap<String, [u8; 32]> {
     let mut map = HashMap::new();
     if FIRST_PARTY_PUBKEY != [0u8; 32] {

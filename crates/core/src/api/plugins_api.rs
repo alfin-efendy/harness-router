@@ -2149,9 +2149,10 @@ async fn enrich_oauth_profile_status(
 /// Install (or update to) a component plugin's signed release via the Task 11a
 /// pipeline (resolve+download+stage+verify_bundle+install+activate), then mark
 /// the host restart-required so the newly activated bundle is picked up.
-/// Returns the release ledger after the install. Fail-closed: with no
-/// first-party signing key yet (the placeholder), this refuses before any
-/// network I/O rather than staging an unverifiable bundle.
+/// Returns the release ledger after the install. Fail-closed: on a build with
+/// no trusted first-party signing key — e.g. a zeroed fork or a dev build
+/// that hasn't been given the real key — this refuses before any network I/O
+/// rather than staging an unverifiable bundle.
 async fn install_component_plugin(
     cp: &ControlPlane,
     plugin_id: &str,

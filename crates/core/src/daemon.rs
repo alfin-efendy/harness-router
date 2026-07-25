@@ -63,12 +63,14 @@ pub struct BuildDaemonOpts {
 /// resolves each field to its production default: a real
 /// [`crate::plugins::remote_catalog::ReqwestCatalogHttp`], the
 /// [`crate::plugins::first_party_key::first_party_trusted_keys`] map (empty
-/// while the placeholder key is in place → fail-closed no-op), the
-/// `component_release_base_url` setting (or
-/// [`crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL`]), and
-/// [`crate::plugins::bundle::installed_bundle_root`]. Tests inject a fake
-/// `CatalogHttp`, a generated trusted key, and a throwaway root to exercise the
-/// pipeline hermetically.
+/// only for a zeroed fork or a dev build with no real key → fail-closed
+/// no-op), the `component_release_base_url` setting — falling back to this
+/// build's own stamped release tag for a release build (see
+/// [`crate::plugins::remote_catalog::default_component_release_base_url_for`]),
+/// or [`crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL`]
+/// for an unstamped one — and [`crate::plugins::bundle::installed_bundle_root`].
+/// Tests inject a fake `CatalogHttp`, a generated trusted key, and a
+/// throwaway root to exercise the pipeline hermetically.
 pub struct ComponentBootstrapConfig {
     pub http: Arc<dyn crate::plugins::remote_catalog::CatalogHttp>,
     pub trusted_keys: std::collections::HashMap<String, [u8; 32]>,

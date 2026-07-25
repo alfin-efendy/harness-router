@@ -64,15 +64,17 @@ pub enum CatalogFeedError {
 /// the single choke point every production and test verify path funnels
 /// through.
 ///
-/// Two hard rejections guard the placeholder key. The compiled-in
-/// `CATALOG_FEED_PUBKEY` is all-zero, which is a valid *low-order* Edwards
-/// point; non-strict ed25519 `verify()` does NOT reject low-order public keys,
-/// so an attacker with no private key could forge a `(feed_bytes, signature)`
-/// pair it accepts. We therefore (1) reject the all-zero key outright — so an
-/// accidental future revert to the placeholder can never reintroduce
-/// forgeability, independent of the strict-verify property — and (2) use
-/// `verify_strict`, which rejects low-order `A` and non-canonical `R`/`S`.
-/// Legitimate full-order signatures still verify.
+/// Two hard rejections guard against an all-zero key — a zeroed fork or a
+/// dev build that hasn't been given a real key; the shipped
+/// `CATALOG_FEED_PUBKEY` itself is live, not all-zero. An all-zero key is a
+/// valid *low-order* Edwards point; non-strict ed25519 `verify()` does NOT
+/// reject low-order public keys, so an attacker with no private key could
+/// forge a `(feed_bytes, signature)` pair it accepts. We therefore (1) reject
+/// the all-zero key outright — so a zeroed fork/dev build (or an accidental
+/// future revert to one) can never reintroduce forgeability, independent of
+/// the strict-verify property — and (2) use `verify_strict`, which rejects
+/// low-order `A` and non-canonical `R`/`S`. Legitimate full-order signatures
+/// still verify.
 fn verify_with(feed_bytes: &[u8], sig_bytes: &[u8], pubkey: &[u8; 32]) -> bool {
     use ed25519_dalek::{Signature, VerifyingKey};
     if pubkey == &[0u8; 32] {
@@ -419,9 +421,10 @@ impl RemoteCatalogManager {
     }
 
     /// `refresh`, but verifying against an injected key instead of the
-    /// compiled-in `CATALOG_FEED_PUBKEY` — a test-only seam, since that key
-    /// is currently an all-zero placeholder (see `catalog_feed_key`) that no
-    /// test-signed feed can satisfy.
+    /// compiled-in `CATALOG_FEED_PUBKEY` — a test-only seam, since tests sign
+    /// feeds with a throwaway keypair and have no way to sign for the real
+    /// production private key that pairs with the compiled-in pubkey (see
+    /// `catalog_feed_key`).
     #[cfg(test)]
     async fn refresh_with_pubkey(&self, pubkey: &[u8; 32]) -> FetchOutcome {
         self.refresh_verified(pubkey).await

@@ -53,10 +53,11 @@ export const FIRST_PARTY_KEY_ID = "first-party";
 export const WIT_API_VERSION = "0.1.0";
 
 /**
- * Base URL the four release artifacts are published under. `component_url` is
- * built as `<base>/<id>.wasm`; the installer's `require_same_origin` check
- * requires the wasm URL to share scheme+host+port with this base, and the 11a
- * default (`DEFAULT_COMPONENT_RELEASE_BASE_URL`) is this same GitHub host, so a
+ * Base URL the seven release artifacts (3 descriptors × 2 stems + 1 wasm —
+ * see `artifactNames`) are published under. `component_url` is built as
+ * `<base>/<id>.wasm`; the installer's `require_same_origin` check requires
+ * the wasm URL to share scheme+host+port with this base, and the 11a default
+ * (`DEFAULT_COMPONENT_RELEASE_BASE_URL`) is this same GitHub host, so a
  * same-host asset URL always passes. Override with `FIRST_PARTY_RELEASE_BASE_URL`.
  */
 export const DEFAULT_RELEASE_BASE_URL = "https://github.com/alfin-efendy/ryuzi/releases/latest/download";
@@ -259,7 +260,7 @@ export async function buildSignatureEnvelope(releaseBytes: Uint8Array, privateKe
   return `${JSON.stringify({ key_id: FIRST_PARTY_KEY_ID, signature: base64UrlNoPad(signature) }, null, 2)}\n`;
 }
 
-/** Build + sign one component, writing its four artifacts into `outDir`. Returns the release descriptor for logging. */
+/** Build + sign one component, writing its seven artifacts (3 descriptors × 2 stems + 1 wasm) into `outDir`. Returns the release descriptor for logging. */
 async function processComponent(
   spec: ComponentSpec,
   privateKeySeedBase64: string,
@@ -359,7 +360,8 @@ async function main(argv: string[]): Promise<void> {
   for (const spec of specs) {
     const release = await processComponent(spec, privateKeySeedBase64, baseUrl, outDir, publishedAt);
     console.log(
-      `signed ${spec.id} ${release.version} -> ${outDir}/${spec.id}.{ryuzi-plugin.toml,wasm,release.json,release.json.sig} (sha256 ${release.component_sha256})`,
+      `signed ${spec.id} ${release.version} -> ${outDir}/${spec.id}.{ryuzi-plugin.toml,wasm,release.json,release.json.sig} ` +
+        `+ pinned ${spec.id}-${release.version}.{ryuzi-plugin.toml,release.json,release.json.sig} aliases (sha256 ${release.component_sha256})`,
     );
   }
 }
