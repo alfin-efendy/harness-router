@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.3.0...core-v0.4.0) (2026-07-25)
+
+
+### Features
+
+* Phase 6 — GitHub connector, WASM WebSocket capability + Discord gateway migration, Atlassian/Bitbucket connectors ([#165](https://github.com/alfin-efendy/ryuzi/issues/165)) ([e9caca2](https://github.com/alfin-efendy/ryuzi/commit/e9caca2dcc9b8cd8f0a91ded6d8b42e9595a1944))
+* Phase 7 — WASM provider migration (transitional) + revocation/doctor/docs/release hardening ([#168](https://github.com/alfin-efendy/ryuzi/issues/168)) ([b3b73e2](https://github.com/alfin-efendy/ryuzi/commit/b3b73e2044433408edb1450b9ec69e99d2dcacb0))
+* **plugins:** activate the plugin release pipeline (CI build/sign/publish + live keys) ([#173](https://github.com/alfin-efendy/ryuzi/issues/173)) ([3e97f9a](https://github.com/alfin-efendy/ryuzi/commit/3e97f9a8501b6b02adbd61bbac377cd517f6fc0f))
+* **plugins:** component catalog migration + end-to-end OAuth connect ([#169](https://github.com/alfin-efendy/ryuzi/issues/169)) ([ba6612a](https://github.com/alfin-efendy/ryuzi/commit/ba6612a93f356e6b8be5cbf2221415954603e55c))
+* **plugins:** unified hub, tabbed detail with tools listing, universal install wizard ([#171](https://github.com/alfin-efendy/ryuzi/issues/171)) ([a147e68](https://github.com/alfin-efendy/ryuzi/commit/a147e686bade5ef5a5c313e154042461299ad6ac))
+* WASM Component Plugin Platform — signed bundles, generic adapters, bootstrap providers & Cockpit UX (Phases 1–5) ([#163](https://github.com/alfin-efendy/ryuzi/issues/163)) ([4993ae1](https://github.com/alfin-efendy/ryuzi/commit/4993ae1b81a488490669abf2c72d2b2625ce3313))
+
+
+### Bug Fixes
+
+* **agents:** enforce plugin/app tool bindings on follow-up prompts ([#172](https://github.com/alfin-efendy/ryuzi/issues/172)) ([1038a4e](https://github.com/alfin-efendy/ryuzi/commit/1038a4e64de2616c9dff92d1709fe8b0b12d3c54))
+* **ci:** stop macOS cargo test timeout and AgentActionsMenu flake ([#167](https://github.com/alfin-efendy/ryuzi/issues/167)) ([55fb165](https://github.com/alfin-efendy/ryuzi/commit/55fb1655cbd074542fa1af2edec68ea60d5e6a8b))
+
 ## [0.3.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.2.0...core-v0.3.0) (2026-07-18)
 
 
