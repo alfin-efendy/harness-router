@@ -1,5 +1,5 @@
 import { test, expect, spyOn } from "bun:test";
-import { usePlugins, browsePlugins, installedPlugins, summarizeUpdateAll, componentPluginIds } from "./store-plugins";
+import { usePlugins, summarizeUpdateAll, componentPluginIds } from "./store-plugins";
 import { commands, type CatalogStatus, type ComponentReleaseDetail, type DoctorFinding, type PluginInfo } from "./bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
@@ -117,14 +117,6 @@ const skillPack: PluginInfo = {
   kind: "skill-pack",
 };
 
-const disabledCatalog: PluginInfo = {
-  ...github,
-  id: "linear",
-  name: "Linear",
-  enabled: false,
-  installed: false,
-};
-
 test("load populates plugins from listPlugins", async () => {
   reset();
   const spy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [builtin, github] });
@@ -237,14 +229,6 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
   listSpy.mockRestore();
   restartSpy.mockRestore();
   catalogSpy.mockRestore();
-});
-
-test("browsePlugins keeps only not-installed entries", () => {
-  expect(browsePlugins([builtin, github, skillPack, disabledCatalog]).map((p) => p.id)).toEqual(["native", "linear"]);
-});
-
-test("installedPlugins keeps only installed entries", () => {
-  expect(installedPlugins([builtin, github, skillPack]).map((p) => p.id)).toEqual(["github", "acme"]);
 });
 
 test("uninstall swaps in the returned list", async () => {

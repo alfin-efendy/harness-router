@@ -333,14 +333,3 @@ export const usePlugins = create<PluginsState>((set, get) => ({
 export function pluginById(plugins: PluginInfo[], id: string): PluginInfo | undefined {
   return plugins.find((p) => p.id === id);
 }
-
-/** Browse tab: only entries not yet installed — installing removes the card. */
-export function browsePlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => !p.installed);
-}
-
-/** Installed tab: providers, gateways, and skill packs that are set up.
- *  MCP apps render from `useApps` separately. */
-export function installedPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.installed);
-}
