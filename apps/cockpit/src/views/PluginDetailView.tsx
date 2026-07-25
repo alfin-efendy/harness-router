@@ -34,6 +34,8 @@ import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
+import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
+import type { WizardStepId } from "@/components/modals/wizard/wizard-steps";
 import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { deriveSetupChecklist, SetupChecklist } from "@/components/plugins/SetupChecklist";
@@ -209,7 +211,11 @@ export function visibleTabs(input: {
 // `Input`. `onSave` always receives the value to persist explicitly (rather
 // than reading component state) so the Bool row's immediate save can pass
 // its freshly toggled value without racing the parent's async state update.
-function FieldRow({
+//
+// Exported (Task 14) so the universal install wizard's `SettingsStep` (and
+// its Connect step's token-auth branch) reuse this exact row instead of a
+// second implementation — see `steps-component.tsx`.
+export function FieldRow({
   label,
   help,
   kind = "string",
@@ -323,6 +329,7 @@ function ComponentReleaseCard({
   onAcceptedChange,
   installBusy,
   onInstall,
+  onInstallWizard,
   activateBusyVersion,
   onActivateVersion,
 }: {
@@ -331,6 +338,12 @@ function ComponentReleaseCard({
   onAcceptedChange: (accepted: boolean) => void;
   installBusy: boolean;
   onInstall: () => void;
+  /** Task 14 duplication cleanup: a never-installed component's fresh
+   *  install now routes through the universal wizard (its own Permissions
+   *  step owns the accept-switch dance) rather than this card's inline
+   *  gate — that gate stays exactly as-is for the update/rollback case
+   *  below, which is this tab's actual job (spec §4). */
+  onInstallWizard: () => void;
   activateBusyVersion: string | null;
   onActivateVersion: (version: string) => void;
 }) {
@@ -358,16 +371,25 @@ function ComponentReleaseCard({
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-3 border-b border-border px-[18px] py-3">
-        <span className="text-[12.5px] font-medium">I understand and accept these permissions</span>
-        <Switch on={permissionsAccepted} onToggle={() => onAcceptedChange(!permissionsAccepted)} label="Accept permissions" />
-      </div>
+      {hasActive && (
+        <div className="flex items-center justify-between gap-3 border-b border-border px-[18px] py-3">
+          <span className="text-[12.5px] font-medium">I understand and accept these permissions</span>
+          <Switch on={permissionsAccepted} onToggle={() => onAcceptedChange(!permissionsAccepted)} label="Accept permissions" />
+        </div>
+      )}
 
       <div className="flex justify-end gap-2 border-b border-border px-[18px] py-3">
-        <Button size="sm" onClick={onInstall} disabled={!permissionsAccepted || installBusy}>
-          <Download aria-hidden size={13} strokeWidth={2} />
-          {installBusy ? "Installing…" : hasActive ? "Update to latest" : "Install"}
-        </Button>
+        {hasActive ? (
+          <Button size="sm" onClick={onInstall} disabled={!permissionsAccepted || installBusy}>
+            <Download aria-hidden size={13} strokeWidth={2} />
+            {installBusy ? "Installing…" : "Update to latest"}
+          </Button>
+        ) : (
+          <Button size="sm" onClick={onInstallWizard}>
+            <Download aria-hidden size={13} strokeWidth={2} />
+            Install with wizard…
+          </Button>
+        )}
       </div>
 
       {releases.map((r) => (
@@ -439,9 +461,15 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   // snaps back to "overview" when the raw value isn't currently visible —
   // covers both a stale deep link and data that hasn't loaded yet.
   const [tab, setTab] = useState<DetailTab>(initialTab ?? "overview");
-  // Pre-install hero action for a non-component plugin (Tasks 13-15 replace
-  // this with a proper guided flow) — reuses the existing catalog wizard.
+  // Pre-install hero action for a non-component plugin — reuses the
+  // existing catalog wizard (Task 15 migrates classic connectors onto the
+  // universal one too).
   const [installWizardOpen, setInstallWizardOpen] = useState(false);
+  // Task 14: the universal install wizard for component-backed plugins —
+  // launched from the hero Install action, the checklist's connect/settings
+  // actions (resuming at that step), and the Versions tab's never-installed
+  // "Install with wizard…" button. `null` when closed.
+  const [universalWizard, setUniversalWizard] = useState<{ initialStep?: WizardStepId } | null>(null);
 
   const load = useCallback(async () => {
     const res = await commands.pluginDetail(LOCAL_RUNNER, id);
@@ -652,12 +680,25 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
                 onAcceptedChange={setPermissionsAccepted}
                 installBusy={installBusy}
                 onInstall={() => void onInstallComponent()}
+                onInstallWizard={() => setUniversalWizard({})}
                 activateBusyVersion={activateBusyVersion}
                 onActivateVersion={(v) => void onActivateComponentVersion(v)}
               />
             </div>
           )}
         </div>
+        {universalWizard && (
+          <UniversalInstallWizard
+            pluginId={id}
+            initialStep={universalWizard.initialStep}
+            onClose={() => {
+              setUniversalWizard(null);
+              void load();
+              void loadRelease();
+              void reloadPlugins();
+            }}
+          />
+        )}
       </div>
     );
   }
@@ -765,17 +806,21 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     await load();
   };
 
+  // Task 14: a component-backed plugin's fresh install goes through the
+  // universal wizard (starting at Overview); a non-component plugin keeps
+  // the existing catalog wizard (Task 15 migrates that path too).
   const onInstallClick = () => {
-    if (info.componentBacked) setTab("versions");
+    if (info.componentBacked) setUniversalWizard({});
     else setInstallWizardOpen(true);
   };
 
   // `install` reuses the SAME hero handler above (not a duplicate branch);
-  // `connect`/`settings` both land on the Settings tab today — Task 14
-  // upgrades these two to resume the guided wizard at that specific step.
+  // `connect`/`settings` both resume the universal wizard at that specific
+  // step (works for a non-component plugin too — e.g. a token/oauth
+  // connector's own Connect step, see `steps-component.tsx`'s `ConnectStep`).
   const onSetupChecklistAction = (itemId: "install" | "connect" | "settings") => {
     if (itemId === "install") onInstallClick();
-    else setTab("settings");
+    else setUniversalWizard({ initialStep: itemId });
   };
 
   const onUninstall = async () => {
@@ -1262,6 +1307,7 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
                 onAcceptedChange={setPermissionsAccepted}
                 installBusy={installBusy}
                 onInstall={() => void onInstallComponent()}
+                onInstallWizard={() => setUniversalWizard({})}
                 activateBusyVersion={activateBusyVersion}
                 onActivateVersion={(v) => void onActivateComponentVersion(v)}
               />
@@ -1322,6 +1368,18 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
           onClose={() => {
             setInstallWizardOpen(false);
             void load();
+            void reloadPlugins();
+          }}
+        />
+      )}
+      {universalWizard && (
+        <UniversalInstallWizard
+          pluginId={id}
+          initialStep={universalWizard.initialStep}
+          onClose={() => {
+            setUniversalWizard(null);
+            void load();
+            void loadRelease();
             void reloadPlugins();
           }}
         />

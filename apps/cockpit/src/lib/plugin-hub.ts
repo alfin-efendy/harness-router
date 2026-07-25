@@ -38,6 +38,11 @@ export type HubItem = {
   experimental: boolean;
   pinned: boolean;
   installed: boolean;
+  /** `PluginInfo.componentBacked` (apps/skill sources are never
+   *  component-backed) — Task 14's launch points read this to decide
+   *  whether a not-yet-installed row's Install action opens the universal
+   *  wizard (component-backed) or the classic `InstallWizardModal`. */
+  componentBacked: boolean;
   status: HubStatus;
   statusDetail: string | null;
   countsLabel: string | null; // "12 tools" | "9 skills" | "2 tools" (apps)
@@ -76,6 +81,7 @@ function pluginToHubItem(plugin: PluginInfo): HubItem {
     experimental: plugin.experimental,
     pinned: plugin.pinned,
     installed: plugin.installed,
+    componentBacked: plugin.componentBacked,
     status: plugin.status as HubStatus,
     statusDetail: plugin.statusDetail,
     countsLabel: pluginCountsLabel(plugin),
@@ -114,6 +120,7 @@ function appToHubItem(app: AppInfo): HubItem {
     experimental: false,
     pinned: false,
     installed: true,
+    componentBacked: false,
     status: appStatusToHubStatus(app.status),
     statusDetail: app.statusDetail,
     countsLabel: app.tools.length > 0 ? `${app.tools.length} tools` : null,
@@ -136,6 +143,7 @@ function skillToHubItem(skill: InstalledSkillInfo): HubItem {
     experimental: false,
     pinned: false,
     installed: true,
+    componentBacked: false,
     status: "ok",
     statusDetail: null,
     countsLabel: `${skill.skillCount} skills`,

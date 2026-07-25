@@ -108,8 +108,24 @@ describe("buildHubItems: plugin mapping", () => {
     expect(item.experimental).toBe(false);
     expect(item.pinned).toBe(false);
     expect(item.installed).toBe(true);
+    expect(item.componentBacked).toBe(false);
     expect(item.blockedReason).toBeNull();
     expect(item.toolNames).toEqual([]);
+  });
+
+  // Task 14: the hub's Install launch point reads `componentBacked` straight
+  // off the row (rather than looking the plugin back up by id in a separate
+  // store) to decide whether Install opens the universal wizard or the
+  // classic modal — this is the passthrough that seam depends on.
+  test("componentBacked passes through from PluginInfo; apps and skill sources are never component-backed", () => {
+    const [pluginItem] = buildHubItems({ plugins: [mkPlugin({ componentBacked: true })], apps: [], skills: [] });
+    expect(pluginItem.componentBacked).toBe(true);
+
+    const [appItem] = buildHubItems({ plugins: [], apps: [mkApp()], skills: [] });
+    expect(appItem.componentBacked).toBe(false);
+
+    const [skillItem] = buildHubItems({ plugins: [], apps: [], skills: [mkSkill()] });
+    expect(skillItem.componentBacked).toBe(false);
   });
 
   test("countsLabel: toolCount wins when set", () => {

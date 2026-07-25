@@ -554,6 +554,28 @@ test("installing a not-installed integration opens the install wizard", async ()
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
 });
 
+// Task 14: a component-backed row's Install opens the universal wizard
+// instead — the mocked `pluginDetail` otherwise always resolves the fixed
+// `wizardDetail` (github-shaped, componentBacked false), so this override
+// gives the wizard a componentBacked detail for its own plan/title.
+const atlassianComponentDetail: PluginDetail = {
+  ...wizardDetail,
+  info: { ...wizardDetail.info, id: "atlassian", name: "Atlassian", componentBacked: true },
+};
+
+test("installing a not-installed component-backed row opens the universal wizard instead of the classic modal", async () => {
+  const componentPlugin = plugin("atlassian", ["issues"], { name: "Atlassian", status: "not-installed", componentBacked: true });
+  pluginsFixture = [componentPlugin];
+  pluginDetail.mockImplementationOnce(async () => ({ status: "ok" as const, data: atlassianComponentDetail }));
+  await renderView();
+  await screen.findByText("Atlassian");
+
+  fireEvent.click(screen.getByRole("button", { name: "Install Atlassian" }));
+
+  expect(await screen.findByRole("dialog", { name: "Install Atlassian" })).toBeTruthy();
+  expect(beginPluginInstall).not.toHaveBeenCalled();
+});
+
 test("installing a not-installed provider adds it to the installed set instead of opening a modal", async () => {
   pluginsFixture = [anthropicPlugin];
   await renderView();

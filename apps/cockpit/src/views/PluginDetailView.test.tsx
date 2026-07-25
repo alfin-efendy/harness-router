@@ -1234,14 +1234,14 @@ test("a never-installed component plugin opens its management page (not 'Plugin 
   render(<PluginDetailView id="mimo" />);
 
   expect(await screen.findByText("mimo")).toBeTruthy();
-  // The hero's Install action is reachable even before any release exists —
-  // for a component-backed plugin it jumps to the Versions tab, where the
-  // real install gate lives. Task 11: the Overview setup checklist ALSO
-  // shows its own "Install" button for this exact (component-backed,
-  // never-installed) scenario, so this specifically targets the hero's copy
-  // — first in DOM order, since it renders above the tabbed content.
+  // Task 14: the hero's Install action for a component-backed plugin opens
+  // the universal wizard (it used to just jump to the Versions tab) — the
+  // Overview setup checklist ALSO shows its own "Install" button for this
+  // exact (component-backed, never-installed) scenario, so this specifically
+  // targets the hero's copy — first in DOM order, since it renders above the
+  // tabbed content.
   fireEvent.click(screen.getAllByRole("button", { name: "Install" })[0]);
-  expect(await screen.findByText("Not installed")).toBeTruthy();
+  expect(await screen.findByRole("dialog", { name: "Install mimo" })).toBeTruthy();
   expect(screen.queryByText("Plugin not found.")).toBeNull();
 });
 
@@ -1250,24 +1250,24 @@ test("an unrelated unknown plugin id still shows Plugin not found", async () => 
   expect(await screen.findByText("Plugin not found.")).toBeTruthy();
 });
 
-test("install is DISABLED until the permission-acceptance switch is toggled, then dispatches installComponentPlugin", async () => {
+// Task 14 duplication cleanup: a never-installed component's Versions-tab
+// button no longer runs the inline accept-switch-then-install dance itself
+// (the wizard's own Permissions step owns that now) — it just opens the
+// wizard. The update/rollback gate (a component WITH an active version)
+// keeps the original inline accept-then-install behavior untouched, covered
+// by the "install is DISABLED until..." scenarios below it in this file.
+test("Versions tab's never-installed component shows 'Install with wizard…', which opens the wizard instead of installing inline", async () => {
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
 
-  // The hero ALSO shows an (always-enabled, navigational) "Install" button
-  // while `!info.installed` — scope queries to the Versions tab panel so
-  // they target `ComponentReleaseCard`'s own gated Install button instead.
   fireEvent.click(screen.getByRole("button", { name: "Versions" }));
   const panel = within(screen.getByTestId("tab-panel-versions"));
 
-  const install = panel.getByRole("button", { name: "Install" }) as HTMLButtonElement;
-  expect(install.disabled).toBe(true);
+  expect(panel.queryByRole("switch", { name: "Accept permissions" })).toBeNull();
+  fireEvent.click(panel.getByRole("button", { name: "Install with wizard…" }));
 
-  fireEvent.click(panel.getByRole("switch", { name: "Accept permissions" }));
-  expect((panel.getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
-
-  fireEvent.click(panel.getByRole("button", { name: "Install" }));
-  await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null));
+  expect(await screen.findByRole("dialog", { name: "Install mimo" })).toBeTruthy();
+  expect(installComponentPlugin).not.toHaveBeenCalled();
 });
 
 test("the permission summary shows 'Unknown until…' before any release is installed", async () => {
@@ -1303,6 +1303,40 @@ test("the permission summary renders the active release's publisher, lifecycle, 
   // is active) lives on the Versions tab.
   fireEvent.click(screen.getByRole("button", { name: "Versions" }));
   expect(within(screen.getByTestId("tab-panel-versions")).getByRole("button", { name: "Update to latest" })).toBeTruthy();
+});
+
+// Task 14 duplication cleanup: only the never-installed case moved its
+// install action to the wizard — a component WITH an active version (the
+// update/rollback case) keeps its original inline accept-switch-then-Update
+// dispatch untouched.
+test("Update to latest is DISABLED until the permission-acceptance switch is toggled, then dispatches installComponentPlugin", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: "0.2.0",
+    releases: [releaseInfo({ version: "0.2.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
+  const panel = within(screen.getByTestId("tab-panel-versions"));
+
+  const update = panel.getByRole("button", { name: "Update to latest" }) as HTMLButtonElement;
+  expect(update.disabled).toBe(true);
+  expect(panel.queryByRole("button", { name: "Install with wizard…" })).toBeNull();
+
+  fireEvent.click(panel.getByRole("switch", { name: "Accept permissions" }));
+  expect((panel.getByRole("button", { name: "Update to latest" }) as HTMLButtonElement).disabled).toBe(false);
+
+  fireEvent.click(panel.getByRole("button", { name: "Update to latest" }));
+  await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null));
 });
 
 test("exactly one release shows the Active badge among several (one-active-version display)", async () => {
@@ -1547,19 +1581,27 @@ test("the setup checklist is hidden once every item is done", async () => {
   expect(screen.queryByText("Finish setting up")).toBeNull();
 });
 
-test("the checklist's Connect action switches to the Settings tab (Task 14 upgrades this to resume the wizard)", async () => {
+// Task 14: the checklist's Connect/Settings actions now open the universal
+// wizard resumed at that step, instead of just switching to the Settings
+// tab — this works for a non-component connector too (its own plan still
+// has a connect step, gated on `authKind !== "none"`).
+test("the checklist's Connect action opens the universal wizard resumed at the connect step", async () => {
   render(<PluginDetailView id="acme-oauth" />);
   await screen.findByText("Acme OAuth");
 
   const panel = within(screen.getByTestId("tab-panel-overview"));
   fireEvent.click(panel.getByRole("button", { name: "Connect" }));
 
-  expect(await screen.findByText("Authentication")).toBeTruthy();
-  const settingsTabButton = screen.getByRole("button", { name: "Settings" });
-  expect(settingsTabButton.className).toContain("bg-background");
+  const dialog = await screen.findByRole("dialog", { name: "Install Acme OAuth" });
+  // acme-oauth: not component-backed (no permissions step), no settings —
+  // plan is overview/install/connect/done (4 steps); connect is index 2. The
+  // dialog itself renders before its own `pluginDetail` fetch resolves (it
+  // starts on "overview" while loading), so the resumed position needs its
+  // own wait rather than a bare `getByText` right after the dialog appears.
+  expect(await within(dialog).findByText("Step 3 of 4 — Connect")).toBeTruthy();
 });
 
-test("the checklist's install action reuses the hero's Install handler (component-backed jumps straight to Versions)", async () => {
+test("the checklist's install action reuses the hero's Install handler (component-backed opens the wizard)", async () => {
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
 
@@ -1571,8 +1613,7 @@ test("the checklist's install action reuses the hero's Install handler (componen
   fireEvent.click(panel.getByRole("button", { name: "Install" }));
 
   // Same behavior the hero's own Install button exercises elsewhere
-  // (component-backed → jump to the Versions tab, where the real install/
-  // permission gate lives) — proves the checklist reused that handler
-  // rather than duplicating the branch.
-  expect(await screen.findByTestId("tab-panel-versions")).toBeTruthy();
+  // (component-backed → open the universal wizard) — proves the checklist
+  // reused that handler rather than duplicating the branch.
+  expect(await screen.findByRole("dialog", { name: "Install mimo" })).toBeTruthy();
 });

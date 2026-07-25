@@ -15,6 +15,7 @@ import { pluginIcon } from "@/lib/plugin-icons";
 import { AddAppModal } from "@/components/modals/AddAppModal";
 import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
 import { SkillInstallModal } from "@/components/modals/SkillInstallModal";
+import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
 import { useNav } from "@/store-nav";
 import { useConnections } from "@/store-connections";
 import { buildHubItems, featuredItems, filterHubItems, type HubItem, type RailFilter } from "@/lib/plugin-hub";
@@ -89,7 +90,12 @@ export function PluginsView() {
     [items],
   );
 
-  const installBusy = installingPlugin !== null || skillInstall !== null;
+  // Task 14: a component-backed row's Install opens the universal wizard;
+  // everything else keeps its existing path unchanged (providers into the
+  // installed set, skill packs through the trust flow, classic connectors
+  // through `InstallWizardModal` — Task 15 migrates that last one).
+  const [wizardPluginId, setWizardPluginId] = useState<string | null>(null);
+  const installBusy = installingPlugin !== null || skillInstall !== null || wizardPluginId !== null;
 
   const startInstall = (item: HubItem) => {
     if (installBusy) return;
@@ -104,6 +110,8 @@ export function PluginsView() {
       // trust step only ever shows up for arbitrary sources — same
       // two-phase gate either way (see `SkillInstallModal`'s doc comment).
       setSkillInstall({ initialSource: item.id });
+    } else if (item.componentBacked) {
+      setWizardPluginId(item.id);
     } else {
       setInstallingPlugin({ id: item.id, name: item.name, icon: item.icon });
     }
@@ -241,6 +249,15 @@ export function PluginsView() {
           pluginName={installingPlugin.name}
           pluginIcon={installingPlugin.icon}
           onClose={() => setInstallingPlugin(null)}
+        />
+      )}
+      {wizardPluginId && (
+        <UniversalInstallWizard
+          pluginId={wizardPluginId}
+          onClose={() => {
+            setWizardPluginId(null);
+            void loadPlugins();
+          }}
         />
       )}
       {doctorOpen && <DoctorPanel onClose={() => setDoctorOpen(false)} />}
