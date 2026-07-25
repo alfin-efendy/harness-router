@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type { AppInfo, InstalledSkillInfo, PluginInfo } from "../bindings";
+import type { AppInfo, ComponentManifestInfo, InstalledSkillInfo, PluginInfo } from "../bindings";
 import {
   appStatusToHubStatus,
   buildHubItems,
+  declaredToolEntries,
   featuredItems,
   filterHubItems,
   fixTargetTab,
@@ -576,4 +577,44 @@ test("fixTargetTab maps per spec §6", () => {
   expect(fixTargetTab("disabled")).toBeNull();
   expect(fixTargetTab("blocked")).toBeNull();
   expect(fixTargetTab("not-installed")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// declaredToolEntries — shared manifest→PluginToolEntry mapping (dedupes
+// PluginDetailView's `fallbackTools` and the install wizard's `OverviewStep`)
+// ---------------------------------------------------------------------------
+
+function mkManifest(overrides: Partial<ComponentManifestInfo> = {}): ComponentManifestInfo {
+  return {
+    publisher: "Acme",
+    description: "A demo component.",
+    lifecycle: "singleton",
+    domains: [],
+    oauthProfiles: [],
+    tools: [],
+    ...overrides,
+  };
+}
+
+describe("declaredToolEntries", () => {
+  test('maps each manifest tool\'s name/description/writes, and stamps kind "tool"', () => {
+    const manifest = mkManifest({
+      tools: [
+        { name: "search", description: "Search the workspace.", writes: false },
+        { name: "create-page", description: "Create a new page.", writes: true },
+      ],
+    });
+    expect(declaredToolEntries(manifest)).toEqual([
+      { name: "search", description: "Search the workspace.", kind: "tool", writes: false },
+      { name: "create-page", description: "Create a new page.", kind: "tool", writes: true },
+    ]);
+  });
+
+  test("a manifest with no declared tools maps to []", () => {
+    expect(declaredToolEntries(mkManifest({ tools: [] }))).toEqual([]);
+  });
+
+  test("a null manifest (never installed/verified) maps to []", () => {
+    expect(declaredToolEntries(null)).toEqual([]);
+  });
 });

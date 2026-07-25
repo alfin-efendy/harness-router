@@ -1,4 +1,4 @@
-import type { AppInfo, InstalledSkillInfo, PluginInfo } from "../bindings";
+import type { AppInfo, ComponentManifestInfo, InstalledSkillInfo, PluginInfo, PluginToolEntry } from "../bindings";
 
 // Unified row model for the Plugins hub (design doc §6, task-7 brief). Pure
 // data module — no React — merging three independent sources (plugins, MCP
@@ -250,6 +250,23 @@ export function kindCounts(items: HubItem[]): Record<string, number> {
  *  capped to 6, preserving input order. */
 export function featuredItems(items: HubItem[]): HubItem[] {
   return items.filter((i) => !i.installed && i.verified && i.kind !== "mcp-server").slice(0, 6);
+}
+
+/** Maps a component's declared manifest tools onto the same `PluginToolEntry`
+ *  shape `plugin_tools` returns, so `PluginToolsList` never needs to branch
+ *  on which source it came from. Shared by `PluginDetailView`'s pre-install
+ *  `fallbackTools` and the universal install wizard's `OverviewStep`
+ *  (`steps-component.tsx`) — both need the declared (not live) tool list
+ *  before a component has ever been installed, or before its own live
+ *  `plugin_tools` fetch has resolved. A `null` manifest (nothing verified/
+ *  installed yet) maps to `[]`. */
+export function declaredToolEntries(manifest: ComponentManifestInfo | null): PluginToolEntry[] {
+  return (manifest?.tools ?? []).map((t) => ({
+    name: t.name,
+    description: t.description,
+    kind: "tool",
+    writes: t.writes,
+  }));
 }
 
 const STATUS_PRESENTATION: Record<HubStatus, { label: string; color: string | null }> = {

@@ -39,6 +39,7 @@ import type { WizardStepId } from "@/components/modals/wizard/wizard-steps";
 import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { deriveSetupChecklist, SetupChecklist } from "@/components/plugins/SetupChecklist";
+import { declaredToolEntries } from "@/lib/plugin-hub";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { useNav } from "@/store-nav";
 import { usePlugins } from "@/store-plugins";
@@ -735,21 +736,19 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const hasHealthTab = isExtensionPlugin || idFindings.length > 0;
 
   // Tools & Skills tab — Task 10. `fallbackTools` is the pre-install case: a
-  // component-backed plugin's declared manifest tools (Task 2), mapped to the
-  // same `PluginToolEntry` shape `plugin_tools` returns, so `PluginToolsList`
-  // never needs to branch on which source it came from. Once the store's
-  // `loadTools(id)` resolves (even to an empty list), its cache wins over the
-  // fallback — `id in toolsById` is the "has this id's fetch completed" gate
-  // (an empty array is falsy under `??`, so a plain `toolsById[id] ??
-  // fallbackTools` would wrongly keep showing the fallback after a real
-  // fetch resolved to zero entries).
+  // component-backed plugin's declared manifest tools (Task 2), mapped via
+  // the shared `declaredToolEntries` (`@/lib/plugin-hub`) to the same
+  // `PluginToolEntry` shape `plugin_tools` returns — so `PluginToolsList`
+  // never needs to branch on which source it came from, and the wizard's own
+  // `OverviewStep` (`steps-component.tsx`) reuses the identical mapping
+  // rather than duplicating it. Once the store's `loadTools(id)` resolves
+  // (even to an empty list), its cache wins over the fallback — `id in
+  // toolsById` is the "has this id's fetch completed" gate (an empty array
+  // is falsy under `??`, so a plain `toolsById[id] ?? fallbackTools` would
+  // wrongly keep showing the fallback after a real fetch resolved to zero
+  // entries).
   const toolsLoaded = id in toolsById;
-  const fallbackTools: PluginToolEntry[] = (releaseDetail?.activeManifest?.tools ?? []).map((t) => ({
-    name: t.name,
-    description: t.description,
-    kind: "tool",
-    writes: t.writes,
-  }));
+  const fallbackTools: PluginToolEntry[] = declaredToolEntries(releaseDetail?.activeManifest ?? null);
   const resolvedTools = toolsLoaded ? (toolsById[id] ?? []) : fallbackTools;
   const resolvedToolsLive = toolsLoaded ? (toolsLiveById[id] ?? false) : false;
   // A provider whose models only ever arrive via `plugin_tools` (`toolCount`

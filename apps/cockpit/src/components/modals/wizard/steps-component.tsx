@@ -3,10 +3,11 @@ import { Check } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button, FormField, Input, Switch } from "@ryuzi/ui";
-import { commands, events, type PluginDetail, type PluginToolEntry } from "@/bindings";
+import { commands, events, type PluginDetail } from "@/bindings";
 import { StatusDot } from "@/components/common/bits";
 import { isDeviceFlowConnectable, OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
+import { declaredToolEntries } from "@/lib/plugin-hub";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
 import { usePlugins } from "@/store-plugins";
@@ -44,15 +45,11 @@ function useMountedRef() {
 
 export function OverviewStep({ ctx }: { ctx: WizardCtx; onNext: () => void }) {
   const info = ctx.detail?.info;
-  // Same manifest→PluginToolEntry mapping `PluginDetailView`'s pre-install
-  // fallback uses — the wizard has no live `plugin_tools` fetch of its own
-  // pre-install, so this is always the declared (not live) list.
-  const tools: PluginToolEntry[] = (ctx.releaseDetail?.activeManifest?.tools ?? []).map((t) => ({
-    name: t.name,
-    description: t.description,
-    kind: "tool",
-    writes: t.writes,
-  }));
+  // Shared `declaredToolEntries` (`@/lib/plugin-hub`) — same manifest→
+  // PluginToolEntry mapping `PluginDetailView`'s pre-install fallback uses —
+  // the wizard has no live `plugin_tools` fetch of its own pre-install, so
+  // this is always the declared (not live) list.
+  const tools = declaredToolEntries(ctx.releaseDetail?.activeManifest ?? null);
 
   return (
     <div className="flex flex-col gap-3">

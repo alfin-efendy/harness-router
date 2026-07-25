@@ -122,6 +122,67 @@ function providerDetailFixture(): PluginDetail {
   };
 }
 
+// Finding 1 (Task 14 review): a non-component, token-auth fixture — mirrors
+// `PluginDetailView.test.tsx`'s `githubDetail` (componentBacked false,
+// auth.kind "token", auth.setting set). PluginDetailView's checklist connect
+// routes EVERY plugin through this wizard, component-backed or not, so this
+// shape (previously untested here) is production-reachable. No permissions
+// gate, no settings, no oauth profiles -> plan collapses to overview/install/
+// connect/done (4 steps), landing ConnectStep on `TokenConnect`.
+function tokenAuthDetailFixture(authOverrides: Partial<NonNullable<PluginDetail["auth"]>> = {}): PluginDetail {
+  return {
+    info: {
+      id: "github",
+      name: "GitHub",
+      description: "Repos, issues, and pull requests.",
+      icon: null,
+      categories: ["vcs"],
+      slot: null,
+      ownsSlot: false,
+      verified: true,
+      experimental: false,
+      enabled: true,
+      configured: false,
+      source: "catalog",
+      capabilities: ["connector"],
+      kind: "integration",
+      installed: false,
+      family: null,
+      pinned: false,
+      sourceSpec: null,
+      resolvedCommit: null,
+      installedAt: null,
+      updatedAt: null,
+      trustTier: null,
+      catalogVersion: null,
+      componentBacked: false,
+      blockedReason: null,
+      status: "not-installed",
+      statusDetail: null,
+      authKind: "token",
+      toolCount: null,
+      skillCount: null,
+    },
+    auth: {
+      kind: "token",
+      setting: "plugin.github.token",
+      env: "GITHUB_PERSONAL_ACCESS_TOKEN",
+      helpUrl: "https://github.com/settings/tokens",
+      configured: false,
+      oauthConnectAvailable: false,
+      oauthConnectError: null,
+      oauthTokenStored: false,
+      oauthReconnectRequired: false,
+      ...authOverrides,
+    },
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: null,
+    publisher: "GitHub (official)",
+  };
+}
+
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 const err = (message: string) => Promise.resolve({ status: "error" as const, error: { message } });
 
@@ -308,6 +369,10 @@ test("Back returns to the previous step and is disabled on the first step", asyn
     within(dialog).getByRole("button", { name: "Back" }).click();
   });
   expect(within(dialog).getByText("Step 1 of 6 — Overview")).toBeTruthy();
+  // PermissionsStep's cleanup effect must clear the Continue-disabled gate it
+  // set on mount (accepted starts false) — otherwise stepping back to
+  // Overview would wrongly inherit Permissions' disabled Continue button.
+  expect((within(dialog).getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
 test("Skip only shows up on the connect and settings steps", async () => {
@@ -585,6 +650,77 @@ test("Connect step renders the device-flow OAuth profile connections when the ma
   expect(within(dialog).getByText("Connections (OAuth)")).toBeTruthy();
   // The plugin-level oauth path must NOT have also fired for this profile-driven case.
   expect(beginPluginOauth).not.toHaveBeenCalled();
+});
+
+// Finding 1 — TokenConnect (non-oauth `detail.auth.setting`) was previously
+// untested here even though it's production-reachable: the checklist connect
+// action now routes every plugin, component-backed or not, through this
+// wizard, and github's real fixture shape (token auth) hits this branch.
+test("Connect step's TokenConnect renders the credential field, disabled Save while empty", async () => {
+  detailData = tokenAuthDetailFixture();
+  await renderWizard();
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+  expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
+
+  // overview -> install (auto-advances) -> connect
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+
+  const input = within(dialog).getByLabelText("Credential *") as HTMLInputElement;
+  expect(input).toBeTruthy();
+  const saveButton = within(dialog).getByRole("button", { name: "Save" }) as HTMLButtonElement;
+  expect(saveButton.disabled).toBe(true);
+
+  fireEvent.change(input, { target: { value: "ghp_abc123" } });
+  expect((within(dialog).getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+test("Connect step's TokenConnect Save calls setPluginSetting, disables while saving, clears the field, and does not auto-advance", async () => {
+  detailData = tokenAuthDetailFixture();
+  await renderWizard();
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+
+  fireEvent.change(within(dialog).getByLabelText("Credential *"), { target: { value: "ghp_abc123" } });
+
+  // Freeze setPluginSetting mid-flight to observe the "while saving" disabled
+  // state deterministically (same technique the shell tests use for a
+  // permanently-pending fetch).
+  let resolveSave: (v: { status: "ok"; data: null }) => void = () => {};
+  setPluginSetting.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveSave = resolve;
+      }),
+  );
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.github.token", "ghp_abc123");
+  expect((within(dialog).getByRole("button", { name: "Saving…" }) as HTMLButtonElement).disabled).toBe(true);
+
+  // The subsequent `ctx.refresh()` re-fetches pluginDetail — reflect the
+  // now-configured credential so the field's `valueSet` (-> "connected") state
+  // is observable once the round trip lands.
+  detailData = tokenAuthDetailFixture({ configured: true });
+  await act(async () => {
+    resolveSave({ status: "ok", data: null });
+  });
+  await act(async () => {});
+  await act(async () => {});
+
+  expect(toastSuccess).toHaveBeenCalledWith("Saved");
+  // TokenConnect's `save()` does not call `onNext()` — per the implementation
+  // this step marks the credential connected (via the refreshed `valueSet`)
+  // rather than auto-advancing.
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  expect((within(dialog).getByLabelText("Credential *") as HTMLInputElement).value).toBe("");
+  expect(within(dialog).getByPlaceholderText("●●●● saved")).toBeTruthy();
 });
 
 test("Settings step renders a FieldRow per declared setting and saves via setPluginSetting", async () => {
