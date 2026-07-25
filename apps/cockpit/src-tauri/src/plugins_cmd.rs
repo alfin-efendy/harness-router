@@ -47,8 +47,8 @@ pub use ryuzi_core::api::types::{
     CatalogStatus, ComponentBootstrapStatus, ComponentManifestInfo, ComponentOauthProfileInfo,
     ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, ExtensionStatusEntry,
     PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo, PluginInstallBeginResult,
-    PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, SkillInstallBegin,
-    TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
+    PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, PluginToolEntry,
+    PluginToolsResult, SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -173,6 +173,26 @@ pub async fn plugin_models(
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc("plugin_models", serde_json::json!({ "id": id }))
+        .await
+}
+
+/// Everything a plugin currently offers — live extension tools, a WASM
+/// component's declared tools, a skill pack's skills, or a provider's model
+/// list (see `plugin_tools`'s doc in `ryuzi_core::api::plugins_api` for the
+/// resolution order). Read-only; safe to call for any known plugin id.
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_tools(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    plugin_id: String,
+) -> R<PluginToolsResult> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "plugin_tools",
+            serde_json::json!({ "plugin_id": plugin_id }),
+        )
         .await
 }
 

@@ -178,6 +178,49 @@ pub(crate) mod tests_support {
     use async_trait::async_trait;
     use std::sync::Arc;
 
+    /// `skills_install::InstallRoots::for_user()` reads the
+    /// `RYUZI_TEST_CONFIG_ROOT` env var under `#[cfg(test)]` so a test can
+    /// point it at a tempdir instead of the operator's real `$HOME`. An env
+    /// var is process-wide, and `cargo test` runs every test in this crate's
+    /// binary concurrently by default — so EVERY `api::*` test that mutates
+    /// it (installed-skill fixtures in `agent_api`, `plugins_api`, ...) must
+    /// serialize through this one lock, or two such tests racing on the same
+    /// variable can each observe the other's tempdir mid-test.
+    static TEST_CONFIG_ROOT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: points `RYUZI_TEST_CONFIG_ROOT` at `dir` for the guard's
+    /// lifetime while holding [`TEST_CONFIG_ROOT_ENV`], restoring the
+    /// previous value (or unsetting it) on drop. See that static's doc for
+    /// why every `RYUZI_TEST_CONFIG_ROOT` mutation in this crate's tests must
+    /// go through this guard rather than setting the env var directly.
+    pub(crate) struct TestConfigRootGuard {
+        previous: Option<std::ffi::OsString>,
+        _env_guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestConfigRootGuard {
+        pub(crate) fn set(dir: &std::path::Path) -> Self {
+            let env_guard = TEST_CONFIG_ROOT_ENV
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("RYUZI_TEST_CONFIG_ROOT");
+            std::env::set_var("RYUZI_TEST_CONFIG_ROOT", dir);
+            Self {
+                previous,
+                _env_guard: env_guard,
+            }
+        }
+    }
+
+    impl Drop for TestConfigRootGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("RYUZI_TEST_CONFIG_ROOT", value),
+                None => std::env::remove_var("RYUZI_TEST_CONFIG_ROOT"),
+            }
+        }
+    }
+
     async fn prepare_test_agent_persistence(store: &Arc<crate::store::Store>) {
         crate::llm_router::connections::add_connection(
             store,

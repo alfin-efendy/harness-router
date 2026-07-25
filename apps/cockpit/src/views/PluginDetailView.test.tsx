@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { DoctorFinding, ExtensionStatusEntry, PluginDetail } from "@/bindings";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { DoctorFinding, ExtensionStatusEntry, PluginDetail, PluginToolEntry } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
@@ -19,12 +19,17 @@ const githubDetail: PluginDetail = {
     ownsSlot: false,
     verified: true,
     experimental: false,
-    enabled: false,
+    // Enabled but not yet configured — a real "needs-setup" state (matches
+    // `installed_flag`'s `configured || enabled` formula for integrations),
+    // so `installed` is true and the Settings tab is reachable to enter the
+    // credential (Task 9: pre-install now hides Settings behind the hero's
+    // Install action instead).
+    enabled: true,
     source: "catalog",
     capabilities: ["connector"],
     configured: false,
     kind: "integration",
-    installed: false,
+    installed: true,
     family: null,
     pinned: false,
     sourceSpec: null,
@@ -35,6 +40,11 @@ const githubDetail: PluginDetail = {
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "not-installed",
+    statusDetail: null,
+    authKind: "token",
+    toolCount: null,
+    skillCount: null,
   },
   auth: {
     kind: "token",
@@ -70,7 +80,8 @@ const ollamaDetail: PluginDetail = {
     capabilities: ["provider"],
     configured: false,
     kind: "integration",
-    installed: false,
+    // enabled: true above → installed_flag's `configured || enabled` is true.
+    installed: true,
     family: null,
     pinned: false,
     sourceSpec: null,
@@ -81,6 +92,11 @@ const ollamaDetail: PluginDetail = {
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "not-installed",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
   },
   auth: null,
   settings: [
@@ -129,6 +145,11 @@ const sandboxDetail: PluginDetail = {
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "not-installed",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
   },
   auth: null,
   settings: [],
@@ -136,6 +157,51 @@ const sandboxDetail: PluginDetail = {
   models: [],
   homepage: "https://vercel.com/docs/vercel-sandbox",
   publisher: "Vercel (no MCP surface)",
+};
+
+// A catalog connector genuinely never touched — not enabled, not configured,
+// not experimental, not component-backed — the true "pre-install" case (Task
+// 9): the hero shows Install instead of the Enabled switch, and there is no
+// Settings tab to fall into since nothing is configured/enabled yet.
+const freshDetail: PluginDetail = {
+  info: {
+    id: "acme-fresh",
+    name: "Acme Fresh",
+    description: "Never installed, configured, or enabled.",
+    icon: "sparkles",
+    categories: [],
+    slot: null,
+    ownsSlot: false,
+    verified: false,
+    experimental: false,
+    enabled: false,
+    source: "catalog",
+    capabilities: [],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
+    catalogVersion: null,
+    componentBacked: false,
+    blockedReason: null,
+    status: "not-installed",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
+  },
+  auth: null,
+  settings: [],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "Acme",
 };
 
 // A plugin declaring an `[[extension]]` (Track D "code plugin") capability —
@@ -157,7 +223,9 @@ const extensionDetail: PluginDetail = {
     capabilities: ["extension"],
     configured: false,
     kind: "integration",
-    installed: false,
+    // enabled: true above → installed_flag's `configured || enabled` is true
+    // (needed so the Health tab, which carries the Extension card, exists).
+    installed: true,
     family: null,
     pinned: false,
     sourceSpec: null,
@@ -168,6 +236,11 @@ const extensionDetail: PluginDetail = {
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "not-installed",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
   },
   auth: null,
   settings: [],
@@ -211,6 +284,11 @@ const skillPackDetail: PluginDetail = {
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "ok",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
   },
   auth: null,
   settings: [],
@@ -236,7 +314,8 @@ const oauthDetail: PluginDetail = {
     capabilities: ["connector"],
     configured: false,
     kind: "integration",
-    installed: false,
+    // enabled: true above → installed_flag's `configured || enabled` is true.
+    installed: true,
     family: null,
     pinned: false,
     sourceSpec: null,
@@ -247,6 +326,11 @@ const oauthDetail: PluginDetail = {
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "not-installed",
+    statusDetail: null,
+    authKind: "oauth",
+    toolCount: null,
+    skillCount: null,
   },
   auth: {
     kind: "oauth",
@@ -264,6 +348,15 @@ const oauthDetail: PluginDetail = {
   models: [],
   homepage: "https://acme.example.com",
   publisher: "Acme",
+};
+
+// Task 11: the SAME oauth plugin as `oauthDetail`, but already connected —
+// used to prove the setup checklist disappears once nothing is left undone
+// (as opposed to `oauthDetail`, its mid-setup counterpart).
+const oauthConnectedDetail: PluginDetail = {
+  ...oauthDetail,
+  info: { ...oauthDetail.info, id: "acme-oauth-connected", name: "Acme OAuth Connected" },
+  auth: { ...(oauthDetail.auth as NonNullable<PluginDetail["auth"]>), configured: true, oauthTokenStored: true },
 };
 
 // A plugin exercising every `SettingField.kind` shape (Feature C3):
@@ -286,7 +379,8 @@ const richFieldsDetail: PluginDetail = {
     capabilities: [],
     configured: false,
     kind: "integration",
-    installed: false,
+    // enabled: true above → installed_flag's `configured || enabled` is true.
+    installed: true,
     family: null,
     pinned: false,
     sourceSpec: null,
@@ -297,6 +391,11 @@ const richFieldsDetail: PluginDetail = {
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "not-installed",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
   },
   auth: null,
   settings: [
@@ -367,6 +466,11 @@ function componentDetail(id: string): PluginDetail {
       capabilities: [],
       kind: "component",
       componentBacked: true,
+      // Explicit (not inherited from `githubDetail.info`, which is
+      // enabled/installed for its own needs-setup scenario) — these fixtures
+      // are the "never installed" component-plugin case its own tests exercise.
+      enabled: false,
+      installed: false,
     },
     auth: null,
     settings: [],
@@ -384,8 +488,10 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
   if (id === "acme-oauth") return ok(oauthDetail);
+  if (id === "acme-oauth-connected") return ok(oauthConnectedDetail);
   if (id === "acme-rich") return ok(richFieldsDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
+  if (id === "acme-fresh") return ok(freshDetail);
   if (id === "acme-ext") return ok(extensionDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
   // First-party component (WASM bundle) plugins are registered manifest-only
@@ -421,6 +527,67 @@ const setPluginPin = mock((_runnerId: string, id: string, pinned: boolean, _reas
   if (id === "acme-pack") acmePackPinned = pinned;
   return ok(null);
 });
+const uninstallPlugin = mock((_runnerId: string, _id: string) => ok([]));
+// Task 10: `plugin_tools` per-id fixtures. Absent from the map ⇒ the same
+// "no live data yet" baseline the brief calls for
+// (`{ pluginId, live: false, entries: [] }`) — a plugin id this file doesn't
+// opt into stays exactly as before Task 10 (an empty Tools tab if it has one
+// at all).
+let pluginToolsFixtures: Record<string, { live: boolean; entries: PluginToolEntry[] }> = {};
+// A real `plugin_tools` call resolves the SAME declared manifest tools a
+// pre-install component's `pluginReleaseDetail` fallback would use (branch 2
+// of the daemon's `plugin_tools`, see `plugins_api.rs`), so in production the
+// fallback is only ever visible for the brief window before that RPC
+// resolves. To test the fallback deterministically (rather than racing a
+// promise that always wins by the time `findByText` settles), a test can
+// register an id here to keep its `plugin_tools` call permanently pending.
+const pluginToolsPendingIds = new Set<string>();
+const pluginTools = mock((_runnerId: string, id: string) => {
+  if (pluginToolsPendingIds.has(id)) return new Promise<never>(() => {});
+  return ok({ pluginId: id, live: pluginToolsFixtures[id]?.live ?? false, entries: pluginToolsFixtures[id]?.entries ?? [] });
+});
+// Task 9/15: the pre-install hero's Install action (and the checklist's
+// Connect resume) opens the universal wizard, whose classic-connector
+// adapter (`steps-connector.tsx`) resolves via `beginPluginInstall` — these
+// are its own mount-time RPCs, mostly mocked here just enough that it mounts
+// without throwing (the wizard's own exhaustive behavior is
+// `UniversalInstallWizard.test.tsx`'s job, not this view's); `acme-oauth`
+// gets its own oauth-available shape since the checklist's "Connect" resume
+// test below depends on the connect step actually staying put on it.
+const beginPluginInstall = mock((_runnerId: string, pluginId: string) => {
+  if (pluginId === "acme-oauth") {
+    return ok({
+      authKind: "oauth",
+      envVarPresent: false,
+      envVarName: null,
+      oauthAvailable: true,
+      oauthExternal: false,
+      needsClientId: false,
+      dcrSucceeded: true,
+      callbackMode: "auto",
+      oauthBegin: {
+        stateToken: "state-456",
+        authorizeUrl: "https://acme.example.com/oauth/authorize?client_id=acme-client",
+        redirectUri: "http://127.0.0.1:8976/plugin-oauth/acme-oauth/callback",
+      },
+      dcrError: null,
+    });
+  }
+  return ok({
+    authKind: "none",
+    envVarPresent: false,
+    envVarName: null,
+    oauthAvailable: false,
+    oauthExternal: false,
+    needsClientId: false,
+    dcrSucceeded: false,
+    callbackMode: "manual",
+    oauthBegin: null,
+    dcrError: null,
+  });
+});
+const cancelPluginInstall = mock((_runnerId: string, _pluginId: string, _stateToken: string | null) => ok(null));
+const setPluginOauthClientId = mock((_runnerId: string, _pluginId: string, _clientId: string) => ok(null));
 const openUrl = mock(async (_url: string) => {});
 
 // Task 12: `PluginDetailView` now also fetches `pluginReleaseDetail` for the
@@ -450,6 +617,11 @@ type ReleaseDetailFixture = {
     lifecycle: string;
     domains: string[];
     oauthProfiles: { id: string; scopes: string[] }[];
+    // Task 10: the pre-install Tools tab fallback source
+    // (`ComponentManifestInfo.tools`) — optional here (rather than mirroring
+    // the real DTO's required field) so every pre-Task-10 fixture literal in
+    // this file stays valid without adding `tools: []` to each one.
+    tools?: { name: string; description: string; writes: boolean }[];
   } | null;
 };
 const emptyReleaseDetail = (id: string): ReleaseDetailFixture => ({
@@ -533,20 +705,22 @@ mock.module("@/bindings", () => ({
     pluginDoctor,
     updatePlugin,
     setPluginPin,
+    uninstallPlugin,
     extensionStatus,
     pluginReleaseDetail,
     installComponentPlugin,
     rollbackComponentPlugin,
+    beginPluginInstall,
+    cancelPluginInstall,
+    setPluginOauthClientId,
+    pluginTools,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
 
-// happy-dom doesn't implement `scrollIntoView` — stub it so the attach-failure
-// banner's "Configure" click doesn't throw.
-Element.prototype.scrollIntoView = mock(() => {});
-
-const { PluginDetailView } = await import("@/views/PluginDetailView");
+const { PluginDetailView, visibleTabs } = await import("@/views/PluginDetailView");
 const { usePlugins } = await import("@/store-plugins");
+const { useNav } = await import("@/store-nav");
 
 beforeEach(() => {
   pluginDetail.mockClear();
@@ -564,15 +738,22 @@ beforeEach(() => {
   pluginDoctor.mockClear();
   updatePlugin.mockClear();
   setPluginPin.mockClear();
+  uninstallPlugin.mockClear();
   extensionStatus.mockClear();
   pluginReleaseDetail.mockClear();
   installComponentPlugin.mockClear();
   rollbackComponentPlugin.mockClear();
+  beginPluginInstall.mockClear();
+  cancelPluginInstall.mockClear();
+  setPluginOauthClientId.mockClear();
+  pluginTools.mockClear();
   doctorFindingsFixture = [];
   extensionStatusFixture = [];
   acmePackPinned = false;
   mimoReleaseFixture = emptyReleaseDetail("mimo");
   componentReleaseFixtures = {};
+  pluginToolsFixtures = {};
+  pluginToolsPendingIds.clear();
   openUrl.mockClear();
   usePlugins.setState({
     plugins: [],
@@ -583,6 +764,8 @@ beforeEach(() => {
     componentBootstrapStatus: null,
     componentPlugins: [],
     componentPluginsLoaded: false,
+    toolsById: {},
+    toolsLiveById: {},
   });
 });
 
@@ -597,7 +780,60 @@ afterEach(() => {
     componentBootstrapStatus: null,
     componentPlugins: [],
     componentPluginsLoaded: false,
+    toolsById: {},
+    toolsLiveById: {},
   });
+});
+
+// ---------- visibleTabs (Task 9) — pure, no mounting ----------
+
+test("visibleTabs: pre-install component row shows overview, tools, and versions", () => {
+  expect(
+    visibleTabs({ installed: false, hasTools: true, hasAuth: false, hasSettings: false, hasVersions: true, hasHealth: false }),
+  ).toEqual(["overview", "tools", "versions"]);
+});
+
+test("visibleTabs: installed connector with auth+findings shows all five tabs", () => {
+  expect(visibleTabs({ installed: true, hasTools: true, hasAuth: true, hasSettings: true, hasVersions: true, hasHealth: true })).toEqual([
+    "overview",
+    "tools",
+    "settings",
+    "versions",
+    "health",
+  ]);
+});
+
+test("visibleTabs: installed, no auth, no settings omits the settings tab even with everything else present", () => {
+  expect(visibleTabs({ installed: true, hasTools: true, hasAuth: false, hasSettings: false, hasVersions: true, hasHealth: true })).toEqual([
+    "overview",
+    "tools",
+    "versions",
+    "health",
+  ]);
+});
+
+test("visibleTabs: settings needs BOTH installed and (auth or settings) — not-installed hides it despite auth/settings", () => {
+  expect(
+    visibleTabs({ installed: false, hasTools: false, hasAuth: true, hasSettings: true, hasVersions: false, hasHealth: false }),
+  ).toEqual(["overview"]);
+});
+
+test("visibleTabs: health needs BOTH installed and hasHealth — not-installed hides it despite findings", () => {
+  expect(
+    visibleTabs({ installed: false, hasTools: false, hasAuth: false, hasSettings: false, hasVersions: false, hasHealth: true }),
+  ).toEqual(["overview"]);
+});
+
+test("visibleTabs: versions is independent of installed (a component-backed plugin's install gate lives there)", () => {
+  expect(
+    visibleTabs({ installed: false, hasTools: false, hasAuth: false, hasSettings: false, hasVersions: true, hasHealth: false }),
+  ).toEqual(["overview", "versions"]);
+});
+
+test("visibleTabs: nothing beyond overview when every input is false", () => {
+  expect(
+    visibleTabs({ installed: true, hasTools: false, hasAuth: false, hasSettings: false, hasVersions: false, hasHealth: false }),
+  ).toEqual(["overview"]);
 });
 
 test("renders identity, about, and category/status badges from the manifest detail", async () => {
@@ -617,6 +853,7 @@ test("renders identity, about, and category/status badges from the manifest deta
 test("shows Not configured for an unset credential, disables Save until typed, and saves through setPluginSetting", async () => {
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
   expect(screen.getByText("Not configured")).toBeTruthy();
   expect(screen.getByText(/Falls back to the GITHUB_PERSONAL_ACCESS_TOKEN environment variable/)).toBeTruthy();
@@ -636,6 +873,7 @@ test("shows Not configured for an unset credential, disables Save until typed, a
 test("opens the auth help link through the shared openUrl mechanism", async () => {
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
   fireEvent.click(screen.getByRole("button", { name: "Help" }));
   expect(openUrl).toHaveBeenCalledWith("https://github.com/settings/tokens");
@@ -644,6 +882,7 @@ test("opens the auth help link through the shared openUrl mechanism", async () =
 test("oauth plugins start Cockpit sign-in through beginPluginOauth", async () => {
   render(<PluginDetailView id="acme-oauth" />);
   await screen.findByText("Acme OAuth");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
   await waitFor(() => expect(beginPluginOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-oauth"));
@@ -654,6 +893,7 @@ test("oauth plugins start Cockpit sign-in through beginPluginOauth", async () =>
 test("a Bool settings field renders as a Switch and saves immediately on toggle", async () => {
   render(<PluginDetailView id="acme-rich" />);
   await screen.findByText("Acme Rich");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
   const sw = screen.getByRole("switch", { name: "Verbose logging" });
   expect(sw.getAttribute("aria-checked")).toBe("false");
@@ -669,6 +909,7 @@ test("a Bool settings field renders as a Switch and saves immediately on toggle"
 test("an enum settings field (non-empty options) renders as a Combobox and saves the picked option", async () => {
   render(<PluginDetailView id="acme-rich" />);
   await screen.findByText("Acme Rich");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
   const combo = screen.getByRole("combobox", { name: "Tier" });
   // Shows the manifest-declared default as an affordance when unset.
@@ -686,6 +927,7 @@ test("an enum settings field (non-empty options) renders as a Combobox and saves
 test("a plain Int settings field renders as a numeric Input", async () => {
   render(<PluginDetailView id="acme-rich" />);
   await screen.findByText("Acme Rich");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
   const retries = screen.getByPlaceholderText("Optional — not set") as HTMLInputElement;
   expect(retries.type).toBe("number");
@@ -694,28 +936,85 @@ test("a plain Int settings field renders as a numeric Input", async () => {
 test("lists MCP servers with their transport and endpoint", async () => {
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
   expect(screen.getByText("MCP servers")).toBeTruthy();
   expect(screen.getByText("http")).toBeTruthy();
   expect(screen.getByText("https://api.githubcopilot.com/mcp/")).toBeTruthy();
 });
 
-test("renders a Models card listing every model for provider-capable plugins", async () => {
+// ---------- Tools & Skills tab — Task 10 ----------
+//
+// The overview's old "Models" card is gone; a provider's models now render
+// as `kind: "model"` `plugin_tools` entries in the Tools tab, alongside any
+// tool/skill entries (see `PluginToolsList.test.tsx` for that grouping's own
+// coverage — this file only proves the wiring: the RPC is called for the
+// mounted id, its entries land in the tab, and the overview card never
+// comes back).
+
+test("a provider's models come from plugin_tools and render in the Tools tab, not on Overview", async () => {
+  pluginToolsFixtures.ollama = {
+    live: true,
+    entries: [
+      { name: "llama3", description: "", kind: "model", writes: null },
+      { name: "mistral", description: "", kind: "model", writes: null },
+    ],
+  };
   render(<PluginDetailView id="ollama" />);
   await screen.findByText("Ollama");
+  await waitFor(() => expect(pluginTools).toHaveBeenCalledWith(LOCAL_RUNNER, "ollama"));
 
-  expect(screen.getByText("Models")).toBeTruthy();
-  expect(screen.getByText("llama3")).toBeTruthy();
+  // The overview Models card is gone entirely — no stray "Models" text and
+  // no model names leak onto the default (Overview) tab.
+  expect(screen.queryByText("Models")).toBeNull();
+  expect(screen.queryByText("llama3")).toBeNull();
+
+  const toolsTabButton = await screen.findByRole("button", { name: /Tools \(2\)/ });
+  fireEvent.click(toolsTabButton);
+  expect(await screen.findByText("llama3")).toBeTruthy();
   expect(screen.getByText("mistral")).toBeTruthy();
+
+  // The declared settings field still lives on the Settings tab.
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
   expect(screen.getByText("Base URL")).toBeTruthy();
   expect(screen.getByPlaceholderText("Optional — not set")).toBeTruthy();
 });
 
-test("omits the Models card for non-provider plugins", async () => {
+test("a plugin with no plugin_tools entries and no manifest tools gets no Tools tab, and no Models card either", async () => {
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
+  await waitFor(() => expect(pluginTools).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
 
+  expect(screen.queryByRole("button", { name: /Tools/ })).toBeNull();
   expect(screen.queryByText("Models")).toBeNull();
+});
+
+test("a component's declared manifest tools render as the pre-install Tools tab fallback, with the declared-list hint", async () => {
+  // Keeps `plugin_tools` from ever resolving for this id, so the fallback
+  // (derived from `pluginReleaseDetail`'s already-loaded manifest) stays the
+  // resolved source for the whole test — see `pluginToolsPendingIds`'s doc.
+  pluginToolsPendingIds.add("atlassian");
+  componentReleaseFixtures.atlassian = {
+    pluginId: "atlassian",
+    activeVersion: null,
+    releases: [],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.atlassian.com"],
+      oauthProfiles: [],
+      tools: [{ name: "jira_search", description: "Search Jira issues", writes: false }],
+    },
+  };
+  render(<PluginDetailView id="atlassian" />);
+  await screen.findByText("atlassian");
+
+  const toolsTabButton = await screen.findByRole("button", { name: /Tools \(1\)/ });
+  fireEvent.click(toolsTabButton);
+  expect(await screen.findByText("jira_search")).toBeTruthy();
+  expect(screen.getByText("Search Jira issues")).toBeTruthy();
+  expect(screen.getByText("Declared by the plugin — final list may differ after install.")).toBeTruthy();
 });
 
 test("disables the enable switch for experimental plugins", async () => {
@@ -766,18 +1065,23 @@ test("skill-pack plugins show Update and Pin actions that call updatePlugin/setP
   render(<PluginDetailView id="acme-pack" />);
   await screen.findByText("Acme Pack");
 
-  fireEvent.click(screen.getByRole("button", { name: "Update" }));
+  // Task 9: Update/Pin moved from hero buttons into the overflow menu.
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Acme Pack" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Update" }));
   await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-pack", false));
 
-  fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Acme Pack" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Pin" }));
   await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-pack", true, "Pinned from Cockpit"));
 
   // Pin toggles the ledger, then this view reloads `pluginDetail` — the
-  // pill/button reflect the REAL persisted `info.pinned`, not a session-only
-  // flag. (Calls so far: mount, post-Update reload, post-Pin reload.)
+  // pill/menu item reflect the REAL persisted `info.pinned`, not a
+  // session-only flag. (Calls so far: mount, post-Update reload, post-Pin
+  // reload.)
   await waitFor(() => expect(pluginDetail).toHaveBeenCalledTimes(3));
   expect(await screen.findByText("Pinned")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Unpin" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Acme Pack" }));
+  expect(await screen.findByRole("menuitem", { name: "Unpin" })).toBeTruthy();
 });
 
 test("pin survives a reload — a fresh pluginDetail fetch reports the persisted pinned flag without any pin() call", async () => {
@@ -786,7 +1090,8 @@ test("pin survives a reload — a fresh pluginDetail fetch reports the persisted
   await screen.findByText("Acme Pack");
 
   expect(screen.getByText("Pinned")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Unpin" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Acme Pack" }));
+  expect(await screen.findByRole("menuitem", { name: "Unpin" })).toBeTruthy();
   expect(setPluginPin).not.toHaveBeenCalled();
 });
 
@@ -817,12 +1122,14 @@ test("Provenance card is hidden entirely for a plugin with no install ledger row
   expect(screen.getAllByText("GitHub (official)").length).toBe(1);
 });
 
-test("non-skill-pack plugins render no Update/Pin actions", async () => {
+test("non-skill-pack plugins render no Update/Pin actions, but the overflow menu still carries Uninstall", async () => {
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
 
-  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Pin" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Actions for GitHub" }));
+  expect(await screen.findByRole("menuitem", { name: "Uninstall" })).toBeTruthy();
+  expect(screen.queryByRole("menuitem", { name: "Update" })).toBeNull();
+  expect(screen.queryByRole("menuitem", { name: "Pin" })).toBeNull();
 });
 
 test("renders an attach-failed doctor finding as a banner with a Configure action", async () => {
@@ -842,8 +1149,10 @@ test("renders an attach-failed doctor finding as a banner with a Configure actio
   expect(screen.getByText("github: authentication failed")).toBeTruthy();
   expect(screen.getByText("Check github's configuration")).toBeTruthy();
 
+  // Task 9: Configure now switches to the Settings tab instead of scrolling.
   fireEvent.click(screen.getByRole("button", { name: "Configure" }));
-  expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+  expect(await screen.findByText("Authentication")).toBeTruthy();
+  expect(screen.queryByText("Attach failed")).toBeNull();
 });
 
 test("omits the attach-failed banner when doctor has no finding for this plugin", async () => {
@@ -872,7 +1181,10 @@ test("an extension-capable plugin fetches extension_status and shows the Runs co
   render(<PluginDetailView id="acme-ext" />);
   await screen.findByText("Acme Ext");
 
+  // "Runs code" is a hero badge (always visible); the Extension card itself
+  // moved into the Health tab.
   expect(screen.getByText("Runs code")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Health" }));
   expect(await screen.findByText("Extension")).toBeTruthy();
   await waitFor(() => expect(extensionStatus).toHaveBeenCalled());
   expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
@@ -892,6 +1204,7 @@ test("renders a Running extension's status badge", async () => {
   ];
   render(<PluginDetailView id="acme-ext" />);
   await screen.findByText("Acme Ext");
+  fireEvent.click(screen.getByRole("button", { name: "Health" }));
 
   expect(await screen.findByText("linter")).toBeTruthy();
   expect(screen.getByText("Running")).toBeTruthy();
@@ -912,6 +1225,7 @@ test("renders a Failed extension's restart count and sanitized last error", asyn
   ];
   render(<PluginDetailView id="acme-ext" />);
   await screen.findByText("Acme Ext");
+  fireEvent.click(screen.getByRole("button", { name: "Health" }));
 
   expect(await screen.findByText("Failed")).toBeTruthy();
   expect(screen.getByText("5 restarts")).toBeTruthy();
@@ -924,6 +1238,7 @@ test("extension_status entries for a different plugin are filtered out", async (
   ];
   render(<PluginDetailView id="acme-ext" />);
   await screen.findByText("Acme Ext");
+  fireEvent.click(screen.getByRole("button", { name: "Health" }));
 
   expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
   expect(screen.queryByText("other")).toBeNull();
@@ -940,9 +1255,14 @@ test("a never-installed component plugin opens its management page (not 'Plugin 
   render(<PluginDetailView id="mimo" />);
 
   expect(await screen.findByText("mimo")).toBeTruthy();
-  // The install gate is reachable even before any release exists.
-  expect(screen.getByRole("button", { name: "Install" })).toBeTruthy();
-  expect(screen.getByText("Not installed")).toBeTruthy();
+  // Task 14: the hero's Install action for a component-backed plugin opens
+  // the universal wizard (it used to just jump to the Versions tab) — the
+  // Overview setup checklist ALSO shows its own "Install" button for this
+  // exact (component-backed, never-installed) scenario, so this specifically
+  // targets the hero's copy — first in DOM order, since it renders above the
+  // tabbed content.
+  fireEvent.click(screen.getAllByRole("button", { name: "Install" })[0]);
+  expect(await screen.findByRole("dialog", { name: "Install mimo" })).toBeTruthy();
   expect(screen.queryByText("Plugin not found.")).toBeNull();
 });
 
@@ -951,18 +1271,24 @@ test("an unrelated unknown plugin id still shows Plugin not found", async () => 
   expect(await screen.findByText("Plugin not found.")).toBeTruthy();
 });
 
-test("install is DISABLED until the permission-acceptance switch is toggled, then dispatches installComponentPlugin", async () => {
+// Task 14 duplication cleanup: a never-installed component's Versions-tab
+// button no longer runs the inline accept-switch-then-install dance itself
+// (the wizard's own Permissions step owns that now) — it just opens the
+// wizard. The update/rollback gate (a component WITH an active version)
+// keeps the original inline accept-then-install behavior untouched, covered
+// by the "install is DISABLED until..." scenarios below it in this file.
+test("Versions tab's never-installed component shows 'Install with wizard…', which opens the wizard instead of installing inline", async () => {
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
 
-  const install = screen.getByRole("button", { name: "Install" }) as HTMLButtonElement;
-  expect(install.disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
+  const panel = within(screen.getByTestId("tab-panel-versions"));
 
-  fireEvent.click(screen.getByRole("switch", { name: "Accept permissions" }));
-  expect((screen.getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(panel.queryByRole("switch", { name: "Accept permissions" })).toBeNull();
+  fireEvent.click(panel.getByRole("button", { name: "Install with wizard…" }));
 
-  fireEvent.click(screen.getByRole("button", { name: "Install" }));
-  await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null));
+  expect(await screen.findByRole("dialog", { name: "Install mimo" })).toBeTruthy();
+  expect(installComponentPlugin).not.toHaveBeenCalled();
 });
 
 test("the permission summary shows 'Unknown until…' before any release is installed", async () => {
@@ -988,12 +1314,50 @@ test("the permission summary renders the active release's publisher, lifecycle, 
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
 
+  // The permission summary lives on Overview (default tab).
   expect(screen.getByText("Ryuzi")).toBeTruthy();
   expect(screen.getByText(/Per call — a fresh instance every call/)).toBeTruthy();
   expect(screen.getByText("api.xiaomimimo.com")).toBeTruthy();
   expect(screen.getByText(/github \(repo, read:user\)/)).toBeTruthy();
-  // Update button label flips once a version is active.
-  expect(screen.getByRole("button", { name: "Update to latest" })).toBeTruthy();
+
+  // The release-management card (Update button label flips once a version
+  // is active) lives on the Versions tab.
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
+  expect(within(screen.getByTestId("tab-panel-versions")).getByRole("button", { name: "Update to latest" })).toBeTruthy();
+});
+
+// Task 14 duplication cleanup: only the never-installed case moved its
+// install action to the wizard — a component WITH an active version (the
+// update/rollback case) keeps its original inline accept-switch-then-Update
+// dispatch untouched.
+test("Update to latest is DISABLED until the permission-acceptance switch is toggled, then dispatches installComponentPlugin", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: "0.2.0",
+    releases: [releaseInfo({ version: "0.2.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
+  const panel = within(screen.getByTestId("tab-panel-versions"));
+
+  const update = panel.getByRole("button", { name: "Update to latest" }) as HTMLButtonElement;
+  expect(update.disabled).toBe(true);
+  expect(panel.queryByRole("button", { name: "Install with wizard…" })).toBeNull();
+
+  fireEvent.click(panel.getByRole("switch", { name: "Accept permissions" }));
+  expect((panel.getByRole("button", { name: "Update to latest" }) as HTMLButtonElement).disabled).toBe(false);
+
+  fireEvent.click(panel.getByRole("button", { name: "Update to latest" }));
+  await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null));
 });
 
 test("exactly one release shows the Active badge among several (one-active-version display)", async () => {
@@ -1015,6 +1379,7 @@ test("exactly one release shows the Active badge among several (one-active-versi
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
 
   expect(screen.getAllByText("Active").length).toBe(1);
   expect(screen.getByText("0.1.0")).toBeTruthy();
@@ -1037,6 +1402,7 @@ test("rolling back to a prior good version dispatches rollbackComponentPlugin wi
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
 
   fireEvent.click(screen.getByRole("button", { name: "Roll back to 0.1.0" }));
   await waitFor(() => expect(rollbackComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", "0.2.0", "0.1.0"));
@@ -1054,6 +1420,7 @@ test("a revoked release offers no Roll back action, and the active release offer
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
 
   expect(screen.queryByRole("button", { name: "Roll back to 0.1.0" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Roll back to 0.2.0" })).toBeNull();
@@ -1069,6 +1436,7 @@ test("a third-party (non-first-party) release is labeled distinctly from a first
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
 
   expect(screen.getByText("Third-party (key: some-other-key)")).toBeTruthy();
 });
@@ -1155,4 +1523,124 @@ test("rendering both in sequence never leaks one's profile into the other's page
   render(<PluginDetailView id="bitbucket" />);
   await screen.findByText(/bitbucket-cloud/);
   expect(screen.queryByText(/atlassian-cloud/)).toBeNull();
+});
+
+// ---------- Tabbed scaffold: hero actions + deep-link consumption — Task 9 ----------
+
+test("initialTab deep-link is honored when the tab is visible (App.tsx's Fix → tab wiring)", async () => {
+  render(<PluginDetailView id="github" initialTab="settings" />);
+  await screen.findByText("GitHub");
+
+  // No click needed — the Settings tab's own content (Authentication) is
+  // already showing, and the Segmented control reflects the selection.
+  expect(screen.getByText("Authentication")).toBeTruthy();
+  const settingsTabButton = screen.getByRole("button", { name: "Settings" });
+  expect(settingsTabButton.className).toContain("bg-background");
+});
+
+test("initialTab snaps back to overview when the requested tab isn't visible for this plugin", async () => {
+  // github has no doctor findings and isn't an extension plugin, so it has
+  // no Health tab at all — a stale/irrelevant deep link must not strand the
+  // view on dead tab state.
+  render(<PluginDetailView id="github" initialTab="health" />);
+  await screen.findByText("GitHub");
+
+  expect(screen.getByText("About")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Health" })).toBeNull();
+  const overviewTabButton = screen.getByRole("button", { name: "Overview" });
+  expect(overviewTabButton.className).toContain("bg-background");
+});
+
+test("the overflow menu's Uninstall calls the store's uninstall then navigates back", async () => {
+  const goBackSpy = spyOn(useNav.getState(), "goBack");
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  fireEvent.click(screen.getByRole("button", { name: "Actions for GitHub" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Uninstall" }));
+
+  await waitFor(() => expect(uninstallPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
+  await waitFor(() => expect(goBackSpy).toHaveBeenCalled());
+  goBackSpy.mockRestore();
+});
+
+test("pre-install (never enabled/configured, non-experimental, non-component) shows Install instead of Enabled, and no Settings tab", async () => {
+  render(<PluginDetailView id="acme-fresh" />);
+  await screen.findByText("Acme Fresh");
+
+  expect(screen.queryByRole("switch", { name: "Enabled" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Install" }));
+
+  // Task 15: the hero's Install action opens the universal wizard (starting
+  // on Overview) for every kind now — `beginPluginInstall` is the classic
+  // connector adapter's "install" step, one Continue click away.
+  expect(await screen.findByRole("dialog", { name: "Install Acme Fresh" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-fresh"));
+});
+
+// ---------- Setup checklist (Overview) — Task 11 ----------
+//
+// `oauthDetail` is already the exact mid-setup shape the brief calls for
+// (installed, oauth, not connected) — no new fixture needed for the
+// "appears" half; `oauthConnectedDetail` (same plugin, fully connected)
+// proves the "hides once complete" half.
+
+test("the setup checklist appears on Overview for a mid-setup plugin (installed, oauth, not connected)", async () => {
+  render(<PluginDetailView id="acme-oauth" />);
+  await screen.findByText("Acme OAuth");
+
+  const panel = within(screen.getByTestId("tab-panel-overview"));
+  expect(panel.getByText("Finish setting up")).toBeTruthy();
+  // install is already done (installed: true); connect is the first (and
+  // only) undone item, so it — not install — carries the action button.
+  expect(panel.getByText("Install the plugin").className).toContain("text-muted-foreground");
+  expect(panel.getByText("Connect your account").className).not.toContain("text-muted-foreground");
+  expect(panel.getByRole("button", { name: "Connect" })).toBeTruthy();
+});
+
+test("the setup checklist is hidden once every item is done", async () => {
+  render(<PluginDetailView id="acme-oauth-connected" />);
+  await screen.findByText("Acme OAuth Connected");
+
+  expect(screen.queryByText("Finish setting up")).toBeNull();
+});
+
+// Task 14: the checklist's Connect/Settings actions now open the universal
+// wizard resumed at that step, instead of just switching to the Settings
+// tab — this works for a non-component connector too (its own plan still
+// has a connect step, gated on `authKind !== "none"`).
+test("the checklist's Connect action opens the universal wizard resumed at the connect step", async () => {
+  render(<PluginDetailView id="acme-oauth" />);
+  await screen.findByText("Acme OAuth");
+
+  const panel = within(screen.getByTestId("tab-panel-overview"));
+  fireEvent.click(panel.getByRole("button", { name: "Connect" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Install Acme OAuth" });
+  // acme-oauth: not component-backed (no permissions step), no settings —
+  // plan is overview/install/connect/done (4 steps); connect is index 2. The
+  // dialog itself renders before its own `pluginDetail` fetch resolves (it
+  // starts on "overview" while loading), so the resumed position needs its
+  // own wait rather than a bare `getByText` right after the dialog appears.
+  expect(await within(dialog).findByText("Step 3 of 4 — Connect")).toBeTruthy();
+});
+
+test("the checklist's install action reuses the hero's Install handler (component-backed opens the wizard)", async () => {
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  // mimo is never-installed + component-backed: the checklist's first
+  // undone item is "install", scoped to the Overview panel so this can't
+  // accidentally hit the hero's OWN (separate) Install button above it.
+  const panel = within(screen.getByTestId("tab-panel-overview"));
+  expect(panel.getByText("Finish setting up")).toBeTruthy();
+  fireEvent.click(panel.getByRole("button", { name: "Install" }));
+
+  // Same behavior the hero's own Install button exercises elsewhere
+  // (component-backed → open the universal wizard) — proves the checklist
+  // reused that handler rather than duplicating the branch.
+  expect(await screen.findByRole("dialog", { name: "Install mimo" })).toBeTruthy();
 });

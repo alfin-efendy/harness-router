@@ -61,7 +61,7 @@ function MainView() {
     case "gatewayDetail":
       return <GatewayDetailView id={view.id} />;
     case "pluginDetail":
-      return <PluginDetailView id={view.id} />;
+      return <PluginDetailView key={`${view.id}:${view.tab ?? ""}`} id={view.id} initialTab={view.tab} />;
     case "settings":
       return <SettingsView />;
     case "agents":

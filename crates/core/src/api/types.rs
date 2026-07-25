@@ -938,6 +938,33 @@ pub struct PluginInfo {
     /// Set when the remote catalog's signed feed blocked (revoked) this id —
     /// mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
     pub blocked_reason: Option<String>,
+    /// Single-source daemon-computed health/setup status (spec §6):
+    /// `ok | disabled | needs-setup | attach-failed | update-available |
+    /// blocked | not-installed`. Derived by `derive_plugin_status` from this
+    /// row's own `installed`/`enabled`/`configured`/`blocked_reason` plus the
+    /// last recorded attach outcome and whether a newer catalog version is
+    /// available. (`unchecked` is MCP-app-only and mapped frontend-side, never
+    /// emitted here.)
+    pub status: String,
+    /// Secret-free human-readable detail for `status` — currently populated
+    /// for `attach-failed` (the recorded attach reason) and `needs-setup`
+    /// (a generic "authentication not configured" message). `None` for every
+    /// other status.
+    pub status_detail: Option<String>,
+    /// Coarse auth requirement for this row: `none` | `token` | `oauth` —
+    /// collapses the SDK's 4-way `AuthKind` (`api-key`/`token` both become
+    /// `"token"`) since only "is a credential required at all" matters for
+    /// `derive_plugin_status`'s needs-setup gate.
+    pub auth_kind: String,
+    /// Declared tool count for component-backed rows (the embedded bundle
+    /// manifest's `tools.len()`, Task 1) — `None` for non-component rows and
+    /// for component-backed ids with no embedded manifest here (e.g. a
+    /// provider bundle represented by its builtin row).
+    pub tool_count: Option<u32>,
+    /// Installed skill count for `skill-pack` rows (`InstalledSkillInfo.
+    /// skill_count`) — `None` for every other kind, and for a synthesized
+    /// curated pack not yet installed.
+    pub skill_count: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -1266,6 +1293,16 @@ pub struct ComponentOauthProfileInfo {
     pub client_id_configured: bool,
 }
 
+/// A tool a component bundle's manifest declares — name, description, and
+/// whether it modifies state (writes). Mirror of `ryuzi_plugin_sdk::DeclaredTool`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentToolInfo {
+    pub name: String,
+    pub description: String,
+    pub writes: bool,
+}
+
 /// Task 12 cross-layer addition: the currently ACTIVE version's bundle
 /// manifest metadata a component plugin's permission-confirmation summary
 /// needs to render (publisher, description, lifecycle, network allowlist
@@ -1294,6 +1331,8 @@ pub struct ComponentManifestInfo {
     /// hostnames the component may reach.
     pub domains: Vec<String>,
     pub oauth_profiles: Vec<ComponentOauthProfileInfo>,
+    /// The tools this component declares it exposes to agents.
+    pub tools: Vec<ComponentToolInfo>,
 }
 
 fn lifecycle_label(l: ryuzi_plugin_sdk::PluginLifecycle) -> &'static str {
@@ -1324,6 +1363,15 @@ impl From<ryuzi_plugin_sdk::PluginBundleManifest> for ComponentManifestInfo {
                     client_id_configured: p.client_id.is_some(),
                 })
                 .collect(),
+            tools: m
+                .tools
+                .into_iter()
+                .map(|t| ComponentToolInfo {
+                    name: t.name,
+                    description: t.description,
+                    writes: t.writes,
+                })
+                .collect(),
         }
     }
 }
@@ -1352,6 +1400,36 @@ pub struct ComponentBootstrapStatus {
     pub pending: bool,
     /// The recorded retry message, present iff `pending`.
     pub message: Option<String>,
+}
+
+/// One entry `plugin_tools` lists for a plugin: an agent-facing tool, an
+/// installed skill, or a provider's model — `kind` discriminates which.
+/// `writes` is only meaningful (`Some`) for `kind == "tool"`, mirroring
+/// [`ComponentToolInfo::writes`]; skills and models never modify state
+/// through this listing, so they carry `None`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginToolEntry {
+    pub name: String,
+    pub description: String,
+    /// `"tool"` | `"skill"` | `"model"`.
+    pub kind: String,
+    pub writes: Option<bool>,
+}
+
+/// `plugin_tools` RPC result: everything a plugin currently offers — live
+/// extension tools, a WASM component's declared tools, a skill pack's
+/// skills, or a provider's model list (see `plugins_api::plugin_tools`'s doc
+/// for the resolution order between those sources; exactly one applies per
+/// plugin id).
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginToolsResult {
+    pub plugin_id: String,
+    /// True when `entries` came from a live enumeration of a currently
+    /// running extension; false when they are declared/manifest/model data.
+    pub live: bool,
+    pub entries: Vec<PluginToolEntry>,
 }
 
 /// `plugin_profile_begin_pkce` RPC result. Mirror of

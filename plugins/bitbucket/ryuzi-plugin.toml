@@ -50,3 +50,47 @@ scopes = ["account", "repository", "pullrequest:write", "issue:write"]
 # 7591 Dynamic Client Registration endpoint. The client id is provisioned
 # out-of-band and supplied host-side at connect time.
 dynamic-registration = false
+
+# The tools this component exposes to agents (name/description copied verbatim
+# from `plugins/bitbucket/src/logic.rs::tool_definitions`). `writes = true`
+# marks every tool that mutates Bitbucket state — exactly the ones gated
+# behind `confirm=true` in the component (see the description above).
+[[tools]]
+name = "auth_status"
+description = "Report whether Bitbucket is connected, and which account the connection can reach."
+
+[[tools]]
+name = "repo_list"
+description = "List repositories in a workspace. Requires workspace."
+
+[[tools]]
+name = "repo_get"
+description = "Get one repository. Requires workspace and repo_slug."
+
+[[tools]]
+name = "pr_list"
+description = "List pull requests in a repository. Requires workspace and repo_slug."
+
+[[tools]]
+name = "issue_list"
+description = "List issues in a repository. Requires workspace and repo_slug."
+
+[[tools]]
+name = "pr_create"
+description = "Create a pull request. Mutating: requires confirm=true."
+writes = true
+
+[[tools]]
+name = "pr_merge"
+description = "Merge a pull request. Mutating: requires confirm=true."
+writes = true
+
+[[tools]]
+name = "issue_create"
+description = "Create an issue. Mutating: requires confirm=true."
+writes = true
+
+[[tools]]
+name = "pr_comment"
+description = "Comment on a pull request. Mutating: requires confirm=true."
+writes = true

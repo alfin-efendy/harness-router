@@ -1530,6 +1530,20 @@ async pluginModels(runnerId: string | null, id: string) : Promise<Result<string[
 }
 },
 /**
+ * Everything a plugin currently offers — live extension tools, a WASM
+ * component's declared tools, a skill pack's skills, or a provider's model
+ * list (see `plugin_tools`'s doc in `ryuzi_core::api::plugins_api` for the
+ * resolution order). Read-only; safe to call for any known plugin id.
+ */
+async pluginTools(runnerId: string | null, pluginId: string) : Promise<Result<PluginToolsResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_tools", { runnerId, pluginId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The install wizard's entry point. The daemon (steps 1-6) resolves the auth
  * kind, discovers / registers OAuth endpoints, builds the authorize URL,
  * stores the PKCE flow state, and emits `CoreEvent::PluginOauthAuthorizeUrl`
@@ -2146,7 +2160,11 @@ lifecycle: string;
  * The outbound network allowlist ("domains") — bare or `*.`-wildcard
  * hostnames the component may reach.
  */
-domains: string[]; oauthProfiles: ComponentOauthProfileInfo[] }
+domains: string[]; oauthProfiles: ComponentOauthProfileInfo[];
+/**
+ * The tools this component declares it exposes to agents.
+ */
+tools: ComponentToolInfo[] }
 /**
  * One OAuth profile a component bundle's manifest declares — id + scopes
  * only (no client id/secret/endpoint: Task 12 renders declared metadata,
@@ -2203,6 +2221,11 @@ export type ComponentReleaseInfo = { pluginId: string; version: string; sourceUr
  * trust check can never drift.
  */
 firstParty: boolean }
+/**
+ * A tool a component bundle's manifest declares — name, description, and
+ * whether it modifies state (writes). Mirror of `ryuzi_plugin_sdk::DeclaredTool`.
+ */
+export type ComponentToolInfo = { name: string; description: string; writes: boolean }
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**
  * OAuth connections only: true once refresh has failed terminally and
@@ -2597,7 +2620,44 @@ catalogVersion: string | null;
  * Set when the remote catalog's signed feed blocked (revoked) this id —
  * mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
  */
-blockedReason: string | null }
+blockedReason: string | null;
+/**
+ * Single-source daemon-computed health/setup status (spec §6):
+ * `ok | disabled | needs-setup | attach-failed | update-available |
+ * blocked | not-installed`. Derived by `derive_plugin_status` from this
+ * row's own `installed`/`enabled`/`configured`/`blocked_reason` plus the
+ * last recorded attach outcome and whether a newer catalog version is
+ * available. (`unchecked` is MCP-app-only and mapped frontend-side, never
+ * emitted here.)
+ */
+status: string;
+/**
+ * Secret-free human-readable detail for `status` — currently populated
+ * for `attach-failed` (the recorded attach reason) and `needs-setup`
+ * (a generic "authentication not configured" message). `None` for every
+ * other status.
+ */
+statusDetail: string | null;
+/**
+ * Coarse auth requirement for this row: `none` | `token` | `oauth` —
+ * collapses the SDK's 4-way `AuthKind` (`api-key`/`token` both become
+ * `"token"`) since only "is a credential required at all" matters for
+ * `derive_plugin_status`'s needs-setup gate.
+ */
+authKind: string;
+/**
+ * Declared tool count for component-backed rows (the embedded bundle
+ * manifest's `tools.len()`, Task 1) — `None` for non-component rows and
+ * for component-backed ids with no embedded manifest here (e.g. a
+ * provider bundle represented by its builtin row).
+ */
+toolCount: number | null;
+/**
+ * Installed skill count for `skill-pack` rows (`InstalledSkillInfo.
+ * skill_count`) — `None` for every other kind, and for a synthesized
+ * curated pack not yet installed.
+ */
+skillCount: number | null }
 export type PluginInstallBeginResult = {
 /**
  * `none` | `api-key` | `token` | `oauth`.
@@ -2658,6 +2718,31 @@ export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: st
  * to the user once and must never be written to durable telemetry.
  */
 export type PluginProfileDeviceFlowStart = { deviceCode: string; userCode: string; verificationUri: string; verificationUriComplete: string | null; intervalSecs: number; expiresAt: number }
+/**
+ * One entry `plugin_tools` lists for a plugin: an agent-facing tool, an
+ * installed skill, or a provider's model — `kind` discriminates which.
+ * `writes` is only meaningful (`Some`) for `kind == "tool"`, mirroring
+ * [`ComponentToolInfo::writes`]; skills and models never modify state
+ * through this listing, so they carry `None`.
+ */
+export type PluginToolEntry = { name: string; description: string;
+/**
+ * `"tool"` | `"skill"` | `"model"`.
+ */
+kind: string; writes: boolean | null }
+/**
+ * `plugin_tools` RPC result: everything a plugin currently offers — live
+ * extension tools, a WASM component's declared tools, a skill pack's
+ * skills, or a provider's model list (see `plugins_api::plugin_tools`'s doc
+ * for the resolution order between those sources; exactly one applies per
+ * plugin id).
+ */
+export type PluginToolsResult = { pluginId: string;
+/**
+ * True when `entries` came from a live enumeration of a currently
+ * running extension; false when they are declared/manifest/model data.
+ */
+live: boolean; entries: PluginToolEntry[] }
 /**
  * Identifies the plugin an approvable action originates from — attribution
  * only, so an operator can see "this MCP tool belongs to plugin X" instead

@@ -20,11 +20,11 @@ function formatBytes(n: number): string {
 
 // Two-phase tiered trust gate for skill-pack installs (curated sources
 // complete immediately; arbitrary sources stop here for review) — see
-// `ryuzi_core::skills_install::begin_install`/`confirm_install`. Deliberately
-// its own component rather than folding into `InstallWizardModal`: that
-// wizard drives an OAuth state machine (env var/token/browser flow/settings)
-// that has nothing to do with skill packs, which only ever need a source
-// string and, sometimes, a trust acknowledgment.
+// `ryuzi_core::skills_install::begin_install`/`confirm_install`. Kept as its
+// own modal solely for the "+ Add ▾ → Add skill source" manual-entry flow
+// (Task 15 moved the Browse-tile install path onto the universal wizard's
+// own skill-pack adapter, `steps-skillpack.tsx`) — there's no catalog id to
+// hand the wizard yet here, only a source string the user is about to type.
 export function SkillInstallModal({
   initialSource,
   onClose,

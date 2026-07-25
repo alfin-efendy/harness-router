@@ -1,8 +1,37 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AddAppInput, AppInfo, CatalogStatus, PluginDetail, PluginInfo, PluginInstallBeginResult } from "@/bindings";
+import type {
+  AddAppInput,
+  AppInfo,
+  CatalogStatus,
+  InstalledSkillInfo,
+  PluginDetail,
+  PluginInfo,
+  PluginInstallBeginResult,
+} from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
+// happy-dom lacks a couple of layout APIs Base UI's Menu popup touches when
+// positioning (same stub `combobox.test.tsx` uses for the Combobox popup) —
+// stub them before anything renders.
+if (typeof Element.prototype.scrollIntoView !== "function") {
+  Element.prototype.scrollIntoView = () => {};
+}
+if (typeof globalThis.ResizeObserver === "undefined") {
+  class ResizeObserverStub {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  globalThis.ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver;
+}
+
+// `verified` defaults to `false` (mirrors `plugin-hub.test.ts`'s `mkPlugin`) —
+// `featuredItems` spotlights not-installed+verified rows regardless of the
+// active rail filter, so a `verified: true` default would make many
+// not-installed fixtures show up TWICE (once in the featured strip, once in
+// the row list) and break exact-text queries. Tests that need the "Verified"
+// badge opt in explicitly.
 function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}): PluginInfo {
   return {
     id,
@@ -12,7 +41,7 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     categories,
     slot: null,
     ownsSlot: false,
-    verified: true,
+    verified: false,
     experimental: false,
     enabled: false,
     source: "catalog",
@@ -30,30 +59,43 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     catalogVersion: null,
     componentBacked: false,
     blockedReason: null,
+    status: "ok",
+    statusDetail: null,
+    authKind: "none",
+    toolCount: null,
+    skillCount: null,
     ...over,
   };
 }
 
-const github = plugin("github", ["vcs", "issues"]);
-const notion = plugin("notion", ["docs"], { installed: true });
-const anthropic = plugin("anthropic", ["model-provider"], { kind: "provider", family: "anthropic", source: "builtin" });
-const superpowers = plugin("superpowers", ["skills"], { kind: "skill-pack", source: "skill-pack" });
-// First-party component bundles are `PluginSource::Component` rows now, and the
-// "Component plugins" section + bootstrap-retry derive their ids from the list
-// (`componentPluginIds`) rather than a hardcoded constant.
-const mimo = plugin("mimo", ["component"], { source: "component", componentBacked: true });
-const opencode = plugin("opencode", ["component"], { source: "component", componentBacked: true });
+// Distinct, human-readable names per row source so assertions never depend on
+// accidental id/name collisions across plugins/apps/skills.
+const githubPlugin = plugin("github", ["vcs", "issues"], { name: "GitHub", status: "not-installed" });
+const notionPlugin = plugin("notion", ["docs"], { name: "Notion", installed: true, status: "ok", toolCount: 12 });
+const anthropicPlugin = plugin("anthropic", ["model-provider"], {
+  name: "Anthropic",
+  kind: "provider",
+  family: "anthropic",
+  source: "builtin",
+  status: "not-installed",
+});
+const superpowersPlugin = plugin("superpowers", ["skills"], {
+  name: "Superpowers",
+  kind: "skill-pack",
+  source: "skill-pack",
+  status: "not-installed",
+});
 
-const githubApp: AppInfo = {
-  id: "github",
-  name: "GitHub",
+const slackApp: AppInfo = {
+  id: "slack",
+  name: "Slack",
   kind: "MCP server",
-  initial: "G",
-  color: "#111827",
-  desc: "GitHub tools",
+  initial: "S",
+  color: "#4A154B",
+  desc: "Slack tools",
   transport: "stdio",
   command: "npx",
-  args: ["-y", "@modelcontextprotocol/server-github"],
+  args: ["-y", "@modelcontextprotocol/server-slack"],
   url: null,
   scope: "global",
   scopeGateways: [],
@@ -67,13 +109,23 @@ const githubApp: AppInfo = {
   agentAccess: [],
 };
 
+const docsSkill: InstalledSkillInfo = {
+  id: "docs-helper",
+  name: "Docs Helper",
+  source: "https://github.com/example/docs-helper",
+  pluginId: null,
+  installedAt: "2026-07-08T10:00:00Z",
+  skillCount: 5,
+};
+
 // Mutable fixtures read by the mocks at call time. PluginsView's `hydrate`
-// (apps) and `load` (plugins) effects re-fetch on mount, so tests set these
-// before rendering instead of seeding store state directly.
+// (apps), `load` (plugins), and `refresh` (skills) effects re-fetch on mount,
+// so tests set these before rendering instead of seeding store state directly.
 let appsFixture: AppInfo[] = [];
-let pluginsFixture: PluginInfo[] = [github, notion, mimo, opencode];
-let doctorFindingsFixture: { pluginId: string; severity: string; kind: string; message: string; suggestedAction: string }[] = [];
+let pluginsFixture: PluginInfo[] = [];
+let skillsFixture: InstalledSkillInfo[] = [];
 let catalogStatusFixture: CatalogStatus = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
+let componentBootstrapStatusFixture: { pending: boolean; message: string | null } = { pending: false, message: null };
 
 const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
 const addApp = mock(async (_runnerId: string, _input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
@@ -84,10 +136,8 @@ const uninstallPlugin = mock(async (_runnerId: string, id: string) => ({
 }));
 const pluginsRestartRequired = mock(async () => ({ status: "ok" as const, data: false }));
 const catalogStatus = mock(async () => ({ status: "ok" as const, data: catalogStatusFixture }));
-// Simulates a real (verified) fetch by default — matches the RPC's own
-// `refresh_catalog` behavior of returning the fresh `catalog_status` snapshot.
 const refreshCatalog = mock(async () => ({ status: "ok" as const, data: catalogStatusFixture }));
-const pluginDoctor = mock(async () => ({ status: "ok" as const, data: doctorFindingsFixture }));
+const pluginDoctor = mock(async () => ({ status: "ok" as const, data: [] as unknown[] }));
 const updatePlugin = mock(async (_runnerId: string, _id: string, _force: boolean) => ({
   status: "ok" as const,
   data: { kind: "updated" as const },
@@ -96,13 +146,10 @@ const updateAllPlugins = mock(async (_runnerId: string) => ({
   status: "ok" as const,
   data: [] as { id: string; outcome: { kind: string } }[],
 }));
-// Mutates the fixture list that `listPlugins` reads from, so `pin()`'s
-// internal reload comes back with the real persisted flag — the same
-// authoritative-reload behavior being exercised, not a session-only mock.
-const setPluginPin = mock(async (_runnerId: string, id: string, pinned: boolean, _reason: string | null) => {
-  pluginsFixture = pluginsFixture.map((p) => (p.id === id ? { ...p, pinned } : p));
-  return { status: "ok" as const, data: null };
-});
+const setPluginPin = mock(async (_runnerId: string, _id: string, _pinned: boolean, _reason: string | null) => ({
+  status: "ok" as const,
+  data: null,
+}));
 
 const beginSkillInstall = mock(async (_runnerId: string, _source: string) => ({
   status: "ok" as const,
@@ -131,23 +178,8 @@ const confirmSkillInstall = mock(async (_runnerId: string, _token: string) => ({
   },
 }));
 
-const listSkills = mock(async () => ({
-  status: "ok" as const,
-  data: [] as {
-    id: string;
-    name: string;
-    source: string;
-    pluginId: string | null;
-    installedAt: string;
-    skillCount: number;
-  }[],
-}));
-
-const removeSkill = mock(async (_runnerId: string, _id: string) => ({
-  status: "ok" as const,
-  data: null,
-}));
-
+const listSkills = mock(async () => ({ status: "ok" as const, data: skillsFixture }));
+const removeSkill = mock(async (_runnerId: string, _id: string) => ({ status: "ok" as const, data: null }));
 const refreshSkill = mock(async (_runnerId: string, _id: string) => ({
   status: "ok" as const,
   data: {
@@ -164,13 +196,13 @@ const refreshSkill = mock(async (_runnerId: string, _id: string) => ({
 // defaults here: begin resolves to authKind "none" with no settings, which
 // routes the wizard straight to done.
 const wizardDetail: PluginDetail = {
-  info: notion,
+  info: githubPlugin,
   auth: null,
   settings: [],
   mcp: [],
   models: [],
   homepage: null,
-  publisher: "Notion",
+  publisher: "GitHub",
 };
 const wizardBegin: PluginInstallBeginResult = {
   authKind: "none",
@@ -184,7 +216,28 @@ const wizardBegin: PluginInstallBeginResult = {
   oauthBegin: null,
   dcrError: null,
 };
-const pluginDetail = mock(async (_runnerId: string, _id: string) => ({ status: "ok" as const, data: wizardDetail }));
+// Task 15: providers and skill packs now open the SAME wizard as classic
+// connectors, so `pluginDetail` needs id-aware fixtures for them too — a
+// provider always gets a "connect" step (`kind === "provider"`), a skill
+// pack's "install" step drives `beginSkillInstall`, not `beginPluginInstall`.
+const anthropicProviderDetail: PluginDetail = {
+  ...wizardDetail,
+  info: { ...wizardDetail.info, id: "anthropic", name: "Anthropic", kind: "provider", family: "anthropic" },
+};
+const superpowersWizardDetail: PluginDetail = {
+  ...wizardDetail,
+  info: { ...wizardDetail.info, id: "superpowers", name: "Superpowers", kind: "skill-pack" },
+};
+const wizardDetailById: Record<string, PluginDetail> = {
+  anthropic: anthropicProviderDetail,
+  superpowers: superpowersWizardDetail,
+};
+// The install wizard's own `ctx.refresh()` re-fetches `pluginDetail` after a
+// mutating step action succeeds (install/connect/settings) — a one-shot
+// `mockImplementationOnce` override would only cover the mount fetch and
+// fall back to the wrong (github-shaped) fixture on that second call, so
+// this stays a persistent, id-aware implementation instead.
+const pluginDetail = mock(async (_runnerId: string, id: string) => ({ status: "ok" as const, data: wizardDetailById[id] ?? wizardDetail }));
 const beginPluginInstall = mock(async (_runnerId: string, _pluginId: string) => ({ status: "ok" as const, data: wizardBegin }));
 const setPluginOauthClientId = mock(async (_runnerId: string, _pluginId: string, _clientId: string) => ({
   status: "ok" as const,
@@ -200,11 +253,13 @@ const completePluginOauth = mock(async (_runnerId: string, _pluginId: string, _c
 }));
 const setPluginSetting = mock(async (_runnerId: string, _key: string, _value: string) => ({ status: "ok" as const, data: null }));
 const setPluginEnabled = mock(async (_runnerId: string, _id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
+// The wizard's shared `DoneStep` fetches this on mount (Task 14/15) — every
+// launch point here can now reach "done".
+const pluginTools = mock(async (_runnerId: string, id: string) => ({
+  status: "ok" as const,
+  data: { pluginId: id, live: false, entries: [] as unknown[] },
+}));
 
-// Task 12: the bootstrap-retry banner + "Component plugins" section fetch
-// these on mount. Defaults are the quiet/nothing-to-see shape so every
-// pre-existing test (which never touches component plugins) is unaffected.
-let componentBootstrapStatusFixture: { pending: boolean; message: string | null } = { pending: false, message: null };
 function emptyReleaseDetail(id: string) {
   return { pluginId: id, releases: [] as unknown[], activeVersion: null as string | null, activeManifest: null };
 }
@@ -221,13 +276,8 @@ const rollbackComponentPlugin = mock(async (_runnerId: string, id: string, _from
 const pluginOauthCompletedMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; ok: boolean; error: string | null } }) => void) => () => {},
 );
-// AddConnectionModal (mounted for provider installs) subscribes to the OAuth
-// authorize-url stream on open; a no-op listener keeps that effect happy.
 const oauthAuthorizeUrlMsgListen = mock(async (_cb: (event: unknown) => void) => () => {});
 
-// Mock the Tauri IPC boundary before the component (and the real stores it
-// pulls in) resolve "@/bindings"; the stores themselves are real zustand
-// singletons, seeded/reset around each test below.
 mock.module("@/bindings", () => ({
   events: {
     pluginOauthCompletedMsg: { listen: pluginOauthCompletedMsgListen },
@@ -257,15 +307,13 @@ mock.module("@/bindings", () => ({
     completePluginOauth,
     setPluginSetting,
     setPluginEnabled,
+    pluginTools,
     componentBootstrapStatus,
     pluginReleaseDetail,
     installComponentPlugin,
     rollbackComponentPlugin,
   },
 }));
-// `refreshCatalog`'s store action toasts the outcome — mock the boundary
-// (matches `DoctorPanel.test.tsx`/`SkillInstallModal.test.tsx`'s convention)
-// so tests can assert on it instead of exercising real sonner DOM state.
 const toastSuccess = mock((_message: string) => {});
 const toastWarning = mock((_message: string) => {});
 const toastError = mock((_message: string) => {});
@@ -277,25 +325,20 @@ mock.module("sonner", () => ({
 const { useSkills } = await import("../store-skills");
 const { useApps } = await import("@/store-apps");
 const { usePlugins } = await import("@/store-plugins");
-const { useGateways } = await import("@/store-gateways");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
-const { filterByCategory, bootstrapBannerMessage, componentPluginStatusLabel, PluginsView } = await import("./PluginsView");
+const { PluginsView } = await import("./PluginsView");
 
-// Provider install/uninstall now flow through the connections store's installed
-// set, not the add-account modal. Override just those two actions with mocks and
-// restore the real ones on the way out (this store singleton is shared across
-// test files in one bun process).
+// Provider install now flows through the connections store's installed set,
+// not the add-account modal. Override just that action with a mock and
+// restore the real one on the way out (this store singleton is shared
+// across test files in one bun process).
 const installProviderMock = mock(async (_family: string) => true);
-const uninstallProviderMock = mock(async (_family: string) => true);
 const defaultInstallProvider = useConnections.getState().installProvider;
-const defaultUninstallProvider = useConnections.getState().uninstallProvider;
-
-const all = [plugin("github", ["vcs", "issues"]), plugin("notion", ["docs", "wiki", "productivity"]), plugin("ollama", ["model-provider"])];
 
 // Render and flush the mount-effect fetches (apps via `hydrate`, plugins via
-// `load`, doctor via `loadDoctor`, skills refresh) inside act so their
-// setState calls do not fire mid-assertion.
+// `load`, skills via `refresh`) inside act so their setState calls do not
+// fire mid-assertion.
 async function renderView() {
   render(<PluginsView />);
   await act(async () => {});
@@ -317,8 +360,8 @@ function resetPluginsStore() {
 
 beforeEach(() => {
   appsFixture = [];
-  pluginsFixture = [github, notion, mimo, opencode];
-  doctorFindingsFixture = [];
+  pluginsFixture = [];
+  skillsFixture = [];
   catalogStatusFixture = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
   componentBootstrapStatusFixture = { pending: false, message: null };
   listApps.mockClear();
@@ -344,260 +387,322 @@ beforeEach(() => {
   completePluginOauth.mockClear();
   setPluginSetting.mockClear();
   setPluginEnabled.mockClear();
+  pluginTools.mockClear();
   pluginOauthCompletedMsgListen.mockClear();
   oauthAuthorizeUrlMsgListen.mockClear();
   toastSuccess.mockClear();
   toastWarning.mockClear();
   toastError.mockClear();
   installProviderMock.mockClear();
-  uninstallProviderMock.mockClear();
   componentBootstrapStatus.mockClear();
   pluginReleaseDetail.mockClear();
   installComponentPlugin.mockClear();
   rollbackComponentPlugin.mockClear();
-  useConnections.setState({ installProvider: installProviderMock, uninstallProvider: uninstallProviderMock });
+  useConnections.setState({ installProvider: installProviderMock });
   useApps.setState({ apps: [], loaded: false, probing: null });
   resetPluginsStore();
-  useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
   useNav.setState({ history: { back: [], current: { kind: "plugins" }, forward: [] } });
   useSkills.setState({ skills: [], loading: false, error: null });
 });
 
-// Reset the shared zustand singletons on the way out too: a later test file
-// in the same bun process would otherwise inherit this file's fixtures.
 afterEach(() => {
   cleanup();
-  useConnections.setState({ installProvider: defaultInstallProvider, uninstallProvider: defaultUninstallProvider });
+  useConnections.setState({ installProvider: defaultInstallProvider });
   useApps.setState({ apps: [], loaded: false, probing: null });
   resetPluginsStore();
-  useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
   useNav.setState({ history: { back: [], current: { kind: "home" }, forward: [] } });
   useSkills.setState({ skills: [], loading: false, error: null });
 });
 
-test("has exactly two tabs and no Access/Skills", async () => {
+// ---------- Row rendering across the three sources ----------
+
+test("renders one row per plugin, app, and non-plugin skill source", async () => {
+  pluginsFixture = [githubPlugin, notionPlugin];
+  appsFixture = [slackApp];
+  skillsFixture = [docsSkill];
   await renderView();
 
-  expect(screen.getByRole("button", { name: "Installed" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Browse" })).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Access" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Skills" })).toBeNull();
+  expect(await screen.findByText("GitHub")).toBeTruthy();
+  expect(screen.getByText("Notion")).toBeTruthy();
+  expect(screen.getByText("Slack")).toBeTruthy();
+  expect(screen.getByText("Docs Helper")).toBeTruthy();
 });
 
-test("header shows Add MCP server and Add skill source, not Browse plugins", async () => {
+test("header shows the Plugins title, search box, and a single + Add menu (no separate top-level buttons)", async () => {
   await renderView();
 
   expect(screen.getByRole("heading", { name: "Plugins" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Add MCP server" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Add skill source" })).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Browse plugins" })).toBeNull();
+  expect(screen.getByPlaceholderText("Search plugins, tools, skills")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Add" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Add MCP server" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Add skill source" })).toBeNull();
 });
 
-test("browse lists only not-installed entries", async () => {
-  pluginsFixture = [github, notion, mimo, opencode];
+test("a skill source backed by an installed plugin id renders once, as the plugin row (not a duplicate)", async () => {
+  const installedPack = { ...superpowersPlugin, installed: true, status: "ok" as const };
+  pluginsFixture = [installedPack];
+  skillsFixture = [{ ...docsSkill, id: "superpowers", name: "Superpowers", pluginId: null }];
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-
-  expect(await screen.findByText("github")).toBeTruthy();
-  expect(screen.queryByText("notion")).toBeNull();
+  expect(await screen.findByText("Superpowers")).toBeTruthy();
+  expect(screen.getAllByText("Superpowers")).toHaveLength(1);
 });
 
-test("browse install routes an integration to the install wizard", async () => {
-  pluginsFixture = [github, anthropic, superpowers];
+// ---------- Rail state filters ----------
+
+test("clicking the Discover rail entry hides installed rows and keeps not-installed rows", async () => {
+  pluginsFixture = [githubPlugin, notionPlugin];
+  await renderView();
+  await screen.findByText("Notion");
+
+  fireEvent.click(screen.getByText("Discover"));
+
+  expect(screen.queryByText("Notion")).toBeNull();
+  expect(screen.getByText("GitHub")).toBeTruthy();
+});
+
+test("clicking the Installed rail entry hides not-installed rows", async () => {
+  pluginsFixture = [githubPlugin, notionPlugin];
+  await renderView();
+  await screen.findByText("GitHub");
+
+  fireEvent.click(screen.getByText("Installed"));
+
+  expect(screen.queryByText("GitHub")).toBeNull();
+  expect(screen.getByText("Notion")).toBeTruthy();
+});
+
+test("clicking the Providers kind rail entry narrows the list to provider rows", async () => {
+  pluginsFixture = [githubPlugin, notionPlugin, { ...anthropicPlugin, installed: true, status: "ok" as const }];
+  await renderView();
+  await screen.findByText("Anthropic");
+
+  fireEvent.click(screen.getByText("Providers"));
+
+  expect(screen.getByText("Anthropic")).toBeTruthy();
+  expect(screen.queryByText("GitHub")).toBeNull();
+  expect(screen.queryByText("Notion")).toBeNull();
+});
+
+// ---------- Search ----------
+
+test("typing in the search box filters the row list live", async () => {
+  pluginsFixture = [githubPlugin, notionPlugin];
+  await renderView();
+  await screen.findByText("Notion");
+
+  fireEvent.change(screen.getByPlaceholderText("Search plugins, tools, skills"), { target: { value: "notion" } });
+
+  expect(screen.queryByText("GitHub")).toBeNull();
+  expect(screen.getByText("Notion")).toBeTruthy();
+});
+
+// ---------- Row status / action button ----------
+
+test("an attach-failed installed plugin shows a Fix button and the Attach failed status label", async () => {
+  const broken = plugin("broken", ["vcs"], { name: "Broken", installed: true, status: "attach-failed", statusDetail: "token rejected" });
+  pluginsFixture = [broken];
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("github");
+  expect(await screen.findByText("Attach failed")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Fix Broken" })).toBeTruthy();
+});
 
-  fireEvent.click(screen.getByRole("button", { name: "Install github" }));
+test("Fix navigates to the plugin detail page on the tab that resolves the status (health for attach-failed)", async () => {
+  const broken = plugin("broken", ["vcs"], { name: "Broken", installed: true, status: "attach-failed" });
+  pluginsFixture = [broken];
+  await renderView();
+  await screen.findByText("Broken");
 
-  expect(await screen.findByText("Install github", { selector: "h2" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Fix Broken" }));
+
+  expect(useNav.getState().history.current).toEqual({ kind: "pluginDetail", id: "broken", tab: "health" });
+});
+
+test("a not-installed plugin row shows the Install button", async () => {
+  pluginsFixture = [githubPlugin];
+  await renderView();
+
+  expect(await screen.findByRole("button", { name: "Install GitHub" })).toBeTruthy();
+});
+
+test("a healthy installed plugin shows a Manage button that navigates with no tab", async () => {
+  pluginsFixture = [notionPlugin];
+  await renderView();
+  await screen.findByText("Notion");
+
+  fireEvent.click(screen.getByRole("button", { name: "Manage Notion" }));
+
+  expect(useNav.getState().history.current).toEqual({ kind: "pluginDetail", id: "notion" });
+});
+
+test("clicking the row body (not the action button) also navigates to the detail page", async () => {
+  pluginsFixture = [notionPlugin];
+  await renderView();
+
+  fireEvent.click(await screen.findByText("Notion"));
+
+  expect(useNav.getState().history.current).toEqual({ kind: "pluginDetail", id: "notion" });
+});
+
+test("a blocked plugin shows its blockedReason and no action button", async () => {
+  const evil = plugin("evil-plugin", ["vcs"], {
+    name: "Evil Plugin",
+    blockedReason: "revoked: known-malicious update",
+    status: "blocked",
+  });
+  pluginsFixture = [evil];
+  await renderView();
+
+  expect(await screen.findByText("revoked: known-malicious update")).toBeTruthy();
+  // No action button (Install/Fix/Manage) for a blocked row — the row stays
+  // open-able (the "Open Evil Plugin" row-click affordance is intentionally
+  // unrelated to this), so check the specific action labels are absent.
+  expect(screen.queryByRole("button", { name: "Install Evil Plugin" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Fix Evil Plugin" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Manage Evil Plugin" })).toBeNull();
+});
+
+test("a pinned installed plugin shows the Pinned pill", async () => {
+  pluginsFixture = [{ ...notionPlugin, pinned: true }];
+  await renderView();
+
+  expect(await screen.findByText("Pinned")).toBeTruthy();
+});
+
+// ---------- Install action ----------
+
+test("installing a not-installed integration opens the install wizard, which resolves its config via beginPluginInstall", async () => {
+  pluginsFixture = [githubPlugin];
+  await renderView();
+  await screen.findByText("GitHub");
+
+  fireEvent.click(screen.getByRole("button", { name: "Install GitHub" }));
+
+  expect(await screen.findByRole("dialog", { name: "Install GitHub" })).toBeTruthy();
+  // The wizard opens on Overview — `beginPluginInstall` is the classic
+  // connector adapter's "install" step, one Continue click away.
+  expect(beginPluginInstall).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
 });
 
-test("browse install adds a provider to the installed set instead of opening the connection modal", async () => {
-  pluginsFixture = [github, anthropic, superpowers];
+// Task 14: a component-backed row's Install opens the universal wizard —
+// the mocked `pluginDetail` otherwise always resolves the fixed
+// `wizardDetail` (github-shaped, componentBacked false), so this override
+// gives the wizard a componentBacked detail for its own plan/title.
+const atlassianComponentDetail: PluginDetail = {
+  ...wizardDetail,
+  info: { ...wizardDetail.info, id: "atlassian", name: "Atlassian", componentBacked: true },
+};
+
+test("installing a not-installed component-backed row's install step never calls beginPluginInstall (the classic connector's own RPC)", async () => {
+  const componentPlugin = plugin("atlassian", ["issues"], { name: "Atlassian", status: "not-installed", componentBacked: true });
+  pluginsFixture = [componentPlugin];
+  pluginDetail.mockImplementationOnce(async () => ({ status: "ok" as const, data: atlassianComponentDetail }));
   await renderView();
+  await screen.findByText("Atlassian");
 
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("anthropic");
+  fireEvent.click(screen.getByRole("button", { name: "Install Atlassian" }));
 
-  fireEvent.click(screen.getByRole("button", { name: "Install anthropic" }));
-
-  await waitFor(() => expect(installProviderMock).toHaveBeenCalledWith("anthropic"));
-  // Installing a provider no longer opens the add-account modal.
-  expect(screen.queryByText("Add account")).toBeNull();
+  expect(await screen.findByRole("dialog", { name: "Install Atlassian" })).toBeTruthy();
+  expect(beginPluginInstall).not.toHaveBeenCalled();
 });
 
-test("browse install routes a skill pack through the two-phase trust flow (beginSkillInstall)", async () => {
-  pluginsFixture = [github, anthropic, superpowers];
+// Task 15: every kind now opens the SAME wizard — a provider's "install"
+// step registers it into the connections store's installed set from
+// INSIDE the wizard (`steps-provider.tsx`), not from `startInstall` itself.
+test("installing a not-installed provider opens the wizard, which installs it via the connections store", async () => {
+  pluginsFixture = [anthropicPlugin];
+  await renderView();
+  await screen.findByText("Anthropic");
+
+  fireEvent.click(screen.getByRole("button", { name: "Install Anthropic" }));
+
+  expect(await screen.findByRole("dialog", { name: "Install Anthropic" })).toBeTruthy();
+  expect(installProviderMock).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  await waitFor(() => expect(installProviderMock).toHaveBeenCalledWith("anthropic"));
+});
+
+test("installing a not-installed skill pack opens the wizard, which routes through the two-phase trust flow (beginSkillInstall)", async () => {
+  pluginsFixture = [superpowersPlugin];
+  await renderView();
+  await screen.findByText("Superpowers");
+
+  fireEvent.click(screen.getByRole("button", { name: "Install Superpowers" }));
+
+  expect(await screen.findByRole("dialog", { name: "Install Superpowers" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers"));
+});
+
+// ---------- + Add menu ----------
+
+test("the + Add menu opens and shows Add MCP server and Add skill source", async () => {
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("superpowers");
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
-  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
+  expect(await screen.findByRole("menuitem", { name: "Add MCP server" })).toBeTruthy();
+  expect(screen.getByRole("menuitem", { name: "Add skill source" })).toBeTruthy();
+});
 
-  await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers"));
-  // Curated packs resolve `completed: true` — no trust step, no old
-  // `install_skill` one-phase command involved.
-  await waitFor(() => expect(listPlugins.mock.calls.length).toBeGreaterThan(1));
+test("Add MCP server opens AddAppModal", async () => {
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Add MCP server" }));
+
+  expect(await screen.findByText(/Point Cockpit at an MCP server/)).toBeTruthy();
 });
 
 test("Add skill source opens the manual source-entry step of the trust-gated install flow", async () => {
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Add skill source" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Add skill source" }));
 
   expect(await screen.findByLabelText("Skill source")).toBeTruthy();
   expect(beginSkillInstall).not.toHaveBeenCalled();
 });
 
-test("installed aggregates apps and installed plugins with uninstall", async () => {
-  appsFixture = [githubApp];
-  pluginsFixture = [notion];
+// ---------- Rail footer: catalog status, refresh, doctor, update all ----------
+
+test("the rail footer shows the catalog status line once catalogStatus has loaded", async () => {
+  catalogStatusFixture = { sequence: 4, lastFetchAt: 1_700_000_000_000, outcome: "ok", entries: 12, blocked: 1 };
   await renderView();
 
-  expect(await screen.findByText("GitHub")).toBeTruthy();
-  expect(screen.getByText("notion")).toBeTruthy();
-
-  fireEvent.click(screen.getByRole("button", { name: "Uninstall notion" }));
-
-  await waitFor(() => expect(uninstallPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "notion"));
+  expect(await screen.findByText(/Catalog seq 4/)).toBeTruthy();
 });
 
-test("uninstalling an installed provider removes it from the set via uninstallProvider", async () => {
-  pluginsFixture = [plugin("anthropic", ["model-provider"], { kind: "provider", family: "anthropic", source: "builtin", installed: true })];
+test("the rail's Refresh catalog button calls refreshCatalog and toasts the outcome", async () => {
+  catalogStatusFixture = { sequence: 4, lastFetchAt: 1_700_000_000_000, outcome: "ok", entries: 12, blocked: 1 };
   await renderView();
+  await screen.findByText(/Catalog seq 4/);
 
-  fireEvent.click(await screen.findByRole("button", { name: "Uninstall anthropic" }));
+  fireEvent.click(screen.getByRole("button", { name: "Refresh catalog" }));
 
-  await waitFor(() => expect(uninstallProviderMock).toHaveBeenCalledWith("anthropic"));
-  // The provider path does not go through the plugin-uninstall command.
-  expect(uninstallPlugin).not.toHaveBeenCalled();
+  await waitFor(() => expect(refreshCatalog).toHaveBeenCalled());
+  await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
 });
 
-test("an installed curated pack renders as exactly one card, not a duplicate manual row", async () => {
-  // The skills store and the plugins list both know about superpowers once
-  // it's installed (same id). The Installed tab must show it once — as the
-  // plugin card with an Uninstall button — and NOT also as a manual "Skill
-  // sources" row (whose id/pluginId matches a listed plugin, so it's filtered
-  // out).
-  const installedPack = { ...superpowers, installed: true };
-  pluginsFixture = [installedPack];
-  useSkills.setState({
-    skills: [
-      {
-        id: "superpowers",
-        name: "superpowers",
-        source: "superpowers",
-        pluginId: null,
-        installedAt: "2026-07-08T10:00:00Z",
-        skillCount: 12,
-      },
-    ],
-    loading: false,
-    error: null,
-  });
+test("the rail's Doctor link opens the doctor panel", async () => {
   await renderView();
 
-  expect(await screen.findByText("superpowers")).toBeTruthy();
-  // Exactly one node bears the pack name (the InstalledPluginCard), and it
-  // carries an Uninstall action — the manual "Skill sources" card would add a
-  // Remove button and a second name node.
-  expect(screen.getAllByText("superpowers")).toHaveLength(1);
-  expect(screen.getByRole("button", { name: "Uninstall superpowers" })).toBeTruthy();
-  expect(screen.queryByText("Skill sources")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Remove superpowers" })).toBeNull();
-});
+  fireEvent.click(screen.getByRole("button", { name: "Doctor" }));
 
-test("empty installed state points at browse", async () => {
-  appsFixture = [];
-  pluginsFixture = [];
-  await renderView();
-
-  expect(await screen.findByText("Nothing installed yet. Browse plugins or add an MCP server by hand.")).toBeTruthy();
-});
-
-test("an installed skill pack shows Update/Pin actions, which call the store's commands", async () => {
-  const installedPack = { ...superpowers, installed: true };
-  pluginsFixture = [installedPack];
-  await renderView();
-
-  fireEvent.click(screen.getByRole("button", { name: "Update superpowers" }));
-  await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers", false));
-
-  fireEvent.click(screen.getByRole("button", { name: "Pin superpowers" }));
-  await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers", true, "Pinned from Cockpit"));
-
-  expect(await screen.findByText("Pinned")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Unpin superpowers" })).toBeTruthy();
-});
-
-test("a pinned skill pack's Pinned pill/button reflects info.pinned straight from listPlugins — no pin() call, so it survives a reload", async () => {
-  // Simulates the persisted ledger state coming back on a fresh load (e.g.
-  // after an app restart) rather than through this session's `pin()` call.
-  const pinnedPack = { ...superpowers, installed: true, pinned: true };
-  pluginsFixture = [pinnedPack];
-  await renderView();
-
-  expect(await screen.findByText("Pinned")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Unpin superpowers" })).toBeTruthy();
-  expect(setPluginPin).not.toHaveBeenCalled();
-
-  // A second reload (`usePlugins.load()`, same fixture) keeps it pinned.
-  await act(async () => {
-    await usePlugins.getState().load();
-  });
-  expect(screen.getByText("Pinned")).toBeTruthy();
-});
-
-test("a non-skill-pack installed plugin shows no Update/Pin actions", async () => {
-  pluginsFixture = [notion];
-  await renderView();
-
-  expect(await screen.findByText("notion")).toBeTruthy();
-  expect(screen.queryByRole("button", { name: /^Update notion$/ })).toBeNull();
-  expect(screen.queryByRole("button", { name: /^Pin notion$/ })).toBeNull();
-});
-
-test("an installed plugin with an attach-failed doctor finding shows the Attach failed pill", async () => {
-  pluginsFixture = [notion];
-  doctorFindingsFixture = [
-    { pluginId: "notion", severity: "warn", kind: "attach-failed", message: "notion failed to attach", suggestedAction: "Check notion" },
-  ];
-  await renderView();
-
-  expect(await screen.findByText("Attach failed")).toBeTruthy();
-});
-
-test("the doctor chip reflects the finding count and opens the doctor panel", async () => {
-  doctorFindingsFixture = [
-    { pluginId: "notion", severity: "warn", kind: "attach-failed", message: "notion failed to attach", suggestedAction: "Check notion" },
-  ];
-  await renderView();
-
-  expect(await screen.findByRole("button", { name: "1 issue" })).toBeTruthy();
-
-  fireEvent.click(screen.getByRole("button", { name: "1 issue" }));
   expect(await screen.findByText("Plugin doctor")).toBeTruthy();
-  expect(screen.getAllByText("notion failed to attach").length).toBeGreaterThan(0);
 });
 
-test("the doctor chip reads Doctor: OK when there are no findings", async () => {
-  await renderView();
-  expect(await screen.findByRole("button", { name: "Doctor: OK" })).toBeTruthy();
-});
-
-test("Update all is disabled with no installed skill packs, and calls updateAllPlugins when enabled", async () => {
-  pluginsFixture = [notion];
+test("Update all is disabled with nothing installed, and enabled once an installed skill pack exists", async () => {
+  pluginsFixture = [notionPlugin];
   await renderView();
 
-  const updateAllBtn = (await screen.findByRole("button", { name: "Update all" })) as HTMLButtonElement;
-  expect(updateAllBtn.disabled).toBe(true);
+  const disabled = (await screen.findByRole("button", { name: "Update all" })) as HTMLButtonElement;
+  expect(disabled.disabled).toBe(true);
 
-  pluginsFixture = [notion, { ...superpowers, installed: true }];
+  pluginsFixture = [notionPlugin, { ...superpowersPlugin, installed: true, status: "ok" }];
   await act(async () => {
     await usePlugins.getState().load();
   });
@@ -609,100 +714,15 @@ test("Update all is disabled with no installed skill packs, and calls updateAllP
   await waitFor(() => expect(updateAllPlugins).toHaveBeenCalled());
 });
 
-test("filterByCategory passes every plugin through for the default all category", () => {
-  expect(filterByCategory(all, "all").map((item) => item.id)).toEqual(["github", "notion", "ollama"]);
-});
-
-test("filterByCategory keeps only plugins whose categories include the picked one", () => {
-  expect(filterByCategory(all, "docs").map((p) => p.id)).toEqual(["notion"]);
-});
-
-test("filterByCategory matches a plugin tagged with several categories from any one of them", () => {
-  expect(filterByCategory(all, "issues").map((p) => p.id)).toEqual(["github"]);
-  expect(filterByCategory(all, "wiki").map((p) => p.id)).toEqual(["notion"]);
-});
-
-test("filterByCategory returns an empty list when nothing matches", () => {
-  expect(filterByCategory(all, "sandbox")).toEqual([]);
-});
-
-test("Browse's Refresh catalog button calls refreshCatalog and toasts the outcome", async () => {
-  catalogStatusFixture = { sequence: 4, lastFetchAt: 1_700_000_000_000, outcome: "ok", entries: 12, blocked: 1 };
+test("Update all is enabled when an update-available row exists, even with no installed skill packs", async () => {
+  pluginsFixture = [{ ...notionPlugin, status: "update-available" }];
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("github");
-
-  fireEvent.click(screen.getByRole("button", { name: "Refresh catalog" }));
-
-  await waitFor(() => expect(refreshCatalog).toHaveBeenCalled());
-  await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+  const enabled = (await screen.findByRole("button", { name: "Update all" })) as HTMLButtonElement;
+  expect(enabled.disabled).toBe(false);
 });
 
-test("Browse shows a subtle catalog status line once catalogStatus has loaded", async () => {
-  catalogStatusFixture = { sequence: 4, lastFetchAt: 1_700_000_000_000, outcome: "ok", entries: 12, blocked: 1 };
-  await renderView();
-
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-
-  expect(await screen.findByText(/Catalog seq 4/)).toBeTruthy();
-});
-
-test("a blocked catalog entry renders the Blocked badge and hides the Install button", async () => {
-  const blockedPlugin = plugin("evil-plugin", ["vcs"], { blockedReason: "revoked: known-malicious update" });
-  pluginsFixture = [blockedPlugin];
-  await renderView();
-
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-
-  expect(await screen.findByText("Blocked")).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Install evil-plugin" })).toBeNull();
-});
-
-// ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
-
-test("bootstrapBannerMessage is null when there's nothing pending", () => {
-  expect(bootstrapBannerMessage(null)).toBeNull();
-  expect(bootstrapBannerMessage({ pending: false, message: null })).toBeNull();
-  expect(bootstrapBannerMessage({ pending: false, message: "stale message" })).toBeNull();
-});
-
-test("bootstrapBannerMessage surfaces the recorded retry message, or a generic fallback", () => {
-  expect(bootstrapBannerMessage({ pending: true, message: "opencode: network unreachable" })).toBe("opencode: network unreachable");
-  expect(bootstrapBannerMessage({ pending: true, message: null })).toBe(
-    "Some first-party component plugins couldn't be installed automatically.",
-  );
-});
-
-test("componentPluginStatusLabel reports the active version or Not installed", () => {
-  expect(componentPluginStatusLabel({ pluginId: "mimo", releases: [], activeVersion: "0.2.0", activeManifest: null })).toBe(
-    "v0.2.0 active",
-  );
-  expect(componentPluginStatusLabel({ pluginId: "mimo", releases: [], activeVersion: null, activeManifest: null })).toBe("Not installed");
-});
-
-test("renders the Component plugins section listing every known first-party id, regardless of tab", async () => {
-  await renderView();
-
-  // The "Manage <id>" button is unique to the Component-plugins section
-  // (`mimo`/`opencode` also now appear as ordinary rows in the grid, so
-  // matching bare text would be ambiguous).
-  expect(await screen.findByRole("button", { name: "Manage mimo" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Manage opencode" })).toBeTruthy();
-  expect(screen.getAllByText("Not installed").length).toBe(2);
-
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  expect(screen.getByRole("button", { name: "Manage mimo" })).toBeTruthy();
-});
-
-test("Manage navigates to the component plugin's detail view", async () => {
-  await renderView();
-  await screen.findByRole("button", { name: "Manage mimo" });
-
-  fireEvent.click(screen.getByRole("button", { name: "Manage mimo" }));
-
-  expect(useNav.getState().history.current).toEqual({ kind: "pluginDetail", id: "mimo" });
-});
+// ---------- Bootstrap banner (Task 12, unchanged behavior) ----------
 
 test("shows the retryable bootstrap banner when component_bootstrap_status reports pending, and hides it otherwise", async () => {
   componentBootstrapStatusFixture = { pending: true, message: "mimo: signature verification failed" };
@@ -714,18 +734,19 @@ test("shows the retryable bootstrap banner when component_bootstrap_status repor
 
 test("omits the bootstrap banner when nothing is pending", async () => {
   await renderView();
-  await screen.findByRole("button", { name: "Manage mimo" });
 
   expect(screen.queryByText("Component plugins need attention")).toBeNull();
 });
 
 test("the bootstrap banner's Retry button reinstalls every known first-party id and refreshes the status", async () => {
+  pluginsFixture = [
+    plugin("mimo", ["component"], { name: "Mimo", source: "component", componentBacked: true, installed: true }),
+    plugin("opencode", ["component"], { name: "Opencode", source: "component", componentBacked: true, installed: true }),
+  ];
   componentBootstrapStatusFixture = { pending: true, message: "opencode: network unreachable" };
   await renderView();
   await screen.findByText("Component plugins need attention");
 
-  // The retry itself succeeds this time — flip the fixture before the click
-  // so the post-retry re-fetch reports resolved.
   componentBootstrapStatusFixture = { pending: false, message: null };
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
@@ -733,4 +754,12 @@ test("the bootstrap banner's Retry button reinstalls every known first-party id 
   await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "opencode", null));
   await waitFor(() => expect(screen.queryByText("Component plugins need attention")).toBeNull());
   expect(toastSuccess).toHaveBeenCalled();
+});
+
+// ---------- Empty state ----------
+
+test("empty state shows when nothing is installed and the catalog is empty", async () => {
+  await renderView();
+
+  expect(await screen.findByText(/Nothing here yet/)).toBeTruthy();
 });

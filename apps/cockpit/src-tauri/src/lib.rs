@@ -202,6 +202,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::plugin_profile_poll_device_flow,
             plugins_cmd::plugin_profile_disconnect,
             plugins_cmd::plugin_models,
+            plugins_cmd::plugin_tools,
             plugins_cmd::begin_plugin_install,
             plugins_cmd::set_plugin_oauth_client_id,
             plugins_cmd::cancel_plugin_install,

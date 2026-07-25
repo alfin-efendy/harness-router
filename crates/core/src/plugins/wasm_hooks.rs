@@ -215,6 +215,7 @@ mod tests {
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
                 provider_ids: vec![],
+                tools: vec![],
             },
             release: PluginRelease {
                 id: plugin_id.to_string(),

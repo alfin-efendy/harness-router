@@ -24,7 +24,7 @@
 //!   [`is_component_bundle`], so Cockpit can offer release management for it
 //!   against whichever row won.
 
-use ryuzi_plugin_sdk::bundle::PluginBundleManifest;
+use ryuzi_plugin_sdk::bundle::{DeclaredTool, PluginBundleManifest};
 use ryuzi_plugin_sdk::{PluginManifest, CONTRACT_VERSION};
 
 use super::host::{CorePlugin, PluginSource};
@@ -128,6 +128,34 @@ fn manifest_from_bundle(bundle: PluginBundleManifest) -> PluginManifest {
         skills: vec![],
         provider: None,
     }
+}
+
+/// The number of tools `id`'s embedded first-party bundle manifest declares
+/// (Task 1) — feeds `PluginInfo.tool_count`. `None` when `id` has no embedded
+/// manifest in [`COMPONENT_BUNDLE_MANIFESTS`] (e.g. a provider bundle
+/// represented by its builtin row, see [`COMPONENT_BACKED_PROVIDER_IDS`]) or
+/// its embedded TOML fails to parse.
+pub fn declared_tool_count(id: &str) -> Option<u32> {
+    COMPONENT_BUNDLE_MANIFESTS
+        .iter()
+        .find(|(got, _)| *got == id)
+        .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
+        .map(|m| m.tools.len() as u32)
+}
+
+/// The full declared-tool detail (name, description, writes) `id`'s embedded
+/// first-party bundle manifest declares (Task 1) — the same lookup
+/// [`declared_tool_count`] uses, but the tools themselves rather than just
+/// the count. Feeds `plugin_tools`' (Task 4) declared-manifest fallback.
+/// Empty (never an error) when `id` has no embedded manifest here or its
+/// embedded TOML fails to parse — same fallback `declared_tool_count` uses.
+pub fn declared_tools(id: &str) -> Vec<DeclaredTool> {
+    COMPONENT_BUNDLE_MANIFESTS
+        .iter()
+        .find(|(got, _)| *got == id)
+        .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
+        .map(|m| m.tools)
+        .unwrap_or_default()
 }
 
 /// Every embedded component bundle as a manifest-only plugin. A manifest that
@@ -238,5 +266,64 @@ mod tests {
                 "`{id}` cannot be both embedded and excluded"
             );
         }
+    }
+
+    // Every first-party connector/gateway manifest must declare the tools its
+    // component registers, with no duplicate names, so Cockpit can show "what
+    // you'll get" before the bundle is ever installed (Task 1).
+    #[test]
+    fn first_party_connector_manifests_declare_tools() {
+        for id in ["github", "atlassian", "bitbucket"] {
+            let (_, src) = COMPONENT_BUNDLE_MANIFESTS
+                .iter()
+                .find(|(got, _)| *got == id)
+                .unwrap_or_else(|| panic!("`{id}` must be an embedded component manifest"));
+            let m: PluginBundleManifest = toml::from_str(src)
+                .unwrap_or_else(|e| panic!("component manifest `{id}` failed to parse: {e}"));
+            assert!(!m.tools.is_empty(), "{id} must declare its tools");
+            let mut names: Vec<_> = m.tools.iter().map(|t| t.name.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), m.tools.len(), "{id} tool names must be unique");
+        }
+
+        // Discord is a gateway component with no agent-facing tools; slash commands are not tools.
+        let (_, src) = COMPONENT_BUNDLE_MANIFESTS
+            .iter()
+            .find(|(got, _)| *got == "discord")
+            .unwrap_or_else(|| panic!("`discord` must be an embedded component manifest"));
+        let m: PluginBundleManifest =
+            toml::from_str(src).unwrap_or_else(|e| panic!("discord manifest failed to parse: {e}"));
+        assert!(
+            m.tools.is_empty(),
+            "discord gateway must declare no agent tools"
+        );
+    }
+
+    // Task 3: `PluginInfo.tool_count` reads through this lookup for
+    // component-backed rows.
+    #[test]
+    fn declared_tool_count_matches_embedded_manifest_and_none_for_unknown_ids() {
+        assert_eq!(declared_tool_count("github"), Some(12));
+        assert_eq!(declared_tool_count("atlassian"), Some(10));
+        assert_eq!(declared_tool_count("bitbucket"), Some(9));
+        // Discord is a gateway component with no agent-facing tools.
+        assert_eq!(declared_tool_count("discord"), Some(0));
+        // No embedded manifest here (represented by its builtin provider row).
+        assert_eq!(declared_tool_count("anthropic"), None);
+        assert_eq!(declared_tool_count("nope"), None);
+    }
+
+    // Task 4: `plugin_tools`' declared-manifest fallback reads through this
+    // lookup for component-backed rows with no live extension/running
+    // instance.
+    #[test]
+    fn declared_tools_matches_the_embedded_manifest_and_is_empty_for_unknown_ids() {
+        assert_eq!(declared_tools("github").len(), 12);
+        assert_eq!(declared_tools("atlassian").len(), 10);
+        assert_eq!(declared_tools("bitbucket").len(), 9);
+        assert!(declared_tools("discord").is_empty());
+        assert!(declared_tools("anthropic").is_empty());
+        assert!(declared_tools("nope").is_empty());
     }
 }

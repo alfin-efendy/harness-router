@@ -1686,6 +1686,7 @@ mod gateway_impl_tests {
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
                 provider_ids: vec![],
+                tools: vec![],
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),

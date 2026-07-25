@@ -37,4 +37,16 @@ function MenuContent({
   );
 }
 
-export { Menu, MenuTrigger, MenuContent };
+function MenuItem({ className, ...props }: MenuPrimitive.Item.Props) {
+  return (
+    <MenuPrimitive.Item
+      className={cn(
+        "flex cursor-default select-none items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] outline-none data-[highlighted]:bg-accent",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+export { Menu, MenuTrigger, MenuContent, MenuItem };

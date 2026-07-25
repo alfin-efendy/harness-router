@@ -27,8 +27,8 @@ pub mod manifest;
 pub mod subst;
 
 pub use bundle::{
-    BundleError, NetworkPermission, OAuthProfile, PluginBundleManifest, PluginLifecycle,
-    PluginPermissions, PluginRelease,
+    BundleError, DeclaredTool, NetworkPermission, OAuthProfile, PluginBundleManifest,
+    PluginLifecycle, PluginPermissions, PluginRelease,
 };
 pub use manifest::{
     AuthKind, AuthSpec, ExtensionDef, FieldKind, ManifestError, McpServerDef, McpTransportDef,

@@ -58,6 +58,13 @@ pub struct PluginBundleManifest {
     /// credential.
     #[serde(default, rename = "provider-ids")]
     pub provider_ids: Vec<String>,
+    /// The tools this bundle's component exposes to agents, declared
+    /// statically so Cockpit can show "what you'll get" before the bundle is
+    /// ever downloaded (and as a fallback when the component isn't running).
+    /// Optional and empty by default: an existing manifest that omits it
+    /// keeps working.
+    #[serde(default)]
+    pub tools: Vec<DeclaredTool>,
 }
 
 /// How the host instances a bundle's component: one shared instance for
@@ -119,6 +126,16 @@ pub struct OAuthProfile {
     pub dynamic_registration: bool,
 }
 
+/// A tool the component exposes to agents, declared statically so Cockpit can
+/// show "what you'll get" before the bundle is ever downloaded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct DeclaredTool {
+    pub name: String,
+    pub description: String,
+    pub writes: bool,
+}
+
 /// A registry's release descriptor for a bundle: the concrete WIT API
 /// version it was built against, where to fetch the component, and its
 /// checksum. Served as JSON (unlike the TOML-authored
@@ -172,6 +189,10 @@ pub enum BundleError {
     DuplicateOAuthProfile(String),
     #[error("invalid provider id: {0:?}")]
     InvalidProviderId(String),
+    #[error("tool name must not be empty")]
+    EmptyToolName,
+    #[error("duplicate tool name: {0}")]
+    DuplicateTool(String),
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -245,7 +266,8 @@ impl PluginBundleManifest {
 
     /// Structural validation: id shape, required fields, `version` and
     /// `wit-api` semver parsing, non-empty `component`, a well-formed
-    /// network allowlist, and unique OAuth profile ids.
+    /// network allowlist, unique OAuth profile ids, and non-empty/unique
+    /// declared tool names.
     pub fn validate(&self) -> Result<(), BundleError> {
         if !is_valid_id(&self.id) {
             return Err(BundleError::InvalidId(self.id.clone()));
@@ -284,6 +306,16 @@ impl PluginBundleManifest {
         for provider_id in &self.provider_ids {
             if !is_valid_id(provider_id) {
                 return Err(BundleError::InvalidProviderId(provider_id.clone()));
+            }
+        }
+
+        let mut seen_tool_names: HashSet<&str> = HashSet::new();
+        for tool in &self.tools {
+            if tool.name.is_empty() {
+                return Err(BundleError::EmptyToolName);
+            }
+            if !seen_tool_names.insert(tool.name.as_str()) {
+                return Err(BundleError::DuplicateTool(tool.name.clone()));
             }
         }
 
@@ -916,5 +948,91 @@ network = ["{host}"]
         }"#;
         let err = PluginRelease::from_json(json).expect_err("invalid id should fail validation");
         assert!(matches!(err, BundleError::InvalidId(id) if id == "Acme Connector"));
+    }
+
+    #[test]
+    fn manifest_parses_declared_tools() {
+        let toml_str = r#"
+id = "test"
+name = "Test"
+version = "0.1.0"
+wit-api = "0.1.0"
+lifecycle = "singleton"
+component = "test.wasm"
+
+[[tools]]
+name = "create_issue"
+description = "Open an issue in a repository"
+writes = true
+
+[[tools]]
+name = "list_issues"
+description = "List issues"
+"#;
+        let m = PluginBundleManifest::from_toml(toml_str).unwrap();
+        assert_eq!(m.tools.len(), 2);
+        assert_eq!(m.tools[0].name, "create_issue");
+        assert!(m.tools[0].writes);
+        assert!(!m.tools[1].writes); // default false
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn manifest_without_tools_defaults_empty() {
+        // Reuses the same minimal-manifest fixture as
+        // `minimal_bundle_without_permissions_or_oauth_parses`.
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "per-session"
+component = "acme.wasm"
+"#;
+        let m = PluginBundleManifest::from_toml(toml_str).unwrap();
+        assert!(m.tools.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_tool_names() {
+        let toml_str = r#"
+id = "test"
+name = "Test"
+version = "0.1.0"
+wit-api = "0.1.0"
+lifecycle = "singleton"
+component = "test.wasm"
+
+[[tools]]
+name = "create_issue"
+description = "Open an issue in a repository"
+writes = true
+
+[[tools]]
+name = "create_issue"
+description = "Duplicate tool name"
+"#;
+        let err = PluginBundleManifest::from_toml(toml_str)
+            .expect_err("duplicate tool name should fail validation");
+        assert!(matches!(err, BundleError::DuplicateTool(name) if name == "create_issue"));
+    }
+
+    #[test]
+    fn rejects_empty_tool_name() {
+        let toml_str = r#"
+id = "test"
+name = "Test"
+version = "0.1.0"
+wit-api = "0.1.0"
+lifecycle = "singleton"
+component = "test.wasm"
+
+[[tools]]
+name = ""
+description = "Nameless tool"
+"#;
+        let err = PluginBundleManifest::from_toml(toml_str)
+            .expect_err("empty tool name should fail validation");
+        assert!(matches!(err, BundleError::EmptyToolName));
     }
 }
