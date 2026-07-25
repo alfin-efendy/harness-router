@@ -13,6 +13,10 @@ builds:
   - id: ryuzi
     builder: rust
     binary: ryuzi
+    # Stamped into crates/core's option_env!("RYUZI_RELEASE_TAG") so released
+    # binaries pin unversioned plugin fetches to this release's own tag.
+    env:
+      - RYUZI_RELEASE_TAG={{ .Tag }}
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
@@ -24,6 +28,10 @@ builds:
     builder: rust
     binary: ryuzi
     command: build # native cargo, NOT zigbuild — see header comment
+    # Stamped into crates/core's option_env!("RYUZI_RELEASE_TAG") so released
+    # binaries pin unversioned plugin fetches to this release's own tag.
+    env:
+      - RYUZI_RELEASE_TAG={{ .Tag }}
     targets:
       - x86_64-apple-darwin
       - aarch64-apple-darwin
@@ -34,6 +42,10 @@ builds:
   - id: ryuzi-musl
     builder: rust
     binary: ryuzi
+    # Stamped into crates/core's option_env!("RYUZI_RELEASE_TAG") so released
+    # binaries pin unversioned plugin fetches to this release's own tag.
+    env:
+      - RYUZI_RELEASE_TAG={{ .Tag }}
     targets:
       - x86_64-unknown-linux-musl
       - aarch64-unknown-linux-musl
