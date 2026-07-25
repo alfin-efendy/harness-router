@@ -506,6 +506,36 @@ impl RemoteCatalogManager {
 pub const DEFAULT_COMPONENT_RELEASE_BASE_URL: &str =
     "https://github.com/alfin-efendy/ryuzi/releases/latest/download";
 
+/// The GitHub release-download root pinned bases are derived from (no tag).
+const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/alfin-efendy/ryuzi/releases/download";
+
+/// The release tag CI stamps into official builds via the `RYUZI_RELEASE_TAG`
+/// compile-time env (the goreleaser CLI builds and the cockpit installer build
+/// both export the vX.Y.Z tag being released — see `.goreleaser.yaml` /
+/// `cockpit-release.yml`). `None` in dev and fork builds. The tag is STAMPED
+/// rather than derived from `CARGO_PKG_VERSION` because the release tag tracks
+/// `crates/runner`'s version — neither this crate's own version nor Cockpit's
+/// matches it.
+pub const BUILD_RELEASE_TAG: Option<&str> = option_env!("RYUZI_RELEASE_TAG");
+
+/// The default release base URL for one component fetch (the
+/// `component_release_base_url` setting overrides this at every call site).
+/// Pin + latest hybrid: unversioned fetches from a stamped build pin to this
+/// build's own release tag; versioned fetches (updates) and unstamped builds
+/// use the rolling `latest` URL. See `release_base_url_for` for the rule.
+pub fn default_component_release_base_url_for(version: Option<&str>) -> String {
+    release_base_url_for(BUILD_RELEASE_TAG, version)
+}
+
+/// Pure derivation seam for [`default_component_release_base_url_for`] —
+/// `option_env!` is compile-time, so tests drive this directly.
+fn release_base_url_for(build_tag: Option<&str>, version: Option<&str>) -> String {
+    match (version, build_tag) {
+        (None, Some(tag)) => format!("{RELEASE_DOWNLOAD_ROOT}/{tag}"),
+        _ => DEFAULT_COMPONENT_RELEASE_BASE_URL.to_string(),
+    }
+}
+
 /// Settings key that, once present, marks first-party component bootstrap as
 /// fully completed (every first-party bundle installed or already present).
 /// Mirrors `agents::bootstrap`'s `FREE_PROVIDERS_SEEDED_MARKER`: once set, a
@@ -1690,5 +1720,34 @@ mod tests {
         let visible: Vec<_> = rows.iter().filter(|r| !r.blocked).collect();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "good");
+    }
+
+    // Pin + latest hybrid: an unversioned fetch (bootstrap, first install,
+    // repair) from a stamped release build pins to that release's own
+    // immutable tag — the exact plugin builds shipped and tested with this app
+    // version. Everything else (explicit-version updates advertised by the
+    // catalog feed, unstamped dev/fork builds) stays on the rolling `latest`.
+    #[test]
+    fn release_base_url_pins_unversioned_fetches_to_the_stamped_tag() {
+        assert_eq!(
+            release_base_url_for(Some("v0.8.0"), None),
+            "https://github.com/alfin-efendy/ryuzi/releases/download/v0.8.0"
+        );
+    }
+
+    #[test]
+    fn release_base_url_uses_latest_for_versioned_or_unstamped_fetches() {
+        assert_eq!(
+            release_base_url_for(Some("v0.8.0"), Some("0.1.2")),
+            DEFAULT_COMPONENT_RELEASE_BASE_URL
+        );
+        assert_eq!(
+            release_base_url_for(None, None),
+            DEFAULT_COMPONENT_RELEASE_BASE_URL
+        );
+        assert_eq!(
+            release_base_url_for(None, Some("0.1.2")),
+            DEFAULT_COMPONENT_RELEASE_BASE_URL
+        );
     }
 }

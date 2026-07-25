@@ -2169,7 +2169,10 @@ async fn install_component_plugin(
         .await?
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL.to_string()
+            // Unversioned installs pin to this build's own release tag; an
+            // explicit version (the catalog-feed update flow) resolves its
+            // pinned stem against `latest`, where newer releases live.
+            crate::plugins::remote_catalog::default_component_release_base_url_for(version)
         });
     let http = crate::plugins::remote_catalog::ReqwestCatalogHttp::new();
     let installer = crate::plugins::bundle::ComponentBundleInstaller::new(

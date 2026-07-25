@@ -440,8 +440,9 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
                     .flatten()
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| {
-                        crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL
-                            .to_string()
+                        // Bootstrap installs are unversioned → pinned to this
+                        // build's own release tag when RYUZI_RELEASE_TAG is stamped.
+                        crate::plugins::remote_catalog::default_component_release_base_url_for(None)
                     }),
                 root: crate::plugins::bundle::installed_bundle_root(),
             },
