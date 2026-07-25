@@ -74,7 +74,9 @@ pub async fn global_command_list(
     runner_id: Option<String>,
 ) -> R<Vec<CommandFileInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client.rpc("global_command_list", serde_json::json!({})).await
+    client
+        .rpc("global_command_list", serde_json::json!({}))
+        .await
 }
 
 #[tauri::command]
@@ -99,7 +101,10 @@ pub async fn global_command_create(
 ) -> R<CommandFileInfo> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
-        .rpc("global_command_create", serde_json::json!({ "input": input }))
+        .rpc(
+            "global_command_create",
+            serde_json::json!({ "input": input }),
+        )
         .await
 }
 
