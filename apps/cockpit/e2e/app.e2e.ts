@@ -632,8 +632,13 @@ test("accounts: late quota cannot repopulate an unmounted provider and reload st
 test("agents: manage a non-default agent and start a chat session for it", async ({ page }) => {
   await page.goto("/");
   await page.getByText("Agents", { exact: true }).first().click();
-  await expect(page.getByText("Main Agent", { exact: true })).toBeVisible();
-  await expect(page.getByText("Sub Agent", { exact: true })).toBeVisible();
+  // Unified single list: no Main/Sub tabs; the built-in Fresh Agent row is
+  // pinned last with a "Built-in" badge and no actions kebab.
+  await expect(page.getByText("Main Agent", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Sub Agent", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Open Fresh Agent" })).toBeVisible();
+  await expect(page.getByText("Built-in", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Actions for Fresh Agent" })).toHaveCount(0);
 
   await page.getByRole("button", { name: "Open Reviewer" }).click();
   const tabs = page.getByTestId("agent-detail-tabs");

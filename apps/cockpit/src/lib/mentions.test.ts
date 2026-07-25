@@ -2,9 +2,10 @@ import { describe, expect, test } from "bun:test";
 import type { AgentMention } from "@/bindings";
 import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "./mentions";
 
-const ada = { id: "ada", name: "Ada", description: "Accessibility review", executable: true };
-const lin = { id: "lin", name: "Lin", description: "Systems planner", executable: true };
-const blocked = { id: "blocked", name: "Blocked", description: "Unavailable", executable: false };
+const ada = { id: "ada", name: "Ada", description: "Accessibility review", executable: true, builtin: false };
+const lin = { id: "lin", name: "Lin", description: "Systems planner", executable: true, builtin: false };
+const blocked = { id: "blocked", name: "Blocked", description: "Unavailable", executable: false, builtin: false };
+const fresh = { id: "fresh", name: "Fresh Agent", description: "Ephemeral worker", executable: true, builtin: true };
 
 function draft(text: string, mentions: AgentMention[] = []): MentionDraft {
   return { text, mentions };
@@ -82,5 +83,10 @@ describe("agent mention query and candidates", () => {
     expect(matchMentionAgents([ada, lin, blocked], "LI", "ada", mentioned)).toEqual([lin]);
     expect(matchMentionAgents([ada, lin, blocked], "review", "lin", mentioned)).toEqual([ada]);
     expect(matchMentionAgents([ada, lin, blocked], "", "lin", mentioned)).toEqual([ada]);
+  });
+
+  test("excludes built-in agents even when they are executable and match the query", () => {
+    expect(matchMentionAgents([ada, fresh], "", "lin", [])).toEqual([ada]);
+    expect(matchMentionAgents([ada, fresh], "fresh", "lin", [])).toEqual([]);
   });
 });

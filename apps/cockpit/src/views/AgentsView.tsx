@@ -1,8 +1,7 @@
 import { useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Plus } from "lucide-react";
-import { Badge, Button, Combobox, Segmented, SettingsCard } from "@ryuzi/ui";
+import { Badge, Button, SettingsCard, cn } from "@ryuzi/ui";
 import type { AgentModelInfo, AgentSummaryInfo } from "@/bindings";
-import { ModelPicker } from "@/components/ModelPicker";
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
 import { AgentEditorModal } from "@/components/agents/AgentEditorModal";
 import { useAgents } from "@/store-agents";
@@ -27,8 +26,11 @@ function modelLabel(model: AgentModelInfo): string {
 
 function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
   const nav = useNav();
+  // Built-in rows (the synthetic Fresh Agent) are non-editable: dashed frame,
+  // "Built-in" badge, no validation surface, and no actions menu. They still
+  // open a detail page like every other row.
   return (
-    <SettingsCard className="flex h-[92px] items-stretch">
+    <SettingsCard className={cn("flex h-[92px] items-stretch", agent.builtin && "border-dashed")}>
       <Button
         type="button"
         variant="ghost"
@@ -44,8 +46,9 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
             <span className="truncate text-[13.5px] font-semibold text-foreground">{agent.name}</span>
+            {agent.builtin && <Badge variant="outline">Built-in</Badge>}
             {agent.isDefault && <Badge variant="secondary">Default</Badge>}
-            {!agent.executable && (
+            {!agent.executable && !agent.builtin && (
               <Badge variant="destructive">
                 <AlertTriangle aria-hidden size={11} strokeWidth={2} /> Invalid
               </Badge>
@@ -62,89 +65,21 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
         </span>
         <ChevronRight aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
       </Button>
-      <span className="flex w-12 shrink-0 items-center justify-center border-l border-border">
-        <AgentActionsMenu agent={agent} />
-      </span>
+      {!agent.builtin && (
+        <span className="flex w-12 shrink-0 items-center justify-center border-l border-border">
+          <AgentActionsMenu agent={agent} />
+        </span>
+      )}
     </SettingsCard>
   );
 }
 
-function SubagentSettings() {
-  const registry = useAgents((s) => s.registry);
-  const models = useAgents((s) => s.models);
-  const saving = useAgents((s) => s.saving);
-  const selected = registry?.subagentModel;
-  const selectedValue = selected ? modelValue(selected) : "";
-  const selectedInfo = models.find((model) => model.requestValue === selectedValue) ?? null;
-  const effortOptions = selected?.kind === "concrete" ? (selectedInfo?.supported ?? []) : [];
-
-  const updateModel = (value: string) => {
-    const info = models.find((model) => model.requestValue === value);
-    const next: AgentModelInfo =
-      info?.kind === "namedRoute"
-        ? { kind: "route", route: value }
-        : {
-            kind: "concrete",
-            name: value,
-            effort:
-              selected?.kind === "concrete" && info?.supported.some((option) => option.value === selected.effort) ? selected.effort : null,
-          };
-    void useAgents.getState().updateSubagentModel(next);
-  };
-
-  return (
-    <div className="flex flex-col gap-3">
-      <p className="m-0 text-[13px] leading-5 text-muted-foreground">
-        Subagents are ephemeral, memoryless runtime workers. They share one model configuration and are created automatically for delegated
-        work.
-      </p>
-      <SettingsCard>
-        <div className="flex items-center gap-3 px-[18px] py-3.5">
-          <span className="w-[168px] shrink-0">
-            <span className="block text-[13px] font-medium">Shared model</span>
-            <span className="block text-[11px] text-muted-foreground">Used by every subagent</span>
-          </span>
-          <ModelPicker
-            ariaLabel="Shared subagent model"
-            variant="field"
-            models={models.map((model) => model.requestValue)}
-            value={selectedValue}
-            onValueChange={updateModel}
-            disabled={saving || models.length === 0}
-          />
-          {effortOptions.length > 0 && selected?.kind === "concrete" && (
-            <Combobox
-              aria-label="Shared subagent effort"
-              className="w-[170px]"
-              options={[
-                { value: "", label: "Model default" },
-                ...effortOptions.map((option) => ({
-                  value: option.value,
-                  label: option.label,
-                  description: option.description ?? undefined,
-                })),
-              ]}
-              value={selected.effort ?? ""}
-              onValueChange={(effort) =>
-                void useAgents.getState().updateSubagentModel({ ...selected, effort: effort === "" ? null : effort })
-              }
-              disabled={saving}
-            />
-          )}
-        </div>
-      </SettingsCard>
-      <p className="m-0 text-xs leading-5 text-muted-foreground">
-        Main agents own durable identity and knowledge. Subagents do not have profiles to create or edit.
-      </p>
-    </div>
-  );
-}
-
 export function AgentsView() {
-  const [tab, setTab] = useState<"main" | "sub">("main");
   const [createOpen, setCreateOpen] = useState(false);
   const registry = useAgents((s) => s.registry);
   const loading = useAgents((s) => s.loading);
+  // The registry appends the built-in Fresh Agent row last — render in order,
+  // no re-sorting here.
   const agents = useMemo(() => registry?.agents ?? [], [registry]);
 
   return (
@@ -153,34 +88,18 @@ export function AgentsView() {
         <div className="mb-5 flex min-h-10 items-start gap-3">
           <div className="min-w-0 flex-1">
             <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Agents</h2>
-            <p className="m-0 text-[13px] text-muted-foreground">Manage durable main agents and shared subagent runtime defaults.</p>
+            <p className="m-0 text-[13px] text-muted-foreground">Manage the agents available in this workspace.</p>
           </div>
-          {tab === "main" && (
-            <Button onClick={() => setCreateOpen(true)} aria-label="New agent" className="shrink-0">
-              <Plus aria-hidden size={14} strokeWidth={2} /> New agent
-            </Button>
-          )}
+          <Button onClick={() => setCreateOpen(true)} aria-label="New agent" className="shrink-0">
+            <Plus aria-hidden size={14} strokeWidth={2} /> New agent
+          </Button>
         </div>
-        <div className="mb-4">
-          <Segmented
-            options={[
-              { id: "main", label: "Main Agent" },
-              { id: "sub", label: "Sub Agent" },
-            ]}
-            value={tab}
-            onChange={setTab}
-          />
+        <div className="flex flex-col gap-2.5">
+          {agents.map((agent) => (
+            <AgentRow key={agent.id} agent={agent} />
+          ))}
+          {!loading && agents.length === 0 && <p className="py-8 text-center text-[13px] text-muted-foreground">No agents found.</p>}
         </div>
-        {tab === "main" ? (
-          <div className="flex flex-col gap-2.5">
-            {agents.map((agent) => (
-              <AgentRow key={agent.id} agent={agent} />
-            ))}
-            {!loading && agents.length === 0 && <p className="py-8 text-center text-[13px] text-muted-foreground">No agents found.</p>}
-          </div>
-        ) : (
-          <SubagentSettings />
-        )}
       </div>
       <AgentEditorModal open={createOpen} onClose={() => setCreateOpen(false)} />
     </div>
