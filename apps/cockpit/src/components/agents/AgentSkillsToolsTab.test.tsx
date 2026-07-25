@@ -47,7 +47,7 @@ const reviewerDetail: AgentDetailInfo = {
     description: "Reviews implementation quality.",
     avatarColor: "violet",
     model: { kind: "route", route: "free" },
-    permissionMode: "ask",
+    builtin: false,
     skillCount: 1,
     toolCount: 3,
     knowledgeCount: 0,
@@ -57,7 +57,11 @@ const reviewerDetail: AgentDetailInfo = {
   },
   permissionRules: [],
   skills: ["requesting-code-review"],
-  nativeTools: ["read", "grep", "bash"],
+  nativeTools: [
+    { tool: "read", decision: "allow" },
+    { tool: "grep", decision: "allow" },
+    { tool: "bash", decision: "allow" },
+  ],
   pluginTools: [],
   apps: [],
   modelInfo: null,
@@ -98,17 +102,14 @@ test("catalog selection has no free-text Stable ID placeholders", async () => {
   await waitFor(() => expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy());
   expect(screen.queryByPlaceholderText(/Stable .* ID/)).toBeNull();
   await choose("Skill catalog", "Systematic debugging");
-  await choose("Native tool catalog", "Glob");
   await choose("Plugin tool catalog", "GitHub");
   await waitFor(() => expect(screen.getByText("systematic-debugging")).toBeTruthy());
-  expect(screen.getByText("glob")).toBeTruthy();
   expect(screen.getAllByText("github").length).toBeGreaterThan(0);
 });
 
 test("capability selections save a complete mutation with catalog IDs", async () => {
   render(<AgentSkillsToolsTab detail={reviewerDetail} />);
   await choose("Skill catalog", "Systematic debugging");
-  await choose("Native tool catalog", "Glob");
   await choose("Plugin tool catalog", "GitHub");
   await choose("App catalog", "GitHub");
   fireEvent.click(screen.getByRole("button", { name: "Save skills and tools" }));
@@ -117,7 +118,6 @@ test("capability selections save a complete mutation with catalog IDs", async ()
     "reviewer",
     expect.objectContaining({
       skills: ["requesting-code-review", "systematic-debugging"],
-      nativeTools: ["read", "grep", "bash", "glob"],
       pluginTools: ["github"],
       apps: ["github"],
     }),
@@ -134,16 +134,6 @@ test("catalog options exclude selected IDs and removals are explicit", async () 
   fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
   fireEvent.click(screen.getByRole("button", { name: "Remove skill requesting-code-review" }));
   expect(screen.queryByText("requesting-code-review")).toBeNull();
-});
-
-test("an unavailable saved native tool remains visible and disables Save", async () => {
-  render(<AgentSkillsToolsTab detail={{ ...reviewerDetail, nativeTools: ["read", "retired-native-tool"] }} />);
-
-  await waitFor(() => expect(screen.getByText("retired-native-tool")).toBeTruthy());
-  expect(screen.getByText("Unavailable")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Save skills and tools" }).hasAttribute("disabled")).toBe(true);
-  fireEvent.click(screen.getByRole("button", { name: "Remove unavailable native tool retired-native-tool" }));
-  expect(screen.queryByText("retired-native-tool")).toBeNull();
 });
 
 test("missing saved apps remain removable and disable Save", async () => {

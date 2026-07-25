@@ -20,7 +20,6 @@ function initialMutation(registry: AgentRegistryInfo): AgentMutationInfo {
     avatarColor: "violet",
     model: registry.subagentModel,
     personality: { preset: "helpful", custom: null },
-    permissionMode: "ask",
     permissionRules: [],
     skills: [],
     nativeTools: [],

@@ -212,7 +212,7 @@ beforeEach(() => {
           description: "",
           avatarColor: "violet",
           model: { kind: "route", route: "free" },
-          permissionMode: "ask",
+          builtin: false,
           skillCount: 0,
           toolCount: 0,
           knowledgeCount: 0,

@@ -19,7 +19,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     description: "",
     avatarColor: "violet",
     model: route("free"),
-    permissionMode: "ask",
+    builtin: false,
     skillCount: 0,
     toolCount: 0,
     knowledgeCount: 0,
@@ -61,7 +61,6 @@ function detail(input: AgentMutationInfo): AgentDetailInfo {
       description: input.description,
       avatarColor: input.avatarColor,
       model: input.model,
-      permissionMode: input.permissionMode,
     }),
     permissionRules: input.permissionRules,
     skills: input.skills,
@@ -131,7 +130,6 @@ test("Main Agent tab renders roster metadata and opens dedicated detail", () => 
   expect(screen.getByRole("button", { name: "Sub Agent" })).toBeTruthy();
   expect(screen.getByText("Reviews implementation quality and regressions.")).toBeTruthy();
   expect(screen.getAllByText("free").length).toBeGreaterThan(0);
-  expect(screen.getAllByText("Ask").length).toBeGreaterThan(0);
   expect(screen.getByText("1 skill · 3 tools")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Open Reviewer" }));
   expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" });
@@ -172,7 +170,6 @@ test("create modal sends the complete initial mutation and opens the new detail"
       avatarColor: "violet",
       model: route("free"),
       personality: { preset: "helpful", custom: null },
-      permissionMode: "ask",
       permissionRules: [],
       skills: [],
       nativeTools: [],

@@ -317,7 +317,7 @@ export const RYUZI_AGENT = {
   description: "General-purpose coding agent",
   avatarColor: "violet",
   model: { kind: "concrete", name: "fixture/model-alpha", effort: "high" },
-  permissionMode: "ask",
+  builtin: false,
   skillCount: 1,
   toolCount: 4,
   knowledgeCount: 1,
@@ -332,7 +332,7 @@ export const REVIEWER_AGENT = {
   description: "Reviews implementation quality and regressions",
   avatarColor: "amber",
   model: { kind: "route", route: "safe" },
-  permissionMode: "ask",
+  builtin: false,
   skillCount: 1,
   toolCount: 4,
   knowledgeCount: 1,
@@ -341,8 +341,26 @@ export const REVIEWER_AGENT = {
   isDefault: false,
 } satisfies AgentSummaryInfo;
 
+/** The synthetic, non-editable Fresh Agent row — mirrors the backend's
+ * `fresh_agent_summary`/`fresh_agent_detail` (crates/core/src/api/agent_api.rs):
+ * always appended LAST to the registry, model-only detail, never mutable. */
+export const FRESH_AGENT = {
+  id: "fresh",
+  name: "Fresh Agent",
+  description: "Ephemeral, memoryless worker dispatched for delegated tasks.",
+  avatarColor: "slate",
+  model: { kind: "route", route: "smart" },
+  builtin: true,
+  skillCount: 0,
+  toolCount: 0,
+  knowledgeCount: 0,
+  executable: true,
+  validation: [],
+  isDefault: false,
+} satisfies AgentSummaryInfo;
+
 const AGENT_REGISTRY = {
-  agents: [RYUZI_AGENT, REVIEWER_AGENT],
+  agents: [RYUZI_AGENT, REVIEWER_AGENT, FRESH_AGENT],
   defaultAgentId: RYUZI_AGENT.id,
   recovery: [],
   subagentModel: { kind: "route", route: "smart" },
@@ -353,14 +371,17 @@ const AGENT_REGISTRY = {
  * the live roster (session-primary.ts's "deleted" branch). */
 export const REGISTRY_WITHOUT_REVIEWER = {
   ...AGENT_REGISTRY,
-  agents: [RYUZI_AGENT],
+  agents: [RYUZI_AGENT, FRESH_AGENT],
 } satisfies AgentRegistryInfo;
 
 export const RYUZI_DETAIL = {
   summary: RYUZI_AGENT,
   permissionRules: [],
   skills: ["general-coding"],
-  nativeTools: ["read_file", "grep"],
+  nativeTools: [
+    { tool: "read_file", decision: "allow" },
+    { tool: "grep", decision: "allow" },
+  ],
   pluginTools: [],
   apps: [],
   modelInfo: null,
@@ -371,7 +392,24 @@ export const REVIEWER_DETAIL = {
   summary: REVIEWER_AGENT,
   permissionRules: [],
   skills: ["code-review"],
-  nativeTools: ["read_file", "grep"],
+  nativeTools: [
+    { tool: "read_file", decision: "allow" },
+    { tool: "grep", decision: "allow" },
+  ],
+  pluginTools: [],
+  apps: [],
+  modelInfo: null,
+  personality: { preset: "helpful", custom: null },
+} satisfies AgentDetailInfo;
+
+/** `get_agent("fresh")`'s detail: everything but the summary/model is empty
+ * so the frontend renders a model-only view — mirrors the backend's
+ * `fresh_agent_detail`. */
+export const FRESH_AGENT_DETAIL = {
+  summary: FRESH_AGENT,
+  permissionRules: [],
+  skills: [],
+  nativeTools: [],
   pluginTools: [],
   apps: [],
   modelInfo: null,
@@ -384,6 +422,7 @@ export const REVIEWER_DETAIL = {
 const AGENT_DETAILS: Record<string, AgentDetailInfo> = {
   ryuzi: RYUZI_DETAIL,
   reviewer: REVIEWER_DETAIL,
+  fresh: FRESH_AGENT_DETAIL,
 };
 
 const EMPTY_AGENT_RUN_ROSTER: AgentRunRosterInfo = { rootRunId: null, runs: [] };

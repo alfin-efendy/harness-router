@@ -12,7 +12,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     description: "",
     avatarColor: "violet",
     model: route("free"),
-    permissionMode: "ask",
+    builtin: false,
     skillCount: 0,
     toolCount: 0,
     knowledgeCount: 0,

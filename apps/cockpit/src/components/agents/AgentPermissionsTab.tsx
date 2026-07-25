@@ -6,13 +6,6 @@ import { useAgents } from "@/store-agents";
 import { useAgentConfigurationCatalog } from "@/store-agent-catalog";
 import { mutationFromDetail } from "./agentMutation";
 
-const MODES = [
-  { value: "ask", label: "Ask" },
-  { value: "accept_edits", label: "Accept edits" },
-  { value: "full", label: "Full access" },
-  { value: "plan", label: "Plan only" },
-];
-
 const DECISIONS = [
   { value: "allow", label: "Allow" },
   { value: "ask", label: "Ask" },
@@ -27,7 +20,6 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
   const saving = useAgents((state) => state.saving);
   const catalog = useAgentConfigurationCatalog((state) => state.catalog);
   const loadCatalog = useAgentConfigurationCatalog((state) => state.load);
-  const [mode, setMode] = useState(detail.summary.permissionMode);
   const [rules, setRules] = useState<PermissionRuleInfo[]>(detail.permissionRules);
 
   useEffect(() => {
@@ -35,7 +27,6 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
   }, [loadCatalog]);
 
   useEffect(() => {
-    setMode(detail.summary.permissionMode);
     setRules(detail.permissionRules);
   }, [detail]);
 
@@ -63,25 +54,6 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
 
   return (
     <div className="flex flex-col gap-3">
-      <SettingsCard>
-        <div className="border-b border-border px-[18px] py-3.5">
-          <SettingsCardTitle>Permission mode</SettingsCardTitle>
-        </div>
-        <SettingsCardRow className="gap-4">
-          <span className="min-w-0 flex-1">
-            <span className="block text-[13px] font-medium">Default behavior</span>
-            <span className="block text-[11px] text-muted-foreground">Applied when no explicit rule matches.</span>
-          </span>
-          <Combobox
-            aria-label="Permission mode"
-            className="w-[190px]"
-            options={MODES}
-            value={mode}
-            onValueChange={setMode}
-            disabled={saving}
-          />
-        </SettingsCardRow>
-      </SettingsCard>
       <SettingsCard>
         <div className="flex items-center border-b border-border px-[18px] py-3">
           <span className="flex-1">
@@ -166,7 +138,6 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
             onClick={() =>
               void useAgents.getState().update(detail.summary.id, {
                 ...mutationFromDetail(detail),
-                permissionMode: mode,
                 permissionRules: rules.map((rule) => ({
                   ...rule,
                   tool: rule.tool.trim(),

@@ -25,19 +25,6 @@ function modelLabel(model: AgentModelInfo): string {
   return modelValue(model);
 }
 
-function permissionLabel(mode: string): string {
-  switch (mode) {
-    case "accept_edits":
-      return "Edit";
-    case "full":
-      return "Full";
-    case "plan":
-      return "Plan";
-    default:
-      return "Ask";
-  }
-}
-
 function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
   const nav = useNav();
   return (
@@ -67,9 +54,6 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
           <span className="mt-1 block truncate text-xs text-muted-foreground">{agent.description}</span>
           <span className="mt-1.5 flex items-center gap-2.5 text-[11px] text-muted-foreground">
             <span className="font-mono text-foreground">{modelLabel(agent.model)}</span>
-            <Badge variant="outline" className="h-[18px] px-1.5 text-[10px]">
-              {permissionLabel(agent.permissionMode)}
-            </Badge>
             <span>
               {agent.skillCount} {agent.skillCount === 1 ? "skill" : "skills"} · {agent.toolCount}{" "}
               {agent.toolCount === 1 ? "tool" : "tools"}

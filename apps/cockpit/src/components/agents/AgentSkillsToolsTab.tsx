@@ -75,7 +75,6 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
   const catalogError = useAgentConfigurationCatalog((state) => state.error);
   const loadCatalog = useAgentConfigurationCatalog((state) => state.load);
   const [skills, setSkills] = useState(detail.skills);
-  const [nativeTools, setNativeTools] = useState(detail.nativeTools);
   const [pluginTools, setPluginTools] = useState(detail.pluginTools);
   const [apps, setApps] = useState(detail.apps);
 
@@ -85,7 +84,6 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
 
   useEffect(() => {
     setSkills(detail.skills);
-    setNativeTools(detail.nativeTools);
     setPluginTools(detail.pluginTools);
     setApps(detail.apps);
   }, [detail]);
@@ -101,7 +99,6 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
     catalog !== null &&
     [
       [skills, catalog.skills],
-      [nativeTools, catalog.nativeTools],
       [pluginTools, catalog.pluginTools],
       [apps, catalog.apps],
     ].some(([values, entries]) =>
@@ -128,14 +125,6 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
   return (
     <div className="flex flex-col gap-3">
       <CatalogIdGroup title="Skills" singular="skill" values={skills} catalog={catalog?.skills} saving={saving} onChange={setSkills} />
-      <CatalogIdGroup
-        title="Native tools"
-        singular="native tool"
-        values={nativeTools}
-        catalog={catalog?.nativeTools}
-        saving={saving}
-        onChange={setNativeTools}
-      />
       <CatalogIdGroup
         title="Plugin tools"
         singular="plugin tool"
@@ -208,7 +197,6 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
             void useAgents.getState().update(detail.summary.id, {
               ...mutationFromDetail(detail),
               skills,
-              nativeTools,
               pluginTools,
               apps,
             })

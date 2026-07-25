@@ -66,7 +66,6 @@ function patchRosterFields(registry: AgentRegistryInfo, agentId: string, input: 
             description: input.description,
             avatarColor: input.avatarColor,
             model: input.model,
-            permissionMode: input.permissionMode,
           }
         : agent,
     ),
@@ -249,7 +248,6 @@ export const useAgents = create<AgentsState>((set, get) => {
                   description: input.description,
                   avatarColor: input.avatarColor,
                   model: input.model,
-                  permissionMode: input.permissionMode,
                 },
                 permissionRules: input.permissionRules,
                 skills: input.skills,
