@@ -461,6 +461,12 @@ fn global_command_root(create: bool) -> Result<Option<PathBuf>, CommandFileError
                 return Ok(None);
             }
             std::fs::create_dir_all(&dir)?;
+            let metadata = std::fs::symlink_metadata(&dir)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(CommandFileError::InvalidName(
+                    "global commands directory must be a real directory".into(),
+                ));
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -489,7 +495,12 @@ pub fn write_global_command(
     input: ProjectCommandInput,
     expected_revision: Option<&str>,
 ) -> Result<ProjectCommandRead, CommandFileError> {
-    let root = global_command_root(true)?.expect("global command root was created");
+    let Some(root) = global_command_root(true)? else {
+        return Err(CommandFileError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory for global commands",
+        )));
+    };
     write_command_at(&root, input, expected_revision)
 }
 
@@ -889,6 +900,32 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_command_at_rejects_a_symlinked_subdirectory() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), root.join("review")).unwrap();
+
+        let input = ProjectCommandInput {
+            name: "review/security".into(),
+            description: "Security review".into(),
+            template: "Review $ARGUMENTS".into(),
+            agent: None,
+            model: None,
+            subtask: false,
+        };
+        let error = write_command_at(&root, input, None).unwrap_err();
+        assert!(matches!(error, CommandFileError::InvalidName(_)));
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "writing through a symlinked subdirectory must not create files outside the root"
+        );
+    }
+
     #[test]
     fn reads_nested_command_and_optional_model_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -1030,6 +1067,9 @@ mod tests {
         let created = write_command_at(&root, input.clone(), None).unwrap();
         assert_eq!(created.revision.len(), 64);
         assert_eq!(created.name, "review/security");
+        assert_eq!(created.agent.as_deref(), Some("plan"));
+        assert_eq!(created.model.as_deref(), Some("openai/gpt-4.1"));
+        assert!(created.subtask);
 
         let error = write_command_at(
             &root,
