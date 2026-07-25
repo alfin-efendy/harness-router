@@ -1336,15 +1336,15 @@ fetched and verified by `ComponentBundleInstaller`/`install_component_release`
 mirrors the [remote catalog](#remote-catalog)'s feed-signing design one
 layer down, with its own independent trusted-signing key
 (`FIRST_PARTY_KEY_ID` in `crates/core/src/plugins/first_party_key.rs`,
-looked up via `first_party_trusted_keys()`). That key goes live with the
-activation release (see [Release pipeline & key
-rollout](#release-pipeline--key-rollout) below): installs are live via the
-release pipeline, and any first-party component — `mimo`, `opencode`, or any
-connector/gateway — can actually be installed in a real deployment. Until a
-build carries a rotated-in key, `first_party_trusted_keys()` returns an
-EMPTY map and `verify_bundle` trusts nothing — the same deliberate
-fail-closed default the [remote catalog's feed key](#signing) uses, not a
-bug.
+looked up via `first_party_trusted_keys()`). Component installs go live
+with the activation release — the release pipeline described in
+[Release pipeline & key rollout](#release-pipeline--key-rollout) — at which
+point any first-party component (`mimo`, `opencode`, or any
+connector/gateway) can actually be installed in a real deployment. Until a
+build carries the real key, `first_party_trusted_keys()` returns an EMPTY
+map and `verify_bundle` trusts nothing, so nothing installs — the same
+deliberate fail-closed default the [remote catalog's feed key](#signing)
+uses, not a bug.
 
 Two further gaps between "the generic machinery exists and is tested" and
 "a user can turn this on today":
@@ -1694,16 +1694,16 @@ key **compiled into the binary**
 never ships anywhere — it lives only as the `CATALOG_FEED_PRIVATE_KEY` CI
 secret, consumed by the publish tooling below.
 
-`CATALOG_FEED_PUBKEY` went live with the activation release; see
+`CATALOG_FEED_PUBKEY` goes live with the activation release; see
 [Release pipeline & key rollout](#release-pipeline--key-rollout) below for
-the rollout mechanics and how a later rotation works. Before activation it
-shipped as the **all-zero placeholder** (`[0u8; 32]`) — a valid *low-order*
+the rollout mechanics and how a later rotation works. Until then it ships
+as the **all-zero placeholder** (`[0u8; 32]`) — a valid *low-order*
 ed25519 point that a non-strict verify could be tricked into accepting a
 forged signature against — so the engine rejects it two ways, defense in
-depth that stays in place regardless of which key is live: an explicit
+depth that stays in place regardless of which key ships: an explicit
 all-zero guard **plus** `verify_strict` (which rejects low-order keys and
-non-canonical signatures). While a placeholder key is active, every fetch is
-rejected (`CatalogFeedError::BadSignature`) and the remote catalog fails
+non-canonical signatures). While a placeholder key is in place, every fetch
+is rejected (`CatalogFeedError::BadSignature`) and the remote catalog fails
 closed; the embedded catalog still loads normally either way.
 
 Bun's WebCrypto (`crypto.subtle`, algorithm `"Ed25519"`) is what both
