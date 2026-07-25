@@ -790,8 +790,18 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
             crate::domain::PermMode::AcceptEdits
         );
         assert_eq!(primary_turns[0].allowed_skills, None);
-        assert!(primary_turns[0].agent_tools.tools.allows("read"));
-        assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
+        // FakeSession::refresh_primary_turn records the PrimaryTurnConfig as
+        // built by primary_turn_config (adapt_primary_profile's output)
+        // verbatim, unlike the real NativeHarness which rebuilds agent_tools
+        // against the live tool registry before use. adapt_primary_profile
+        // is now registry-blind by design and emits a fail-closed
+        // placeholder (see harness/native/mod.rs); the live-registry rebuild
+        // path is covered separately by
+        // refresh_primary_turn_rebuilds_bindings_against_live_registry.
+        assert_eq!(
+            primary_turns[0].agent_tools.tools,
+            crate::harness::native::agents::ToolFilter::Only(Vec::new())
+        );
         assert_eq!(primary_turns[0].run_id, run_id);
         assert_eq!(primary_turns[0].root_run_id, run_id);
     }

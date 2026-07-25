@@ -111,11 +111,6 @@ fn tool_filter_for_profile(
 fn adapt_primary_profile(
     profile: &crate::agents::types::AgentProfile,
 ) -> anyhow::Result<AdaptedPrimary> {
-    let tools = if profile.tools.native.is_empty() {
-        agents::ToolFilter::All
-    } else {
-        agents::ToolFilter::Only(profile.tools.native.clone())
-    };
     Ok(AdaptedPrimary {
         agent: agents::Agent {
             name: profile.id.clone(),
@@ -123,7 +118,14 @@ fn adapt_primary_profile(
             mode: agents::AgentMode::Primary,
             prompt: None,
             identity_prompt: Some(profile.personality.prompt()?.to_owned()),
-            tools,
+            // Fail-closed placeholder: a registry-blind config cannot express
+            // the profile's plugin/app bindings, so every consumer that
+            // reaches a model rebuilds this against the live registry via
+            // `tool_filter_for_profile` (`primary_turn_config_with_tools` at
+            // session/dispatch build time, `refresh_primary_turn` at prompt
+            // time). If a new consumer forgets, every tool is blocked —
+            // loudly visible — instead of silently overgranting.
+            tools: agents::ToolFilter::Only(Vec::new()),
             permission_rules: profile.permissions.rules.clone(),
             can_delegate: false,
             builtin: false,
@@ -892,25 +894,30 @@ mod tests {
     }
 
     #[test]
-    fn durable_primary_adapter_uses_the_profile_id_and_native_tools() {
+    fn durable_primary_adapter_uses_the_profile_id_and_a_fail_closed_tool_placeholder() {
         let profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
         let adapted = adapt_primary_profile(&profile).unwrap();
 
         assert_eq!(adapted.agent.name, "ryuzi");
-        assert!(adapted.agent.tools.allows("bash"));
+        // adapt_primary_profile is registry-blind, so it can no longer derive
+        // a real filter from profile.tools.native; it emits the fail-closed
+        // placeholder and leaves rebuilding to tool_filter_for_profile.
+        assert_eq!(adapted.agent.tools, agents::ToolFilter::Only(Vec::new()));
         assert_eq!(adapted.allowed_skills, None);
     }
 
     #[test]
-    fn durable_primary_adapter_filters_profile_tools_and_skills_without_build_fallback() {
+    fn durable_primary_adapter_still_filters_skills_without_build_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
         profile.tools.native = vec!["read".into()];
         profile.skills = vec!["release".into()];
         let adapted = adapt_primary_profile(&profile).unwrap();
 
         assert_eq!(adapted.agent.name, "ryuzi");
-        assert!(adapted.agent.tools.allows("read"));
-        assert!(!adapted.agent.tools.allows("bash"));
+        // Tools are always the fail-closed placeholder regardless of
+        // profile.tools.native; only the registry-independent skills mapping
+        // is exercised here.
+        assert_eq!(adapted.agent.tools, agents::ToolFilter::Only(Vec::new()));
         assert_eq!(adapted.allowed_skills, Some(vec!["release".into()]));
     }
 
