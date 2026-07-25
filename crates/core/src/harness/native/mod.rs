@@ -614,12 +614,20 @@ impl HarnessSession for NativeSession {
         // `RunnerDeps` snapshot until it completes.
         let _turn = self.turn_lock.lock().await;
         let mut deps = self.deps.lock().unwrap();
+        // The control plane builds this config registry-blind (it has no tool
+        // registry), so its ToolFilter cannot express plugin/app bindings.
+        // Rebuild the filter against the live registry — the same resolution
+        // `start_session` uses — so bound plugin/app tools survive every
+        // follow-up prompt instead of collapsing to All (natives empty) or
+        // Only(natives) (natives set).
+        let mut agent_tools = primary.agent_tools;
+        agent_tools.tools = tool_filter_for_profile(&primary.agent.profile, &deps.tools.names());
         deps.primary_agent = primary.agent;
         deps.run_id = primary.run_id;
         deps.root_run_id = primary.root_run_id;
         deps.model = primary.model;
         deps.perm_mode = Arc::new(std::sync::Mutex::new(primary.perm_mode));
-        deps.agent = primary.agent_tools;
+        deps.agent = agent_tools;
         deps.allowed_skills = primary.allowed_skills;
     }
 
@@ -1034,6 +1042,80 @@ mod tests {
         assert!(
             advertised.is_empty(),
             "unattached configured tools must not overgrant native tools: {advertised:?}"
+        );
+    }
+
+    /// A plugin/app-only profile (no natives bound) must keep advertising ZERO
+    /// native tools on the SECOND prompt. The control plane refreshes every
+    /// follow-up prompt with a registry-blind config (`PrimaryTurn::config()`
+    /// → `refresh_primary_turn`); before the fix that clobbered the filter to
+    /// `ToolFilter::All` and advertised the whole native registry.
+    #[tokio::test]
+    async fn refresh_primary_turn_rebuilds_bindings_against_live_registry() {
+        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let profile_db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(profile_db.path()).await.unwrap());
+        let mut ctx = ctx_for(store, work_dir.path().to_path_buf()).await;
+        let mut primary = (*ctx.primary_agent).clone();
+        primary.profile.id = "plugin-app-only".into();
+        primary.profile.tools.native.clear();
+        primary.profile.tools.plugins = vec!["github.search".into()];
+        primary.profile.tools.apps = vec!["slack".into()];
+        ctx.primary_agent = Arc::new(primary);
+        ctx.main_agent_id = "plugin-app-only".into();
+        ctx.isolated_target = true;
+        let refresh_agent = ctx.primary_agent.clone();
+        let run_id = ctx.run_id.clone();
+        let root_run_id = ctx.root_run_id.clone();
+
+        let turn = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![turn.clone(), turn]));
+        struct TwoTurnFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for TwoTurnFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let harness = NativeHarness::with_llm_factory(Arc::new(TwoTurnFactory(llm.clone())));
+        let session = harness.start_session(ctx).await.unwrap();
+        session
+            .send_prompt(TurnPrompt::text("first", "first"))
+            .await
+            .unwrap();
+
+        // Exactly what `continue_session_with_primary_turn` does per prompt:
+        // build a registry-blind config and push it at the live session.
+        let registry_blind = primary_turn_config(refresh_agent, run_id, root_run_id).unwrap();
+        session.refresh_primary_turn(registry_blind).await;
+        session
+            .send_prompt(TurnPrompt::text("second", "second"))
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let advertised = |i: usize| -> Vec<String> {
+            bodies[i]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        assert!(
+            advertised(0).is_empty(),
+            "start-path guard (already correct today): {:?}",
+            advertised(0)
+        );
+        assert!(
+            advertised(1).is_empty(),
+            "a prompt-time refresh must not clobber plugin/app bindings into ToolFilter::All: {:?}",
+            advertised(1)
         );
     }
 
