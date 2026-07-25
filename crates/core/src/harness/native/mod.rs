@@ -1127,11 +1127,13 @@ mod tests {
     }
 
     /// The positive direction of the refresh fix: a BOUND plugin tool that is
-    /// live in the registry must still be advertised on the second prompt.
-    /// Task 1's test alone would pass under a wrong fix that collapses the
-    /// refresh filter to `Only(natives)`; this one fails under both that and
-    /// the original `All` clobber. `#[cfg(unix)]`: the fake extension is an
-    /// `sh -c` subprocess, like the DT6 extension test above.
+    /// live in the registry must still be advertised on the second prompt,
+    /// alongside a non-empty native tool list (the two `tools.native` shapes
+    /// the design spec calls out: empty and populated). Task 1's test alone
+    /// would pass under a wrong fix that collapses the refresh filter to
+    /// `Only(natives)`; this one fails under both that and the original
+    /// `All` clobber. `#[cfg(unix)]`: the fake extension is an `sh -c`
+    /// subprocess, like the DT6 extension test above.
     #[cfg(unix)]
     #[tokio::test]
     async fn refresh_primary_turn_keeps_bound_plugin_tools_advertised() {
@@ -1141,6 +1143,7 @@ mod tests {
         use crate::plugins::host::PluginHost;
         use crate::settings::SettingsStore;
         use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+        use std::collections::BTreeSet;
         use std::time::Duration;
 
         struct FakeExtFactory {
@@ -1216,7 +1219,7 @@ mod tests {
         let mut primary = (*ctx.primary_agent).clone();
         primary.profile.id = "plugin-bound-target".into();
         primary.profile.name = "Plugin bound target".into();
-        primary.profile.tools.native.clear();
+        primary.profile.tools.native = vec!["read".into()];
         primary.profile.tools.plugins = vec!["github.search".into()];
         ctx.primary_agent = Arc::new(primary);
         ctx.main_agent_id = "plugin-bound-target".into();
@@ -1250,25 +1253,27 @@ mod tests {
             .await
             .unwrap();
 
-        let bodies = llm.bodies.lock().unwrap();
-        let advertised = |i: usize| -> Vec<String> {
-            bodies[i]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
-                .collect()
-        };
-        assert_eq!(
-            advertised(0),
-            vec!["ext__github__search".to_string()],
-            "start-path guard"
-        );
-        assert_eq!(
-            advertised(1),
-            vec!["ext__github__search".to_string()],
-            "a bound plugin tool must survive the prompt-time refresh"
-        );
+        let expected: BTreeSet<String> = ["read", "ext__github__search"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        {
+            let bodies = llm.bodies.lock().unwrap();
+            let advertised = |i: usize| -> BTreeSet<String> {
+                bodies[i]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                    .collect()
+            };
+            assert_eq!(advertised(0), expected, "start-path guard");
+            assert_eq!(
+                advertised(1),
+                expected,
+                "a bound plugin tool and a bound native tool must both survive the prompt-time refresh"
+            );
+        }
 
         ext_host.shutdown_all(Duration::from_millis(200)).await;
     }
