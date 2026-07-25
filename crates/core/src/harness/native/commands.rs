@@ -193,12 +193,20 @@ impl CommandRegistry {
         let global = dirs::home_dir()
             .map(|home| home.join(".config/ryuzi/commands"))
             .unwrap_or_default();
-        Self::load_from_dirs(work_dir, &global)
+        Self::load_from_dirs(Some(work_dir), &global)
     }
 
-    pub(crate) fn load_from_dirs(work_dir: &Path, global_dir: &Path) -> CommandRegistry {
+    /// Global + builtin commands only — the no-project catalog path.
+    pub fn load_without_project() -> CommandRegistry {
+        let global = dirs::home_dir()
+            .map(|home| home.join(".config/ryuzi/commands"))
+            .unwrap_or_default();
+        Self::load_from_dirs(None, &global)
+    }
+
+    pub(crate) fn load_from_dirs(work_dir: Option<&Path>, global_dir: &Path) -> CommandRegistry {
         let global_commands = read_command_dir(global_dir);
-        let project_commands = read_project_command_dir(work_dir);
+        let project_commands = work_dir.map(read_project_command_dir).unwrap_or_default();
         let builtin_commands = builtin_commands();
         let mut catalog = Vec::new();
 
@@ -970,7 +978,7 @@ mod tests {
         std::fs::write(global.path().join("init.md"), "global init").unwrap();
         std::fs::write(global.path().join("ship.md"), "global ship").unwrap();
 
-        let registry = CommandRegistry::load_from_dirs(dir.path(), global.path());
+        let registry = CommandRegistry::load_from_dirs(Some(dir.path()), global.path());
         assert!(registry
             .get("init")
             .unwrap()

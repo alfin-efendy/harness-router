@@ -29,6 +29,7 @@ pub mod memory;
 pub mod permission;
 pub mod runner;
 pub mod skills;
+pub mod slash_catalog;
 pub mod snapshot;
 pub mod steer;
 pub mod summary_budget;

@@ -271,7 +271,7 @@ mod tests {
         std::fs::write(global.path().join("init.md"), "global init").unwrap();
         std::fs::write(global.path().join("deploy.md"), "global deploy").unwrap();
 
-        let registry = CommandRegistry::load_from_dirs(workdir.path(), global.path());
+        let registry = CommandRegistry::load_from_dirs(Some(workdir.path()), global.path());
         let commands = command_infos(&registry);
         let command = |name: &str, origin| {
             commands
