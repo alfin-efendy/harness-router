@@ -74,8 +74,18 @@ impl SlashCatalog {
     /// Merged autocomplete entries. Command sources come through unchanged
     /// (including shadowed ones, for the Automation tab); listed skills are
     /// appended unless a command already owns the name. Without a project,
-    /// builtins are omitted (nothing home-visible exists outside a project).
+    /// builtins are omitted from the LISTING (nothing home-visible exists
+    /// outside a project), but the collision set below still spans the FULL
+    /// registry (builtins included) — `resolve()` always consults the full
+    /// registry via `self.commands.get`, so a name a builtin owns must never
+    /// list as a skill even when the builtin itself isn't listed here.
     pub fn entries(&self) -> Vec<SlashEntry> {
+        let command_names: BTreeSet<String> = self
+            .commands
+            .catalog()
+            .into_iter()
+            .map(|entry| entry.command.name)
+            .collect();
         let mut entries: Vec<SlashEntry> = self
             .commands
             .catalog()
@@ -90,8 +100,6 @@ impl SlashCatalog {
                 )
             })
             .collect();
-        let command_names: BTreeSet<String> =
-            entries.iter().map(|entry| entry.name.clone()).collect();
         for skill in self.skills.all() {
             if !self.skill_listed(&skill) || command_names.contains(&skill.name) {
                 continue;
@@ -318,9 +326,11 @@ mod tests {
         let resolved = catalog.resolve("/outer").unwrap();
         assert!(resolved.prompt.contains("Inner does run fast"));
         assert!(!resolved.prompt.contains("/inner"));
-        // Cycles never hang; the revisited token stays literal.
+        // Cycles never hang; the revisited token stays literal. Traced:
+        // loop-a -> "/loop-b" -> loop-b -> "/loop-a" -> loop-a already
+        // visited, so the innermost line stays the literal "/loop-a".
         let looped = catalog.resolve("/loop-a").unwrap();
-        assert!(looped.prompt.contains("/loop-a") || looped.prompt.contains("/loop-b"));
+        assert_eq!(looped.prompt, "/loop-a");
         // Unknown names stay literal.
         let dir2 = project_with(&[("solo", "Line\n/does-not-exist x")], &[]);
         let catalog2 = SlashCatalog::load(Some(dir2.path()), None);
@@ -353,5 +363,52 @@ mod tests {
             .entries()
             .iter()
             .all(|e| e.origin == CommandOrigin::Global));
+    }
+
+    /// Hermetic version of the test above: rather than relying on whatever
+    /// this machine's real `~/.config/ryuzi/{commands,skills}` happen to
+    /// contain, build the catalog directly from its private fields with a
+    /// controlled `SkillRegistry` (an empty project dir + an explicit extra
+    /// skills root, both `SkillOrigin::Global` per Task 2). Covers both the
+    /// "bound global skills" half of the name above (a skill lists once
+    /// bound) AND the Issue-1 regression (a bound global skill whose name
+    /// collides with a BUILTIN command — invisible in a has_project-filtered
+    /// listing, but still present in the full registry `resolve()` uses —
+    /// must be dropped from the listing, and the builtin must still win at
+    /// resolve time).
+    #[test]
+    fn no_project_load_binds_global_skills_and_drops_ones_colliding_with_builtins() {
+        let empty_project = tempfile::tempdir().unwrap();
+        let extra_root = tempfile::tempdir().unwrap();
+        for name in ["triage", "init"] {
+            let dir = extra_root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let skills =
+            SkillRegistry::load_with(empty_project.path(), &[extra_root.path().to_path_buf()]);
+        let catalog = SlashCatalog {
+            commands: CommandRegistry::load_without_project(),
+            skills,
+            allowed_skills: Some(vec!["triage".into(), "init".into()]),
+            has_project: false,
+        };
+        let entries = catalog.entries();
+        assert!(entries.iter().any(|e| e.name == "triage"
+            && e.kind == SlashKind::Skill
+            && e.origin == CommandOrigin::Global));
+        // "init" collides with the builtin command: even though it's bound
+        // via allowed_skills, it must NOT appear as a Skill entry.
+        assert!(!entries
+            .iter()
+            .any(|e| e.name == "init" && e.kind == SlashKind::Skill));
+        // The builtin still resolves and wins — the skill never shadows it.
+        let resolved = catalog.resolve("/init").unwrap();
+        assert!(resolved.prompt.contains("Analyze this codebase"));
+        assert!(entries.iter().all(|e| e.origin == CommandOrigin::Global));
     }
 }
