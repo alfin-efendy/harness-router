@@ -295,8 +295,11 @@ async function processComponent(
   const signatureEnvelope = await buildSignatureEnvelope(releaseBytes, privateKeySeedBase64);
 
   const manifestBytes = new Uint8Array(await Bun.file(`${spec.dir}/ryuzi-plugin.toml`).arrayBuffer());
-  const [manifestName, releaseName, sigName, componentName, pinnedManifestName, pinnedReleaseName, pinnedSigName] =
-    artifactNames(spec.id, manifest.version, manifest.component);
+  const [manifestName, releaseName, sigName, componentName, pinnedManifestName, pinnedReleaseName, pinnedSigName] = artifactNames(
+    spec.id,
+    manifest.version,
+    manifest.component,
+  );
   await Bun.write(`${outDir}/${manifestName}`, manifestBytes);
   await Bun.write(`${outDir}/${componentName}`, wasmBytes);
   await Bun.write(`${outDir}/${releaseName}`, releaseBytes);
