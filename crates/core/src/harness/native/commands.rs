@@ -469,7 +469,9 @@ fn validate_project_command_path_name(
 }
 
 fn is_builtin_command_name(name: &str) -> bool {
-    BUILTIN_COMMAND_ASSETS.iter().any(|(builtin, _)| *builtin == name)
+    BUILTIN_COMMAND_ASSETS
+        .iter()
+        .any(|(builtin, _)| *builtin == name)
 }
 
 /// List every readable project command file, including its content revision.
@@ -792,6 +794,9 @@ mod tests {
         let compact = reg.get("compact").unwrap();
         assert!(compact.template.is_empty());
         assert!(!compact.surfaces.home && compact.surfaces.session);
+        // Verify templates don't have trailing newlines (byte-identical to originals)
+        assert!(!init.template.ends_with('\n'));
+        assert!(!review.template.ends_with('\n'));
     }
 
     #[test]
@@ -1131,8 +1136,3 @@ mod tests {
         assert!(resolved.subtask);
     }
 }
-
-
-
-
-
