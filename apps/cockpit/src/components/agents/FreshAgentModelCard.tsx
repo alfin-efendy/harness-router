@@ -29,7 +29,10 @@ export function FreshAgentModelCard({ detail }: { detail: AgentDetailInfo }) {
     void useAgents.getState().updateSubagentModel(next);
   };
 
+  // No-op guards mirroring AgentModelTab: the pickers fire onValueChange
+  // even on same-value reselects — don't burn a save + SaveIndicator flash.
   const selectModel = (requestValue: string) => {
+    if (requestValue === value) return;
     const candidate = models.find((item) => item.requestValue === requestValue);
     if (candidate?.kind === "namedRoute") {
       persist({ kind: "route", route: requestValue });
@@ -41,6 +44,7 @@ export function FreshAgentModelCard({ detail }: { detail: AgentDetailInfo }) {
 
   const selectEffort = (effort: string) => {
     if (model.kind !== "concrete") return;
+    if (effort === (model.effort ?? "")) return;
     persist({ ...model, effort: effort || null });
   };
 

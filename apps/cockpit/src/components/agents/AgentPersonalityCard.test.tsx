@@ -80,6 +80,15 @@ test("switching to Custom reveals the textarea without autosaving a blank value;
   );
 });
 
+test("reselecting the active preset fires no update", async () => {
+  render(<AgentPersonalityCard detail={reviewerDetail} />);
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Personality preset" }));
+  fireEvent.click(await screen.findByRole("option", { name: /^Helpful/ }));
+
+  expect(updateAgent).not.toHaveBeenCalled();
+});
+
 test("blurring the custom textarea with an unchanged value does not re-autosave", () => {
   render(<AgentPersonalityCard detail={{ ...reviewerDetail, personality: { preset: "custom", custom: "Stay terse and precise." } }} />);
 

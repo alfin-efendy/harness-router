@@ -35,7 +35,10 @@ export function AgentModelTab({ detail }: { detail: AgentDetailInfo }) {
     );
   };
 
+  // Same no-op guard as selectKind: the pickers fire onValueChange even on
+  // same-value reselects — don't burn a save + SaveIndicator flash on those.
   const selectModel = (requestValue: string) => {
+    if (requestValue === value) return;
     const candidate = models.find((item) => item.requestValue === requestValue);
     if (candidate?.kind === "namedRoute") {
       persist({ kind: "route", route: requestValue });
@@ -47,6 +50,7 @@ export function AgentModelTab({ detail }: { detail: AgentDetailInfo }) {
 
   const selectEffort = (effort: string) => {
     if (model.kind !== "concrete") return;
+    if (effort === (model.effort ?? "")) return;
     persist({ ...model, effort: effort || null });
   };
 

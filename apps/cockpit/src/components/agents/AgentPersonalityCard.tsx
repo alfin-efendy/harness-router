@@ -111,8 +111,11 @@ export function AgentPersonalityCard({ detail }: { detail: AgentDetailInfo }) {
 
   // Non-custom presets autosave the instant they're picked. Switching TO
   // custom only updates local state — there's no text to persist yet, so
-  // the textarea's blur-commit takes over from here.
+  // the textarea's blur-commit takes over from here. Reselecting the active
+  // preset is a no-op: the Combobox fires onValueChange even on same-value
+  // reselects, and that shouldn't burn a save + SaveIndicator flash.
   const selectPreset = (preset: string) => {
+    if (preset === personality.preset) return;
     if (preset === "custom") {
       setPersonality({ preset: "custom", custom: customText });
       return;

@@ -398,6 +398,24 @@ test("model transitions preserve supported effort, clear unsupported effort, and
   );
 });
 
+test("reselecting the current model or effort fires no update", async () => {
+  const concrete = detail({
+    summary: { ...detail().summary, model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
+    modelInfo: opusInfo,
+  });
+  seed(concrete);
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
+  fireEvent.click(await screen.findByRole("option", { name: opusInfo.requestValue }));
+  expect(updateAgent).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "High" }));
+  expect(updateAgent).not.toHaveBeenCalled();
+});
+
 test("Overview loads owned sessions and opens a selected session", async () => {
   listAgentSessions.mockResolvedValue({ status: "ok", data: [recentSession()] });
   render(<AgentDetailView agentId="reviewer" />);
