@@ -149,6 +149,21 @@ test("adding a prefix rule fires update with the appended rule", async () => {
   expect(mutation.permissionRules).toHaveLength(3);
 });
 
+test("no update fires when confirming a new rule while a save is already in flight", async () => {
+  render(<AgentPermissionsTab detail={reviewerDetail} />);
+  const bashRow = await screen.findByTestId("tool-row-bash");
+  fireEvent.click(within(bashRow).getByRole("button", { name: "Expand Bash prefix rules" }));
+  fireEvent.click(screen.getByRole("button", { name: "＋ Add prefix rule" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "New prefix rule for Bash" }), { target: { value: "git status" } });
+
+  useAgents.setState({ saving: true });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Confirm new rule" }).hasAttribute("disabled")).toBe(true));
+
+  fireEvent.click(screen.getByRole("button", { name: "Confirm new rule" }));
+
+  expect(updateAgent).not.toHaveBeenCalled();
+});
+
 test("deleting a prefix rule fires update without it", async () => {
   render(<AgentPermissionsTab detail={reviewerDetail} />);
   const bashRow = await screen.findByTestId("tool-row-bash");

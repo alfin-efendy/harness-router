@@ -787,11 +787,11 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
         );
         assert_eq!(primary_turns[0].agent.profile.name, "Renamed primary");
         assert_eq!(primary_turns[0].agent.profile.model, profile.model);
-        // TODO(Task 2): profile no longer carries a permission mode at all
-        // (perm_mode becomes session-owned, threaded through
-        // `primary_turn_config`'s new argument); this checks that the
-        // updated native-decision map propagated instead, the closest
-        // still-meaningful analog of this test's original intent.
+        // The profile no longer carries a permission mode at all (perm_mode
+        // is session-owned, threaded through `primary_turn_config`'s own
+        // argument); this checks that the updated native-decision map
+        // propagated instead, the closest still-meaningful analog of this
+        // test's original intent.
         assert_eq!(
             primary_turns[0]
                 .agent
@@ -1554,8 +1554,8 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
             branch: None,
             title: None,
             status: SessionStatus::Interrupted,
-            // TODO(Task 2): profile no longer carries a permission mode;
-            // this session row's mode is a plain default now.
+            // The profile no longer carries a permission mode; this session
+            // row's mode is a plain default now.
             perm_mode: PermMode::Default,
             started_by: Some("test".into()),
             created_at: Some(now),

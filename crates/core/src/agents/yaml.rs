@@ -1232,11 +1232,16 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
 
     #[test]
     fn bool_false_parses_as_off() {
-        // A rendered `off` is a bare, unquoted plain-string scalar (see
-        // `render_yaml`'s doc comment). Replacing the quote characters here
-        // is a no-op string replace when there were none to begin with;
-        // this test's real job is exercising the `Legacy(bool)` hand-edit
-        // tolerance path in case someone types a literal `false` instead.
+        // A rendered `off` is already a bare, unquoted plain-string scalar
+        // (see `render_yaml`'s doc comment), so replacing quote characters
+        // around it is a no-op. To actually exercise the `Legacy(bool)`
+        // hand-edit tolerance path (someone types a literal `false` instead
+        // of `off`/`"off"`), rewrite the rendered scalar to `false` — that's
+        // the only spelling `NativeToolDecisionWire::Legacy` ever sees.
+        // Verified this discriminates: temporarily deleting the `Legacy`
+        // variant (and its `resolve` arm) makes this test fail to compile /
+        // fail to parse, since `false` no longer deserializes into
+        // `NativeToolDecisionWire` at all.
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("t".into());
         profile
             .permissions
@@ -1244,8 +1249,13 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
             .insert("write".into(), NativeToolDecision::Off);
         let rendered = render_agent_profile(&profile)
             .unwrap()
-            .replace("\"off\"", "off")
-            .replace("'off'", "off");
+            .replace("write: \"off\"", "write: false")
+            .replace("write: 'off'", "write: false")
+            .replace("write: off", "write: false");
+        assert!(
+            rendered.contains("write: false"),
+            "replace must have matched the rendered `write` line: {rendered}"
+        );
         let back = parse_agent_profile(&rendered).unwrap();
         assert_eq!(
             back.permissions.native_decision("write"),

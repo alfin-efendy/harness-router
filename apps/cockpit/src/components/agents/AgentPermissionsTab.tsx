@@ -145,7 +145,12 @@ function ToolRow({
                 onChange={(decision) => onDraftChange({ decision })}
                 size="sm"
               />
-              <Button size="sm" aria-label="Confirm new rule" disabled={draft.commandPrefix.trim() === ""} onClick={onDraftConfirm}>
+              <Button
+                size="sm"
+                aria-label="Confirm new rule"
+                disabled={draft.commandPrefix.trim() === "" || saving}
+                onClick={onDraftConfirm}
+              >
                 Add
               </Button>
               <Button variant="ghost" size="icon-sm" aria-label="Cancel new rule" onClick={onDraftCancel}>
@@ -254,6 +259,10 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
       return next;
     });
   const confirmDraft = (tool: string) => {
+    // Read the store directly rather than closing over the `saving` prop —
+    // a click can land between a save kicking off and this component's
+    // next render, and only a fresh read reliably blocks it.
+    if (useAgents.getState().saving) return;
     const draft = drafts[tool];
     const commandPrefix = draft?.commandPrefix.trim();
     if (!draft || !commandPrefix) return;

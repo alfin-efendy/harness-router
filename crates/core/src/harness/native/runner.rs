@@ -3021,6 +3021,7 @@ async fn execute_tool_call(
     let gate = super::permission::PermGate {
         permission_rules: &agent.permission_rules,
         native_decisions: &deps.primary_agent.profile.permissions.native,
+        tool_id: tool_name,
         perm_mode,
         project_id: deps.project_id.as_deref(),
         store: &deps.store,

@@ -72,10 +72,23 @@ pub struct PermGate<'a> {
     pub permission_rules: &'a [crate::agents::types::PermissionRule],
     /// The active profile's per-tool native decision map (`AgentPermissions::
     /// native`), keyed by the tool's registry id (the same lowercase key
-    /// `tool_filter_for_profile` resolves against) — not the canonical
-    /// `key_to_policy_tool` name. Consulted only for non-namespaced (native)
-    /// tools; `mcp__`/`ext__`/`wasm__` calls never match an entry here.
+    /// `tool_filter_for_profile` resolves against) — not the permission-CLASS
+    /// key (`spec.key`/`key_to_policy_tool`). It MUST be looked up via
+    /// [`Self::tool_id`], never `spec.key`: several tools share a
+    /// permission-class key with unrelated tools (`grep`/`glob`/`ls`/`skill`/
+    /// `lsp`/`session_search`/`delegate_agent` all report class `"read"`;
+    /// `write`/`revert` both report class `"edit"`), so keying this map by
+    /// `spec.key` would alias their per-tool `Off`/`Allow` entries onto each
+    /// other. Consulted only for non-namespaced (native) tools;
+    /// `mcp__`/`ext__`/`wasm__` calls never match an entry here.
     pub native_decisions: &'a BTreeMap<String, NativeToolDecision>,
+    /// The registry id of the tool actually being invoked (`Tool::name()`,
+    /// e.g. `"write"`, `"grep"`, `"mcp__acme__search"`) — the ONLY key
+    /// [`Self::native_decisions`] is looked up by. Distinct from
+    /// `spec.key`, which is the tool's permission-CLASS key and stays the
+    /// vocabulary for `key_to_policy_tool`, project `tool_policies`, and
+    /// session overrides.
+    pub tool_id: &'a str,
     pub perm_mode: PermMode,
     pub project_id: Option<&'a str>,
     pub store: &'a Store,
@@ -165,7 +178,11 @@ pub async fn evaluate(
     if !is_namespaced_tool_key(&spec.key) {
         match gate
             .native_decisions
-            .get(&spec.key)
+            // Registry id, not `spec.key`: see `PermGate::tool_id`'s doc for
+            // why the permission-CLASS key would silently alias unrelated
+            // tools (e.g. `write`'s Off would also gate `revert`, since both
+            // report class `"edit"`).
+            .get(gate.tool_id)
             .copied()
             .unwrap_or(NativeToolDecision::Ask)
         {
@@ -306,6 +323,13 @@ mod tests {
             PermGate {
                 permission_rules: &[],
                 native_decisions: &self.native_decisions,
+                // Every pre-existing test in this fixture calls `spec("bash")`
+                // against a native-decisions map keyed by `"bash"` too, where
+                // registry id and permission-class key happen to coincide —
+                // so this default keeps every one of them unchanged. Tests
+                // that need a different executing tool override this field
+                // via struct-update syntax, same as `native_decisions` above.
+                tool_id: "bash",
                 perm_mode,
                 project_id,
                 store: &self.store,
@@ -440,6 +464,81 @@ mod tests {
         };
         let d = evaluate(&spec("bash"), &serde_json::json!({}), &gate).await;
         assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn native_decision_lookup_uses_the_tool_id_not_the_shared_class_key() {
+        // `write`'s own `permission()` reports class key `"edit"` (shared
+        // with `revert` and the literal `edit` tool) — never `"write"`. A
+        // map keyed by `spec.key` would therefore never see this `"write"`
+        // entry at all, and BypassPermissions' unconditional mode-based
+        // auto-allow would wrongly grant the call once the (mis-keyed) native
+        // check falls through to `Ask`. Regression-tests the CRITICAL-1
+        // review finding directly: "map {"write": Off} ... write call
+        // Denied without prompting".
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("write".to_string(), NativeToolDecision::Off)]);
+        let gate = PermGate {
+            native_decisions: &native,
+            tool_id: "write",
+            ..f.gate(PermMode::BypassPermissions, None)
+        };
+        let d = evaluate(&spec("edit"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn native_decision_lookup_is_immune_to_a_same_named_class_key_collision() {
+        // `grep`'s class key is `"read"` — the SAME string as the registry
+        // id of the actual `read` (file-read) tool. A map keyed by
+        // `spec.key` would have the `read` tool's own `Off` decision
+        // silently gate every `"read"`-classed tool (grep/glob/ls/skill/
+        // lsp/session_search/delegate_agent) too. Map both entries under
+        // their real registry ids — `read` tool Off, `grep` tool Allow —
+        // and call `grep`: only `grep`'s own entry must govern.
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([
+            ("read".to_string(), NativeToolDecision::Off),
+            ("grep".to_string(), NativeToolDecision::Allow),
+        ]);
+        let gate = PermGate {
+            native_decisions: &native,
+            tool_id: "grep",
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(&spec("read"), &serde_json::json!({}), &gate).await;
+        assert_eq!(
+            d,
+            PermDecision::Allow,
+            "the `read` tool's Off must not leak onto grep's own Allow"
+        );
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn class_key_entry_is_never_consulted_for_the_native_decision_map() {
+        // Map `{"write": Allow}` with no `"edit"` entry at all, PLUS a
+        // project `rejectAlways` row for the canonical `"Edit"` name (the
+        // outcome a `spec.key`-keyed lookup would fall through to once it
+        // missed on `"edit"`). A `write` call must resolve straight from its
+        // own registry-id entry — `Allow`, no prompt — and never even reach
+        // the project-policy fallback that would otherwise deny it.
+        let f = Fixture::new().await;
+        f.store
+            .set_tool_policy(WriteOrigin::User, "p1", "Edit", "rejectAlways")
+            .await
+            .unwrap();
+        let native = BTreeMap::from([("write".to_string(), NativeToolDecision::Allow)]);
+        assert!(!native.contains_key("edit"));
+        let gate = PermGate {
+            native_decisions: &native,
+            tool_id: "write",
+            ..f.gate(PermMode::Default, Some("p1"))
+        };
+        let d = evaluate(&spec("edit"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Allow);
         assert!(!f.approvals.has_pending());
     }
 
