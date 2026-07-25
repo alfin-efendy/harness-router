@@ -583,7 +583,7 @@ async fn get_2xx(http: &dyn CatalogHttp, url: &str) -> anyhow::Result<Vec<u8>> {
 /// feed cannot turn the staging step into an arbitrary-file-write primitive.
 /// (`verify_bundle` re-checks containment, but only after the wasm is staged,
 /// so this pre-write guard is the load-bearing one here.)
-fn sanitize_staged_component(name: &str) -> anyhow::Result<()> {
+pub(crate) fn sanitize_staged_component(name: &str) -> anyhow::Result<()> {
     use std::path::{Component, Path};
     if name.is_empty() {
         anyhow::bail!("component filename must not be empty");
