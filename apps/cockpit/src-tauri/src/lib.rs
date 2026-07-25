@@ -176,7 +176,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::set_custom_provider_format,
             connections_cmd::remove_custom_provider,
             native_cmd::native_agents,
-            native_cmd::native_commands,
+            native_cmd::slash_catalog,
             native_cmd::session_todos,
             native_cmd::list_project_commands,
             native_cmd::read_project_command,

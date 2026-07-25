@@ -1294,11 +1294,11 @@ async nativeAgents(runnerId: string | null, projectId: string) : Promise<Result<
 }
 },
 /**
- * The slash commands available for a project.
+ * The unified "/" autocomplete catalog for a project/agent pairing.
  */
-async nativeCommands(runnerId: string | null, projectId: string) : Promise<Result<CommandInfo[], CmdError>> {
+async slashCatalog(runnerId: string | null, projectId: string | null, agentId: string | null) : Promise<Result<SlashEntryInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("native_commands", { runnerId, projectId }) };
+    return { status: "ok", data: await TAURI_INVOKE("slash_catalog", { runnerId, projectId, agentId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2115,7 +2115,6 @@ export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
-export type CommandInfo = { name: string; description: string; agent: string | null; model?: string | null; subtask?: boolean; origin: CommandOriginInfo; effective?: boolean; shadowsGlobal: boolean }
 export type CommandOriginInfo = "builtin" | "global" | "project"
 /**
  * `component_bootstrap_status` RPC result (Task 11a): whether the first-party
@@ -2847,6 +2846,11 @@ export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
  * for `Completed` — exactly one is ever `Some`.
  */
 export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
+/**
+ * One "/" autocomplete entry: a slash command or a user-invocable skill.
+ */
+export type SlashEntryInfo = { name: string; description: string; kind: SlashKindInfo; origin: CommandOriginInfo; home: boolean; session: boolean; requiresProject: boolean; effective: boolean; shadowsGlobal: boolean; agent: string | null; model: string | null; subtask: boolean }
+export type SlashKindInfo = "command" | "skill"
 export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string;

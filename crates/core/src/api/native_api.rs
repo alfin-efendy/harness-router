@@ -12,7 +12,7 @@ use crate::control::ControlPlane;
 use crate::harness::native::agents::AgentRegistry;
 use crate::harness::native::commands::{
     delete_project_command, list_project_commands, read_project_command, write_project_command,
-    CommandFileError, CommandOrigin, CommandRegistry,
+    CommandFileError, CommandOrigin,
 };
 use crate::serve::ApiState;
 use serde::Deserialize;
@@ -21,7 +21,7 @@ use std::path::Path;
 
 pub(crate) const HANDLES: &[&str] = &[
     "native_agents",
-    "native_commands",
+    "slash_catalog",
     "session_todos",
     "list_project_commands",
     "read_project_command",
@@ -37,6 +37,14 @@ struct ProjectIdP {
 #[derive(Deserialize)]
 struct SessionPkP {
     session_pk: String,
+}
+
+#[derive(Deserialize)]
+struct SlashCatalogP {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -77,9 +85,12 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: ProjectIdP = params(p)?;
             ok(native_agents(cp, &a.project_id).await?)
         }
-        "native_commands" => {
-            let a: ProjectIdP = params(p)?;
-            ok(native_commands(cp, &a.project_id).await?)
+        "slash_catalog" => {
+            let a: SlashCatalogP = params(p)?;
+            ok(
+                slash_catalog_entries(state, a.project_id.as_deref(), a.agent_id.as_deref())
+                    .await?,
+            )
         }
         "list_project_commands" => {
             let a: ProjectIdP = params(p)?;
@@ -207,39 +218,64 @@ fn command_file_error(error: CommandFileError) -> ApiError {
         },
     }
 }
-/// The slash commands available for a project.
-async fn native_commands(
-    cp: &ControlPlane,
-    project_id: &str,
-) -> Result<Vec<CommandInfo>, ApiError> {
-    let workdir = project_workdir(cp, project_id).await?;
-    Ok(command_infos(&CommandRegistry::load(Path::new(&workdir))))
+/// The unified "/" autocomplete catalog for a project/agent pairing.
+async fn slash_catalog_entries(
+    state: &ApiState,
+    project_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<Vec<SlashEntryInfo>, ApiError> {
+    let workdir = match project_id {
+        Some(id) => Some(project_workdir(&state.cp, id).await?),
+        None => None,
+    };
+    let allowed = agent_allowed_skills(state, agent_id).await;
+    let catalog = crate::harness::native::slash_catalog::SlashCatalog::load(
+        workdir.as_deref().map(Path::new),
+        allowed.as_deref(),
+    );
+    Ok(catalog
+        .entries()
+        .into_iter()
+        .map(slash_entry_info)
+        .collect())
 }
 
-fn command_infos(registry: &CommandRegistry) -> Vec<CommandInfo> {
-    registry
-        .catalog()
-        .into_iter()
-        .map(|entry| CommandInfo {
-            name: entry.command.name,
-            description: entry.command.description,
-            agent: entry.command.agent,
-            model: entry.command.model,
-            subtask: entry.command.subtask,
-            origin: match entry.origin {
-                CommandOrigin::Builtin => CommandOriginInfo::Builtin,
-                CommandOrigin::Global => CommandOriginInfo::Global,
-                CommandOrigin::Project => CommandOriginInfo::Project,
-            },
-            effective: entry.effective,
-            shadows_global: entry.shadows_global,
-        })
-        .collect()
+/// The durable primary agent's bound skill names (`profile.skills`), mirroring
+/// the harness adapter's `allowed_skills` mapping. `None` = no binding.
+async fn agent_allowed_skills(state: &ApiState, agent_id: Option<&str>) -> Option<Vec<String>> {
+    let agent_id = agent_id?;
+    let registry = state.agents.snapshot().await;
+    let agent = registry.agents.iter().find(|a| a.profile.id == agent_id)?;
+    (!agent.profile.skills.is_empty()).then(|| agent.profile.skills.clone())
+}
+
+fn slash_entry_info(entry: crate::harness::native::slash_catalog::SlashEntry) -> SlashEntryInfo {
+    use crate::harness::native::slash_catalog::SlashKind;
+    SlashEntryInfo {
+        name: entry.name,
+        description: entry.description,
+        kind: match entry.kind {
+            SlashKind::Command => SlashKindInfo::Command,
+            SlashKind::Skill => SlashKindInfo::Skill,
+        },
+        origin: match entry.origin {
+            CommandOrigin::Builtin => CommandOriginInfo::Builtin,
+            CommandOrigin::Global => CommandOriginInfo::Global,
+            CommandOrigin::Project => CommandOriginInfo::Project,
+        },
+        home: entry.surfaces.home,
+        session: entry.surfaces.session,
+        requires_project: entry.requires_project,
+        effective: entry.effective,
+        shadows_global: entry.shadows_global,
+        agent: entry.agent,
+        model: entry.model,
+        subtask: entry.subtask,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
 
@@ -253,54 +289,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_command_listing_keeps_all_sources_and_reports_precedence() {
+    async fn slash_catalog_lists_commands_and_project_skills_per_surface() {
+        use crate::domain::{PermMode, Project};
         let workdir = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(workdir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::create_dir_all(workdir.path().join(".agents/skills/pdf")).unwrap();
         std::fs::write(
-            workdir.path().join(".ryuzi/commands/ship.md"),
-            "project ship",
+            workdir.path().join(".agents/skills/pdf/SKILL.md"),
+            "---\nname: pdf\ndescription: PDFs\n---\nbody",
         )
         .unwrap();
-        std::fs::write(
-            workdir.path().join(".ryuzi/commands/init.md"),
-            "project init",
-        )
-        .unwrap();
-        std::fs::write(global.path().join("ship.md"), "global ship").unwrap();
-        std::fs::write(global.path().join("init.md"), "global init").unwrap();
-        std::fs::write(global.path().join("deploy.md"), "global deploy").unwrap();
-
-        let registry = CommandRegistry::load_from_dirs(Some(workdir.path()), global.path());
-        let commands = command_infos(&registry);
-        let command = |name: &str, origin| {
-            commands
-                .iter()
-                .find(|command| command.name == name && command.origin == origin)
-                .unwrap()
-        };
-
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|command| command.name == "ship")
-                .count(),
-            2
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|command| command.name == "init")
-                .count(),
-            3
-        );
-        assert!(command("ship", CommandOriginInfo::Project).effective);
-        assert!(command("ship", CommandOriginInfo::Project).shadows_global);
-        assert!(!command("ship", CommandOriginInfo::Global).effective);
-        assert!(command("init", CommandOriginInfo::Builtin).effective);
-        assert!(!command("init", CommandOriginInfo::Global).effective);
-        assert!(!command("init", CommandOriginInfo::Project).effective);
-        assert!(command("deploy", CommandOriginInfo::Global).effective);
+        let state = state().await;
+        state
+            .cp
+            .store()
+            .insert_project(Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: workdir.path().display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        let out = dispatch(&state, "slash_catalog", json!({"project_id": "p1"}))
+            .await
+            .unwrap();
+        let entries: Vec<crate::api::types::SlashEntryInfo> = serde_json::from_value(out).unwrap();
+        let init = entries.iter().find(|e| e.name == "init").unwrap();
+        assert!(init.home && init.session && init.requires_project);
+        let review = entries.iter().find(|e| e.name == "review").unwrap();
+        assert!(!review.home && review.session);
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "pdf" && e.kind == crate::api::types::SlashKindInfo::Skill));
     }
 
     #[tokio::test]

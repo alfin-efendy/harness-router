@@ -627,24 +627,29 @@ pub enum CommandOriginInfo {
     Project,
 }
 
-const fn default_command_effective() -> bool {
-    true
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SlashKindInfo {
+    Command,
+    Skill,
 }
 
+/// One "/" autocomplete entry: a slash command or a user-invocable skill.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct CommandInfo {
+pub struct SlashEntryInfo {
     pub name: String,
     pub description: String,
-    pub agent: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub subtask: bool,
+    pub kind: SlashKindInfo,
     pub origin: CommandOriginInfo,
-    #[serde(default = "default_command_effective")]
+    pub home: bool,
+    pub session: bool,
+    pub requires_project: bool,
     pub effective: bool,
     pub shadows_global: bool,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub subtask: bool,
 }
 
 /// Editable fields for a project-owned slash command. The command name is

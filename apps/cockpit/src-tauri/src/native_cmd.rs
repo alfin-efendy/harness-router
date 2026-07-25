@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tauri::State;
 
 pub use ryuzi_core::api::types::{
-    AgentInfo, CommandInfo, ProjectCommandInfo, ProjectCommandInputDto, ProjectCommandMutationDto,
-    QueuedMessageInfo, TodoItem,
+    AgentInfo, ProjectCommandInfo, ProjectCommandInputDto, ProjectCommandMutationDto,
+    QueuedMessageInfo, SlashEntryInfo, TodoItem,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -32,19 +32,20 @@ pub async fn native_agents(
         .await
 }
 
-/// The slash commands available for a project.
+/// The unified "/" autocomplete catalog for a project/agent pairing.
 #[tauri::command]
 #[specta::specta]
-pub async fn native_commands(
+pub async fn slash_catalog(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    project_id: String,
-) -> R<Vec<CommandInfo>> {
+    project_id: Option<String>,
+    agent_id: Option<String>,
+) -> R<Vec<SlashEntryInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
-            "native_commands",
-            serde_json::json!({ "project_id": project_id }),
+            "slash_catalog",
+            serde_json::json!({ "project_id": project_id, "agent_id": agent_id }),
         )
         .await
 }
