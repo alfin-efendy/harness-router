@@ -124,7 +124,7 @@ impl fmt::Display for CommandFileError {
             Self::NotFound(name) => write!(f, "project command not found: {name}"),
             Self::RevisionConflict => write!(
                 f,
-                "project command was modified externally; reload it before saving"
+                "command was modified externally; reload it before saving"
             ),
             Self::Io(error) => error.fmt(f),
         }

@@ -180,6 +180,26 @@ test("saves an existing command via globalCommandUpdate, disabling the name fiel
   );
 });
 
+test("preserves a legacy global command's hand-authored agent, model, and subtask on edit", async () => {
+  const legacyCommand: CommandFileInfo = { ...command, name: "legacy", agent: "plan", model: "m", subtask: true };
+  globalCommandList.mockResolvedValueOnce({ status: "ok", data: [legacyCommand] });
+  render(<CommandsTab />);
+  await screen.findByText("/legacy");
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit /legacy" }));
+  fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Updated description" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() =>
+    expect(globalCommandUpdate).toHaveBeenCalledWith(
+      "local",
+      "legacy",
+      "rev-1",
+      expect.objectContaining({ description: "Updated description", agent: "plan", model: "m", subtask: true }),
+    ),
+  );
+});
+
 test("rejects a name reserved by the loaded catalog, even though the catalog can free up a name from the static fallback", async () => {
   render(<CommandsTab />);
   await screen.findByText("/audit");

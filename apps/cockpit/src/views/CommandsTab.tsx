@@ -228,9 +228,9 @@ export function CommandsTab() {
       const input: CommandFileMutationDto = {
         description: draft.description,
         template: draft.template,
-        agent: null,
-        model: null,
-        subtask: false,
+        agent: editing.agent,
+        model: editing.model,
+        subtask: editing.subtask,
       };
       return useNative.getState().updateGlobalCommand(LOCAL_RUNNER, editing, input);
     }

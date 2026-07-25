@@ -83,7 +83,10 @@ export function TemplateTextarea({
 
   const lineSlash = useMemo(() => activeLineSlashQuery(value, caret), [value, caret]);
   const slashMatches = useMemo(
-    () => (lineSlash === null ? [] : slashEntries.filter((entry) => entry.name.toLowerCase().startsWith(lineSlash.query)).slice(0, 6)),
+    () =>
+      lineSlash === null
+        ? []
+        : slashEntries.filter((entry) => entry.effective && entry.name.toLowerCase().startsWith(lineSlash.query)).slice(0, 6),
     [slashEntries, lineSlash],
   );
 

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AgentInfo } from "@/bindings";
+import type { AgentInfo, SlashEntryInfo } from "@/bindings";
 
 const reviewerAgent: AgentInfo = { name: "reviewer", description: "Reviews changes", mode: "subagent", builtin: true };
 
@@ -16,9 +16,9 @@ mock.module("@/bindings", () => ({
 const { TemplateTextarea } = await import("./TemplateTextarea");
 const { useNative } = await import("@/store-native");
 
-function Harness({ projectId }: { projectId: string | null }) {
+function Harness({ projectId, slashEntries = [] }: { projectId: string | null; slashEntries?: SlashEntryInfo[] }) {
   const [value, setValue] = useState("");
-  return <TemplateTextarea value={value} onChange={setValue} projectId={projectId} slashEntries={[]} aria-label="Template" />;
+  return <TemplateTextarea value={value} onChange={setValue} projectId={projectId} slashEntries={slashEntries} aria-label="Template" />;
 }
 
 afterEach(() => {
@@ -50,6 +50,39 @@ test("does not query or list agents when there is no hint project", async () => 
   await new Promise((resolve) => setTimeout(resolve, 10));
   expect(nativeAgents).not.toHaveBeenCalled();
   expect(screen.queryByRole("button", { name: /reviewer/ })).toBeNull();
+});
+
+test("filters out a shadowed same-name slash entry so only the effective one renders", async () => {
+  const shadowed: SlashEntryInfo = {
+    name: "review",
+    description: "Shadowed global command",
+    kind: "command",
+    origin: "global",
+    home: true,
+    session: true,
+    requiresProject: false,
+    effective: false,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
+  };
+  const effective: SlashEntryInfo = {
+    ...shadowed,
+    description: "Effective project command",
+    origin: "project",
+    home: false,
+    requiresProject: true,
+    effective: true,
+    shadowsGlobal: true,
+  };
+  render(<Harness projectId={null} slashEntries={[shadowed, effective]} />);
+  const textarea = screen.getByLabelText("Template") as HTMLTextAreaElement;
+  fireEvent.change(textarea, { target: { value: "/rev", selectionStart: 4 } });
+
+  const items = await screen.findAllByRole("button", { name: /\/review/ });
+  expect(items).toHaveLength(1);
+  expect(screen.getByText("Effective project command")).toBeTruthy();
 });
 
 test("Escape closes an open menu and does not let the keydown reach a parent listener", async () => {
