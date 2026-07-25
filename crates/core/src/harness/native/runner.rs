@@ -103,8 +103,9 @@ pub struct RunnerDeps {
     pub attachments_dir: Option<PathBuf>,
     /// Task-artifact service shared with the control plane.
     pub artifacts: Arc<crate::artifacts::ArtifactService>,
-    /// Plugin-bundled skill directories folded in beside the worktree/global
-    /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
+    /// Extra skill directories folded in beside the worktree/global ones —
+    /// see `SessionCtx::extra_skill_dirs` for why this no longer carries
+    /// plugin-bundled dirs in production.
     pub extra_skill_dirs: Vec<PathBuf>,
     /// Live handle to the daemon's extension host (Track D), threaded
     /// straight from `SessionCtx::extension_events` at session start — see

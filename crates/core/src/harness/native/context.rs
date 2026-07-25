@@ -252,7 +252,7 @@ mod tests {
     fn limits_skill_guidance_to_durable_primary_profile() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["release", "unrelated"] {
-            let skill = dir.path().join(".ryuzi/skills").join(name);
+            let skill = dir.path().join(".agents/skills").join(name);
             std::fs::create_dir_all(&skill).unwrap();
             std::fs::write(
                 skill.join("SKILL.md"),

@@ -337,9 +337,9 @@ pub struct ToolCtx {
     /// — a SECOND read root beside the worktree jail, so the model can open
     /// files the user attached. `None` in bare test contexts.
     pub attachments_dir: Option<PathBuf>,
-    /// Plugin-bundled skill directories (see
-    /// `crate::plugins::PluginHost::enabled_skill_dirs`), consulted by the
-    /// `skill` tool alongside `work_dir`'s own skill dirs.
+    /// Extra skill directories consulted by the `skill` tool alongside
+    /// `work_dir`'s own skill dirs — see `SessionCtx::extra_skill_dirs` for
+    /// why this no longer carries plugin-bundled dirs in production.
     pub extra_skill_dirs: Vec<PathBuf>,
     pub artifacts: Arc<crate::artifacts::ArtifactService>,
     pub(crate) pinned_file_reference:

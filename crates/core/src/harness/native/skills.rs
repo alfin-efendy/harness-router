@@ -1,11 +1,21 @@
 //! Skills: progressive-disclosure capability docs, mirroring opencode/Claude
 //! skills. A skill is a `SKILL.md` (name + description frontmatter, markdown
-//! body) under `.ryuzi/skills/<name>/`, `~/.config/ryuzi/skills/<name>/`, or
-//! `~/.claude/skills/<name>/`. Only names+descriptions are surfaced to the
-//! model up front; the full body is fetched on demand via the `skill` tool.
+//! body) under `.agents/skills/<name>/` (project) or
+//! `~/.config/ryuzi/skills/<name>/` (global — also where the installer
+//! materializes installed skill packs). Only names+descriptions are surfaced
+//! to the model up front; the full body is fetched on demand via the `skill`
+//! tool.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Which discovery root a skill came from. Project skills are always
+/// user-invocable; global skills surface only when bound to the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillOrigin {
+    Project,
+    Global,
+}
 
 /// One discovered skill.
 #[derive(Debug, Clone)]
@@ -17,6 +27,8 @@ pub struct Skill {
     /// containing its `SKILL.md`), used to resolve companion files the skill
     /// ships alongside its instructions.
     pub dir: PathBuf,
+    /// Which discovery root this skill came from.
+    pub origin: SkillOrigin,
 }
 
 /// The set of available skills.
@@ -25,7 +37,8 @@ pub struct SkillRegistry {
 }
 
 impl SkillRegistry {
-    /// Discover skills under the worktree and the global config/claude dirs.
+    /// Discover skills under the project (`.agents/skills`) and global
+    /// (`~/.config/ryuzi/skills`) roots.
     pub fn load(work_dir: &Path) -> SkillRegistry {
         Self::load_with(work_dir, &[])
     }
@@ -33,28 +46,48 @@ impl SkillRegistry {
     /// Like [`Self::load`], but also scans `extra` directories — each
     /// can be either:
     ///   - A skills root (i.e. `<extra>/<name>/SKILL.md`), exactly like
-    ///     `.ryuzi/skills` or `~/.claude/skills`, OR
+    ///     `~/.config/ryuzi/skills`, OR
     ///   - A leaf skill directory (i.e. `<extra>/SKILL.md` directly).
     ///
-    /// Used to fold in plugin-bundled skill directories
-    /// (`PluginHost::enabled_skill_dirs`) beside the worktree/global ones.
-    /// A name already found in an earlier (worktree/global) directory wins
-    /// over one from `extra`.
+    /// `extra` dirs are attributed [`SkillOrigin::Global`]. A name already
+    /// found in an earlier (project/global) directory wins over one from
+    /// `extra`.
     pub fn load_with(work_dir: &Path, extra: &[std::path::PathBuf]) -> SkillRegistry {
+        let legacy = work_dir.join(".ryuzi/skills");
+        if legacy.is_dir() {
+            tracing::warn!(
+                path = %legacy.display(),
+                "skills: .ryuzi/skills is no longer scanned; move skills to .agents/skills"
+            );
+        }
+
         let mut skills = BTreeMap::new();
-        for base in skill_dirs(work_dir).iter().chain(extra) {
+        let extras = extra.iter().map(|p| (p.clone(), SkillOrigin::Global));
+        for (base, origin) in skill_dirs(work_dir).into_iter().chain(extras) {
             // Check if this is a leaf skill dir (SKILL.md at the base).
             if base.join("SKILL.md").is_file() {
                 // This is a leaf: parse it as a single skill.
                 if let Ok(text) = std::fs::read_to_string(base.join("SKILL.md")) {
-                    let skill = parse_skill(base, &text);
+                    let skill = parse_skill(&base, &text, origin);
                     skills.entry(skill.name.clone()).or_insert(skill);
                 }
             } else {
                 // This is a root: scan for subdirectories containing SKILL.md.
-                for skill in read_skills(base) {
+                for skill in read_skills(&base, origin) {
                     skills.entry(skill.name.clone()).or_insert(skill);
                 }
+            }
+        }
+        SkillRegistry { skills }
+    }
+
+    /// Skills from the global root only (`~/.config/ryuzi/skills`) — the
+    /// no-project catalog path.
+    pub fn load_global() -> SkillRegistry {
+        let mut skills = BTreeMap::new();
+        if let Some(home) = dirs::home_dir() {
+            for skill in read_skills(&home.join(".config/ryuzi/skills"), SkillOrigin::Global) {
+                skills.entry(skill.name.clone()).or_insert(skill);
             }
         }
         SkillRegistry { skills }
@@ -97,17 +130,16 @@ impl SkillRegistry {
     }
 }
 
-fn skill_dirs(work_dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut dirs = vec![work_dir.join(".ryuzi/skills")];
+fn skill_dirs(work_dir: &Path) -> Vec<(PathBuf, SkillOrigin)> {
+    let mut dirs = vec![(work_dir.join(".agents/skills"), SkillOrigin::Project)];
     if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".config/ryuzi/skills"));
-        dirs.push(home.join(".claude/skills"));
+        dirs.push((home.join(".config/ryuzi/skills"), SkillOrigin::Global));
     }
     dirs
 }
 
 /// Read `<base>/<name>/SKILL.md` skills from a skills directory.
-fn read_skills(base: &Path) -> Vec<Skill> {
+fn read_skills(base: &Path, origin: SkillOrigin) -> Vec<Skill> {
     let Ok(entries) = std::fs::read_dir(base) else {
         return vec![];
     };
@@ -117,12 +149,12 @@ fn read_skills(base: &Path) -> Vec<Skill> {
         .filter_map(|e| {
             let path = e.path();
             let text = std::fs::read_to_string(path.join("SKILL.md")).ok()?;
-            Some(parse_skill(&path, &text))
+            Some(parse_skill(&path, &text, origin))
         })
         .collect()
 }
 
-fn parse_skill(dir: &Path, text: &str) -> Skill {
+fn parse_skill(dir: &Path, text: &str, origin: SkillOrigin) -> Skill {
     let (frontmatter, body) = super::agents::split_frontmatter_pub(text);
     let dir_name = dir
         .file_name()
@@ -143,6 +175,7 @@ fn parse_skill(dir: &Path, text: &str) -> Skill {
         description,
         body: body.trim().to_string(),
         dir: dir.to_path_buf(),
+        origin,
     }
 }
 
@@ -151,9 +184,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discovers_project_skills_from_agents_dir_with_project_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/pdf");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Work with PDFs\n---\nUse pdftotext.",
+        )
+        .unwrap();
+        let reg = SkillRegistry::load(dir.path());
+        let s = reg.get("pdf").unwrap();
+        assert_eq!(s.origin, SkillOrigin::Project);
+    }
+
+    #[test]
+    fn legacy_ryuzi_skills_dir_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(".ryuzi/skills/old");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("SKILL.md"), "---\nname: old\n---\nOld body").unwrap();
+        assert!(SkillRegistry::load(dir.path()).get("old").is_none());
+    }
+
+    #[test]
     fn discovers_skill_with_frontmatter() {
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        let skill_dir = dir.path().join(".agents/skills/pdf");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -171,7 +228,7 @@ mod tests {
     #[test]
     fn load_with_merges_an_extra_dir_alongside_the_worktree_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        let skill_dir = dir.path().join(".agents/skills/pdf");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -210,7 +267,7 @@ mod tests {
     fn load_with_no_extra_dirs_matches_load() {
         let dir = tempfile::tempdir().unwrap();
         // Both load and load_with should have the same result when no extras are
-        // provided (but may include global skills from ~/.claude/skills, etc).
+        // provided (but may include global skills from ~/.config/ryuzi/skills, etc).
         let via_load = SkillRegistry::load(dir.path()).names();
         let via_load_with = SkillRegistry::load_with(dir.path(), &[]).names();
         assert_eq!(via_load, via_load_with);
@@ -220,7 +277,7 @@ mod tests {
     fn empty_skills_dir_yields_nothing() {
         // read_skills over a non-existent / empty dir returns no skills.
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_skills(&dir.path().join(".ryuzi/skills")).is_empty());
+        assert!(read_skills(&dir.path().join(".agents/skills"), SkillOrigin::Project).is_empty());
     }
 
     #[test]
@@ -233,6 +290,7 @@ mod tests {
                 description: "a".repeat(200),
                 body: String::new(),
                 dir: std::path::PathBuf::new(),
+                origin: SkillOrigin::Project,
             },
         );
         let g = SkillRegistry { skills }.guidance().unwrap();
@@ -248,11 +306,16 @@ mod tests {
 
     #[test]
     fn parse_skill_falls_back_to_dir_name() {
-        let s = parse_skill(Path::new("mytool"), "No frontmatter, just a body.");
+        let s = parse_skill(
+            Path::new("mytool"),
+            "No frontmatter, just a body.",
+            SkillOrigin::Project,
+        );
         assert_eq!(s.name, "mytool");
         assert!(s.description.contains("mytool"));
         assert_eq!(s.body, "No frontmatter, just a body.");
         assert_eq!(s.dir, Path::new("mytool"));
+        assert_eq!(s.origin, SkillOrigin::Project);
     }
 
     #[test]
@@ -260,7 +323,7 @@ mod tests {
         // Test that plugin-bundled leaf skill dirs (SKILL.md directly inside)
         // are discovered as single skills, not roots.
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        let skill_dir = dir.path().join(".agents/skills/pdf");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -301,7 +364,7 @@ mod tests {
         // Test that root-shaped extra dirs (with subdirectories containing
         // SKILL.md) still work as before.
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        let skill_dir = dir.path().join(".agents/skills/pdf");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),

@@ -658,7 +658,7 @@ mod tests {
     }
 
     fn write_skill(work: &std::path::Path, name: &str) -> std::path::PathBuf {
-        let skill_dir = work.join(".ryuzi/skills").join(name);
+        let skill_dir = work.join(".agents/skills").join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -687,7 +687,7 @@ mod tests {
     async fn skill_companion_traversal_escape_is_rejected() {
         let work = tempfile::tempdir().unwrap();
         write_skill(work.path(), "mytool");
-        std::fs::write(work.path().join(".ryuzi/skills/secret.txt"), "nope").unwrap();
+        std::fs::write(work.path().join(".agents/skills/secret.txt"), "nope").unwrap();
         let ctx = ctx_at(work.path()).await;
         let out = Read
             .execute(&ctx, json!({"path": "skills/mytool/../secret.txt"}))

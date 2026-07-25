@@ -63,7 +63,7 @@ mod tests {
     #[tokio::test]
     async fn loads_a_skill_body() {
         let dir = tempfile::tempdir().unwrap();
-        let sd = dir.path().join(".ryuzi/skills/deploy");
+        let sd = dir.path().join(".agents/skills/deploy");
         std::fs::create_dir_all(&sd).unwrap();
         std::fs::write(
             sd.join("SKILL.md"),
