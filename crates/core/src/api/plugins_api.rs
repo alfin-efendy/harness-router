@@ -4748,18 +4748,38 @@ writes = true
         );
     }
 
-    // With no first-party signing key configured yet (the all-zero
-    // placeholder), an install must refuse fail-closed BEFORE any network I/O
-    // rather than stage an unverifiable bundle.
+    // Key-state-agnostic: with no first-party signing key compiled in this
+    // must refuse with the "disabled until" message BEFORE any network I/O
+    // (the fail-closed guard `install_component_plugin` opens with); with a
+    // real key compiled in that guard is bypassed and the call proceeds to
+    // resolve+download, which we point at a closed local port so the
+    // assertion stays hermetic (no live network dependency, no dependence on
+    // a real "mimo" release existing) rather than reasserting the "no key"
+    // message the live-key build can no longer produce.
     #[tokio::test]
     async fn install_component_plugin_is_fail_closed_without_a_signing_key() {
         let cp = test_cp().await;
+        cp.store()
+            .set_setting_raw("component_release_base_url", "http://127.0.0.1:1")
+            .await
+            .unwrap();
         match install_component_plugin(&cp, "mimo", None).await {
-            Ok(_) => panic!("expected a fail-closed refusal without a signing key"),
-            Err(err) => assert!(
-                err.to_string().contains("disabled until"),
-                "unexpected error: {err}"
+            Ok(_) => panic!(
+                "expected mimo install to fail (no signing key, or nothing listening on the closed port)"
             ),
+            Err(err) => {
+                if crate::plugins::first_party_key::FIRST_PARTY_PUBKEY == [0u8; 32] {
+                    assert!(
+                        err.to_string().contains("disabled until"),
+                        "unexpected error: {err}"
+                    );
+                } else {
+                    assert!(
+                        !err.to_string().contains("disabled until"),
+                        "a real signing key must bypass the fail-closed guard: {err}"
+                    );
+                }
+            }
         }
     }
 

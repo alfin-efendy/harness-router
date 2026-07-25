@@ -2,26 +2,23 @@
 //! PRIVATE key is a release/CI secret (`CATALOG_FEED_PRIVATE_KEY`, consumed
 //! by `scripts/catalog/build-feed.ts`) and is never committed.
 //!
-//! This is still the all-zero placeholder — a deliberate, one-time HUMAN ops
-//! step, not something this crate can safely invent a key for. The all-zero
-//! key is a valid *low-order* Edwards point, so a non-strict verify could be
-//! tricked into accepting a forged signature against it; `verify_with`
-//! (`crates/core/src/plugins/remote_catalog.rs`) therefore rejects it two
-//! ways — an explicit all-zero guard AND `verify_strict` (which rejects
-//! low-order keys). While this placeholder is in place, EVERY feed is rejected
-//! (the remote catalog is fail-closed), so the engine still ships and enables
-//! the embedded catalog either way.
+//! Live as of the plugin-release activation: `build-feed.ts` now signs the
+//! published feed with the matching private key, and `verify_with`
+//! (`crates/core/src/plugins/remote_catalog.rs`) verifies fetched feeds
+//! against this compiled-in public key. The all-zero key is a valid
+//! *low-order* Edwards point, so a non-strict verify could be tricked into
+//! accepting a forged signature against it; `verify_with` still rejects an
+//! all-zero key two ways — an explicit all-zero guard AND `verify_strict`
+//! (which rejects low-order keys) — so a zeroed fork or a dev build that
+//! hasn't been given a real key stays fail-closed (EVERY feed is rejected,
+//! and the engine still ships and enables the embedded catalog either way).
 //!
-//! To go live:
-//! 1. Run `bun scripts/catalog/keygen.ts` ONCE (a second run makes an
-//!    unrelated keypair, not a recovery of the first).
-//! 2. Store its printed base64 PRIVATE key as the CI secret
-//!    `CATALOG_FEED_PRIVATE_KEY` (repo Settings -> Secrets and variables ->
-//!    Actions). Never commit it.
-//! 3. Paste its printed `[u8; 32]` PUBLIC key below, replacing the
-//!    all-zero placeholder, and ship that change in a normal PR — the
-//!    public key is not a secret.
-//! 4. The next release's `catalog-feed` job (`.github/workflows/release.yml`)
-//!    then builds and publishes a feed the new binary can verify. See
-//!    docs/development/plugins.md#remote-catalog for the full picture.
-pub const CATALOG_FEED_PUBKEY: [u8; 32] = [0u8; 32]; // TODO(ops): real key from `bun scripts/catalog/keygen.ts`
+//! Rotation is overlap-based, on the same release-N/release-N+1 cadence as
+//! the first-party bundle key. See
+//! docs/development/plugins.md#release-pipeline--key-rollout for the full
+//! rollout and compromise-response playbook (and
+//! docs/development/plugins.md#remote-catalog for the feed pipeline itself).
+pub const CATALOG_FEED_PUBKEY: [u8; 32] = [
+    95, 16, 205, 235, 121, 10, 169, 175, 134, 221, 148, 40, 59, 168, 223, 92, 124, 87, 250, 169,
+    27, 0, 236, 12, 251, 192, 190, 188, 159, 166, 120, 148,
+];

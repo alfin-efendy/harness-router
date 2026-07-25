@@ -6,30 +6,32 @@
 //!
 //! This mirrors `plugins::catalog_feed_key` exactly, one layer up: the catalog
 //! *feed* key signs which integrations exist; this key signs each downloadable
-//! component release before it is installed. It is still the all-zero
-//! placeholder — a deliberate, one-time HUMAN ops step, not something this
-//! crate can safely invent a key for.
+//! component release before it is installed.
 //!
-//! # Fail-closed while the placeholder is in place
+//! # Live key
+//! [`FIRST_PARTY_PUBKEY`] shipped live with the plugin-release activation —
+//! 11b's signer now signs every first-party bundle with the matching private
+//! key. The fail-closed empty-map guard below still protects zeroed forks and
+//! dev builds that have not been given a real key. Rotation is overlap-based
+//! via the `key_id` -> pubkey map: release N adds a second entry (e.g.
+//! `first-party-2`) alongside this one, release N+1 switches CI signing (the
+//! signer's `FIRST_PARTY_KEY_ID` + secret) to the new key, and a later
+//! release drops the old entry. See
+//! docs/development/plugins.md#release-pipeline--key-rollout for the full
+//! rollout and compromise-response playbook.
+//!
+//! # Fail-closed on an all-zero key
 //! The all-zero key is a valid *low-order* Edwards point, so a non-strict
 //! verify could be tricked into accepting a forged signature against it.
-//! [`first_party_trusted_keys`] therefore NEVER hands the placeholder to
-//! `verify_bundle`: while the constant is all-zero it returns an EMPTY trusted
-//! set, so every bundle fails the untrusted-key check and NOTHING installs.
-//! (`verify_bundle` itself also uses `verify_strict`, which rejects low-order
-//! keys, as a second line of defense — see `plugins::bundle`.) The daemon's
-//! first-party bootstrap detects the empty set and does nothing (no network,
-//! no retry state), so the engine still ships; the first-party bundles simply
-//! do not land until the real key is filled in below.
-//!
-//! To go live (done by unit 11b or a later rollout):
-//! 1. Generate the signing keypair ONCE (11b's `build-first-party.ts` keygen).
-//! 2. Store its base64 PRIVATE key as the CI secret consumed by the signer.
-//!    Never commit it.
-//! 3. Paste its printed `[u8; 32]` PUBLIC key below, replacing the all-zero
-//!    placeholder, and ship that change in a normal PR — the public key is not
-//!    a secret. Nothing else in this crate changes: [`first_party_trusted_keys`]
-//!    starts returning a non-empty map and installs begin verifying against it.
+//! [`first_party_trusted_keys`] therefore NEVER hands an all-zero key to
+//! `verify_bundle`: whenever the constant is all-zero — a zeroed fork or a
+//! dev build that has not been given a real key — it returns an EMPTY
+//! trusted set, so every bundle fails the untrusted-key check and NOTHING
+//! installs. (`verify_bundle` itself also uses `verify_strict`, which
+//! rejects low-order keys, as a second line of defense — see
+//! `plugins::bundle`.) The daemon's first-party bootstrap detects the empty
+//! set and does nothing (no network, no retry state), so the engine still
+//! ships without first-party bundles in that case.
 
 use std::collections::HashMap;
 
@@ -38,9 +40,12 @@ use std::collections::HashMap;
 /// id in every first-party bundle's `plugin.sig`.
 pub const FIRST_PARTY_KEY_ID: &str = "first-party";
 
-/// The first-party bundle-signing public key. All-zero placeholder until the
-/// real key is rolled out (see the module docs). Not a secret.
-pub const FIRST_PARTY_PUBKEY: [u8; 32] = [0u8; 32]; // TODO(ops): real key from 11b's signer keygen
+/// The first-party bundle-signing public key. Live as of the plugin-release
+/// activation (see the module docs for rotation). Not a secret.
+pub const FIRST_PARTY_PUBKEY: [u8; 32] = [
+    114, 176, 153, 157, 229, 138, 150, 207, 30, 129, 201, 64, 150, 198, 74, 77, 208, 45, 133, 111,
+    223, 225, 182, 83, 170, 95, 184, 138, 218, 249, 217, 9,
+];
 
 /// The trusted-key map passed to
 /// [`crate::plugins::bundle::verify_bundle`] in production. Keyed by
