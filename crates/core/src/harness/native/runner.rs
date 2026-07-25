@@ -2131,6 +2131,7 @@ impl RunnerMainAgentSpawner {
                 snapshot.clone(),
                 run_id.clone(),
                 child_deps.root_run_id.clone(),
+                child_deps.current_perm_mode(),
                 &child_deps.tools.names(),
             )?;
             child_deps.primary_agent = primary_turn.agent;
@@ -3019,6 +3020,7 @@ async fn execute_tool_call(
     let spec = tool.permission(&input);
     let gate = super::permission::PermGate {
         permission_rules: &agent.permission_rules,
+        native_decisions: &deps.primary_agent.profile.permissions.native,
         perm_mode,
         project_id: deps.project_id.as_deref(),
         store: &deps.store,
@@ -5738,6 +5740,62 @@ mod tests {
         assert!(!DisplayMode::Silent.auto_continues());
     }
 
+    /// Narrow one native tool's decision on `deps.primary_agent`'s profile to
+    /// `Ask` (deferring to `permission_rules` → session overrides → project
+    /// policy → `perm_mode`'s prompt path). The bootstrapped default Ryuzi
+    /// profile every `deps_at`-family helper resolves maps EVERY builtin to
+    /// `Allow` (matching the shipped default), which now also short-circuits
+    /// the permission gate — a test exercising a non-bypass `perm_mode`'s
+    /// prompt/approval flow for a specific tool must narrow that tool back to
+    /// `Ask` first, or the gate never reaches `perm_mode` at all.
+    fn narrow_native_to_ask(deps: &mut RunnerDeps, tool: &str) {
+        let mut snapshot = (*deps.primary_agent).clone();
+        snapshot.profile.permissions.native.insert(
+            tool.to_string(),
+            crate::agents::types::NativeToolDecision::Ask,
+        );
+        deps.primary_agent = Arc::new(snapshot);
+    }
+
+    /// Re-resolve `deps.agent`'s tool filter against the CURRENT
+    /// `deps.tools` registry — what production always does (the filter is
+    /// resolved against the FINAL registry in `start_session`, and
+    /// `refresh_primary_turn` rebuilds it live). A test that swaps
+    /// `deps.tools` AFTER `deps_at`/`seed_owned_session_with_root` holds a
+    /// filter snapshotted against the old registry: a non-builtin test tool
+    /// added by the swap (absent from the map = `Ask` = enabled) only enters
+    /// the filter once this re-resolution runs.
+    fn rebind_agent_tools(deps: &mut RunnerDeps) {
+        deps.agent = crate::harness::native::primary_turn_config_with_tools(
+            deps.primary_agent.clone(),
+            deps.run_id.clone(),
+            deps.root_run_id.clone(),
+            deps.current_perm_mode(),
+            &deps.tools.names(),
+        )
+        .unwrap()
+        .agent_tools;
+    }
+
+    /// Build a `permissions.native` map that enables ONLY the given
+    /// (tool, decision) pairs: every builtin id starts `Off`, then the
+    /// overrides apply. Under the absent=`Ask`=enabled model, "this profile
+    /// exposes only these natives" can no longer be expressed by listing them
+    /// alone — every other builtin must be explicitly `Off`.
+    fn natives_only(
+        overrides: &[(&str, crate::agents::types::NativeToolDecision)],
+    ) -> std::collections::BTreeMap<String, crate::agents::types::NativeToolDecision> {
+        let mut map: std::collections::BTreeMap<_, _> =
+            crate::harness::native::tools::ToolRegistry::builtin_ids()
+                .into_iter()
+                .map(|id| (id, crate::agents::types::NativeToolDecision::Off))
+                .collect();
+        for (tool, decision) in overrides {
+            map.insert(tool.to_string(), *decision);
+        }
+        map
+    }
+
     async fn deps_at(dir: &std::path::Path, llm: Arc<dyn LlmStream>) -> RunnerDeps {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -5904,6 +5962,7 @@ mod tests {
             deps.primary_agent.clone(),
             deps.run_id.clone(),
             deps.root_run_id.clone(),
+            deps.current_perm_mode(),
             &deps.tools.names(),
         )
         .unwrap()
@@ -8964,6 +9023,10 @@ mod tests {
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
         deps.set_perm_mode(PermMode::Default);
+        // The bootstrapped default profile maps every builtin (including
+        // `edit`) to `Allow`, which would short-circuit straight past the
+        // `Default`-mode prompt this test races against. Narrow it to `Ask`.
+        narrow_native_to_ask(&mut deps, "edit");
         enable_v2(&mut deps);
         let mut events = deps.events.subscribe();
         let approvals = deps.approvals.clone();
@@ -9098,6 +9161,11 @@ mod tests {
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
         deps.set_perm_mode(PermMode::Default);
+        // Same rationale as the race test above: keep `edit`'s decision at
+        // `Ask` so this fixture still means "Default mode would normally
+        // prompt" even though the assertion below is that ambiguity rejects
+        // the call BEFORE the gate is ever reached.
+        narrow_native_to_ask(&mut deps, "edit");
         let hook_calls = Arc::new(RecordingExtensionEvents::default());
         deps.extension_events = Some(hook_calls.clone());
         enable_v2(&mut deps);
@@ -11163,6 +11231,7 @@ mod tests {
             deps.primary_agent.clone(),
             deps.run_id.clone(),
             deps.root_run_id.clone(),
+            deps.current_perm_mode(),
             &deps.tools.names(),
         )
         .unwrap()
@@ -11526,9 +11595,13 @@ mod tests {
             message_stop(),
         ];
         let llm = Arc::new(ScriptedLlm::new(vec![turn]));
-        let deps = deps_at(dir.path(), llm).await;
-        // Default mode: bash prompts, and nobody will ever answer.
+        let mut deps = deps_at(dir.path(), llm).await;
+        // Default mode: bash prompts, and nobody will ever answer. Narrow
+        // `bash`'s native decision to `Ask` first — the bootstrapped default
+        // profile maps every builtin to `Allow`, which would otherwise
+        // short-circuit past this prompt entirely.
         deps.set_perm_mode(PermMode::Default);
+        narrow_native_to_ask(&mut deps, "bash");
         let mut rx = deps.events.subscribe();
         let cancel = CancellationToken::new();
         let run = {
@@ -12657,17 +12730,20 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    native: std::collections::BTreeMap::from([
+                    // `natives_only`: every other builtin is `Off`, so the
+                    // target keeps its original narrow advertisement (the
+                    // `!advertised.contains("write")` guard below) under the
+                    // absent=Ask=enabled model. `read` is `Ask` (not `Allow`):
+                    // the native decision is checked BEFORE profile rules, and
+                    // `Allow` would short-circuit straight past `target-rule`'s
+                    // deny below; `Ask` still advertises/enables the tool but
+                    // defers the verdict to the rule, matching this test's
+                    // asserted "the target profile's deny rule applies".
+                    native: natives_only(&[
+                        ("read", crate::agents::types::NativeToolDecision::Ask),
+                        ("bash", crate::agents::types::NativeToolDecision::Allow),
                         (
-                            "read".into(),
-                            crate::agents::types::NativeToolDecision::Allow,
-                        ),
-                        (
-                            "bash".into(),
-                            crate::agents::types::NativeToolDecision::Allow,
-                        ),
-                        (
-                            "app_projects".into(),
+                            "app_projects",
                             crate::agents::types::NativeToolDecision::Allow,
                         ),
                     ]),
@@ -12888,8 +12964,12 @@ mod tests {
                 },
                 personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
-                    native: std::collections::BTreeMap::from([(
-                        "read".into(),
+                    // Every other builtin `Off` so the retry target keeps its
+                    // original "read + bound plugins only" advertisement (the
+                    // `!advertised.contains("bash"/"write")` guards below)
+                    // under the absent=Ask=enabled model.
+                    native: natives_only(&[(
+                        "read",
                         crate::agents::types::NativeToolDecision::Allow,
                     )]),
                     rules: Vec::new(),
@@ -13140,6 +13220,10 @@ mod tests {
             release: release.clone(),
             effects: effects.clone(),
         })]));
+        // Re-resolve the parent filter against the swapped registry so the
+        // non-builtin `blocking` tool (absent from the map = Ask = enabled)
+        // enters it — mirrors production's final-registry resolution.
+        rebind_agent_tools(&mut deps);
         let root = deps.run_id.clone();
         let spawner = RunnerSpawner {
             deps: deps.clone(),
@@ -13229,6 +13313,9 @@ mod tests {
                 release: release.clone(),
                 effects: effects.clone(),
             })]));
+            // Same rationale as the cancel test above: re-resolve the parent
+            // filter against the swapped registry so `blocking` is enabled.
+            rebind_agent_tools(&mut deps);
             deps
         };
         let root = deps.run_id.clone();

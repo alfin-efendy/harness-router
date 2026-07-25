@@ -45,11 +45,16 @@ impl PrimaryTurn {
         }
     }
 
-    fn config(&self) -> anyhow::Result<PrimaryTurnConfig> {
+    /// `perm_mode` is session-owned (not carried by the profile at all), so
+    /// the caller supplies the current session row's value — the only place
+    /// this is called (`continue_session_with_primary_turn`) has just fetched
+    /// that row.
+    fn config(&self, perm_mode: PermMode) -> anyhow::Result<PrimaryTurnConfig> {
         crate::harness::native::primary_turn_config(
             self.agent.clone(),
             self.run_id.clone(),
             self.root_run_id.clone(),
+            perm_mode,
         )
     }
 }
@@ -89,7 +94,15 @@ async fn validate_executable_primary(
             details_suffix,
         );
     }
-    crate::harness::native::primary_turn_config(agent.clone(), String::new(), String::new())?;
+    // Validation probe only: never dispatched, so the perm_mode value is
+    // inert here — `PermMode::Default` mirrors every other placeholder probe
+    // argument (`run_id`/`root_run_id` are empty strings for the same reason).
+    crate::harness::native::primary_turn_config(
+        agent.clone(),
+        String::new(),
+        String::new(),
+        PermMode::Default,
+    )?;
     Ok(())
 }
 
@@ -243,9 +256,10 @@ impl ControlPlane {
             branch,
             title: Some(title),
             status: SessionStatus::Running,
-            // TODO(Task 2): perm_mode is a session-owned concept now; the
-            // profile no longer carries one. `PermMode::Default` matches the
-            // pre-migration bootstrap default (Ryuzi's YAML `mode: ask`).
+            // perm_mode is a session-owned concept, not carried by the
+            // profile at all. `PermMode::Default` matches the pre-migration
+            // bootstrap default (Ryuzi's YAML `mode: ask`); a caller changes
+            // it per-session via `update_session_perm_mode`.
             perm_mode: PermMode::Default,
             started_by: Some(started_by.to_string()),
             created_at: Some(now),
@@ -789,7 +803,12 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
 
-        let primary_config = primary_turn.config()?;
+        // The session row's persisted `perm_mode` is the session-owned
+        // source of truth (the profile no longer carries one at all); this
+        // is also how a live `update_session_perm_mode` API call reaches an
+        // already-running session — `refresh_primary_turn` below applies
+        // whatever this resolves to on every continued turn.
+        let primary_config = primary_turn.config(session.perm_mode)?;
         let run_id = primary_turn.run_id.clone();
 
         // Reserve the session as Running for the lifetime of this turn so the
@@ -1632,12 +1651,11 @@ impl ControlPlane {
         let run_id = primary_turn.run_id;
         let root_run_id = primary_turn.root_run_id;
         let (model, effort) = agent_model_parts(&primary_agent.profile.model);
-        // TODO(Task 2): thread perm_mode through `primary_turn_config`
-        // properly (`ctx.perm_mode` per the plan brief) instead of
-        // recomputing it here. The profile no longer carries a mode at all,
-        // so this falls back to the persisted session row's mode (the real
-        // session-owned value) and only defaults when that row is missing
-        // (a not-yet-persisted resume path).
+        // perm_mode is session-owned, not carried by the profile at all.
+        // This becomes `ctx.perm_mode` below, which `NativeHarness::
+        // start_session` threads into `primary_turn_config_with_tools` — the
+        // persisted session row's mode is the real value; only a not-yet-
+        // persisted resume path (row missing) falls back to the default.
         let perm_mode = session_row
             .as_ref()
             .map(|s| s.perm_mode)
