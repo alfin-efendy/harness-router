@@ -5,6 +5,9 @@ import type {
   AgentRun,
   AgentRunRosterInfo,
   AgentSummaryInfo,
+  CommandFileInfo,
+  CommandFileInputDto,
+  CommandFileMutationDto,
   ComponentReleaseDetail,
   ConnectionInfo,
   CoreEvent,
@@ -13,6 +16,7 @@ import type {
   PluginDetail,
   PluginInfo,
   Session,
+  SlashEntryInfo,
 } from "../src/bindings";
 
 /**
@@ -561,6 +565,103 @@ export const ROUTE_TARGET_CAPABILITIES = [
   { provider: "fixture", model: "model-beta", contextWindow: 128000, supported: [], providerDefault: null },
 ] satisfies ModelRouteTargetCapability[];
 
+// ---------- Slash catalog + global commands fixtures (slash-command-overhaul
+// plan, SDD Task 12) ----------
+//
+// The project-less "/" catalog always includes the three embedded builtin
+// commands (`init`/`review`/`compact` — see `SlashCatalog::entries` and its
+// `no_project_load_lists_global_and_builtin_commands` test in
+// crates/core/src/harness/native/slash_catalog.rs) alongside whatever global
+// commands and bound global skills are configured. `home`/`session`/
+// `requiresProject` below mirror the real builtins exactly: `init` is
+// home+session+requires-project, `review` (agent: "plan") and `compact` are
+// session-only. A "global" command and a "project" skill are included too so
+// both the Automations "Commands" tab (which filters to `origin === "builtin"`
+// for its read-only rows) and the composer "/" popup have non-trivial data.
+export const SLASH_CATALOG = [
+  {
+    name: "init",
+    description: "Analyze the codebase and write an AGENTS.md for future agents.",
+    kind: "command",
+    origin: "builtin",
+    home: true,
+    session: true,
+    requiresProject: true,
+    effective: true,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
+  },
+  {
+    name: "review",
+    description: "Review the current working changes for bugs and issues.",
+    kind: "command",
+    origin: "builtin",
+    home: false,
+    session: true,
+    requiresProject: false,
+    effective: true,
+    shadowsGlobal: false,
+    agent: "plan",
+    model: null,
+    subtask: false,
+  },
+  {
+    name: "compact",
+    description: "Summarize older history to free context-window space.",
+    kind: "command",
+    origin: "builtin",
+    home: false,
+    session: true,
+    requiresProject: false,
+    effective: true,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
+  },
+  {
+    name: "ship",
+    description: "Ship it",
+    kind: "command",
+    origin: "global",
+    home: true,
+    session: true,
+    requiresProject: false,
+    effective: true,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
+  },
+  {
+    name: "brainstorm",
+    description: "Explore an idea",
+    kind: "skill",
+    origin: "project",
+    home: true,
+    session: true,
+    requiresProject: false,
+    effective: true,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
+  },
+] satisfies SlashEntryInfo[];
+
+/** `global_command_list` fixture — one saved global command ("ship"),
+ *  matching the catalog's `origin: "global"` entry above so the two stay
+ *  consistent. `global_command_create/update/delete` (see the dynamic
+ *  dispatch in `installMockIPC`) echo the mutation's own input back rather
+ *  than mutating this array — no e2e journey round-trips through
+ *  create/edit/delete → list yet (that Automations → Commands flow is an
+ *  owed manual Tauri smoke, per the SDD brief). */
+export const GLOBAL_COMMANDS = [
+  { name: "ship", description: "Ship it", template: "Ship $ARGUMENTS", agent: null, model: null, subtask: false, revision: "1" },
+] satisfies CommandFileInfo[];
+
 // ---------- Plugins hub fixtures (Task 16) ----------
 //
 // Three `list_plugins` rows covering the hub's unified-row cases the e2e
@@ -795,6 +896,14 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   probe_gateways: [],
   list_jobs: [],
   list_apps: [],
+  // `slash_catalog` is keyed by project/agent pairing on the frontend
+  // (`catalogKey`) but this mock answers every pairing with the same fixture
+  // — fine for these specs, since none of them override it per-test. Global
+  // command CRUD (`global_command_create/update/delete`) is dispatched
+  // dynamically further down instead of listed here, since it takes an
+  // `input`/`name`/`revision`.
+  slash_catalog: SLASH_CATALOG,
+  global_command_list: GLOBAL_COMMANDS,
   // Plugin-distribution commands invoked on the Plugins view mount. Without
   // these, the fallback returns `null` for the non-`list_`-prefixed ones
   // (`plugin_doctor`, `plugins_restart_required`), and the store then renders
@@ -877,7 +986,11 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
       // can't catch, since it only scans source text, not runtime
       // invocations), the unmocked-command fallback below throws instead of
       // silently resolving — so an accidental call fails the test
-      // immediately rather than degrading quietly.
+      // immediately rather than degrading quietly. The slash-command-overhaul
+      // plan (SDD Task 3/6) similarly deleted the old per-project native
+      // command commands once `slash_catalog` and the global command CRUD
+      // replaced them — same fail-fast reasoning applies to `native_commands`
+      // and the `*_project_command(s)` family below.
       const removedCommands = new Set([
         "search_sessions",
         "list_skill_usage",
@@ -896,6 +1009,12 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
         "orch_retry",
         "orch_answer_block",
         "orch_steer",
+        "native_commands",
+        "list_project_commands",
+        "read_project_command",
+        "create_project_command",
+        "update_project_command",
+        "delete_project_command",
       ]);
       type RouteIdentity = {
         resolvedProviderId: string;
@@ -1365,6 +1484,43 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
             );
             return Promise.resolve(connections);
           }
+          // Global command CRUD (slash-command-overhaul plan, SDD Task 12):
+          // `global_command_read` is dispatched dynamically by `name` against
+          // the static `global_command_list` fixture; create/update/delete
+          // echo the mutation's own input back as a fresh `CommandFileInfo`
+          // rather than mutating that array — see the comment on
+          // `GLOBAL_COMMANDS` above for why a stateful mock isn't needed yet.
+          if (cmd === "global_command_read") {
+            const { name } = args as { name: string };
+            const found = (fixtures.global_command_list as CommandFileInfo[]).find((command) => command.name === name);
+            if (!found) return Promise.reject({ message: `unknown global command: ${name}` });
+            return Promise.resolve(found);
+          }
+          if (cmd === "global_command_create") {
+            const { input } = args as { input: CommandFileInputDto };
+            return Promise.resolve({
+              name: input.name,
+              description: input.description,
+              template: input.template,
+              agent: input.agent,
+              model: input.model,
+              subtask: input.subtask ?? false,
+              revision: "1",
+            } satisfies CommandFileInfo);
+          }
+          if (cmd === "global_command_update") {
+            const { name, revision, input } = args as { name: string; revision: string; input: CommandFileMutationDto };
+            return Promise.resolve({
+              name,
+              description: input.description,
+              template: input.template,
+              agent: input.agent,
+              model: input.model,
+              subtask: input.subtask ?? false,
+              revision: `${revision}-1`,
+            } satisfies CommandFileInfo);
+          }
+          if (cmd === "global_command_delete") return Promise.resolve(null);
           if (cmd in fixtures) return Promise.resolve(fixtures[cmd]);
           if (removedCommands.has(cmd)) {
             throw new Error(`[mock-ipc] removed command invoked by UI: ${cmd} — this should never be called`);
