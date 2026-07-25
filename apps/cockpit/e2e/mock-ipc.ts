@@ -5,10 +5,13 @@ import type {
   AgentRun,
   AgentRunRosterInfo,
   AgentSummaryInfo,
+  ComponentReleaseDetail,
   ConnectionInfo,
   CoreEvent,
   Message,
   ModelRouteTargetCapability,
+  PluginDetail,
+  PluginInfo,
   Session,
 } from "../src/bindings";
 
@@ -558,6 +561,215 @@ export const ROUTE_TARGET_CAPABILITIES = [
   { provider: "fixture", model: "model-beta", contextWindow: 128000, supported: [], providerDefault: null },
 ] satisfies ModelRouteTargetCapability[];
 
+// ---------- Plugins hub fixtures (Task 16) ----------
+//
+// Three `list_plugins` rows covering the hub's unified-row cases the e2e
+// spec (`plugins.e2e.ts`) exercises: an installed, component-backed,
+// healthy connector (`github`); a not-yet-installed, non-component
+// connector (`linear` — pre-install detail's Overview+Tools-only case,
+// since it has no release footprint and isn't componentBacked, so
+// `visibleTabs` hides Settings/Health/Versions before install); and a
+// not-yet-installed, component-backed connector with no declared auth
+// (`slack` — the universal wizard's shortest component plan, `overview →
+// permissions → install → done`, since `authKind: "none"` and no manifest
+// settings/OAuth profiles skip the connect/settings steps).
+
+const HUB_GITHUB_PLUGIN: PluginInfo = {
+  id: "github",
+  name: "GitHub",
+  description: "Repos, issues, and pull requests via GitHub's official connector.",
+  icon: "github",
+  categories: ["dev-tools"],
+  slot: null,
+  ownsSlot: false,
+  verified: true,
+  experimental: false,
+  enabled: true,
+  source: "component",
+  capabilities: ["connector"],
+  configured: true,
+  kind: "integration",
+  installed: true,
+  family: null,
+  pinned: false,
+  sourceSpec: null,
+  resolvedCommit: null,
+  installedAt: 1_700_000_000_000,
+  updatedAt: 1_700_000_000_000,
+  trustTier: null,
+  catalogVersion: null,
+  componentBacked: true,
+  blockedReason: null,
+  status: "ok",
+  statusDetail: null,
+  authKind: "oauth",
+  toolCount: 12,
+  skillCount: null,
+};
+
+const HUB_LINEAR_PLUGIN: PluginInfo = {
+  id: "linear",
+  name: "Linear",
+  description: "Track issues and projects in Linear.",
+  icon: "linear",
+  categories: ["project-management"],
+  slot: null,
+  ownsSlot: false,
+  verified: false,
+  experimental: false,
+  enabled: false,
+  source: "catalog",
+  capabilities: ["connector"],
+  configured: false,
+  kind: "integration",
+  installed: false,
+  family: null,
+  pinned: false,
+  sourceSpec: null,
+  resolvedCommit: null,
+  installedAt: null,
+  updatedAt: null,
+  trustTier: null,
+  catalogVersion: null,
+  componentBacked: false,
+  blockedReason: null,
+  status: "not-installed",
+  statusDetail: null,
+  authKind: "token",
+  toolCount: null,
+  skillCount: null,
+};
+
+const HUB_SLACK_PLUGIN: PluginInfo = {
+  id: "slack",
+  name: "Slack",
+  description: "Post messages and read channels from Slack.",
+  icon: "slack",
+  categories: ["messaging"],
+  slot: null,
+  ownsSlot: false,
+  verified: true,
+  experimental: false,
+  enabled: false,
+  source: "component",
+  capabilities: ["connector"],
+  configured: false,
+  kind: "integration",
+  installed: false,
+  family: null,
+  pinned: false,
+  sourceSpec: null,
+  resolvedCommit: null,
+  installedAt: null,
+  updatedAt: null,
+  trustTier: null,
+  catalogVersion: null,
+  componentBacked: true,
+  blockedReason: null,
+  status: "not-installed",
+  statusDetail: null,
+  authKind: "none",
+  toolCount: 5,
+  skillCount: null,
+};
+
+export const PLUGIN_HUB_ROWS: PluginInfo[] = [HUB_GITHUB_PLUGIN, HUB_LINEAR_PLUGIN, HUB_SLACK_PLUGIN];
+
+/** `plugin_detail` per id — every registered plugin resolves here regardless
+ *  of `installed` (pre-install support, Task 7); an id outside this map
+ *  falls through to the dynamic dispatch's "unknown plugin" error below,
+ *  matching the daemon's real 404 contract (`PluginDetailView` special-cases
+ *  the `"unknown plugin:"` prefix). */
+const PLUGIN_DETAILS: Record<string, PluginDetail> = {
+  github: {
+    info: HUB_GITHUB_PLUGIN,
+    auth: {
+      kind: "oauth",
+      setting: null,
+      env: null,
+      helpUrl: "https://github.com/settings/tokens",
+      configured: true,
+      oauthConnectAvailable: true,
+      oauthConnectError: null,
+      oauthTokenStored: true,
+      oauthReconnectRequired: false,
+    },
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: "https://github.com/github/github-mcp-server",
+    publisher: "GitHub (official)",
+  },
+  linear: {
+    info: HUB_LINEAR_PLUGIN,
+    auth: {
+      kind: "token",
+      setting: "plugin.linear.token",
+      env: null,
+      helpUrl: null,
+      configured: false,
+      oauthConnectAvailable: false,
+      oauthConnectError: null,
+      oauthTokenStored: false,
+      oauthReconnectRequired: false,
+    },
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: null,
+    publisher: "Linear",
+  },
+  slack: {
+    info: HUB_SLACK_PLUGIN,
+    // authKind "none" — no top-level auth block, matching `planWizardSteps`'s
+    // `detail.auth?.kind ?? "none"` read so the wizard's Connect step stays
+    // skipped for this fixture.
+    auth: null,
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: null,
+    publisher: "Slack",
+  },
+};
+
+/** `plugin_release_detail` overrides for ids with a release footprint —
+ *  every other id (including never-installed `linear`/`slack`) falls back to
+ *  the dynamic dispatch's empty-ledger default below, which mirrors the real
+ *  `plugin_release_detail_is_empty_for_a_never_installed_plugin` behavior
+ *  (`crates/core/src/api/plugins_api.rs`). */
+const COMPONENT_RELEASES: Record<string, ComponentReleaseDetail> = {
+  github: {
+    pluginId: "github",
+    releases: [
+      {
+        pluginId: "github",
+        version: "1.4.0",
+        sourceUrl: "https://plugins.ryuzi.dev/github/1.4.0.wasm",
+        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+        signingKeyId: "ryuzi-first-party",
+        installedAt: 1_700_000_000_000,
+        active: true,
+        revoked: false,
+        revocationReason: null,
+        firstParty: true,
+      },
+    ],
+    activeVersion: "1.4.0",
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "GitHub connector — repos, issues, and pull requests.",
+      lifecycle: "per-session",
+      domains: ["api.github.com"],
+      oauthProfiles: [],
+      tools: [
+        { name: "create_issue", description: "Open an issue", writes: true },
+        { name: "list_repos", description: "List repositories", writes: false },
+      ],
+    },
+  },
+};
+
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
 const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   list_projects: [PROJECT],
@@ -588,7 +800,7 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   // (`plugin_doctor`, `plugins_restart_required`), and the store then renders
   // `doctorFindings`/`restartRequired` from `null` — crashing the view and
   // wedging sidebar navigation.
-  list_plugins: [],
+  list_plugins: PLUGIN_HUB_ROWS,
   list_skills: [],
   plugin_doctor: [],
   plugins_restart_required: false,
@@ -635,6 +847,16 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   // Internal lookup bag for the dynamically-dispatched `get_agent` command
   // (see its branch in installMockIPC) — not a real Tauri command name.
   agent_details: AGENT_DETAILS,
+  // Internal lookup bags for the dynamically-dispatched `plugin_detail`/
+  // `plugin_release_detail` commands (Task 16) — not real Tauri command
+  // names. `page.addInitScript`'s callback is serialized via `.toString()`
+  // and re-evaluated in the page, so it only ever sees its own `fixtures`
+  // parameter — a direct reference to `PLUGIN_DETAILS`/`COMPONENT_RELEASES`
+  // from inside the callback body would throw a `ReferenceError` in the
+  // browser (no closure survives the serialization), same reasoning
+  // `agent_details` above already established.
+  plugin_details: PLUGIN_DETAILS,
+  component_releases: COMPONENT_RELEASES,
 };
 
 /**
@@ -979,7 +1201,66 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
           // the same fixture object (which would break `pluginId`-keyed lists).
           if (cmd === "plugin_release_detail") {
             const { id } = args as { id: string };
-            return Promise.resolve({ pluginId: id, releases: [], activeVersion: null, activeManifest: null });
+            const releases = fixtures.component_releases as Record<string, unknown>;
+            return Promise.resolve(releases[id] ?? { pluginId: id, releases: [], activeVersion: null, activeManifest: null });
+          }
+          // Task 16: `plugin_detail` — pre-install support (Task 7) means this
+          // resolves for a registered-but-not-yet-installed plugin too (the hub's
+          // Discover rows), not just installed ones. An id outside `plugin_details`
+          // rejects with the "unknown plugin:" prefix `PluginDetailView` special-cases
+          // (its own component-only fallback render).
+          if (cmd === "plugin_detail") {
+            const { id } = args as { id: string };
+            const details = fixtures.plugin_details as Record<string, unknown>;
+            const detail = details[id];
+            if (!detail) return Promise.reject({ message: `unknown plugin: ${id}` });
+            return Promise.resolve(detail);
+          }
+          // Task 16: `plugin_tools` — echoes a single declared tool for any id,
+          // mirroring a component's declared-tools manifest response (`live:
+          // false`) regardless of install state, so the Tools tab/wizard Overview
+          // and Done steps always have something to render.
+          if (cmd === "plugin_tools") {
+            const { pluginId } = args as { pluginId: string };
+            return Promise.resolve({
+              pluginId,
+              live: false,
+              entries: [{ name: "create_issue", description: "Open an issue", kind: "tool", writes: true }],
+            });
+          }
+          // Task 16: `install_component_plugin` — the universal wizard's
+          // `InstallComponentStep` calls this for any component-backed plugin;
+          // echoes a fresh single-release `ComponentReleaseDetail` back so the
+          // step's `ctx.refresh()` (and the Versions tab, if reopened) has
+          // something coherent to show post-install.
+          if (cmd === "install_component_plugin") {
+            const { id } = args as { id: string; version: string | null };
+            return Promise.resolve({
+              pluginId: id,
+              releases: [
+                {
+                  pluginId: id,
+                  version: "1.0.0",
+                  sourceUrl: `https://plugins.ryuzi.dev/${id}/1.0.0.wasm`,
+                  sha256: "0".repeat(64),
+                  signingKeyId: "ryuzi-first-party",
+                  installedAt: Date.now(),
+                  active: true,
+                  revoked: false,
+                  revocationReason: null,
+                  firstParty: true,
+                },
+              ],
+              activeVersion: "1.0.0",
+              activeManifest: {
+                publisher: "Ryuzi",
+                description: "Installed via the e2e fixture.",
+                lifecycle: "per-session",
+                domains: [],
+                oauthProfiles: [],
+                tools: [],
+              },
+            });
           }
           if (cmd === "list_model_routes") return Promise.resolve(modelRoutes);
           if (cmd === "save_model_route") {
