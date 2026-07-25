@@ -68,10 +68,14 @@ struct PermissionRuleWire {
 }
 
 /// A native tool's decision on the wire. `NativeToolDecision` covers the
-/// current `allow`/`ask`/`off` vocabulary; `Legacy(bool)` tolerates a
-/// hand-edited YAML 1.1 bareword (`off`/`no` parse as `false`) so a profile
-/// is never bricked by an unquoted `off`. `true` has no meaning here (there
-/// is no boolean "on" decision) and is rejected at parse time.
+/// current `allow`/`ask`/`off` vocabulary; a bare `off` scalar always lands
+/// directly in this arm (this crate's `serde_yaml` follows the YAML 1.2
+/// core schema, so unquoted `off`/`no`/`on`/`yes` are plain strings, never
+/// booleans — only `true`/`false` resolve as booleans). `Legacy(bool)`
+/// exists purely to tolerate a hand-edited literal boolean `false` (as
+/// opposed to the string `"false"`), folding it to `Off` so a profile is
+/// never bricked by that. `true` has no meaning here (there is no boolean
+/// "on" decision) and is rejected at parse time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum NativeToolDecisionWire {
@@ -806,29 +810,25 @@ fn merge_value(target: &mut Value, replacement: Value) {
     }
 }
 
+/// No post-processing of the rendered text happens here on purpose: an
+/// earlier version of this function used to rewrite every line ending in
+/// `: off` to `: "off"`, on the theory that `serde_yaml`'s YAML 1.1-style
+/// resolver would otherwise read an unquoted `off` back as the boolean
+/// `false`. That rewrite was both unnecessary and unsafe — unnecessary
+/// because this crate's `serde_yaml` (0.9) follows the YAML 1.2 core
+/// schema, under which only bareword `true`/`false` resolve as booleans;
+/// `off`/`no`/`on`/`yes` always parse back as plain strings (see
+/// [`NativeToolDecision::Off`] and `NativeToolDecisionWire`), so a bare
+/// `off` scalar in `permissions.native` already round-trips correctly with
+/// no quoting at all. It was unsafe because the line-based rewrite matched
+/// *any* line in the document ending in `: off`, including interior
+/// content lines of a multi-line literal block scalar (e.g. an agent
+/// description containing a sentence like "turn logging: off") — silently
+/// corrupting user text on every save. Emit exactly what `serde_yaml`
+/// produces.
 fn render_yaml<T: Serialize>(value: &T) -> anyhow::Result<String> {
     let rendered = serde_yaml::to_string(value)?;
-    Ok(quote_off_scalars(format!("{}\n", rendered.trim_end())))
-}
-
-/// `serde_yaml` does not quote a bare `off` scalar, but YAML 1.1's core
-/// schema (the resolver `serde_yaml` follows) treats an unquoted
-/// `off`/`no`/`false` as the boolean `false`. [`NativeToolDecision::Off`]
-/// always serializes as the plain string `off`, so every line whose entire
-/// value is that word gets its value quoted here to keep it a string on the
-/// next parse (mirrored on the read side by `NativeToolDecisionWire`'s
-/// `Legacy(bool)` fallback, which tolerates a hand-edited unquoted `off`).
-fn quote_off_scalars(rendered: String) -> String {
-    let mut out = rendered
-        .lines()
-        .map(|line| match line.strip_suffix(": off") {
-            Some(prefix) => format!("{prefix}: \"off\""),
-            None => line.to_owned(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    out.push('\n');
-    out
+    Ok(format!("{}\n", rendered.trim_end()))
 }
 
 #[cfg(test)]
@@ -1188,17 +1188,46 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
             .native
             .insert("write".into(), NativeToolDecision::Off);
         let rendered = render_agent_profile(&profile).unwrap();
-        assert!(
-            rendered.contains("\"off\"") || rendered.contains("'off'"),
-            "off must be quoted: {rendered}"
-        );
+        // The `off` scalar is never quoted (serde_yaml 0.9 follows the YAML
+        // 1.2 core schema, where only `true`/`false` bareword scalars
+        // resolve as booleans — `off` always round-trips as a plain
+        // string). The requirement is that it parses back to `Off`, not
+        // that it carries any particular quote style.
         let back = parse_agent_profile(&rendered).unwrap();
         assert_eq!(back.permissions, profile.permissions);
     }
 
     #[test]
+    fn description_content_line_ending_in_colon_off_is_not_corrupted() {
+        // Regression test: a multi-line description forces serde_yaml to
+        // emit it as a literal block scalar. A content line that happens to
+        // end in ": off" (e.g. a sentence about a logging toggle) must
+        // survive render -> parse byte-for-byte; it must never be rewritten
+        // into `...: "off"` the way a real `permissions.native` decision is.
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("t".into());
+        profile.description =
+            "Handles alerts.\nRuntime toggle for turn logging: off\nAlso handles greetings."
+                .to_string();
+        let rendered = render_agent_profile(&profile).unwrap();
+        assert!(
+            rendered.contains("Runtime toggle for turn logging: off"),
+            "description content line must survive unquoted: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Runtime toggle for turn logging: \"off\""),
+            "description content must not be quoted like a permission decision: {rendered}"
+        );
+        let back = parse_agent_profile(&rendered).unwrap();
+        assert_eq!(back.description, profile.description);
+    }
+
+    #[test]
     fn bool_false_parses_as_off() {
-        // YAML 1.1 hand-edit tolerance
+        // A rendered `off` is a bare, unquoted plain-string scalar (see
+        // `render_yaml`'s doc comment). Replacing the quote characters here
+        // is a no-op string replace when there were none to begin with;
+        // this test's real job is exercising the `Legacy(bool)` hand-edit
+        // tolerance path in case someone types a literal `false` instead.
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("t".into());
         profile
             .permissions
