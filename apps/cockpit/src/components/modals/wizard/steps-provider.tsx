@@ -21,7 +21,11 @@ export function InstallProviderStep({ ctx, onNext }: { ctx: WizardCtx; onNext: (
 
   const attempt = useCallback(async () => {
     setStatus("installing");
-    const ok = await installProvider(ctx.pluginId);
+    // Finding 2: `install_provider` (the daemon RPC `installProvider` calls)
+    // bails on any id that isn't a family head — a member whose id differs
+    // from its family (e.g. `anthropic-oauth`, family `anthropic`) must
+    // register the FAMILY, not its own id.
+    const ok = await installProvider(ctx.detail?.info.family ?? ctx.pluginId);
     if (!mountedRef.current) return;
     if (!ok) {
       setStatus("error");
@@ -58,5 +62,8 @@ export function InstallProviderStep({ ctx, onNext }: { ctx: WizardCtx; onNext: (
 }
 
 export function ProviderConnectStep({ ctx, onNext }: { ctx: WizardCtx; onNext: () => void }) {
-  return <ConnectionMethodForm family={ctx.pluginId} onDone={onNext} />;
+  // Finding 2: same family-head requirement as `InstallProviderStep` —
+  // `ConnectionMethodForm` filters the catalog by `family`, which only ever
+  // matches a family HEAD id, not a joining member's own id.
+  return <ConnectionMethodForm family={ctx.detail?.info.family ?? ctx.pluginId} onDone={onNext} />;
 }

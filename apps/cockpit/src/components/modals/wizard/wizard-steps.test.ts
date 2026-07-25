@@ -25,6 +25,24 @@ test("provider always gets a connect step, even with authKind none", () => {
   expect(steps).toEqual(["overview", "install", "connect", "done"]);
 });
 
+// Finding 1 — the daemon flags every `COMPONENT_BACKED_PROVIDER_IDS` entry
+// `componentBacked: true` for release-management purposes only; the planner
+// must NOT grow a permissions step for it (the provider adapter has no
+// component release/manifest to summarize permissions from — see
+// `wizardKind`'s doc in `UniversalInstallWizard.tsx`).
+test("a component-backed provider skips permissions despite componentBacked", () => {
+  const steps = planWizardSteps(input({ kind: "provider", componentBacked: true, authKind: "none" }));
+  expect(steps).toEqual(["overview", "install", "connect", "done"]);
+});
+
+// trustRequired still wins even for a provider (defensive — providers never
+// actually set skillTrust, but the gate's `|| trustRequired` must not be
+// short-circuited by the kind !== "provider" exclusion).
+test("trustRequired still adds permissions for a provider", () => {
+  const steps = planWizardSteps(input({ kind: "provider", componentBacked: true, authKind: "none", trustRequired: true }));
+  expect(steps).toEqual(["overview", "permissions", "install", "connect", "done"]);
+});
+
 test("curated skill pack (trust not required) skips permissions and connect", () => {
   const steps = planWizardSteps(input({ kind: "skill-pack" }));
   expect(steps).toEqual(["overview", "install", "done"]);

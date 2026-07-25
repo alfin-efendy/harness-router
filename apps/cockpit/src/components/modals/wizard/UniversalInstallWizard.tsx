@@ -60,18 +60,26 @@ export type WizardCtx = {
   setConnectorBegin: (v: PluginInstallBeginResult | null) => void;
 };
 
-/** Which per-kind adapter set owns this plugin's steps (Task 15). A
- *  component bundle wins first (its own release/manifest drives overview's
- *  tool list and permissions' summary regardless of what `kind` string the
- *  manifest declares); skill-pack and provider are the two other kinds with
- *  their own install/connect mechanics; everything else is a classic
- *  (pre-component, catalog-manifest) connector — integrations, gateways,
- *  and any future kind this switch doesn't know about yet. */
+/** Which per-kind adapter set owns this plugin's steps (Task 15). `kind`
+ *  ("provider"/"skill-pack") wins FIRST (Finding 1 — review of Task 15): the
+ *  daemon flags every one of the twelve `COMPONENT_BACKED_PROVIDER_IDS`
+ *  (crates/core/src/plugins/component_catalog.rs) `componentBacked: true` so
+ *  Cockpit can offer release management (install / active version /
+ *  rollback) for their bundle, but that's a display-only flag for them — they
+ *  still install/connect through the provider adapter
+ *  (`installProvider`/`ConnectionMethodForm`), not `InstallComponentStep`'s
+ *  fail-closed component-bundle path. Checking `componentBacked` before
+ *  `kind` used to route every one of those provider ids into the wrong
+ *  adapter. Everything else that IS component-backed drives overview's tool
+ *  list and permissions' summary off its own release/manifest regardless of
+ *  what `kind` string the manifest declares; anything left over is a classic
+ *  (pre-component, catalog-manifest) connector — integrations, gateways, and
+ *  any future kind this switch doesn't know about yet. */
 function wizardKind(detail: PluginDetail | null): "component" | "connector" | "skill-pack" | "provider" {
   if (!detail) return "connector";
-  if (detail.info.componentBacked) return "component";
-  if (detail.info.kind === "skill-pack") return "skill-pack";
   if (detail.info.kind === "provider") return "provider";
+  if (detail.info.kind === "skill-pack") return "skill-pack";
+  if (detail.info.componentBacked) return "component";
   return "connector";
 }
 

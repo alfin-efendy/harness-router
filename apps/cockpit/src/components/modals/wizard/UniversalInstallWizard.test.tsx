@@ -83,17 +83,27 @@ function releaseFixture(): ComponentReleaseDetail {
   return { pluginId: "notion", releases: [], activeVersion: null, activeManifest: null };
 }
 
-// Provider-shaped fixture with no permissions gate (not component-backed),
-// no settings, and no oauth requirement other than the provider-kind rule
-// itself — planWizardSteps collapses this down to overview/install/connect/
-// done (4 steps), exercising the shell against a plan shorter than the
-// full six-step fixture every other test in this file uses.
+// Provider-shaped fixture with no permissions gate, no settings, and no
+// oauth requirement other than the provider-kind rule itself —
+// planWizardSteps collapses this down to overview/install/connect/done (4
+// steps), exercising the shell against a plan shorter than the full
+// six-step fixture every other test in this file uses.
+//
+// Finding 1 (final-review fix): `componentBacked: true` and a real
+// `COMPONENT_BACKED_PROVIDER_IDS` id ("groq" — see
+// crates/core/src/plugins/component_catalog.rs) — faithful to what the
+// daemon actually sends for every one of the twelve component-backed
+// provider bundles. Before the fix, `wizardKind` checked `componentBacked`
+// before `kind`, so this exact shape routed through `InstallComponentStep`/
+// the component `ConnectStep` instead of the provider adapter; this fixture
+// is what proves the fix (`wizardKind`/`planWizardSteps` now check
+// `kind === "provider"` first).
 function providerDetailFixture(): PluginDetail {
   return {
     info: {
-      id: "openai",
-      name: "OpenAI",
-      description: "OpenAI provider",
+      id: "groq",
+      name: "Groq",
+      description: "Groq provider",
       icon: null,
       categories: ["llm"],
       slot: null,
@@ -106,7 +116,7 @@ function providerDetailFixture(): PluginDetail {
       capabilities: ["provider"],
       kind: "provider",
       installed: false,
-      family: "openai",
+      family: "groq",
       pinned: false,
       sourceSpec: null,
       resolvedCommit: null,
@@ -114,7 +124,7 @@ function providerDetailFixture(): PluginDetail {
       updatedAt: null,
       trustTier: null,
       catalogVersion: null,
-      componentBacked: false,
+      componentBacked: true,
       blockedReason: null,
       status: "not-installed",
       statusDetail: null,
@@ -127,7 +137,56 @@ function providerDetailFixture(): PluginDetail {
     mcp: [],
     models: [],
     homepage: null,
-    publisher: "OpenAI",
+    publisher: "Groq",
+  };
+}
+
+// Finding 2 (final-review fix): a component-backed provider whose id is NOT
+// its own family head — mirrors the real `anthropic-oauth` entry
+// (`llm_router::registry::CATALOG`, family "anthropic"). Proves
+// `steps-provider.tsx` reads `ctx.detail?.info.family`, not `ctx.pluginId`,
+// when calling `installProvider`/rendering `ConnectionMethodForm` — the
+// daemon's `install_provider` RPC bails on any id that isn't a family head.
+function familyMemberProviderDetailFixture(): PluginDetail {
+  return {
+    info: {
+      id: "anthropic-oauth",
+      name: "Claude (subscription)",
+      description: "Anthropic subscription sign-in",
+      icon: null,
+      categories: ["llm"],
+      slot: null,
+      ownsSlot: false,
+      verified: true,
+      experimental: false,
+      enabled: false,
+      configured: false,
+      source: "catalog",
+      capabilities: ["provider"],
+      kind: "provider",
+      installed: false,
+      family: "anthropic",
+      pinned: false,
+      sourceSpec: null,
+      resolvedCommit: null,
+      installedAt: null,
+      updatedAt: null,
+      trustTier: null,
+      catalogVersion: null,
+      componentBacked: true,
+      blockedReason: null,
+      status: "not-installed",
+      statusDetail: null,
+      authKind: "none",
+      toolCount: null,
+      skillCount: null,
+    },
+    auth: null,
+    settings: [],
+    mcp: [],
+    models: [],
+    homepage: null,
+    publisher: "Anthropic",
   };
 }
 
@@ -356,7 +415,7 @@ const confirmSkillInstall = mock((_runnerId: string, _token: string) => ok({ id:
 // Task 15: the provider adapter's `installProvider` (via the REAL
 // `useConnections` store) and `ConnectionMethodForm`'s own oauth-authorize-url
 // listener (mounted unconditionally by the provider connect step).
-const installProvider = mock((_runnerId: string, _family: string) => ok(["openai"]));
+const installProvider = mock((_runnerId: string, _family: string) => ok(["groq"]));
 const oauthAuthorizeUrlMsgListen = mock(async (_cb: (event: { payload: { provider: string; authorizeUrl: string } }) => void) => () => {});
 
 const pluginOauthCompletedMsgListen = mock(
@@ -433,15 +492,20 @@ function resetPluginsStore() {
   });
 }
 
-// A single api-key member so `ConnectionMethodForm` (the provider adapter's
+// api-key members so `ConnectionMethodForm` (the provider adapter's
 // "connect" step) has something concrete to render — mirrors
-// `AddConnectionModal.test.tsx`'s own single-member fixtures.
-const openaiCatalogEntry: CatalogEntry = {
-  id: "openai",
-  name: "OpenAI",
-  family: "openai",
-  color: "#10a37f",
-  initial: "O",
+// `AddConnectionModal.test.tsx`'s own single-member fixtures. Two families:
+// `groqCatalogEntry` backs `providerDetailFixture()` (id == family); the
+// `anthropic` entry backs `familyMemberProviderDetailFixture()` (Finding 2 —
+// its own id "anthropic-oauth" differs from this entry's family
+// "anthropic", which is what `ConnectionMethodForm`'s `family` prop must
+// resolve to for its member filter to find it).
+const groqCatalogEntry: CatalogEntry = {
+  id: "groq",
+  name: "Groq",
+  family: "groq",
+  color: "#F97316",
+  initial: "G",
   category: "api_key",
   format: "openai",
   requiresBaseUrl: false,
@@ -451,8 +515,29 @@ const openaiCatalogEntry: CatalogEntry = {
   usesDeviceGrant: false,
 };
 
+const anthropicCatalogEntry: CatalogEntry = {
+  id: "anthropic",
+  name: "Anthropic",
+  family: "anthropic",
+  color: "#D97757",
+  initial: "A",
+  category: "api_key",
+  format: "anthropic",
+  requiresBaseUrl: false,
+  models: [],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+
 function resetConnectionsStore() {
-  useConnections.setState({ catalog: [openaiCatalogEntry], customProviders: [], connections: [], installedProviders: [], loaded: true });
+  useConnections.setState({
+    catalog: [groqCatalogEntry, anthropicCatalogEntry],
+    customProviders: [],
+    connections: [],
+    installedProviders: [],
+    loaded: true,
+  });
 }
 
 beforeEach(() => {
@@ -659,7 +744,7 @@ test("initialStep falls back to step 1 when the plan doesn't include that step",
   pluginDetail.mockImplementationOnce(() => ok(providerDetailFixture()));
   await renderWizard("settings");
 
-  const dialog = screen.getByRole("dialog", { name: "Install OpenAI" });
+  const dialog = screen.getByRole("dialog", { name: "Install Groq" });
   expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
 });
 
@@ -688,9 +773,10 @@ test("Continue is disabled while the initial fetch is pending and does not close
 });
 
 // Finding 2 — every other shell test in this file plans the full six steps;
-// this fixture (provider kind, no auth, no settings, not component-backed,
-// no oauth profiles) collapses the plan to overview/install/connect/done so
-// the progress math and step sequencing are exercised against a shorter plan.
+// this fixture (provider kind, no auth, no settings, component-backed per
+// Finding 1's fix, no oauth profiles) collapses the plan to
+// overview/install/connect/done so the progress math and step sequencing
+// are exercised against a shorter plan.
 test("renders a shortened 4-step plan for a provider with no settings or permissions gate", async () => {
   // This test navigates past the install step, whose own success path calls
   // `ctx.refresh()` — a SECOND `pluginDetail` fetch, not just the mount's
@@ -699,9 +785,9 @@ test("renders a shortened 4-step plan for a provider with no settings or permiss
   // call alone would consume, leaving the refresh to fall through to
   // whatever the OTHER tests' `detailData` last left behind).
   detailData = providerDetailFixture();
-  await renderWizard(undefined, "openai");
+  await renderWizard(undefined, "groq");
 
-  const dialog = screen.getByRole("dialog", { name: "Install OpenAI" });
+  const dialog = screen.getByRole("dialog", { name: "Install Groq" });
   expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
   const segments = dialog.querySelectorAll(".rounded-full.h-1, .h-1.rounded-full");
   expect(segments.length).toBe(4);
@@ -717,7 +803,7 @@ test("renders a shortened 4-step plan for a provider with no settings or permiss
   await act(async () => {});
   await act(async () => {});
   expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
-  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "openai");
+  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "groq");
   expect(within(dialog).queryByText("Permissions")).toBeNull();
   expect(within(dialog).queryByText("Settings")).toBeNull();
 
@@ -1219,13 +1305,13 @@ test("a curated skill pack's install completes immediately with no permissions s
 // (connect is skippable) reaches Done without adding an account.
 test("provider path: install registers the family, connect renders the account form, and Skip reaches Done", async () => {
   detailData = providerDetailFixture();
-  await renderWizard(undefined, "openai");
-  const dialog = screen.getByRole("dialog", { name: "Install OpenAI" });
+  await renderWizard(undefined, "groq");
+  const dialog = screen.getByRole("dialog", { name: "Install Groq" });
 
   act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
   await act(async () => {});
   await act(async () => {});
-  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "openai");
+  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "groq");
   expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
   // `ConnectionMethodForm`'s own account-form content — proves the provider
   // adapter's connect step actually rendered it, not a placeholder.
@@ -1234,6 +1320,50 @@ test("provider path: install registers the family, connect renders the account f
   fireEvent.click(within(dialog).getByRole("button", { name: "Skip" }));
   await act(async () => {});
   expect(within(dialog).getByText("Step 4 of 4 — Done")).toBeTruthy();
+});
+
+// Finding 1 (c): the component-backed-provider fixture must walk the
+// PROVIDER install/connect steps, not the component ones — proves
+// `wizardKind`'s reordered check. `installComponentPlugin` must never fire
+// for it, and its connect step must render `ConnectionMethodForm` (not the
+// component `ConnectStep`'s "Nothing more to connect here." fallback).
+test("a component-backed provider installs via installProvider (not installComponentPlugin) and connects via ConnectionMethodForm", async () => {
+  detailData = providerDetailFixture();
+  await renderWizard(undefined, "groq");
+  const dialog = screen.getByRole("dialog", { name: "Install Groq" });
+  expect(within(dialog).getByText("Step 1 of 4 — Overview")).toBeTruthy();
+  // No permissions step in the plan at all.
+  expect(within(dialog).queryByText("Permissions")).toBeNull();
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "groq");
+  expect(installComponentPlugin).not.toHaveBeenCalled();
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  expect(within(dialog).getByRole("button", { name: "Add account" })).toBeTruthy();
+  expect(within(dialog).queryByText("Nothing more to connect here.")).toBeNull();
+});
+
+// Finding 2: a family member (id != family head) must install/connect via
+// the FAMILY, not its own id — the daemon's `install_provider` bails on a
+// non-head id, and `ConnectionMethodForm`'s catalog filter only matches the
+// head.
+test("a provider family member installs and connects via its family, not its own id", async () => {
+  detailData = familyMemberProviderDetailFixture();
+  await renderWizard(undefined, "anthropic-oauth");
+  const dialog = screen.getByRole("dialog", { name: "Install Claude (subscription)" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(installProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic");
+  expect(installProvider).not.toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic-oauth");
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  // `ConnectionMethodForm` found the "anthropic" catalog entry via `family`
+  // — if it had been passed "anthropic-oauth" instead, no member would match
+  // and "Add account" would not render.
+  expect(within(dialog).getByRole("button", { name: "Add account" })).toBeTruthy();
 });
 
 test("Settings step renders a FieldRow per declared setting and saves via setPluginSetting", async () => {
