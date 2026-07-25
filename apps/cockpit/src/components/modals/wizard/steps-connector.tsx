@@ -307,6 +307,46 @@ function OauthWait({
   );
 }
 
+/** Dead-end sub-state — every case `subStateFor` can't otherwise resolve
+ *  (oauth auth, not external, not needing a client id, and no available
+ *  browser flow) — ports the retired catalog install modal's `checkError`
+ *  step's Retry button: re-runs the same begin resolution
+ *  `InstallConnectorStep` made at mount (mirrors `OauthWait`'s `retry`), in
+ *  case a transient failure (network blip, vendor outage) now resolves to
+ *  something actionable. */
+function DeadEnd({
+  ctx,
+  begin,
+  onBegin,
+}: {
+  ctx: WizardCtx;
+  begin: PluginInstallBeginResult;
+  onBegin: (b: PluginInstallBeginResult) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const mountedRef = useMountedRef();
+
+  const retry = async () => {
+    if (busy) return;
+    setBusy(true);
+    const b = await runBegin(ctx.pluginId);
+    if (!mountedRef.current) return;
+    setBusy(false);
+    if (!b) return;
+    ctx.setConnectorBegin(b);
+    onBegin(b);
+  };
+
+  return (
+    <div className="flex flex-col items-center gap-3 py-6">
+      <div className="text-[13px] text-muted-foreground">{begin.dcrError ?? "Couldn't resolve a sign-in method for this plugin."}</div>
+      <Button variant="outline" size="sm" disabled={busy} onClick={() => void retry()}>
+        {busy ? "Retrying…" : "Retry"}
+      </Button>
+    </div>
+  );
+}
+
 /** The "connect" step for a classic connector — reads `ctx.connectorBegin`
  *  (populated by `InstallConnectorStep` moments earlier) and branches into
  *  the right sub-state; self-fetches it if entered directly (the setup
@@ -357,5 +397,5 @@ export function ConnectorConnectStep({ ctx, onNext }: { ctx: WizardCtx; onNext: 
   }
   if (sub === "clientId") return <ManualClientId ctx={ctx} begin={begin} onBegin={setBegin} onNext={onNext} />;
   if (sub === "oauthWait") return <OauthWait ctx={ctx} begin={begin} onBegin={setBegin} onNext={onNext} />;
-  return <div className="text-[13px] text-muted-foreground">{begin.dcrError ?? "Couldn't resolve a sign-in method for this plugin."}</div>;
+  return <DeadEnd ctx={ctx} begin={begin} onBegin={setBegin} />;
 }

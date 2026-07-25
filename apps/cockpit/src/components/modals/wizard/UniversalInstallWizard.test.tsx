@@ -260,6 +260,27 @@ let beginData: PluginInstallBeginResult = {
   oauthBegin: null,
   dcrError: null,
 };
+
+// Fix (dead-end retry + connector coverage): a `beginPluginInstall` result
+// builder — mirrors the retired `InstallWizardModal.test.tsx`'s own
+// `beginResult` fixture — for the connector oauth sub-state tests below
+// (deadEnd/manualClientId), which each only need to override a couple of
+// fields off an oauth-shaped baseline.
+function beginResult(overrides: Partial<PluginInstallBeginResult> = {}): PluginInstallBeginResult {
+  return {
+    authKind: "oauth",
+    envVarPresent: false,
+    envVarName: null,
+    oauthAvailable: false,
+    oauthExternal: false,
+    needsClientId: false,
+    dcrSucceeded: false,
+    callbackMode: "auto",
+    oauthBegin: null,
+    dcrError: null,
+    ...overrides,
+  };
+}
 // Task 15: `steps-skillpack.tsx`'s `InstallSkillPackStep` mutable
 // begin-result fixture.
 let skillBeginData: { completed: boolean; trust: TrustPromptDto | null; plugin: { id: string; name: string } | null } = {
@@ -963,6 +984,168 @@ test("closing during a connector's pending oauth flow cancels the pending instal
   fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
   await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github", "state-999"));
   expect(onClose).toHaveBeenCalled();
+});
+
+// Fix (Finding 1 — review of Task 15): the connector "connect" step's
+// `deadEnd` sub-state (every case `subStateFor` can't otherwise resolve) used
+// to render a static message with no way out — the retired catalog install
+// modal's equivalent `checkError` step had a Retry button. `beginPluginInstall`
+// first resolves to a dead-end shape (oauth, not external, doesn't need a
+// client id, no browser flow available), then — after clicking Retry —
+// resolves to `oauthAvailable`, landing on the oauth-wait UI. Two
+// `beginPluginInstall` calls total: the "install" step's own mount-time call,
+// then the dead-end's Retry.
+test("connector dead-end shows Retry, and Retry re-resolves to the oauth-wait UI", async () => {
+  detailData = tokenAuthDetailFixture({ kind: "oauth" });
+  beginData = beginResult();
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  expect(within(dialog).getByText("Couldn't resolve a sign-in method for this plugin.")).toBeTruthy();
+  expect(beginPluginInstall).toHaveBeenCalledTimes(1);
+
+  beginData = beginResult({
+    oauthAvailable: true,
+    dcrSucceeded: true,
+    oauthBegin: {
+      stateToken: "state-retry",
+      authorizeUrl: "https://github.example.com/oauth/authorize",
+      redirectUri: "http://127.0.0.1:8976/callback",
+    },
+  });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+  await act(async () => {});
+  await act(async () => {});
+
+  expect(within(dialog).getByText("Browser opened — finish signing in there.")).toBeTruthy();
+  expect(beginPluginInstall).toHaveBeenCalledTimes(2);
+});
+
+// Fix (Finding 1): a dead-end with a `dcrError` shows that message instead of
+// the generic fallback — same as `ManualClientId`/`OauthWait`'s own dcrError
+// rendering.
+test("connector dead-end shows the dcrError message when one is present", async () => {
+  detailData = tokenAuthDetailFixture({ kind: "oauth" });
+  beginData = beginResult({ dcrError: "vendor discovery endpoint returned 500" });
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("vendor discovery endpoint returned 500")).toBeTruthy();
+  expect(within(dialog).getByRole("button", { name: "Retry" })).toBeTruthy();
+});
+
+// Fix (Finding 2 — review of Task 15): `ManualClientId`'s `needsClientId`
+// sub-state had zero coverage in this file. Its own submit button is also
+// labeled "Continue" (same as the shell's footer button, always rendered) —
+// scope queries to the modal-body slot to disambiguate.
+test("connector manualClientId (needsClientId) renders the client-id form", async () => {
+  detailData = tokenAuthDetailFixture({ kind: "oauth" });
+  beginData = beginResult({ needsClientId: true });
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+  expect(within(dialog).getByText(/doesn't support automatic app registration/)).toBeTruthy();
+  expect(within(dialog).getByPlaceholderText("Paste the client ID from the vendor's console")).toBeTruthy();
+});
+
+// Fix (Finding 2b): `oauthExternal` also lands on `ManualClientId` (different
+// copy — the vendor's own first-run sign-in, not automatic app registration)
+// — and saving the client id short-circuits straight past the oauth-wait
+// machinery via `onNext()` (steps-connector.tsx submit(), the `begin.oauthExternal`
+// branch) rather than re-begining a browser flow.
+test("connector manualClientId (oauthExternal) renders the form, and saving advances straight to Done without a second begin call", async () => {
+  detailData = tokenAuthDetailFixture({ kind: "oauth" });
+  beginData = beginResult({ oauthExternal: true, needsClientId: true });
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText(/brokers its own sign-in/)).toBeTruthy();
+
+  const body = dialog.querySelector('[data-slot="modal-body"]') as HTMLElement;
+  fireEvent.change(within(body).getByPlaceholderText("Paste the client ID from the vendor's console"), {
+    target: { value: "google-client" },
+  });
+  fireEvent.click(within(body).getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith(LOCAL_RUNNER, "github", "google-client"));
+  await act(async () => {});
+  expect(beginPluginInstall).toHaveBeenCalledTimes(1);
+  expect(within(dialog).getByText("Step 4 of 4 — Done")).toBeTruthy();
+});
+
+// Fix (Finding 2c): non-external `needsClientId` — saving calls
+// `setPluginOauthClientId` with the runner/pluginId/clientId, then re-begins
+// (a second `beginPluginInstall` call); when that re-begin resolves
+// `oauthAvailable`, the connect step lands on the oauth-wait UI.
+test("connector manualClientId (needsClientId) save re-begins, landing on oauth-wait when it resolves oauthAvailable", async () => {
+  detailData = tokenAuthDetailFixture({ kind: "oauth" });
+  beginData = beginResult({ needsClientId: true });
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+
+  const body = dialog.querySelector('[data-slot="modal-body"]') as HTMLElement;
+  fireEvent.change(within(body).getByPlaceholderText("Paste the client ID from the vendor's console"), {
+    target: { value: "client-abc" },
+  });
+
+  beginData = beginResult({
+    oauthAvailable: true,
+    dcrSucceeded: true,
+    oauthBegin: {
+      stateToken: "state-cid",
+      authorizeUrl: "https://github.example.com/oauth/authorize",
+      redirectUri: "http://127.0.0.1:8976/callback",
+    },
+  });
+  fireEvent.click(within(body).getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith(LOCAL_RUNNER, "github", "client-abc"));
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledTimes(2));
+  expect(await within(dialog).findByText("Browser opened — finish signing in there.")).toBeTruthy();
+});
+
+// Fix (Finding 3 — review of Task 15): `DoneStep`'s classic-connector
+// enable-commit (`setPluginEnabled`) must stay gated on `info.experimental` —
+// pairs with the existing "classic connector token path" test above, which
+// asserts the non-experimental case DOES enable.
+test("classic connector experimental: reaching Done does not call setPluginEnabled", async () => {
+  const fixture = tokenAuthDetailFixture();
+  detailData = { ...fixture, info: { ...fixture.info, experimental: true } };
+  await renderWizard(undefined, "github");
+  const dialog = screen.getByRole("dialog", { name: "Install GitHub" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 3 of 4 — Connect")).toBeTruthy();
+
+  fireEvent.change(within(dialog).getByLabelText("Credential *"), { target: { value: "ghp_abc123" } });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.github.token", "ghp_abc123"));
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  expect(within(dialog).getByText("Step 4 of 4 — Done")).toBeTruthy();
+  await act(async () => {});
+  expect(setPluginEnabled).not.toHaveBeenCalled();
 });
 
 // Skill-pack trust path: `beginSkillInstall` returns a trust prompt (an
