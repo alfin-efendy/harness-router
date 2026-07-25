@@ -321,17 +321,14 @@ test("concrete model renders resolver-supported effort values and route has no e
   expect(screen.queryByRole("combobox", { name: "Agent effort" })).toBeNull();
 });
 
-test("explicit permission rule editing persists catalog-selected tools", async () => {
+test("adding a prefix rule under Bash autosaves it immediately (no Save button)", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-  fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-  await waitFor(() => expect(screen.getByRole("combobox", { name: "Rule tool" }).hasAttribute("disabled")).toBe(false));
-  fireEvent.click(screen.getByRole("combobox", { name: "Rule tool" }));
-  fireEvent.click(await screen.findByRole("option", { name: /^Bash/ }));
-  fireEvent.click(screen.getByRole("combobox", { name: "Rule decision" }));
-  fireEvent.click(await screen.findByRole("option", { name: "Allow" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Command prefix" }), { target: { value: "cargo test" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
+  const bashRow = await screen.findByTestId("tool-row-bash");
+  fireEvent.click(within(bashRow).getByRole("button", { name: "Expand Bash prefix rules" }));
+  fireEvent.click(screen.getByRole("button", { name: "＋ Add prefix rule" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "New prefix rule for Bash" }), { target: { value: "cargo test" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm new rule" }));
   await waitFor(() =>
     expect(updateAgent).toHaveBeenCalledWith(
       LOCAL_RUNNER,
@@ -343,18 +340,21 @@ test("explicit permission rule editing persists catalog-selected tools", async (
   );
 });
 
-test("permission rules keep unknown stable tool IDs unavailable until removed", async () => {
+test("permission rules for tools no longer in the catalog are preserved untouched across unrelated autosaves", async () => {
   seed(detail({ permissionRules: [{ id: "custom-rule", tool: "plugin__acme__deploy", decision: "deny", commandPrefix: null }] }));
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-  await waitFor(() => expect(screen.getByText("Unavailable")).toBeTruthy());
-  expect(screen.queryByRole("textbox", { name: "Rule tool ID" })).toBeNull();
-  expect(screen.getByRole("button", { name: "Save permissions" }).hasAttribute("disabled")).toBe(true);
-  fireEvent.click(screen.getByRole("button", { name: "Remove unavailable rule plugin__acme__deploy" }));
-  await waitFor(() => expect(screen.queryByText("Unavailable")).toBeNull());
-  expect(screen.getByRole("button", { name: "Save permissions" }).hasAttribute("disabled")).toBe(false);
-  fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
-  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", expect.objectContaining({ permissionRules: [] })));
+  const readRow = await screen.findByTestId("tool-row-read");
+  fireEvent.click(within(readRow).getByRole("button", { name: "Off" }));
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "reviewer",
+      expect.objectContaining({
+        permissionRules: [{ id: "custom-rule", tool: "plugin__acme__deploy", decision: "deny", commandPrefix: null }],
+      }),
+    ),
+  );
 });
 
 test("model transitions preserve supported effort, clear unsupported effort, and save a complete mutation", async () => {
@@ -406,7 +406,7 @@ test("Overview loads owned sessions and opens a selected session", async () => {
 test("changing agent resets the local tab to Overview", async () => {
   const { rerender } = render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-  expect(screen.getByText("Explicit rules")).toBeTruthy();
+  expect(await screen.findByRole("textbox", { name: "Search tools" })).toBeTruthy();
 
   const ryuzi = detail({ summary: { ...detail().summary, id: "ryuzi", name: "Ryuzi", isDefault: true } });
   act(() => {
@@ -414,7 +414,7 @@ test("changing agent resets the local tab to Overview", async () => {
     rerender(<AgentDetailView agentId="ryuzi" />);
   });
   await waitFor(() => expect(screen.getByText("Recent sessions")).toBeTruthy());
-  expect(screen.queryByText("Explicit rules")).toBeNull();
+  expect(screen.queryByRole("textbox", { name: "Search tools" })).toBeNull();
 });
 
 test("Skills & Tools and Advanced tabs render their owned settings", async () => {
