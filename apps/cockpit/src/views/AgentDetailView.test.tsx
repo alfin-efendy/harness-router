@@ -420,9 +420,9 @@ test("changing agent resets the local tab to Overview", async () => {
 test("Skills & Tools and Advanced tabs render their owned settings", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Skills & Tools" }));
-  await waitFor(() => expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy());
-  expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Save skills and tools" })).toBeTruthy();
+  await waitFor(() => expect(screen.getByRole("textbox", { name: "Search skills" })).toBeTruthy());
+  expect(screen.getByTestId("skill-group-Standalone")).toBeTruthy();
+  expect(screen.getByTestId("app-card-github")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
   expect(screen.getByRole("button", { name: "Delete Reviewer" })).toBeTruthy();
 });

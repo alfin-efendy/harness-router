@@ -3,11 +3,12 @@ import { AlertTriangle, ArrowLeft } from "lucide-react";
 import { Badge, Button, Segmented, SettingsCard, SettingsCardTitle } from "@ryuzi/ui";
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
 import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
+import { AgentAppsTab } from "@/components/agents/AgentAppsTab";
 import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
 import { AgentPersonalityCard } from "@/components/agents/AgentPersonalityCard";
-import { AgentSkillsToolsTab } from "@/components/agents/AgentSkillsToolsTab";
+import { AgentSkillsTab } from "@/components/agents/AgentSkillsTab";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useAgents } from "@/store-agents";
@@ -154,7 +155,18 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
         ) : null}
         {tab === "model" ? <AgentModelTab detail={detail} /> : null}
         {tab === "permissions" ? <AgentPermissionsTab detail={detail} /> : null}
-        {tab === "capabilities" ? <AgentSkillsToolsTab detail={detail} /> : null}
+        {tab === "capabilities" ? (
+          <div className="flex flex-col gap-6">
+            <div className="flex flex-col gap-3">
+              <h3 className="m-0 text-[13px] font-semibold">Skills</h3>
+              <AgentSkillsTab detail={detail} />
+            </div>
+            <div className="flex flex-col gap-3">
+              <h3 className="m-0 text-[13px] font-semibold">Apps &amp; MCP</h3>
+              <AgentAppsTab detail={detail} />
+            </div>
+          </div>
+        ) : null}
         {tab === "learning" ? <AgentLearningTab agentId={agentId} /> : null}
         {tab === "advanced" ? <AgentAdvancedTab detail={detail} onDeleteSuccess={leaveDeletedDetail} /> : null}
       </div>
