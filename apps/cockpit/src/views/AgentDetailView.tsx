@@ -9,6 +9,8 @@ import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
 import { AgentPersonalityCard } from "@/components/agents/AgentPersonalityCard";
 import { AgentSkillsTab } from "@/components/agents/AgentSkillsTab";
+import { FreshAgentModelCard } from "@/components/agents/FreshAgentModelCard";
+import { SaveIndicator } from "@/components/agents/SaveIndicator";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useAgents } from "@/store-agents";
@@ -18,7 +20,8 @@ const TABS = [
   { id: "overview", label: "Overview" },
   { id: "model", label: "Model" },
   { id: "permissions", label: "Permissions" },
-  { id: "capabilities", label: "Skills & Tools" },
+  { id: "skills", label: "Skills" },
+  { id: "apps", label: "Apps & MCP" },
   { id: "learning", label: "Learning" },
   { id: "advanced", label: "Advanced" },
 ] as const;
@@ -65,6 +68,41 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
       </div>
     );
   const { summary } = detail;
+
+  // The Fresh Agent is a synthetic, ephemeral worker (not a registry-backed
+  // agent — see `fresh_agent_summary`/`fresh_agent_detail` in agent_api.rs):
+  // no identity to edit, no permissions/skills/personality of its own, just
+  // the shared subagent model. Render a reduced header (no Executable/
+  // Invalid badge, no actions menu — there's nothing to duplicate/delete)
+  // and skip the tab strip entirely.
+  if (summary.builtin) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto px-8 py-5">
+        <div className="mx-auto max-w-[920px]">
+          <header className="flex h-[52px] items-center gap-3 border-b border-border">
+            <Button variant="ghost" size="icon-sm" aria-label="Back" title="Back" onClick={nav.goBack} className="-ml-1 shrink-0">
+              <ArrowLeft aria-hidden size={15} />
+            </Button>
+            <span
+              aria-hidden
+              className="size-8 shrink-0 rounded-lg border border-white/10"
+              style={{ backgroundColor: COLORS[summary.avatarColor] ?? summary.avatarColor }}
+            />
+            <div className="min-w-0 flex-1">
+              <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
+              <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
+            </div>
+            <Badge variant="outline">Built-in</Badge>
+            <SaveIndicator />
+          </header>
+          <div className="mt-4">
+            <FreshAgentModelCard detail={detail} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-5">
       <div className="mx-auto max-w-[920px]">
@@ -91,6 +129,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
               </>
             )}
           </Badge>
+          <SaveIndicator />
           <AgentActionsMenu agent={summary} onDeleteSuccess={leaveDeletedDetail} />
         </header>
         <div className="my-4 overflow-x-auto" data-testid="agent-detail-tabs">
@@ -155,18 +194,8 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
         ) : null}
         {tab === "model" ? <AgentModelTab detail={detail} /> : null}
         {tab === "permissions" ? <AgentPermissionsTab detail={detail} /> : null}
-        {tab === "capabilities" ? (
-          <div className="flex flex-col gap-6">
-            <div className="flex flex-col gap-3">
-              <h3 className="m-0 text-[13px] font-semibold">Skills</h3>
-              <AgentSkillsTab detail={detail} />
-            </div>
-            <div className="flex flex-col gap-3">
-              <h3 className="m-0 text-[13px] font-semibold">Apps &amp; MCP</h3>
-              <AgentAppsTab detail={detail} />
-            </div>
-          </div>
-        ) : null}
+        {tab === "skills" ? <AgentSkillsTab detail={detail} /> : null}
+        {tab === "apps" ? <AgentAppsTab detail={detail} /> : null}
         {tab === "learning" ? <AgentLearningTab agentId={agentId} /> : null}
         {tab === "advanced" ? <AgentAdvancedTab detail={detail} onDeleteSuccess={leaveDeletedDetail} /> : null}
       </div>

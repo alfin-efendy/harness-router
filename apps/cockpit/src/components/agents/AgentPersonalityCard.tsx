@@ -1,14 +1,5 @@
 import { useEffect, useState } from "react";
-import {
-  Button,
-  Combobox,
-  type ComboboxGroup,
-  type ComboboxOption,
-  SettingsCard,
-  SettingsCardRow,
-  SettingsCardTitle,
-  Textarea,
-} from "@ryuzi/ui";
+import { Combobox, type ComboboxGroup, type ComboboxOption, SettingsCard, SettingsCardRow, SettingsCardTitle, Textarea } from "@ryuzi/ui";
 import { Markdown } from "@/components/transcript/Markdown";
 import type { AgentDetailInfo, AgentPersonalityInfo } from "@/bindings";
 import { useAgents } from "@/store-agents";
@@ -112,18 +103,32 @@ export function AgentPersonalityCard({ detail }: { detail: AgentDetailInfo }) {
   const isCustom = personality.preset === "custom";
   const description = ALL_PRESETS.find((preset) => preset.value === personality.preset)?.description ?? null;
   const customText = personality.custom ?? "";
-  const customBlank = isCustom && customText.trim().length === 0;
 
-  const selectPreset = (preset: string) => {
-    setPersonality({ preset, custom: preset === "custom" ? customText : null });
+  const persist = (next: AgentPersonalityInfo) => {
+    setPersonality(next);
+    void useAgents.getState().update(detail.summary.id, { ...mutationFromDetail(detail), personality: next });
   };
 
-  const save = () => {
-    if (saving || customBlank) return;
-    void useAgents.getState().update(detail.summary.id, {
-      ...mutationFromDetail(detail),
-      personality: isCustom ? { preset: "custom", custom: customText.trim() } : { preset: personality.preset, custom: null },
-    });
+  // Non-custom presets autosave the instant they're picked. Switching TO
+  // custom only updates local state — there's no text to persist yet, so
+  // the textarea's blur-commit takes over from here.
+  const selectPreset = (preset: string) => {
+    if (preset === "custom") {
+      setPersonality({ preset: "custom", custom: customText });
+      return;
+    }
+    persist({ preset, custom: null });
+  };
+
+  // The custom textarea saves on blur, not per keystroke, and only when
+  // there's something to save: a non-blank trimmed value that differs from
+  // what's already persisted (detail.personality — the last-committed copy).
+  const commitCustom = () => {
+    const trimmed = customText.trim();
+    if (trimmed.length === 0) return;
+    const previous = detail.personality.preset === "custom" ? (detail.personality.custom ?? "").trim() : null;
+    if (trimmed === previous) return;
+    persist({ preset: "custom", custom: trimmed });
   };
 
   return (
@@ -153,6 +158,7 @@ export function AgentPersonalityCard({ detail }: { detail: AgentDetailInfo }) {
               value={customText}
               disabled={saving}
               onChange={(event) => setPersonality((current) => ({ ...current, custom: event.target.value }))}
+              onBlur={commitCustom}
             />
             {customText.trim() && (
               <section className="mt-3 rounded-md border border-border bg-muted/30 px-3 py-2.5" aria-label="Instruction preview">
@@ -167,11 +173,6 @@ export function AgentPersonalityCard({ detail }: { detail: AgentDetailInfo }) {
           <span className="min-w-0 flex-1 text-xs text-muted-foreground">{description}</span>
         </SettingsCardRow>
       ) : null}
-      <div className="flex justify-end border-t border-border px-[18px] py-3">
-        <Button disabled={saving || customBlank} onClick={save}>
-          Save personality
-        </Button>
-      </div>
     </SettingsCard>
   );
 }

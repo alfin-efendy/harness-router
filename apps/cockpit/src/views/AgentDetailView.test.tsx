@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import type {
   AgentDetailInfo,
   AgentLearningInfo,
+  AgentModelInfo,
   AgentMutationInfo,
   AgentRegistryInfo,
   AgentConfigurationCatalogInfo,
@@ -59,6 +60,10 @@ const listAgentSessions = mock(async (_runner: string | null, _agentId: string, 
   data: [] as Session[],
 }));
 const listMessages = mock(async (_runner: string | null, _sessionPk: string) => ({ status: "ok" as const, data: [] }));
+const updateSubagentModel = mock(async (_runner: string | null, model: AgentModelInfo) => ({
+  status: "ok" as const,
+  data: { ...registry, subagentModel: model },
+}));
 
 mock.module("@/bindings", () => ({
   commands: {
@@ -70,6 +75,7 @@ mock.module("@/bindings", () => ({
     listApps,
     listMessages,
     updateAgent,
+    updateSubagentModel,
   },
   events: {},
 }));
@@ -209,6 +215,7 @@ beforeEach(() => {
   duplicateAgent.mockClear();
   listApps.mockClear();
   updateAgent.mockClear();
+  updateSubagentModel.mockClear();
   useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
   useLearning.setState({
     byAgent: { reviewer: learningSnapshot },
@@ -277,7 +284,7 @@ test("Advanced delete uses the same success-only detail navigation", async () =>
   await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agents" }));
 });
 
-test("detail has Back, identity, actions, six tabs, and overview metrics", () => {
+test("detail has Back, identity, actions, seven tabs, and overview metrics", () => {
   render(<AgentDetailView agentId="reviewer" />);
   expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
@@ -287,7 +294,7 @@ test("detail has Back, identity, actions, six tabs, and overview metrics", () =>
     within(tabs)
       .getAllByRole("button")
       .map((button) => button.textContent),
-  ).toEqual(["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]);
+  ).toEqual(["Overview", "Model", "Permissions", "Skills", "Apps & MCP", "Learning", "Advanced"]);
   expect(screen.getByText("12 readable concepts")).toBeTruthy();
   expect(screen.getByText("1 enabled skill")).toBeTruthy();
   expect(screen.getByText("3 enabled tools")).toBeTruthy();
@@ -357,7 +364,7 @@ test("permission rules for tools no longer in the catalog are preserved untouche
   );
 });
 
-test("model transitions preserve supported effort, clear unsupported effort, and save a complete mutation", async () => {
+test("model transitions preserve supported effort, clear unsupported effort, and autosave a complete mutation (no Save button)", async () => {
   const concrete = detail({
     summary: { ...detail().summary, model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
     modelInfo: opusInfo,
@@ -365,12 +372,12 @@ test("model transitions preserve supported effort, clear unsupported effort, and
   seed(concrete);
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.queryByRole("button", { name: "Save model" })).toBeNull();
 
   fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
   fireEvent.click(await screen.findByRole("option", { name: miniInfo.requestValue }));
   expect((screen.getByRole("combobox", { name: "Agent effort" }) as HTMLButtonElement).textContent).toContain("Model default");
 
-  fireEvent.click(screen.getByRole("button", { name: "Save model" }));
   await waitFor(() =>
     expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", {
       name: "Reviewer",
@@ -417,14 +424,19 @@ test("changing agent resets the local tab to Overview", async () => {
   expect(screen.queryByRole("textbox", { name: "Search tools" })).toBeNull();
 });
 
-test("Skills & Tools and Advanced tabs render their owned settings", async () => {
+test("Skills tab renders the pack-grouped skills settings", async () => {
   render(<AgentDetailView agentId="reviewer" />);
-  fireEvent.click(screen.getByRole("button", { name: "Skills & Tools" }));
+  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
   await waitFor(() => expect(screen.getByRole("textbox", { name: "Search skills" })).toBeTruthy());
   expect(screen.getByTestId("skill-group-Standalone")).toBeTruthy();
-  expect(screen.getByTestId("app-card-github")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-  expect(screen.getByRole("button", { name: "Delete Reviewer" })).toBeTruthy();
+  expect(screen.queryByTestId("app-card-github")).toBeNull();
+});
+
+test("Apps & MCP tab renders the apps settings", async () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Apps & MCP" }));
+  await waitFor(() => expect(screen.getByTestId("app-card-github")).toBeTruthy());
+  expect(screen.queryByRole("textbox", { name: "Search skills" })).toBeNull();
 });
 
 test("Learning renders the selected agent's Learning tab", () => {
@@ -432,4 +444,56 @@ test("Learning renders the selected agent's Learning tab", () => {
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   expect(screen.getByRole("button", { name: "Add memory" })).toBeTruthy();
   expect(screen.getByText("No memory concepts yet.")).toBeTruthy();
+});
+
+function freshDetail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
+  return detail({
+    summary: {
+      ...detail().summary,
+      id: "fresh",
+      name: "Fresh Agent",
+      description: "Ephemeral, memoryless worker dispatched for delegated tasks.",
+      avatarColor: "slate",
+      builtin: true,
+      skillCount: 0,
+      toolCount: 0,
+      knowledgeCount: 0,
+      isDefault: false,
+    },
+    permissionRules: [],
+    skills: [],
+    nativeTools: [],
+    pluginTools: [],
+    apps: [],
+    personality: { preset: "helpful", custom: null },
+    ...overrides,
+  });
+}
+
+test("Fresh Agent detail renders only the header and the shared model editor", () => {
+  seed(freshDetail());
+  render(<AgentDetailView agentId="fresh" />);
+
+  expect(screen.getByRole("heading", { name: "Fresh Agent" })).toBeTruthy();
+  expect(screen.getByText("Built-in")).toBeTruthy();
+  expect(screen.queryByTestId("agent-detail-tabs")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Actions for Fresh Agent" })).toBeNull();
+  expect(screen.queryByText("Executable")).toBeNull();
+  expect(screen.queryByText("Invalid")).toBeNull();
+  expect(screen.queryByRole("combobox", { name: "Personality preset" })).toBeNull();
+  expect(screen.queryByRole("textbox", { name: "Search tools" })).toBeNull();
+  expect(screen.getByRole("combobox", { name: "Agent model" })).toBeTruthy();
+});
+
+test("Fresh Agent model change autosaves via updateSubagentModel, not updateAgent", async () => {
+  seed(freshDetail());
+  render(<AgentDetailView agentId="fresh" />);
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
+  fireEvent.click(await screen.findByRole("option", { name: miniInfo.requestValue }));
+
+  await waitFor(() =>
+    expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, { kind: "concrete", name: miniInfo.requestValue, effort: null }),
+  );
+  expect(updateAgent).not.toHaveBeenCalled();
 });
