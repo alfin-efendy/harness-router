@@ -3,6 +3,8 @@ import { Button, Combobox, FormField, Input, Modal, ModalBody, ModalFooter, Moda
 import type { AgentMutationInfo, AgentRegistryInfo } from "@/bindings";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
+import { AgentAvatar } from "./AgentAvatar";
+import { PetPicker } from "./PetPicker";
 
 const COLOR_OPTIONS = [
   { value: "violet", label: "Violet" },
@@ -13,11 +15,22 @@ const COLOR_OPTIONS = [
   { value: "rose", label: "Rose" },
 ];
 
+// Mirrors AgentsView.tsx / AgentDetailView.tsx's own avatar-color maps.
+const COLOR_HEX: Record<string, string> = {
+  violet: "#8B5CF6",
+  blue: "#3B82F6",
+  cyan: "#06B6D4",
+  emerald: "#10B981",
+  amber: "#F59E0B",
+  rose: "#F43F5E",
+};
+
 function initialMutation(registry: AgentRegistryInfo): AgentMutationInfo {
   return {
     name: "",
     description: "",
     avatarColor: "violet",
+    avatarPet: null,
     model: registry.subagentModel,
     personality: { preset: "helpful", custom: null },
     permissionRules: [],
@@ -32,6 +45,7 @@ export function AgentEditorModal({ open, onClose }: { open: boolean; onClose: ()
   const registry = useAgents((s) => s.registry);
   const saving = useAgents((s) => s.saving);
   const [draft, setDraft] = useState<AgentMutationInfo | null>(() => (registry ? initialMutation(registry) : null));
+  const [petPickerOpen, setPetPickerOpen] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
   const nav = useNav();
 
@@ -75,13 +89,26 @@ export function AgentEditorModal({ open, onClose }: { open: boolean; onClose: ()
             rows={3}
           />
         </FormField>
-        <FormField label="Avatar color">
+        <FormField label="Avatar color" hint="The fallback look when no pet is set.">
           <Combobox
             aria-label="Avatar color"
             options={COLOR_OPTIONS}
             value={draft.avatarColor}
             onValueChange={(avatarColor) => setDraft((current) => (current ? { ...current, avatarColor } : current))}
           />
+        </FormField>
+        <FormField label="Pet" hint="Optional animated avatar. Clear it to fall back to the color tile.">
+          <button
+            type="button"
+            aria-label={draft.avatarPet ? "Change pet" : "Choose a pet"}
+            onClick={() => setPetPickerOpen(true)}
+            className="flex items-center gap-2.5 rounded-md border border-border px-3 py-2 text-left hover:bg-accent"
+          >
+            <AgentAvatar pet={draft.avatarPet} colorHex={COLOR_HEX[draft.avatarColor] ?? draft.avatarColor} size={28} />
+            <span aria-hidden className="text-[12.5px] font-medium">
+              {draft.avatarPet ? "Change pet" : "Choose a pet"}
+            </span>
+          </button>
         </FormField>
       </ModalBody>
       <ModalFooter>
@@ -92,6 +119,12 @@ export function AgentEditorModal({ open, onClose }: { open: boolean; onClose: ()
           {saving ? "Creating…" : "Create"}
         </Button>
       </ModalFooter>
+      <PetPicker
+        open={petPickerOpen}
+        onClose={() => setPetPickerOpen(false)}
+        currentPet={draft.avatarPet}
+        onSelect={(avatarPet) => setDraft((current) => (current ? { ...current, avatarPet } : current))}
+      />
     </Modal>
   );
 }

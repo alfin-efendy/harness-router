@@ -1,7 +1,10 @@
-import { Bot, CircleAlert, Clock3 } from "lucide-react";
+import { CircleAlert, Clock3 } from "lucide-react";
 import type { AgentRun } from "@/bindings";
-import { formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
+import { AgentGlyph } from "@/components/agents/AgentGlyph";
+import { formatAgentRunDuration, kindLabel, petSlugForRun } from "@/lib/agent-runs";
+import { poseForRunStatus } from "@/lib/pet-sprite";
 import { useNow } from "@/hooks/useNow";
+import { useAgents } from "@/store-agents";
 import { useDelegation, delegationSessionKey } from "@/store-delegation";
 import { Button } from "@ryuzi/ui";
 
@@ -24,9 +27,19 @@ function retryAttemptNumber(run: AgentRun, byId: Map<string, AgentRun>): number 
 function RunCard({ run, retryAttempt, onSelect }: { run: AgentRun; retryAttempt: number; onSelect: () => void }) {
   const now = useNow(activeStatuses.has(run.status));
   const duration = formatAgentRunDuration(run, now);
+  const pet = petSlugForRun(
+    run,
+    useAgents((s) => s.registry?.agents),
+  );
   return (
     <Button variant="ghost" onClick={onSelect} className="h-auto w-full justify-start rounded-md px-3 py-2 text-left hover:bg-accent">
-      <Bot aria-hidden size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
+      <AgentGlyph
+        pet={pet}
+        pose={poseForRunStatus(run.status)}
+        petSize={16}
+        botSize={14}
+        botClassName="mt-0.5 shrink-0 text-muted-foreground"
+      />
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-2">
           <span className="truncate font-medium text-foreground">{run.executingAgentNameSnapshot}</span>

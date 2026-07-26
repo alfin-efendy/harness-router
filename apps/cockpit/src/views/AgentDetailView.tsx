@@ -4,12 +4,15 @@ import { Badge, Button, Segmented, SettingsCard, SettingsCardTitle } from "@ryuz
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
 import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
 import { AgentAppsTab } from "@/components/agents/AgentAppsTab";
+import { AgentAvatar } from "@/components/agents/AgentAvatar";
+import { mutationFromDetail } from "@/components/agents/agentMutation";
 import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
 import { AgentPersonalityCard } from "@/components/agents/AgentPersonalityCard";
 import { AgentSkillsTab } from "@/components/agents/AgentSkillsTab";
 import { FreshAgentModelCard } from "@/components/agents/FreshAgentModelCard";
+import { PetPicker } from "@/components/agents/PetPicker";
 import { SaveIndicator } from "@/components/agents/SaveIndicator";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
@@ -47,6 +50,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
   const detail = useAgents((state) => (state.detail?.summary.id === agentId ? state.detail : null));
   const loading = useAgents((state) => state.loading);
   const [tab, setTab] = useState<Tab>("overview");
+  const [petPickerOpen, setPetPickerOpen] = useState(false);
   const recentSessions = useAgents((state) => state.recentSessionsByAgent[agentId] ?? []);
   const setFocused = useStore((state) => state.setFocused);
   const nav = useNav();
@@ -83,11 +87,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             <Button variant="ghost" size="icon-sm" aria-label="Back" title="Back" onClick={nav.goBack} className="-ml-1 shrink-0">
               <ArrowLeft aria-hidden size={15} />
             </Button>
-            <span
-              aria-hidden
-              className="size-8 shrink-0 rounded-lg border border-white/10"
-              style={{ backgroundColor: COLORS[summary.avatarColor] ?? summary.avatarColor }}
-            />
+            <AgentAvatar pet={summary.avatarPet} colorHex={COLORS[summary.avatarColor] ?? summary.avatarColor} size={32} />
             <div className="min-w-0 flex-1">
               <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
               <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
@@ -110,11 +110,14 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
           <Button variant="ghost" size="icon-sm" aria-label="Back" title="Back" onClick={nav.goBack} className="-ml-1 shrink-0">
             <ArrowLeft aria-hidden size={15} />
           </Button>
-          <span
-            aria-hidden
-            className="size-8 shrink-0 rounded-lg border border-white/10"
-            style={{ backgroundColor: COLORS[summary.avatarColor] ?? summary.avatarColor }}
-          />
+          <button
+            type="button"
+            aria-label={`Change ${summary.name}'s pet`}
+            onClick={() => setPetPickerOpen(true)}
+            className="shrink-0 rounded-lg focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+          >
+            <AgentAvatar pet={summary.avatarPet} colorHex={COLORS[summary.avatarColor] ?? summary.avatarColor} size={32} />
+          </button>
           <div className="min-w-0 flex-1">
             <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
             <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
@@ -199,6 +202,12 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
         {tab === "learning" ? <AgentLearningTab agentId={agentId} /> : null}
         {tab === "advanced" ? <AgentAdvancedTab detail={detail} onDeleteSuccess={leaveDeletedDetail} /> : null}
       </div>
+      <PetPicker
+        open={petPickerOpen}
+        onClose={() => setPetPickerOpen(false)}
+        currentPet={summary.avatarPet}
+        onSelect={(avatarPet) => void useAgents.getState().update(detail.summary.id, { ...mutationFromDetail(detail), avatarPet })}
+      />
     </div>
   );
 }

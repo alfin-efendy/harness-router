@@ -1,13 +1,34 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { AgentRun } from "@/bindings";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { AgentRun, AgentSummaryInfo } from "@/bindings";
+import { __resetBundledPetsCacheForTests } from "@/lib/bundled-pets";
 
 const getChildTranscript = mock(() => Promise.resolve({ status: "ok", data: [] }));
 mock.module("@/bindings", () => ({ commands: { getChildTranscript } }));
 
+import { useAgents } from "@/store-agents";
 import { useDelegation, delegationSessionKey } from "@/store-delegation";
 
 const { AgentRunRoster } = await import("./AgentRunRoster");
+
+function agentSummary(id: string, overrides: Partial<AgentSummaryInfo> = {}): AgentSummaryInfo {
+  return {
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    avatarPet: null,
+    model: { kind: "route", route: "free" },
+    builtin: false,
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable: true,
+    validation: [],
+    isDefault: false,
+    ...overrides,
+  };
+}
 
 function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Partial<AgentRun> = {}): AgentRun {
   return {
@@ -44,6 +65,40 @@ function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Pa
 
 beforeEach(() => useDelegation.setState({ bySession: {}, transcriptByRun: {}, selectedBySession: {} }));
 afterEach(cleanup);
+
+const originalFetch = globalThis.fetch;
+
+test("shows the executing agent's pet, posed for the run status, instead of the Bot icon when it has one", async () => {
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: null }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    useAgents.setState({
+      registry: {
+        agents: [agentSummary("worker", { avatarPet: "sprout" })],
+        defaultAgentId: "worker",
+        recovery: [],
+        subagentModel: { kind: "route", route: "free" },
+      },
+    });
+    useDelegation.setState({
+      bySession: { [delegationSessionKey("local", "s1")]: [run({ status: "running" })] },
+    });
+
+    render(<AgentRunRoster runnerId="local" sessionPk="s1" />);
+
+    await waitFor(() => expect(screen.getByTestId("pet-sprite")).toBeTruthy());
+    expect(document.querySelector("svg.lucide-bot")).toBeNull();
+  } finally {
+    globalThis.fetch = originalFetch;
+    useAgents.setState({ registry: null });
+  }
+});
 
 test("splits exactly queued/running into Active and terminal runs into Done", () => {
   useDelegation.setState({

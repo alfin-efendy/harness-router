@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, expect, spyOn, test } from "bun:test";
+import { waitFor } from "@testing-library/react";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
 import type {
@@ -28,6 +29,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     name,
     description: "",
     avatarColor: "#7C5CFF",
+    avatarPet: null,
     model: route("free"),
     builtin: false,
     skillCount: 0,
@@ -72,6 +74,7 @@ function reviewerInput(): AgentMutationInfo {
     name: "Reviewer",
     description: "",
     avatarColor: "#7C5CFF",
+    avatarPet: null,
     model: route("free"),
     personality: { preset: "helpful", custom: null },
     permissionRules: [],
@@ -653,7 +656,7 @@ test("update while a different agent's detail is focused never paints that detai
     }),
   );
   useAgents.setState({ registry: registry(), detail: detailOf(ryuziSummary()), loaded: true });
-  const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead" });
+  const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead", avatarPet: "sprout" });
   await Promise.resolve();
 
   const during = useAgents.getState();
@@ -661,6 +664,7 @@ test("update while a different agent's detail is focused never paints that detai
   const reviewerRow = during.registry?.agents.find((a) => a.id === "reviewer");
   expect(reviewerRow?.id).toBe("reviewer");
   expect(reviewerRow?.name).toBe("Lead"); // representable field previews the edit
+  expect(reviewerRow?.avatarPet).toBe("sprout"); // patchRosterFields carries avatarPet too
   expect(reviewerRow?.isDefault).toBe(false); // server-derived field untouched
   expect(during.registry?.agents.map((a) => a.id)).toEqual(["ryuzi", "reviewer"]);
   expect(during.detail?.summary.id).toBe("ryuzi");
@@ -670,6 +674,31 @@ test("update while a different agent's detail is focused never paints that detai
   expect(await pending).toBe(true);
   expect(useAgents.getState().registry?.agents[1]?.name).toBe("Lead");
   expect(useAgents.getState().detail?.summary.id).toBe("ryuzi");
+});
+
+test("update to the focused agent previews avatarPet optimistically in both detail and roster", async () => {
+  // Let any prior test's mutation-queue tail fully settle first — same
+  // guard as AgentActionsMenu.test.tsx's beforeEach, needed here because
+  // this test reads the optimistic (pre-response) window, which a still-
+  // draining prior mutation could otherwise delay past a single microtask.
+  await waitFor(() => expect(useAgents.getState().saving).toBe(false));
+
+  let resolveUpdate: (r: Result<AgentDetailInfo, CmdError>) => void = () => {};
+  updateAgent.mockReturnValueOnce(
+    new Promise<Result<AgentDetailInfo, CmdError>>((resolve) => {
+      resolveUpdate = resolve;
+    }),
+  );
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+  const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), avatarPet: "sprout" });
+
+  await waitFor(() => expect(useAgents.getState().detail?.summary.avatarPet).toBe("sprout"));
+  expect(useAgents.getState().registry?.agents.find((a) => a.id === "reviewer")?.avatarPet).toBe("sprout");
+
+  resolveUpdate(ok(detailOf(summary("reviewer", "Reviewer", { avatarPet: "sprout" }))));
+  expect(await pending).toBe(true);
+  expect(useAgents.getState().detail?.summary.avatarPet).toBe("sprout");
+  expect(useAgents.getState().registry?.agents[1]?.avatarPet).toBe("sprout");
 });
 
 // ---------- remove ----------

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Bot, ChevronDown, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
+import { ArrowUp, ChevronDown, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
 import { commands, type AgentSummaryInfo, type BranchList } from "@/bindings";
@@ -11,6 +11,7 @@ import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS } from "@/constants";
 import { useAgents } from "@/store-agents";
 import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
+import { AgentGlyph } from "@/components/agents/AgentGlyph";
 import { AgentMentionMenu } from "@/components/composer/AgentMentionMenu";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { activeSlashQuery, matchSlashEntries } from "@/lib/slash-autocomplete";
@@ -441,7 +442,12 @@ export function HomeView() {
                 placeholder="Agent"
                 trigger={
                   <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
-                    <Bot aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                    <AgentGlyph
+                      pet={registry.agents.find((a) => a.id === primaryAgentId)?.avatarPet ?? null}
+                      petSize={13}
+                      botSize={13}
+                      botClassName="size-[13px]"
+                    />
                     {registry.agents.find((a) => a.id === primaryAgentId)?.name ?? "Agent"}
                     <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
                   </Button>

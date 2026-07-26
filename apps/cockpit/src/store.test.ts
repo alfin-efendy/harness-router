@@ -945,6 +945,7 @@ test("choosePrimaryAgent integrates pending, persisted, default, then executable
     name: id,
     description: "",
     avatarColor: "violet",
+    avatarPet: null,
     model: { kind: "route", route: "free" },
     builtin: false,
     skillCount: 0,

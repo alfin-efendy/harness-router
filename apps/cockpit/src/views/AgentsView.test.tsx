@@ -8,6 +8,7 @@ import type {
   AgentSummaryInfo,
   SelectableModelInfo,
 } from "@/bindings";
+import { __resetBundledPetsCacheForTests } from "@/lib/bundled-pets";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const route = (r: string): AgentModelInfo => ({ kind: "route", route: r });
@@ -18,6 +19,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     name,
     description: "",
     avatarColor: "violet",
+    avatarPet: null,
     model: route("free"),
     builtin: false,
     skillCount: 0,
@@ -141,6 +143,27 @@ test("renders roster metadata for every agent and opens a real agent's dedicated
   expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" });
 });
 
+test("a row tile renders the agent's pet when it has one, and the plain color tile otherwise", async () => {
+  const originalFetch = globalThis.fetch;
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    useAgents.setState({ registry: { ...registry(), agents: [ryuzi, summary("reviewer", "Reviewer", { avatarPet: "sprout" })] } });
+    render(<AgentsView />);
+
+    await waitFor(() => expect(screen.getByTestId("pet-sprite")).toBeTruthy());
+    expect(screen.getByTestId("agent-avatar-color-tile")).toBeTruthy(); // ryuzi still has no pet
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("renders a single list — no Main/Sub segmented control and no subagent settings section", () => {
   render(<AgentsView />);
   expect(screen.queryByRole("button", { name: "Main Agent" })).toBeNull();
@@ -190,6 +213,7 @@ test("create modal sends the complete initial mutation and opens the new detail"
       name: "Architect",
       description: "Designs system boundaries.",
       avatarColor: "violet",
+      avatarPet: null,
       model: route("free"),
       personality: { preset: "helpful", custom: null },
       permissionRules: [],

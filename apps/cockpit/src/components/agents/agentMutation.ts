@@ -5,6 +5,7 @@ export function mutationFromDetail(detail: AgentDetailInfo): AgentMutationInfo {
     name: detail.summary.name,
     description: detail.summary.description,
     avatarColor: detail.summary.avatarColor,
+    avatarPet: detail.summary.avatarPet,
     model: detail.summary.model,
     personality: detail.personality,
     permissionRules: detail.permissionRules,

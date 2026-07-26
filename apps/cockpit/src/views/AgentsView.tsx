@@ -3,6 +3,7 @@ import { AlertTriangle, ChevronRight, Plus } from "lucide-react";
 import { Badge, Button, SettingsCard, cn } from "@ryuzi/ui";
 import type { AgentModelInfo, AgentSummaryInfo } from "@/bindings";
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
+import { AgentAvatar } from "@/components/agents/AgentAvatar";
 import { AgentEditorModal } from "@/components/agents/AgentEditorModal";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
@@ -38,11 +39,7 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
         onClick={() => nav.navigate({ kind: "agentDetail", agentId: agent.id })}
         className="h-full min-w-0 flex-1 justify-start gap-3 rounded-none px-[18px] text-left font-normal hover:bg-accent/50"
       >
-        <span
-          aria-hidden
-          className="size-9 shrink-0 rounded-lg border border-white/10"
-          style={{ backgroundColor: AVATAR_COLORS[agent.avatarColor] ?? agent.avatarColor }}
-        />
+        <AgentAvatar pet={agent.avatarPet} colorHex={AVATAR_COLORS[agent.avatarColor] ?? agent.avatarColor} size={36} />
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
             <span className="truncate text-[13.5px] font-semibold text-foreground">{agent.name}</span>

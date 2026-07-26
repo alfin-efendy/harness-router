@@ -29,6 +29,7 @@ const reviewerDetail: AgentDetailInfo = {
     name: "Reviewer",
     description: "Reviews implementation quality.",
     avatarColor: "violet",
+    avatarPet: null,
     model: { kind: "route", route: "free" },
     builtin: false,
     skillCount: 0,

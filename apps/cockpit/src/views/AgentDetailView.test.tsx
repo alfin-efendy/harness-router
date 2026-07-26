@@ -13,6 +13,7 @@ import type {
   SelectableModelInfo,
   Session,
 } from "@/bindings";
+import { __resetBundledPetsCacheForTests } from "@/lib/bundled-pets";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const getAgent = mock(async (_runner: string | null, id: string) => ({
@@ -153,6 +154,7 @@ function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
       name: "Reviewer",
       description: "Reviews implementation quality.",
       avatarColor: "violet",
+      avatarPet: null,
       model: { kind: "route", route: "free" },
       builtin: false,
       skillCount: 1,
@@ -303,6 +305,60 @@ test("detail has Back, identity, actions, seven tabs, and overview metrics", () 
   expect(screen.queryByRole("button", { name: "Start chat" })).toBeNull();
 });
 
+test("the header avatar is a button that opens PetPicker; choosing a bundled pet persists it and preserves the rest of the mutation", async () => {
+  const originalFetch = globalThis.fetch;
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    render(<AgentDetailView agentId="reviewer" />);
+    fireEvent.click(screen.getByRole("button", { name: "Change Reviewer's pet" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: /Sprout/i }));
+
+    await waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith(
+        LOCAL_RUNNER,
+        "reviewer",
+        expect.objectContaining({
+          avatarPet: "sprout",
+          name: "Reviewer",
+          description: "Reviews implementation quality.",
+          skills: ["requesting-code-review"],
+        }),
+      ),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("the built-in Fresh Agent header shows its pet but is not a clickable picker trigger", async () => {
+  const originalFetch = globalThis.fetch;
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    seed(freshDetail({ summary: { avatarPet: "sprout" } }));
+    render(<AgentDetailView agentId="fresh" />);
+
+    await waitFor(() => expect(screen.getByTestId("pet-sprite")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Change Fresh Agent's pet" })).toBeNull();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Back uses navigation history", () => {
   useNav.setState({ history: { back: [{ kind: "models" }], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
   render(<AgentDetailView agentId="reviewer" />);
@@ -384,6 +440,7 @@ test("model transitions preserve supported effort, clear unsupported effort, and
       name: "Reviewer",
       description: "Reviews implementation quality.",
       avatarColor: "violet",
+      avatarPet: null,
       model: { kind: "concrete", name: miniInfo.requestValue, effort: null },
       personality: { preset: "helpful", custom: null },
       permissionRules: [],

@@ -1,11 +1,32 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { AgentRun, Message } from "@/bindings";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { AgentRun, AgentSummaryInfo, Message } from "@/bindings";
 import type { ActivityItem } from "@/lib/transcript";
 import { dispatchSlotKey } from "@/lib/agent-runs";
+import { __resetBundledPetsCacheForTests } from "@/lib/bundled-pets";
+import { useAgents } from "@/store-agents";
 import { delegationRunKey, delegationSessionKey, useDelegation } from "@/store-delegation";
 import { useNav } from "@/store-nav";
 import { AgentDispatchGroup } from "./AgentDispatchGroup";
+
+function agentSummary(id: string, overrides: Partial<AgentSummaryInfo> = {}): AgentSummaryInfo {
+  return {
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    avatarPet: null,
+    model: { kind: "route", route: "free" },
+    builtin: false,
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable: true,
+    validation: [],
+    isDefault: false,
+    ...overrides,
+  };
+}
 
 const runnerId = "local";
 const sessionPk = "session-1";
@@ -119,6 +140,39 @@ test("linked dispatch replaces its ordinary task chip with a semantic child card
   expect(screen.getByRole("button", { name: /Open Researcher agent run/i })).toBeTruthy();
   expect(screen.getByText("Inspect the dispatch behavior")).toBeTruthy();
   expect(screen.getByText("Running")).toBeTruthy();
+});
+
+test("a rendered run card shows the executing agent's pet instead of the Bot icon when it has one", async () => {
+  const originalFetch = globalThis.fetch;
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: null }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    const key = delegationSessionKey(runnerId, sessionPk);
+    useDelegation.setState({ bySession: { [key]: [run()] }, rosterStateBySession: { [key]: { status: "ready", error: null } } });
+    useAgents.setState({
+      registry: {
+        agents: [agentSummary("worker", { avatarPet: "sprout" })],
+        defaultAgentId: "worker",
+        recovery: [],
+        subagentModel: { kind: "route", route: "free" },
+      },
+    });
+
+    renderGroup();
+
+    const card = screen.getByRole("button", { name: /Open Researcher agent run/i });
+    await waitFor(() => expect(card.querySelector('[data-testid="pet-sprite"]')).toBeTruthy());
+    expect(card.querySelector("svg.lucide-bot")).toBeNull();
+  } finally {
+    globalThis.fetch = originalFetch;
+    useAgents.setState({ registry: null });
+  }
 });
 
 test("orders batch cards by persistent dispatch index and shows retry and kind labels", () => {
