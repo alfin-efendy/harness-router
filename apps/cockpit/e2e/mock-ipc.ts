@@ -1022,6 +1022,12 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   // `plugin_release_detail` (the other Task 12 mount-time call) is dispatched
   // dynamically further down instead of listed here, since it takes an `id`.
   component_bootstrap_status: { pending: false, message: null },
+  // Spec B3: App.tsx's "Restart engine" banner button calls this — without a
+  // fixture the unmocked fallback returns `null`, which is actually the same
+  // resolved value the real `Result<null, CmdError>` unwraps to, but listing
+  // it explicitly documents the call and keeps it out of the
+  // `console.warn("[mock-ipc] unmocked command")` noise on every restart.
+  restart_engine: null,
   get_setting: null,
   backdrop_capability: "none",
   system_accent_color: null,
