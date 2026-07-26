@@ -589,7 +589,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     },
     ProviderDescriptor {
         id: "opencode-free",
-        name: "OpenCode (free)",
+        name: "OpenCode",
         family: "opencode-free",
         color: "#F5A623",
         initial: "OC",
@@ -642,7 +642,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     },
     ProviderDescriptor {
         id: "mimo-free",
-        name: "MiMo (free)",
+        name: "MiMo",
         family: "mimo-free",
         color: "#FF6900",
         initial: "M",
