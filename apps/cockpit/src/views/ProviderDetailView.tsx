@@ -19,7 +19,7 @@ import {
   Switch,
 } from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Chip } from "@/components/common/bits";
+import { Chip, StatusDot } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
@@ -33,6 +33,19 @@ import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
 function accountLabel(count: number): string {
   return `${count} account${count === 1 ? "" : "s"}`;
+}
+
+/** Spec A2: built-in free-tier connections are infrastructure — routed and
+ *  active, but not user-managed accounts. They get an informational row
+ *  instead of an AccountRow (no rename/delete/reorder). */
+export function splitAccounts(connections: ConnectionInfo[]): {
+  manageable: ConnectionInfo[];
+  builtin: ConnectionInfo | null;
+} {
+  return {
+    manageable: connections.filter((c) => !c.builtin),
+    builtin: connections.find((c) => c.builtin) ?? null,
+  };
 }
 
 // User-defined custom providers are their own family head with a `custom-`
@@ -452,6 +465,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
     [connections, memberIds, provider],
   );
   const providerConnectionIds = providerConnections.map((conn) => conn.id).join("|");
+  const { manageable, builtin } = useMemo(() => splitAccounts(providerConnections), [providerConnections]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on providerConnectionIds so usage reloads only when the set of connection ids changes, not on every providerConnections re-derive
   useEffect(() => {
@@ -472,7 +486,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
     }
     return Array.from(set);
   }, [catalog, provider]);
-  const activeCount = providerConnections.filter((c) => c.enabled).length;
+  const activeCount = manageable.filter((c) => c.enabled).length;
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on providerConnectionIds so usage re-aggregates only when the set of connection ids changes
   const usage = useMemo(
     () => aggregateUsage(providerConnections.map((conn) => usageByConnection[conn.id])),
@@ -509,14 +523,14 @@ export function ProviderDetailView({ provider }: { provider: string }) {
         <DetailHeader
           chip={<Chip initial={initial} color={color} size={44} />}
           title={name}
-          sub={`${accountLabel(providerConnections.length)} · ${modelLabel(catalogModels.length, "catalog ")}`}
+          sub={`${accountLabel(manageable.length)} · ${modelLabel(catalogModels.length, "catalog ")}`}
         />
 
         <Card>
           <CardHeader className="flex-wrap">
             <CardTitle>Accounts</CardTitle>
             <CardHint>
-              {providerConnections.length > 0 ? `${activeCount} active · ${strategyText(accountStrategy)}` : "No accounts connected"}
+              {manageable.length > 0 ? `${activeCount} active · ${strategyText(accountStrategy)}` : "No accounts connected"}
             </CardHint>
             <div className="ml-auto flex items-center gap-2">
               <span className="text-xs font-medium text-muted-foreground">Account routing</span>
@@ -537,12 +551,19 @@ export function ProviderDetailView({ provider }: { provider: string }) {
               </Button>
             </div>
           </CardHeader>
-          {providerConnections.map((conn, index) => (
+          {builtin && (
+            <div className="flex items-center gap-2 border-b border-border px-[18px] py-3 text-[13px]">
+              <StatusDot color="#22C55E" size={8} />
+              <span className="font-medium">Free tier</span>
+              <span className="text-muted-foreground">Built in — always connected. Add an account to use a paid plan.</span>
+            </div>
+          )}
+          {manageable.map((conn, index) => (
             <AccountRow
               key={conn.id}
               conn={conn}
               index={index}
-              count={providerConnections.length}
+              count={manageable.length}
               deviceSignin={(() => {
                 const entry = catalog.find((candidate) => candidate.id === conn.provider);
                 return accountReconnectKind(conn, entry) === "device";
@@ -560,7 +581,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
               onDeviceReconnect={() => setAddOpen(true)}
             />
           ))}
-          {loaded && providerConnections.length === 0 && (
+          {loaded && manageable.length === 0 && !builtin && (
             <div className="px-[18px] py-8 text-center text-[13px] text-muted-foreground">
               No accounts yet. Add an account for this provider to route models through Ryuzi.
             </div>

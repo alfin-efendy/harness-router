@@ -1,7 +1,13 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { CatalogEntry, ConnectionInfo, SelectableModelInfo } from "@/bindings";
-import { accountReconnectKind, isCustomProvider, ModelEffortDefaultCombobox, modelEffortDefaultOptions } from "./ProviderDetailView";
+import {
+  accountReconnectKind,
+  isCustomProvider,
+  ModelEffortDefaultCombobox,
+  modelEffortDefaultOptions,
+  splitAccounts,
+} from "./ProviderDetailView";
 
 afterEach(() => {
   cleanup();
@@ -68,6 +74,19 @@ test("provider_model_default_selector_clears_and_reports_varied_defaults", () =>
     { value: "__model_default__", label: "Default: varies by target" },
     { value: "high", label: "High", description: "Deep reasoning" },
   ]);
+});
+
+test("splitAccounts hides builtin free rows from the manageable list", () => {
+  const builtinFree = { ...account, id: "builtin-1", provider: "mimo-free", authType: "free", builtin: true };
+  const { manageable, builtin } = splitAccounts([account, builtinFree]);
+  expect(manageable.map((c) => c.id)).toEqual([account.id]);
+  expect(builtin?.id).toBe("builtin-1");
+});
+
+test("splitAccounts returns null builtin when none exists", () => {
+  const { manageable, builtin } = splitAccounts([account]);
+  expect(manageable).toEqual([account]);
+  expect(builtin).toBeNull();
 });
 
 test("rendered_concrete_model_default_is_compact_and_clears_structured_key", async () => {
