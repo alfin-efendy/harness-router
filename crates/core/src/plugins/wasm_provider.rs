@@ -385,6 +385,103 @@ pub(crate) fn provider_fixture_artifact() -> std::path::PathBuf {
         .join("ryuzi_component_provider_fixture.wasm")
 }
 
+/// The prebuilt gateway fixture artifact (caller must build fixtures first via
+/// [`crate::plugins::build_fixture_components_once`]) — a real compiled
+/// component exporting `ryuzi:gateway/gateway`, not `ryuzi:provider/provider`.
+/// Module-level (not inside `mod tests`) so `api::plugins_api`'s test for
+/// [`crate::api::plugins_api`]'s `installed_bundle_is_gateway` positive path
+/// can reuse it instead of compiling its own throwaway gateway component.
+#[cfg(test)]
+pub(crate) fn gateway_fixture_artifact() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/component-gateway/target/wasm32-wasip2/release")
+        .join("ryuzi_component_gateway_fixture.wasm")
+}
+
+/// Lay a verified, active bundle onto `root` in the exact on-disk layout
+/// [`crate::plugins::bundle::load_active_bundles`] requires (versioned dir +
+/// `current` pointer + `ryuzi-plugin.toml` + `release.json` + the component,
+/// hashes all agreeing) and seed the matching active release row into
+/// `store`. Signed under the first-party key so
+/// `HostPolicy::for_installed_bundle` grants `allow_self_auth`, exactly like
+/// the real mimo/opencode bundles.
+///
+/// Module-level (not inside `mod tests`), same reason as
+/// [`gateway_fixture_artifact`]: `api::plugins_api`'s hermetic positive-path
+/// test for `installed_bundle_is_gateway` reuses this exact staging logic
+/// rather than duplicating it.
+#[cfg(test)]
+pub(crate) async fn install_bundle_on_disk(
+    root: &std::path::Path,
+    store: &Store,
+    plugin_id: &str,
+    component_artifact: &std::path::Path,
+    provider_ids: &[&str],
+) {
+    use crate::store::ComponentPluginReleaseRecord;
+    use sha2::{Digest, Sha256};
+
+    let version = "0.1.0";
+    let component_name = "plugin.wasm";
+    let version_dir = root.join(plugin_id).join(version);
+    std::fs::create_dir_all(&version_dir).unwrap();
+    let bytes = std::fs::read(component_artifact).unwrap();
+    std::fs::write(version_dir.join(component_name), &bytes).unwrap();
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+
+    let provider_ids_line = if provider_ids.is_empty() {
+        String::new()
+    } else {
+        let quoted = provider_ids
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("provider-ids = [{quoted}]\n")
+    };
+    let manifest = format!(
+        "id = \"{plugin_id}\"\n\
+         name = \"{plugin_id}\"\n\
+         version = \"{version}\"\n\
+         wit-api = \"^0.1.0\"\n\
+         lifecycle = \"per-call\"\n\
+         component = \"{component_name}\"\n\
+         {provider_ids_line}"
+    );
+    std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
+
+    let release = serde_json::json!({
+        "id": plugin_id,
+        "version": version,
+        "wit-api": "0.1.0",
+        "component_url": "https://example.invalid/x.wasm",
+        "component_sha256": sha,
+    });
+    std::fs::write(
+        version_dir.join("release.json"),
+        serde_json::to_vec(&release).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join(plugin_id).join("current"), version).unwrap();
+
+    let record = ComponentPluginReleaseRecord {
+        plugin_id: plugin_id.to_string(),
+        version: version.to_string(),
+        source_url: "https://example.invalid/x.wasm".to_string(),
+        sha256: sha,
+        signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
+        installed_at: 0,
+        active: false,
+        revoked: false,
+        revocation_reason: None,
+    };
+    store.upsert_component_release(&record).await.unwrap();
+    store
+        .set_active_component_release(plugin_id, version)
+        .await
+        .unwrap();
+}
+
 /// The extra capability grants + storage seeding
 /// [`build_test_transport_with_grants`] layers onto the baseline `deny_all`
 /// policy every test transport starts from. Kept as one struct (rather than
@@ -793,91 +890,7 @@ mod tests {
     // discover_provider_components: production discovery + registration
     // -----------------------------------------------------------------
 
-    use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
-
-    fn gateway_fixture_artifact() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/component-gateway/target/wasm32-wasip2/release")
-            .join("ryuzi_component_gateway_fixture.wasm")
-    }
-
-    /// Lay a verified, active bundle onto `root` in the exact on-disk layout
-    /// [`crate::plugins::bundle::load_active_bundles`] requires (versioned dir +
-    /// `current` pointer + `ryuzi-plugin.toml` + `release.json` + the component,
-    /// hashes all agreeing) and seed the matching active release row into
-    /// `store`. Signed under the first-party key so
-    /// `HostPolicy::for_installed_bundle` grants `allow_self_auth`, exactly like
-    /// the real mimo/opencode bundles.
-    async fn install_bundle_on_disk(
-        root: &std::path::Path,
-        store: &Store,
-        plugin_id: &str,
-        component_artifact: &std::path::Path,
-        provider_ids: &[&str],
-    ) {
-        use sha2::{Digest, Sha256};
-
-        let version = "0.1.0";
-        let component_name = "plugin.wasm";
-        let version_dir = root.join(plugin_id).join(version);
-        std::fs::create_dir_all(&version_dir).unwrap();
-        let bytes = std::fs::read(component_artifact).unwrap();
-        std::fs::write(version_dir.join(component_name), &bytes).unwrap();
-        let sha = format!("{:x}", Sha256::digest(&bytes));
-
-        let provider_ids_line = if provider_ids.is_empty() {
-            String::new()
-        } else {
-            let quoted = provider_ids
-                .iter()
-                .map(|p| format!("\"{p}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("provider-ids = [{quoted}]\n")
-        };
-        let manifest = format!(
-            "id = \"{plugin_id}\"\n\
-             name = \"{plugin_id}\"\n\
-             version = \"{version}\"\n\
-             wit-api = \"^0.1.0\"\n\
-             lifecycle = \"per-call\"\n\
-             component = \"{component_name}\"\n\
-             {provider_ids_line}"
-        );
-        std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
-
-        let release = serde_json::json!({
-            "id": plugin_id,
-            "version": version,
-            "wit-api": "0.1.0",
-            "component_url": "https://example.invalid/x.wasm",
-            "component_sha256": sha,
-        });
-        std::fs::write(
-            version_dir.join("release.json"),
-            serde_json::to_vec(&release).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(root.join(plugin_id).join("current"), version).unwrap();
-
-        let record = ComponentPluginReleaseRecord {
-            plugin_id: plugin_id.to_string(),
-            version: version.to_string(),
-            source_url: "https://example.invalid/x.wasm".to_string(),
-            sha256: sha,
-            signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
-            installed_at: 0,
-            active: false,
-            revoked: false,
-            revocation_reason: None,
-        };
-        store.upsert_component_release(&record).await.unwrap();
-        store
-            .set_active_component_release(plugin_id, version)
-            .await
-            .unwrap();
-    }
 
     /// A fresh temp store + a `SettingsStore` over it + a throwaway on-disk
     /// install root, all sharing one lifetime tempfile so nothing is dropped

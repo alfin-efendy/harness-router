@@ -4273,6 +4273,38 @@ mod tests {
         assert!(!installed_bundle_is_gateway(cp.store(), &nonexistent, "discord").await);
     }
 
+    // Positive path: a REAL bundle that genuinely exports `ryuzi:gateway/
+    // gateway`, staged on a hermetic on-disk root, must report `true`. The
+    // two tests above only pin the "nothing to find" false paths and the
+    // fail-closed error paths — none of them prove the actual
+    // `compiled.exports_gateway()` read at the end of the function ever
+    // returns `true` for a genuine gateway component. Reuses
+    // `wasm_provider`'s own gateway fixture + on-disk staging helper (the
+    // exact fixture `non_provider_bundle_registers_nothing` in that module
+    // uses to prove the OPPOSITE thing — that a gateway bundle must NOT
+    // register as a provider) rather than compiling a second throwaway
+    // gateway component just for this assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installed_bundle_is_gateway_is_true_for_a_real_gateway_bundle() {
+        crate::plugins::build_fixture_components_once();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        let root = tempfile::tempdir().unwrap();
+        crate::plugins::wasm_provider::install_bundle_on_disk(
+            root.path(),
+            &store,
+            "acme-gateway-fixture",
+            &crate::plugins::wasm_provider::gateway_fixture_artifact(),
+            &[],
+        )
+        .await;
+
+        assert!(
+            installed_bundle_is_gateway(&store, root.path(), "acme-gateway-fixture").await,
+            "a real gateway-exporting bundle must report true, not fail-closed-adjacent false"
+        );
+    }
+
     // No end-to-end test of `uninstall_and_reconcile`/`install_component_plugin`/
     // `rollback_component_plugin`'s "integration" arm through the REAL
     // `installed_bundle_root()` is added here, deliberately: those call
