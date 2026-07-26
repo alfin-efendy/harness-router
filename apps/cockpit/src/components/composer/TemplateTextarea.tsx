@@ -43,10 +43,16 @@ function activeLineSlashQuery(value: string, caret: number): LineSlashQuery | nu
   return { start: tokenStart, end: caret, query };
 }
 
-type MentionCandidate = { id: string; name: string; description: string; executable: true };
+type MentionCandidate = { id: string; name: string; description: string; executable: true; builtin: boolean };
 
 function toMentionCandidates(agents: AgentInfo[]): MentionCandidate[] {
-  return agents.map((agent) => ({ id: agent.name, name: agent.name, description: agent.description, executable: true }));
+  return agents.map((agent) => ({
+    id: agent.name,
+    name: agent.name,
+    description: agent.description,
+    executable: true,
+    builtin: agent.builtin,
+  }));
 }
 
 /** A `/` at the start of the current line suggests catalog commands; a bare

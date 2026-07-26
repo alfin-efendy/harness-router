@@ -3,9 +3,12 @@ import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AgentInfo, SlashEntryInfo } from "@/bindings";
 
-const reviewerAgent: AgentInfo = { name: "reviewer", description: "Reviews changes", mode: "subagent", builtin: true };
+const reviewerAgent: AgentInfo = { name: "reviewer", description: "Reviews changes", mode: "subagent", builtin: false };
+// Built-in agents are hidden from @ suggestion menus app-wide (mentions.ts
+// filters `!agent.builtin`); typing a builtin name manually still routes.
+const builtinAgent: AgentInfo = { name: "plan", description: "Planning agent", mode: "subagent", builtin: true };
 
-const nativeAgents = mock(async () => ({ status: "ok" as const, data: [reviewerAgent] }));
+const nativeAgents = mock(async () => ({ status: "ok" as const, data: [reviewerAgent, builtinAgent] }));
 const searchFiles = mock(async () => ({ status: "ok" as const, data: [] }));
 
 mock.module("@/bindings", () => ({
@@ -31,7 +34,7 @@ afterEach(() => {
 test("loads the hint project's agents and lists them in the @ menu, inserting @name on pick", async () => {
   render(<Harness projectId="p1" />);
   await waitFor(() => expect(nativeAgents).toHaveBeenCalledWith("local", "p1"));
-  await waitFor(() => expect(useNative.getState().agentsByProject.p1).toHaveLength(1));
+  await waitFor(() => expect(useNative.getState().agentsByProject.p1).toHaveLength(2));
 
   const textarea = screen.getByLabelText("Template") as HTMLTextAreaElement;
   fireEvent.change(textarea, { target: { value: "@rev", selectionStart: 4 } });
@@ -39,6 +42,17 @@ test("loads the hint project's agents and lists them in the @ menu, inserting @n
   const item = await screen.findByRole("button", { name: /reviewer/ });
   fireEvent.click(item);
   expect(textarea.value).toBe("@reviewer ");
+});
+
+test("excludes builtin agents from the @ menu", async () => {
+  render(<Harness projectId="p1" />);
+  await waitFor(() => expect(useNative.getState().agentsByProject.p1).toHaveLength(2));
+
+  const textarea = screen.getByLabelText("Template") as HTMLTextAreaElement;
+  fireEvent.change(textarea, { target: { value: "@", selectionStart: 1 } });
+
+  await screen.findByRole("button", { name: /reviewer/ });
+  expect(screen.queryByRole("button", { name: /plan/ })).toBeNull();
 });
 
 test("does not query or list agents when there is no hint project", async () => {
