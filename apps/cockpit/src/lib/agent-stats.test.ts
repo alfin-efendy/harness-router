@@ -59,12 +59,9 @@ test("reliabilitySummary renders an em dash for zero runs and a rounded percent 
   expect(reliabilitySummary(1, 1)).toEqual({ percent: "0%", detail: "1 of 1 runs" });
 });
 
-test("considerOffCandidates flags explicitly-on native tools and bound plugins missing from top tools", () => {
-  const result = considerOffCandidates(decisions(["read", "allow"], ["bash", "ask"]), ["github"], catalog, [tool("read", 5)], 12);
-  expect(result).toEqual([
-    { id: "bash", label: "Bash" },
-    { id: "github", label: "GitHub" },
-  ]);
+test("considerOffCandidates flags explicitly-on native tools missing from top tools", () => {
+  const result = considerOffCandidates(decisions(["read", "allow"], ["bash", "ask"]), catalog, [tool("read", 5)], 12);
+  expect(result).toEqual([{ id: "bash", label: "Bash" }]);
 });
 
 test("considerOffCandidates excludes tools already in top tools, an explicit off decision, and an implicit (absent) default-ask decision", () => {
@@ -72,11 +69,23 @@ test("considerOffCandidates excludes tools already in top tools, an explicit off
   // off → excluded. "grep" never appears in nativeToolDecisions at all,
   // which means an implicit default-ask decision (not "explicit") →
   // excluded too.
-  const result = considerOffCandidates(decisions(["read", "allow"], ["bash", "off"]), [], catalog, [tool("read", 5)], 12);
+  const result = considerOffCandidates(decisions(["read", "allow"], ["bash", "off"]), catalog, [tool("read", 5)], 12);
+  expect(result).toEqual([]);
+});
+
+test("considerOffCandidates never flags a plugin catalog entry, even with a 30d run and nothing in top tools", () => {
+  // Plugin catalog ids (e.g. "github") are manifest ids; topTools records
+  // the namespaced runtime tool name actually invoked
+  // (ext__github__create_issue, etc.), which never literally matches — so
+  // the plugin branch is dropped entirely rather than produce this false
+  // "unused" positive on every bound plugin. `catalog.pluginTools` (see the
+  // fixture above) has a "github" entry, but it can never appear in the
+  // result since plugin catalog entries are no longer diffed at all.
+  const result = considerOffCandidates([], catalog, [], 12);
   expect(result).toEqual([]);
 });
 
 test("considerOffCandidates suppresses entirely without a loaded catalog or with zero runs in the trailing 30 days", () => {
-  expect(considerOffCandidates(decisions(["read", "allow"]), [], null, [], 12)).toEqual([]);
-  expect(considerOffCandidates(decisions(["read", "allow"]), [], catalog, [], 0)).toEqual([]);
+  expect(considerOffCandidates(decisions(["read", "allow"]), null, [], 12)).toEqual([]);
+  expect(considerOffCandidates(decisions(["read", "allow"]), catalog, [], 0)).toEqual([]);
 });

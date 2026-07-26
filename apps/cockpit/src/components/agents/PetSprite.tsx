@@ -1,6 +1,6 @@
 import { type CSSProperties, useEffect, useState } from "react";
 import { commands } from "@/bindings";
-import { PET_COLS, PET_FRAME_H, PET_FRAME_W, PET_ROWS, POSE_ROW, type PetPose } from "@/lib/pet-sprite";
+import { PET_COLS, PET_FRAME_H, PET_FRAME_W, PET_ROWS, POSE_FRAMES, POSE_ROW, type PetPose } from "@/lib/pet-sprite";
 
 export interface PetSpriteProps {
   slug: string;
@@ -92,8 +92,13 @@ export function PetSprite({ slug, bundled, size, pose = "idle", animate = true, 
     imageRendering: "pixelated",
   };
   if (shouldAnimate) {
-    style.animation = `pet-sprite-cycle 1s steps(${PET_COLS}) infinite`;
-    (style as Record<string, string>)["--pet-sprite-total-w"] = `${backgroundWidth}px`;
+    // Only cycle through the frames this pose's row actually has (rows are
+    // short — see POSE_FRAMES in pet-sprite.ts) — stepping past the last
+    // real frame would land on the blank padding columns some rows leave
+    // unused out to PET_COLS.
+    const frameCount = POSE_FRAMES[pose];
+    style.animation = `pet-sprite-cycle 1s steps(${frameCount}) infinite`;
+    (style as Record<string, string>)["--pet-sprite-total-w"] = `${frameCount * size}px`;
   }
 
   return <div aria-hidden data-testid="pet-sprite" className="shrink-0 rounded-lg" style={style} />;

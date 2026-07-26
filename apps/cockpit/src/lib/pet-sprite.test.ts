@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PET_COLS, PET_FRAME_H, PET_FRAME_W, PET_ROWS, POSE_ROW, type PetPose, poseForRunStatus } from "./pet-sprite";
+import { PET_COLS, PET_FRAME_H, PET_FRAME_W, PET_ROWS, POSE_FRAMES, POSE_ROW, type PetPose, poseForRunStatus } from "./pet-sprite";
 
 describe("grid constants", () => {
   test("match the verified spritesheet layout (1536x1872, 192x208 frames, 8x9 grid)", () => {
@@ -31,13 +31,41 @@ describe("POSE_ROW", () => {
     expect(new Set(rows).size).toBe(rows.length);
   });
 
-  test("matches the documented top-to-bottom README row order", () => {
+  test("matches the empirically-verified row layout (NOT the petdex README's stated order)", () => {
     expect(POSE_ROW.idle).toBe(0);
-    expect(POSE_ROW.wave).toBe(1);
     expect(POSE_ROW.run).toBe(2);
-    expect(POSE_ROW.failed).toBe(3);
-    expect(POSE_ROW.review).toBe(4);
-    expect(POSE_ROW.jump).toBe(5);
+    expect(POSE_ROW.wave).toBe(3);
+    expect(POSE_ROW.jump).toBe(4);
+    expect(POSE_ROW.failed).toBe(5);
+    expect(POSE_ROW.review).toBe(8);
+  });
+});
+
+describe("POSE_FRAMES", () => {
+  const poses: PetPose[] = ["idle", "wave", "run", "failed", "review", "jump"];
+
+  test("has an entry for every PetPose", () => {
+    for (const pose of poses) {
+      expect(POSE_FRAMES[pose]).toBeDefined();
+    }
+  });
+
+  test("every frame count is a positive integer that fits within PET_COLS", () => {
+    for (const pose of poses) {
+      const frames = POSE_FRAMES[pose];
+      expect(Number.isInteger(frames)).toBe(true);
+      expect(frames).toBeGreaterThan(0);
+      expect(frames).toBeLessThanOrEqual(PET_COLS);
+    }
+  });
+
+  test("matches the empirically-verified per-row frame counts", () => {
+    expect(POSE_FRAMES.idle).toBe(6);
+    expect(POSE_FRAMES.run).toBe(8);
+    expect(POSE_FRAMES.wave).toBe(4);
+    expect(POSE_FRAMES.jump).toBe(5);
+    expect(POSE_FRAMES.failed).toBe(8);
+    expect(POSE_FRAMES.review).toBe(6);
   });
 });
 

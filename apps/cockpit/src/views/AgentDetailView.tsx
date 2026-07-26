@@ -126,9 +126,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
   const tokensLabel = stats ? `${formatCompactTokens(stats.tokens7d)} tokens` : "—";
   const reliability = stats ? reliabilitySummary(stats.runsTotal30d, stats.runsFailed30d) : { percent: "—", detail: "—" };
   const topTools = stats?.topTools.slice(0, 6) ?? [];
-  const considerOff = stats
-    ? considerOffCandidates(detail.nativeTools, detail.pluginTools, catalog, stats.topTools, stats.runsTotal30d)
-    : [];
+  const considerOff = stats ? considerOffCandidates(detail.nativeTools, catalog, stats.topTools, stats.runsTotal30d) : [];
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-5">

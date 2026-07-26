@@ -51,29 +51,37 @@ export function reliabilitySummary(runsTotal30d: number, runsFailed30d: number):
 export type ConsiderOffCandidate = { id: string; label: string };
 
 /**
- * Native tools with an explicit non-Off decision, plus bound plugin tools,
- * that never appear in `topTools` — a nudge to turn off configuration that
- * isn't actually being used. Suppressed entirely (returns `[]`) without a
- * loaded catalog, or when the agent had zero runs in the trailing 30 days:
- * no data is not the same claim as "unused".
+ * Native tools with an explicit non-Off decision that never appear in
+ * `topTools` — a nudge to turn off configuration that isn't actually being
+ * used. Suppressed entirely (returns `[]`) without a loaded catalog, or when
+ * the agent had zero runs in the trailing 30 days: no data is not the same
+ * claim as "unused".
+ *
+ * Plugin tools are deliberately excluded, not just unused-filtered — there
+ * used to be a `boundPluginTools`/`catalog.pluginTools` branch here doing
+ * the same diff as the native one below, and it's been removed rather than
+ * fixed in place: catalog `pluginTools` entries are keyed by manifest id
+ * (e.g. `github`), but `topTools` records the runtime tool name actually
+ * invoked, which for plugin-sourced tools is namespaced by
+ * extension/component (`ext__<extension>__<tool>`, `wasm__<component>__
+ * <tool>`, `mcp__...`). Those never literally match a plugin catalog id, so
+ * the old branch flagged every bound plugin as "unused" the moment the
+ * agent had any run in the trailing 30 days — a false positive, not a real
+ * usage signal. Native tool ids don't have this problem: they align with
+ * the recorded tool name as-is.
  */
 export function considerOffCandidates(
   nativeToolDecisions: NativeToolDecisionInfo[],
-  boundPluginTools: string[],
-  catalog: Pick<AgentConfigurationCatalogInfo, "nativeTools" | "pluginTools"> | null,
+  catalog: Pick<AgentConfigurationCatalogInfo, "nativeTools"> | null,
   topTools: AgentToolUsageInfo[],
   runsTotal30d: number,
 ): ConsiderOffCandidate[] {
   if (!catalog || runsTotal30d === 0) return [];
   const used = new Set(topTools.map((entry) => entry.tool));
   const explicitlyOn = new Set(nativeToolDecisions.filter((entry) => entry.decision !== "off").map((entry) => entry.tool));
-  const bound = new Set(boundPluginTools);
   const candidates: ConsiderOffCandidate[] = [];
   for (const entry of catalog.nativeTools) {
     if (explicitlyOn.has(entry.id) && !used.has(entry.id)) candidates.push({ id: entry.id, label: entry.label });
-  }
-  for (const entry of catalog.pluginTools) {
-    if (bound.has(entry.id) && !used.has(entry.id)) candidates.push({ id: entry.id, label: entry.label });
   }
   return candidates;
 }

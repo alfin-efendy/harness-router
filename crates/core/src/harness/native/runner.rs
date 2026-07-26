@@ -3794,8 +3794,9 @@ async fn complete_tool_call(
     // durable agent — reassigned for delegated main children (see the
     // reassignment around the main-delegate dispatch path); ephemeral
     // subagents carry their parent's id, which is intended (their tool use
-    // counts toward the agent that dispatched them). Fire-and-forget: stats
-    // must never fail or delay the tool call itself.
+    // counts toward the agent that dispatched them). Awaited inline (this is
+    // NOT fire-and-forget/spawned), but the error is only warn-logged, never
+    // propagated: stats can never fail the tool call itself.
     if let Err(e) = deps
         .store
         .increment_agent_tool_usage(

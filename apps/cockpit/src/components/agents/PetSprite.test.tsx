@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { PET_COLS, PET_FRAME_H, PET_FRAME_W, PET_ROWS, POSE_ROW } from "@/lib/pet-sprite";
+import { PET_COLS, PET_FRAME_H, PET_FRAME_W, PET_ROWS, POSE_FRAMES, POSE_ROW } from "@/lib/pet-sprite";
 
 // Only `commands.getPetSprite` is exercised by PetSprite.tsx, so that's all
 // this file's mock needs to provide — see the sibling agents/*.test.tsx
@@ -70,11 +70,32 @@ test("a different pose yields a different background-position-y, still on the co
   expect(sprite.style.backgroundPositionY).toBe(`${expectedY}px`);
 });
 
-test("animate=true applies a stepped keyframe animation over PET_COLS frames", async () => {
+test("animate=true applies a stepped keyframe animation over the pose's own frame count, not PET_COLS", async () => {
+  // Default pose is "idle" (6 frames), which is narrower than PET_COLS (8)
+  // — pinning this to POSE_FRAMES.idle (not the fixed grid width) catches a
+  // regression back to animating past a short row's blank padding columns.
   render(<PetSprite slug="sprout" bundled size={SIZE} fallbackColor="#8B5CF6" />);
 
   const sprite = await screen.findByTestId("pet-sprite");
-  expect(sprite.style.animation).toContain(`steps(${PET_COLS})`);
+  expect(sprite.style.animation).toContain(`steps(${POSE_FRAMES.idle})`);
+});
+
+test("a pose with a different frame count steps a different number of times", async () => {
+  render(<PetSprite slug="sprout" bundled size={SIZE} pose="run" fallbackColor="#8B5CF6" />);
+
+  const sprite = await screen.findByTestId("pet-sprite");
+  expect(sprite.style.animation).toContain(`steps(${POSE_FRAMES.run})`);
+  expect(POSE_FRAMES.run).not.toBe(POSE_FRAMES.idle);
+});
+
+test("the keyframe end offset custom property is the pose's frame count times the rendered frame width, not the full row width", async () => {
+  render(<PetSprite slug="sprout" bundled size={SIZE} pose="wave" fallbackColor="#8B5CF6" />);
+
+  const sprite = await screen.findByTestId("pet-sprite");
+  expect(sprite.style.getPropertyValue("--pet-sprite-total-w")).toBe(`${POSE_FRAMES.wave * SIZE}px`);
+  // Sanity: wave's row is shorter than the full PET_COLS-wide grid, so this
+  // must differ from a PET_COLS-based offset.
+  expect(POSE_FRAMES.wave * SIZE).not.toBe(PET_COLS * SIZE);
 });
 
 test("animate=false yields no animation style", async () => {
@@ -112,7 +133,7 @@ test("a missing window.matchMedia is treated as no motion preference (animates n
   try {
     render(<PetSprite slug="sprout" bundled size={SIZE} fallbackColor="#8B5CF6" />);
     const sprite = await screen.findByTestId("pet-sprite");
-    expect(sprite.style.animation).toContain(`steps(${PET_COLS})`);
+    expect(sprite.style.animation).toContain(`steps(${POSE_FRAMES.idle})`);
   } finally {
     window.matchMedia = original;
   }

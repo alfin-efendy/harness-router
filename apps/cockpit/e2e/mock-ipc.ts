@@ -1540,16 +1540,19 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
             );
           }
           // Task 8: `get_agent_stats_batch` — the roster row's lazy stats
-          // fragment. Real backend shape: a map keyed by the requested agent
-          // ids, entries absent for ids with no stats rather than zeroed —
-          // mirrored here by only including ids found in `agent_stats_lite`.
+          // fragment. Real backend shape (see `agent_stats_batch_returns_
+          // entries_only_for_requested_ids` in crates/core/src/api/
+          // agent_api.rs): a map with exactly one entry per requested agent
+          // id — never more (unrequested agents are excluded), never fewer
+          // (an id with no stats, e.g. unknown or synthetic, still gets a
+          // zeroed `AgentStatsLite` entry, same "zeroes out" contract as
+          // `get_agent_stats` above) — mirrored here via `?? zeroed`.
           if (cmd === "get_agent_stats_batch") {
             const { agentIds } = args as { agentIds: string[] };
             const lite = fixtures.agent_stats_lite as Record<string, AgentStatsLite>;
             const batch: Record<string, AgentStatsLite> = {};
             for (const id of agentIds) {
-              const entry = lite[id];
-              if (entry) batch[id] = entry;
+              batch[id] = lite[id] ?? { sessionCount: 0, lastActive: null, costUsd7d: 0 };
             }
             return Promise.resolve(batch);
           }
