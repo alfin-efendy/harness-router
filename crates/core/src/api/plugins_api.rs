@@ -1849,6 +1849,56 @@ async fn hot_reload_provider_transports(cp: &ControlPlane) {
     }
 }
 
+/// True when `plugin_id`'s ACTIVE installed bundle exports the wasm gateway
+/// interface. The granular restart latch needs this because a component
+/// gateway's host row is the manifest-only catalog stand-in — `derive_kind`
+/// says "integration", but the gateway supervisor + Router map stay frozen
+/// until reboot. Fail-closed: any load/compile error latches conservatively
+/// (returns true); a missing bundle root or no active bundle for this id
+/// returns false (classic rows, and a first-time install with nothing on
+/// disk yet, have nothing frozen to reload).
+///
+/// `root` is a parameter (rather than always
+/// [`crate::plugins::bundle::installed_bundle_root`] internally) for the
+/// same reason [`crate::plugins::wasm_provider::discover_provider_components`]
+/// takes one: it lets a unit test point this at a hermetic temp dir instead
+/// of this machine's real, possibly-populated per-user install root —
+/// `installed_bundle_root()` has no env-var test seam of its own (see
+/// `InstalledBundleFixture`'s doc in this module's tests), and `load_active_
+/// bundles` fails closed (this fn's own contract) on ANY mismatch anywhere
+/// under the root, so a real root with unrelated real installs would make a
+/// hermetic-root-less test of this function flaky on a machine that has
+/// ever manually installed a component bundle.
+async fn installed_bundle_is_gateway(
+    store: &std::sync::Arc<Store>,
+    root: &std::path::Path,
+    plugin_id: &str,
+) -> bool {
+    use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
+    // Mirrors `discover_provider_components`'s own pre-check: `load_active_
+    // bundles` calls `root.canonicalize()` first, which errors on a
+    // nonexistent path — so an absent bundle root (nothing ever installed)
+    // must be treated as "no active bundle", not a fail-closed error.
+    if !root.exists() {
+        return false;
+    }
+    let bundles = match crate::plugins::bundle::load_active_bundles(root, store).await {
+        Ok(bundles) => bundles,
+        Err(_) => return true,
+    };
+    let Some(bundle) = bundles.into_iter().find(|b| b.manifest.id == plugin_id) else {
+        return false;
+    };
+    let Ok(runtime) = ComponentRuntime::new() else {
+        return true;
+    };
+    let policy = HostPolicy::for_installed_bundle(&bundle);
+    match runtime.compile(&bundle, policy) {
+        Ok(compiled) => compiled.exports_gateway(),
+        Err(_) => true,
+    }
+}
+
 /// Same semantics as `ryuzi plugins enable/disable` — delegates to the shared
 /// core helper so the two surfaces never drift.
 async fn set_plugin_enabled(cp: &ControlPlane, id: String, enabled: bool) -> Result<(), ApiError> {
@@ -1969,12 +2019,34 @@ async fn uninstall_and_reconcile(cp: &ControlPlane, id: &str) -> anyhow::Result<
         .as_deref()
         .and_then(derive_kind)
         .map(str::to_owned);
+    // A component GATEWAY's host row still reads "integration" via the
+    // catalog stand-in (see `installed_bundle_is_gateway`'s doc comment), so
+    // that arm needs the bundle capability check. Computed BEFORE `uninstall`
+    // runs below — uninstall may deactivate the bundle, after which the
+    // check could no longer answer. Only paid for on the "integration" arm
+    // (the one case that needs it), so a provider/gateway/skill-pack
+    // uninstall never touches the bundle root at all.
+    let was_gateway_bundle = if kind.as_deref() == Some("integration") {
+        installed_bundle_is_gateway(
+            cp.store(),
+            &crate::plugins::bundle::installed_bundle_root(),
+            id,
+        )
+        .await
+    } else {
+        false
+    };
     uninstall(cp, id).await?;
     match kind.as_deref() {
         // Hot: drop the live transport (no-op when none registered).
         Some("provider") => crate::plugins::wasm_provider::unregister_wasm_provider(id),
-        // Hot next session: connector bundles re-discover per session.
-        Some("integration") => {}
+        // Hot next session UNLESS the installed bundle is actually a gateway
+        // (frozen Router map) — see the capability check above.
+        Some("integration") => {
+            if was_gateway_bundle {
+                cp.mark_plugins_restart_required();
+            }
+        }
         // Gateway (frozen Router map), skill packs, and anything the
         // host doesn't know keep the conservative latch.
         _ => cp.mark_plugins_restart_required(),
@@ -2265,9 +2337,24 @@ async fn install_component_plugin(
     // Spec B1 granular latch: only a GATEWAY bundle still needs a process
     // restart (the Router's gateway map is immutable). Provider bundles are
     // hot-reloaded just below; connector bundles re-discover per session. An
-    // id the host doesn't know latches conservatively.
+    // id the host doesn't know latches conservatively. A component GATEWAY's
+    // host row is the manifest-only catalog stand-in on a first-time install
+    // — `derive_kind` reports "integration" for it, not "gateway" — so the
+    // "integration" arm must fall through to the bundle capability check
+    // rather than assume "not a gateway" (see `installed_bundle_is_gateway`).
     match cp.plugins().get(plugin_id).as_deref().and_then(derive_kind) {
-        Some("provider") | Some("integration") => {}
+        Some("provider") => {}
+        Some("integration") => {
+            if installed_bundle_is_gateway(
+                cp.store(),
+                &crate::plugins::bundle::installed_bundle_root(),
+                plugin_id,
+            )
+            .await
+            {
+                cp.mark_plugins_restart_required();
+            }
+        }
         _ => cp.mark_plugins_restart_required(),
     }
     hot_reload_provider_transports(cp).await;
@@ -2311,9 +2398,22 @@ async fn rollback_component_plugin(
     // Spec B1 granular latch: same rule as `install_component_plugin` — only
     // a gateway (or an id the host doesn't know) still needs a process
     // restart; a provider hot-swaps below, a connector re-discovers per
-    // session.
+    // session. Same "integration" caveat as `install_component_plugin`: a
+    // component gateway's host row still reads as "integration" via the
+    // catalog stand-in, so that arm defers to the bundle capability check.
     match cp.plugins().get(plugin_id).as_deref().and_then(derive_kind) {
-        Some("provider") | Some("integration") => {}
+        Some("provider") => {}
+        Some("integration") => {
+            if installed_bundle_is_gateway(
+                cp.store(),
+                &crate::plugins::bundle::installed_bundle_root(),
+                plugin_id,
+            )
+            .await
+            {
+                cp.mark_plugins_restart_required();
+            }
+        }
         _ => cp.mark_plugins_restart_required(),
     }
     // If the rolled-back plugin is a currently-running gateway, stop its
@@ -4131,6 +4231,61 @@ mod tests {
             "gateway uninstall still needs a restart"
         );
     }
+
+    // A first-time component GATEWAY install/rollback/uninstall has NO host row
+    // yet other than the manifest-only catalog stand-in (`derive_kind` sees
+    // `Some("integration")` for it, never `Some("gateway")` — see
+    // `installed_bundle_is_gateway`'s doc comment). These pin the capability
+    // check the granular latch now runs for that `Some("integration")` case.
+
+    #[tokio::test]
+    async fn installed_bundle_is_gateway_is_false_without_active_bundle() {
+        // A hermetic, empty temp dir (not the real per-user
+        // `installed_bundle_root()`, which may hold real installs left over
+        // from manual smoke-testing on a dev machine — `load_active_bundles`
+        // fails closed on ANY mismatched entry anywhere under the root, so a
+        // populated real root would make this test flaky depending on
+        // ambient machine state; see this fn's own doc). No active bundle on
+        // disk for this id — a classic integration row has nothing frozen to
+        // reload, so this must be false, not fail-closed.
+        let cp = test_cp().await;
+        let empty_root = tempfile::tempdir().unwrap();
+        assert!(
+            !installed_bundle_is_gateway(
+                cp.store(),
+                empty_root.path(),
+                "definitely-not-an-installed-bundle-id"
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn installed_bundle_is_gateway_is_false_when_the_bundle_root_does_not_exist_yet() {
+        // The bundle root itself doesn't exist at all — the common case for
+        // a first-time daemon that has never installed ANY component bundle.
+        // `load_active_bundles` errors on `root.canonicalize()` for a
+        // nonexistent path, so this pins the pre-check that treats "no root"
+        // as "no active bundle" rather than a fail-closed error.
+        let cp = test_cp().await;
+        let root = tempfile::tempdir().unwrap();
+        let nonexistent = root.path().join("never-created");
+        assert!(!installed_bundle_is_gateway(cp.store(), &nonexistent, "discord").await);
+    }
+
+    // No end-to-end test of `uninstall_and_reconcile`/`install_component_plugin`/
+    // `rollback_component_plugin`'s "integration" arm through the REAL
+    // `installed_bundle_root()` is added here, deliberately: those call
+    // sites always pass the real root (by design — see their own comments),
+    // and `load_active_bundles`'s fail-closed contract means ANY mismatch
+    // between that real root's contents and a test's fresh, unrelated store
+    // trips the conservative "true" path — not a bug, but a mismatch that
+    // can ONLY occur in a test harness (production always pairs the real
+    // root with the SAME real store the install pipeline wrote both
+    // through). `installed_bundle_is_gateway_is_false_without_active_bundle`
+    // and its bundle-root-missing sibling above already pin that function's
+    // own correctness hermetically (root injected); the three call sites'
+    // wiring onto it is a single `if` one-liner each, verified by reading.
 
     // The positive skill-pack uninstall path (a real pack on disk removed via
     // `remove_installed_skill`) resolves through `InstallRoots::for_user()`,
