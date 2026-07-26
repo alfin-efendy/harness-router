@@ -1922,7 +1922,7 @@ async fn set_plugin_enabled(cp: &ControlPlane, id: String, enabled: bool) -> Res
         if enabled {
             hot_reload_provider_transports(cp).await;
         } else {
-            crate::plugins::wasm_provider::unregister_wasm_provider(&id);
+            crate::plugins::wasm_provider::unregister_wasm_providers_for_plugin(&id);
         }
     }
     cp.emit(CoreEvent::PluginsChanged);
@@ -1971,6 +1971,11 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
                 }
                 crate::llm_router::connections::remove_connection(cp.store(), &row.id).await?;
             }
+            // Spec B1: an uninstalled provider must stay off — clear the
+            // transport key or the next hot reload would re-register it.
+            cp.store()
+                .delete_setting_raw(&format!("plugin.{id}.enabled"))
+                .await?;
             Ok(())
         }
         Some("gateway") => {
@@ -2048,7 +2053,7 @@ async fn uninstall_and_reconcile(cp: &ControlPlane, id: &str) -> anyhow::Result<
     uninstall(cp, id).await?;
     match kind.as_deref() {
         // Hot: drop the live transport (no-op when none registered).
-        Some("provider") => crate::plugins::wasm_provider::unregister_wasm_provider(id),
+        Some("provider") => crate::plugins::wasm_provider::unregister_wasm_providers_for_plugin(id),
         // Hot next session UNLESS the installed bundle is actually a gateway
         // (frozen Router map) — see the capability check above.
         Some("integration") => {
@@ -2366,6 +2371,11 @@ async fn install_component_plugin(
         }
         _ => cp.mark_plugins_restart_required(),
     }
+    // Fail-closed: drop this plugin's live transports BEFORE re-discovery, so
+    // a version whose compile fails leaves NO transport (router falls back to
+    // the native/generic path) instead of silently keeping the previous —
+    // for rollback, the just-revoked — version serving traffic.
+    crate::plugins::wasm_provider::unregister_wasm_providers_for_plugin(plugin_id);
     hot_reload_provider_transports(cp).await;
     cp.emit(CoreEvent::PluginsChanged);
     plugin_release_detail(cp, plugin_id).await
@@ -2432,6 +2442,11 @@ async fn rollback_component_plugin(
     // connector/provider or a gateway not presently supervised.
     cp.stop_revoked_running_gateways(&std::iter::once(plugin_id.to_string()).collect())
         .await;
+    // Fail-closed: drop this plugin's live transports BEFORE re-discovery, so
+    // a version whose compile fails leaves NO transport (router falls back to
+    // the native/generic path) instead of silently keeping the previous —
+    // for rollback, the just-revoked — version serving traffic.
+    crate::plugins::wasm_provider::unregister_wasm_providers_for_plugin(plugin_id);
     // A rolled-back ENABLED provider bundle hot-swaps to the restored release
     // (discovery compiles the now-active version; replace semantics).
     hot_reload_provider_transports(cp).await;
@@ -4156,6 +4171,33 @@ mod tests {
             ids,
             vec!["builtin-mimo"],
             "builtin free row survives; paid family row is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_provider_clears_transport_enable_key() {
+        // Spec B1 / Fix 2: an uninstalled provider must stay off. Before this
+        // fix, `uninstall`'s provider arm only cleaned up connection rows —
+        // the `plugin.<id>.enabled` row (what `discover_provider_components`
+        // reads to decide whether to (re-)register a live transport) was left
+        // "true", so a later unrelated `hot_reload_provider_transports` call
+        // (from ANY other install/enable) could resurrect the uninstalled
+        // plugin's transport out of the still-active-on-disk bundle.
+        let cp = test_cp().await;
+        cp.store()
+            .set_setting_raw("plugin.mimo.enabled", "true")
+            .await
+            .unwrap();
+
+        uninstall(&cp, "mimo").await.unwrap();
+
+        assert_eq!(
+            cp.store()
+                .get_setting_raw("plugin.mimo.enabled")
+                .await
+                .unwrap(),
+            None,
+            "uninstalling a provider must clear its transport-enable key"
         );
     }
 
