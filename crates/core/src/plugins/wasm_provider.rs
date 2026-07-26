@@ -269,7 +269,10 @@ pub fn wasm_provider(provider_id: &str) -> Option<Arc<dyn WasmProviderRuntime>> 
         .cloned()
 }
 
-/// Drop a provider transport from the registry (e.g. on uninstall/disable).
+/// Drop ONE transport by its router provider id. Production uninstall/disable
+/// paths must use [`unregister_wasm_providers_for_plugin`] instead — a bundle's
+/// declared `provider-ids` may alias its plugin id (mimo → "mimo-free"), so
+/// removing by a single id string misses aliased registrations.
 pub fn unregister_wasm_provider(provider_id: &str) {
     provider_registry()
         .write()
