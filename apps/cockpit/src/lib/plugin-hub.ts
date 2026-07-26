@@ -157,6 +157,46 @@ function skillToHubItem(skill: InstalledSkillInfo): HubItem {
   };
 }
 
+/** Spec A3: one hub card per provider VENDOR, not per auth-method descriptor.
+ *  Members sharing a `family` collapse into the head row (the member whose
+ *  id equals the family — same display-head rule ModelsView and CatalogEntry
+ *  use). Aggregation: installed if any member is installed; needs-setup only
+ *  if every member needs setup (a healthy head must not be masked by an
+ *  unconfigured sibling method); otherwise the head's own status. Non-provider
+ *  rows pass through untouched. Input order is preserved (heads keep their
+ *  catalog position — the `discover` rail relies on it). */
+export function collapseProviderFamilies(plugins: PluginInfo[]): PluginInfo[] {
+  const members = new Map<string, PluginInfo[]>();
+  for (const p of plugins) {
+    if (p.kind !== "provider") continue;
+    const family = p.family ?? p.id;
+    const list = members.get(family);
+    if (list) list.push(p);
+    else members.set(family, [p]);
+  }
+  const out: PluginInfo[] = [];
+  for (const p of plugins) {
+    if (p.kind !== "provider") {
+      out.push(p);
+      continue;
+    }
+    const family = p.family ?? p.id;
+    const group = members.get(family) ?? [p];
+    const head = group.find((m) => m.id === family) ?? group[0];
+    if (p.id !== head.id) continue; // folded into the head's card
+    if (group.length === 1) {
+      out.push(p);
+      continue;
+    }
+    out.push({
+      ...head,
+      installed: group.some((m) => m.installed),
+      status: group.every((m) => m.status === "needs-setup") ? "needs-setup" : head.status,
+    });
+  }
+  return out;
+}
+
 /** Builds the unified hub row set from the three independent sources. Skill
  *  sources that are already represented by a plugin row (same exclusion
  *  `PluginsView.tsx` uses for its "Skill sources" card) are dropped so a
@@ -164,7 +204,11 @@ function skillToHubItem(skill: InstalledSkillInfo): HubItem {
 export function buildHubItems(input: { plugins: PluginInfo[]; apps: AppInfo[]; skills: InstalledSkillInfo[] }): HubItem[] {
   const pluginIds = new Set(input.plugins.map((p) => p.id));
   const standaloneSkills = input.skills.filter((s) => !pluginIds.has(s.id) && !(s.pluginId && pluginIds.has(s.pluginId)));
-  return [...input.plugins.map(pluginToHubItem), ...input.apps.map(appToHubItem), ...standaloneSkills.map(skillToHubItem)];
+  return [
+    ...collapseProviderFamilies(input.plugins).map(pluginToHubItem),
+    ...input.apps.map(appToHubItem),
+    ...standaloneSkills.map(skillToHubItem),
+  ];
 }
 
 const ATTENTION_STATUSES: ReadonlySet<HubStatus> = new Set(["needs-setup", "attach-failed", "blocked"]);

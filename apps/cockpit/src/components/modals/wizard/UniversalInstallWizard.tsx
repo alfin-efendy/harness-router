@@ -190,6 +190,7 @@ export function UniversalInstallWizard({
       hasSettings: detail.settings.length > 0,
       trustRequired: skillTrust != null,
       hasOauthProfiles: (releaseDetail?.activeManifest?.oauthProfiles.length ?? 0) > 0,
+      freeBuiltin: detail.info.kind === "provider" && detail.info.categories.includes("free"),
     });
   }, [detail, releaseDetail, skillTrust]);
 

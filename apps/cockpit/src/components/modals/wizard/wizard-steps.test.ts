@@ -11,6 +11,7 @@ function input(overrides: Partial<WizardPlanInput> = {}): WizardPlanInput {
     hasSettings: false,
     trustRequired: false,
     hasOauthProfiles: false,
+    freeBuiltin: false,
     ...overrides,
   };
 }
@@ -20,8 +21,21 @@ test("component connector with oauth + settings includes all six steps", () => {
   expect(steps).toEqual(["overview", "permissions", "install", "connect", "settings", "done"]);
 });
 
-test("provider always gets a connect step, even with authKind none", () => {
+// Spec A2: a provider still defaults to a connect step (paid providers need an
+// account), EXCEPT the built-in free tiers whose connection is guaranteed by
+// the daemon — those finish the wizard with no account form.
+test("paid provider gets a connect step even with authKind none", () => {
   const steps = planWizardSteps(input({ kind: "provider", authKind: "none" }));
+  expect(steps).toEqual(["overview", "install", "connect", "done"]);
+});
+
+test("built-in free provider skips the connect step", () => {
+  const steps = planWizardSteps(input({ kind: "provider", authKind: "none", freeBuiltin: true }));
+  expect(steps).toEqual(["overview", "install", "done"]);
+});
+
+test("freeBuiltin does not suppress connect for a token provider", () => {
+  const steps = planWizardSteps(input({ kind: "provider", authKind: "token", freeBuiltin: true }));
   expect(steps).toEqual(["overview", "install", "connect", "done"]);
 });
 

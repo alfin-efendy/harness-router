@@ -99,7 +99,7 @@ const kiroProvider: CatalogEntry = {
 };
 const mimoFree: CatalogEntry = {
   id: "mimo-free",
-  name: "MiMo (free)",
+  name: "MiMo",
   family: "mimo-free",
   color: "#ff6900",
   initial: "M",
@@ -127,7 +127,7 @@ const mimo: CatalogEntry = {
 };
 const opencodeFree: CatalogEntry = {
   id: "opencode-free",
-  name: "OpenCode (free)",
+  name: "OpenCode",
   family: "opencode-free",
   color: "#f5a623",
   initial: "OC",

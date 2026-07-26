@@ -2253,7 +2253,13 @@ export type ConnectionInfo = { id: string; provider: string; providerName: strin
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
  */
-needsRelogin: boolean }
+needsRelogin: boolean;
+/**
+ * True for the built-in free-tier connections (`mimo-free`/`opencode-free`):
+ * always present (re-seeded at startup), hidden from account management,
+ * not deletable (spec A2).
+ */
+builtin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */

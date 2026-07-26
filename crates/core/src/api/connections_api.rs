@@ -376,6 +376,7 @@ fn to_info(row: &ConnectionRow) -> ConnectionInfo {
             .map(|d| connections::effective_models(d, row))
             .unwrap_or_default(),
         needs_relogin: row.data.needs_relogin.unwrap_or(false),
+        builtin: connections::is_builtin_free(&row.provider, &row.auth_type),
     }
 }
 
@@ -880,6 +881,12 @@ async fn add_free_connection(
     if desc.device_flow.is_some() {
         return Err(ApiError::bad_request(format!(
             "{} uses device login — connect it from the provider list.",
+            desc.name
+        )));
+    }
+    if connections::is_builtin_free(&provider, "free") {
+        return Err(ApiError::bad_request(format!(
+            "{} is built in — the free tier is always connected.",
             desc.name
         )));
     }
@@ -1414,10 +1421,41 @@ mod tests {
         assert!(claude.get("baseUrl").is_none());
         assert!(claude.get("keyMasked").is_none());
         assert!(claude.get("claudeCloaking").is_none());
+        assert_eq!(claude["builtin"], false);
 
         row.provider = "openai-oauth".into();
         let codex = serde_json::to_value(to_info(&row)).unwrap();
         assert_eq!(codex["quotaCapability"], "codex");
+    }
+
+    #[test]
+    fn to_info_flags_builtin_free_tier_rows() {
+        let row = ConnectionRow {
+            id: "mimo-free-account".into(),
+            provider: "mimo-free".into(),
+            auth_type: "free".into(),
+            label: "MiMo (free)".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let info = to_info(&row);
+        assert!(info.builtin);
+    }
+
+    #[tokio::test]
+    async fn add_free_connection_refuses_builtin_free_tiers() {
+        let s = state().await;
+        match add_free_connection(&s.cp, "mimo-free".into(), "MiMo (free)".into()).await {
+            Ok(_) => panic!("expected add_free_connection to refuse a builtin free tier"),
+            Err(err) => assert!(
+                err.message.contains("built in"),
+                "unexpected message: {}",
+                err.message
+            ),
+        }
     }
 
     #[test]

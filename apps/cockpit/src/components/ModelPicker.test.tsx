@@ -32,6 +32,7 @@ const connection: ConnectionInfo = {
   quotaCapability: null,
   models: ["claude-opus-4", "claude-sonnet-4"],
   needsRelogin: false,
+  builtin: false,
 };
 
 const { ModelPicker } = await import("./ModelPicker");

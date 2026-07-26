@@ -20,6 +20,7 @@ const connection = {
   quotaCapability: "codex",
   models: ["gpt-5"],
   needsRelogin: false,
+  builtin: false,
 } satisfies ConnectionInfo;
 
 const refreshModelConfiguration = mock(async () => {});

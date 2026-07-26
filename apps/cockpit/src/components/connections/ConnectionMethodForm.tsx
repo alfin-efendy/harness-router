@@ -2,7 +2,7 @@ import { Loader2 } from "lucide-react";
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
-import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
+import { events, type CatalogEntry, type ConnectionInfo, type DeviceFlowInfo } from "@/bindings";
 import { Chip } from "@/components/common/bits";
 import { Button, ChoiceCard, Combobox, FormField, Input, ModalBody, ModalFooter, RadioGroup } from "@ryuzi/ui";
 import {
@@ -66,6 +66,16 @@ function authMethodLabel(entry: CatalogEntry): string {
 
 export type ConnectionMethodFormHandle = { cancel: () => void };
 
+/** Spec A2: the "Free tier" method disappears once its built-in connection
+ *  exists (always, for mimo-free/opencode-free) — there is nothing to add,
+ *  and addFreeConnection would be refused by the daemon anyway. Non-builtin
+ *  free providers keep the method. */
+export function visibleMembers(catalog: CatalogEntry[], family: string, connections: ConnectionInfo[]): CatalogEntry[] {
+  return catalog
+    .filter((entry) => entry.family === family)
+    .filter((entry) => !(entry.category === "free" && connections.some((c) => c.provider === entry.id && c.builtin)));
+}
+
 // The account-creation form for one provider family (Task 15) — extracted
 // from `AddConnectionModal` so the universal install wizard's provider
 // adapter (`steps-provider.tsx`) can embed the exact same method chooser/
@@ -96,6 +106,7 @@ export const ConnectionMethodForm = forwardRef<
 >(function ConnectionMethodForm({ family, onDone, onBusyChange, onSelectedChange }, ref) {
   const {
     catalog,
+    connections,
     add,
     connectOauth,
     addFree,
@@ -106,7 +117,7 @@ export const ConnectionMethodForm = forwardRef<
     startDeviceFlow,
     awaitDeviceFlow,
   } = useConnections();
-  const members = useMemo(() => catalog.filter((entry) => entry.family === family), [catalog, family]);
+  const members = useMemo(() => visibleMembers(catalog, family, connections), [catalog, family, connections]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");

@@ -420,7 +420,7 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
     // Auto-connect the MiMo/OpenCode free tiers on first run so a fresh
     // install has runnable models (and the `free` route below has candidates)
-    // without any "Add account" step. Idempotent + respects user deletion.
+    // without any "Add account" step. Idempotent + self-healing: recreates missing built-in free rows on every start.
     crate::agents::bootstrap::ensure_free_providers_seeded(&store).await?;
     // Bootstrap the first-party component bundles (MiMo/OpenCode) on first run
     // so their signed provider bundles can land + activate without any manual

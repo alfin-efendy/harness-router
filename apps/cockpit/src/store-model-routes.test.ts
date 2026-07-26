@@ -27,6 +27,7 @@ const connection: ConnectionInfo = {
   quotaCapability: null,
   models: ["gpt-5"],
   needsRelogin: false,
+  builtin: false,
 };
 
 const targetCapabilities: ModelRouteTargetCapability[] = [

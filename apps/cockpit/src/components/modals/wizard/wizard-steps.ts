@@ -15,6 +15,11 @@ export type WizardPlanInput = {
   // component can need a connect step with authKind "none" when it declares
   // at least one profile. True when that manifest lists ≥1 OAuth profile.
   hasOauthProfiles: boolean;
+  // Spec A2: true for a provider whose free tier is a built-in, daemon-
+  // guaranteed connection (descriptor category Free — surfaced to the UI as a
+  // "free" entry in PluginInfo.categories). Such a provider needs no account
+  // to work, so the wizard plans no connect step for it.
+  freeBuiltin: boolean;
 };
 
 // Rules (spec §5 table): overview and install and done are unconditional;
@@ -27,13 +32,13 @@ export type WizardPlanInput = {
 // permissions for — so `kind === "provider"` is excluded from this gate
 // regardless of `componentBacked`; settings gates on the manifest declaring
 // [[settings]]; connect gates on either a top-level auth requirement,
-// providers always needing a connection, or a component's declared OAuth
-// profile.
+// providers needing a connection unless their free tier is built in, or a
+// component's declared OAuth profile.
 export function planWizardSteps(i: WizardPlanInput): WizardStepId[] {
   const steps: WizardStepId[] = ["overview"];
   if ((i.componentBacked && i.kind !== "provider") || i.trustRequired) steps.push("permissions");
   steps.push("install");
-  if (i.authKind !== "none" || i.kind === "provider" || i.hasOauthProfiles) steps.push("connect");
+  if (i.authKind !== "none" || (i.kind === "provider" && !i.freeBuiltin) || i.hasOauthProfiles) steps.push("connect");
   if (i.hasSettings) steps.push("settings");
   steps.push("done");
   return steps;

@@ -786,6 +786,10 @@ pub struct ConnectionInfo {
     /// OAuth connections only: true once refresh has failed terminally and
     /// the user needs to reconnect via the browser/paste flow again.
     pub needs_relogin: bool,
+    /// True for the built-in free-tier connections (`mimo-free`/`opencode-free`):
+    /// always present (re-seeded at startup), hidden from account management,
+    /// not deletable (spec A2).
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
