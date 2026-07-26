@@ -317,6 +317,7 @@ mod tests {
             description: String::new(),
             avatar: AgentAvatar {
                 color: "blue".to_string(),
+                pet: None,
             },
             model: AgentModel::Route {
                 route: "default".to_string(),

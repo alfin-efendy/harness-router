@@ -157,6 +157,7 @@ mod tests {
             id: id.into(),
             name: "Ada at creation".into(),
             avatar_color: "violet".into(),
+            avatar_pet: None,
         }
     }
 
@@ -279,6 +280,7 @@ mod tests {
                     description: "Updated".into(),
                     avatar: crate::agents::types::AgentAvatar {
                         color: "blue".into(),
+                        pet: None,
                     },
                     model: crate::agents::types::AgentModel::Concrete {
                         name: "anthropic/claude-opus-4-8".into(),

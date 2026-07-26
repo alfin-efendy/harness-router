@@ -2220,6 +2220,7 @@ mod gateway_impl_tests {
                     id: primary_agent.profile.id.clone(),
                     name: primary_agent.profile.name.clone(),
                     avatar_color: primary_agent.profile.avatar.color.clone(),
+                    avatar_pet: primary_agent.profile.avatar.pet.clone(),
                 }),
                 project_id: None,
                 agent_session_id: None,

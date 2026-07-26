@@ -332,6 +332,7 @@ mod tests {
                     id: primary_agent_snapshot.profile.id.clone(),
                     name: primary_agent_snapshot.profile.name.clone(),
                     avatar_color: primary_agent_snapshot.profile.avatar.color.clone(),
+                    avatar_pet: primary_agent_snapshot.profile.avatar.pet.clone(),
                 }),
                 project_id: None,
                 agent_session_id: None,

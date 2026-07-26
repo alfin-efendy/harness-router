@@ -6863,6 +6863,7 @@ mod tests {
             id: "ada".into(),
             name: "Ada".into(),
             avatar_color: "violet".into(),
+            avatar_pet: None,
         };
         let root = NewAgentRun {
             run_id: "root".into(),

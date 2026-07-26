@@ -27,6 +27,8 @@ struct AgentIndexWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AvatarWire {
     color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pet: Option<String>,
     #[serde(flatten)]
     extensions: IndexMap<String, Value>,
 }
@@ -410,6 +412,7 @@ fn profile_from_wire(
         description: required(wire.description, "description")?,
         avatar: AgentAvatar {
             color: required(wire.avatar.color, "avatar.color")?,
+            pet: trim_option(wire.avatar.pet).filter(|value| !value.is_empty()),
         },
         model,
         personality,
@@ -529,6 +532,7 @@ fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -
         description: value.description.clone(),
         avatar: AvatarWire {
             color: value.avatar.color.clone(),
+            pet: value.avatar.pet.clone(),
             extensions: nested_extensions(extensions, "avatar"),
         },
         model: model_to_wire(&value.model, nested_extensions(extensions, "model")),
@@ -867,6 +871,54 @@ x_vendor: { enabled: true }
         assert_eq!(reparsed.extensions()["avatar"]["x_icon"], "owl");
         assert_eq!(reparsed.extensions()["model"]["x_model"], "keep");
         assert_eq!(reparsed.extensions()["permissions"]["x_policy"], "keep");
+    }
+
+    #[test]
+    fn avatar_pet_round_trips_when_present() {
+        let raw = r#"schema_version: 1
+id: reviewer
+name: Reviewer
+description: Reviews code.
+avatar: { color: violet, pet: paperclip }
+model: { name: anthropic/claude-opus-4-8, effort: high }
+permissions: { mode: ask, rules: [] }
+skills: { enabled: [] }
+tools: { native: [], plugins: [], apps: [] }
+loop: { max_turns: 50, max_tool_rounds: 100 }
+"#;
+        let parsed = parse_agent_profile_document(raw).unwrap();
+        assert_eq!(parsed.typed().avatar.pet.as_deref(), Some("paperclip"));
+
+        let rendered = render_agent_profile_document(&parsed).unwrap();
+        assert!(rendered.contains("pet: paperclip"));
+        let reparsed = parse_agent_profile_document(&rendered).unwrap();
+        assert_eq!(reparsed.typed().avatar.pet.as_deref(), Some("paperclip"));
+    }
+
+    #[test]
+    fn avatar_pet_absent_parses_to_none_and_stays_absent_on_render() {
+        // Old doc without the `pet` key at all — back-compat parse.
+        let doc = parse_agent_profile_document(LEGACY_AGENT_YAML).unwrap();
+        assert_eq!(doc.typed().avatar.pet, None);
+        let rendered = render_agent_profile_document(&doc).unwrap();
+        assert!(!rendered.contains("pet:"));
+    }
+
+    #[test]
+    fn empty_avatar_pet_normalizes_to_none() {
+        let raw = r#"schema_version: 1
+id: reviewer
+name: Reviewer
+description: Reviews code.
+avatar: { color: violet, pet: "" }
+model: { name: anthropic/claude-opus-4-8, effort: high }
+permissions: { mode: ask, rules: [] }
+skills: { enabled: [] }
+tools: { native: [], plugins: [], apps: [] }
+loop: { max_turns: 50, max_tool_rounds: 100 }
+"#;
+        let parsed = parse_agent_profile_document(raw).unwrap();
+        assert_eq!(parsed.typed().avatar.pet, None);
     }
 
     const LEGACY_AGENT_YAML: &str = r#"schema_version: 1

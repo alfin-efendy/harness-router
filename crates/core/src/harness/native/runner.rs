@@ -5686,6 +5686,7 @@ mod tests {
                 description: String::new(),
                 avatar: AgentAvatar {
                     color: "blue".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/model-b".into(),
@@ -5959,6 +5960,7 @@ mod tests {
                     id: deps.primary_agent.profile.id.clone(),
                     name: deps.primary_agent.profile.name.clone(),
                     avatar_color: deps.primary_agent.profile.avatar.color.clone(),
+                    avatar_pet: deps.primary_agent.profile.avatar.pet.clone(),
                 }),
                 project_id: None,
                 agent_session_id: None,
@@ -6111,6 +6113,7 @@ mod tests {
                 description: format!("{name} delegated target"),
                 avatar: AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/target-model".into(),
@@ -12227,6 +12230,7 @@ mod tests {
                 description: "delegate".into(),
                 avatar: crate::agents::types::AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: crate::agents::types::AgentModel::Concrete {
                     name: "anthropic/target-model".into(),
@@ -12326,6 +12330,7 @@ mod tests {
                 description: "background target".into(),
                 avatar: AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/target-model".into(),
@@ -12403,6 +12408,7 @@ mod tests {
                 description: "background target".into(),
                 avatar: AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/target-model".into(),
@@ -12528,6 +12534,7 @@ mod tests {
                 description: "background target".into(),
                 avatar: AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/target-model".into(),
@@ -12605,6 +12612,7 @@ mod tests {
                 description: "mentioned target".into(),
                 avatar: AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/target-model".into(),
@@ -12758,6 +12766,7 @@ mod tests {
                 description: "Parent-only profile".into(),
                 avatar: AgentAvatar {
                     color: "orange".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/parent-model".into(),
@@ -12790,6 +12799,7 @@ mod tests {
                 description: "Target-only profile".into(),
                 avatar: AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/target-model".into(),
@@ -13024,6 +13034,7 @@ mod tests {
                 description: "target profile".into(),
                 avatar: AgentAvatar {
                     color: "violet".into(),
+                    pet: None,
                 },
                 model: AgentModel::Concrete {
                     name: "anthropic/target-model".into(),

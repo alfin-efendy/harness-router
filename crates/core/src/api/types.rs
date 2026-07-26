@@ -1608,6 +1608,9 @@ pub struct AgentSummaryInfo {
     pub name: String,
     pub description: String,
     pub avatar_color: String,
+    /// Bundled or downloaded pet slug shown alongside the avatar color;
+    /// `None` when no pet is configured.
+    pub avatar_pet: Option<String>,
     pub model: AgentModelInfo,
     /// True for the built-in, non-editable rows (currently only the
     /// synthetic Fresh Agent row) — `false` for every registry-backed agent.
@@ -1642,6 +1645,9 @@ pub struct AgentMutationInfo {
     pub name: String,
     pub description: String,
     pub avatar_color: String,
+    /// Bundled or downloaded pet slug; free-form (no catalog check against
+    /// the petdex manifest happens on write). `None`/blank clears it.
+    pub avatar_pet: Option<String>,
     pub model: AgentModelInfo,
     pub personality: AgentPersonalityInfo,
     pub permission_rules: Vec<PermissionRuleInfo>,
@@ -1884,6 +1890,23 @@ pub struct ArtifactFileInfo {
     pub name: String,
     pub content_type: Option<String>,
     pub data_base64: String,
+}
+
+/// One pet in the petdex manifest (`pets_api::list_pet_manifest`). Doubles
+/// as the manifest JSON's own per-pet wire shape — `Deserialize`d straight
+/// out of `https://petdex.dev/api/manifest`'s `pets` array, which also
+/// carries `petJsonUrl`/`zipUrl` fields this DTO deliberately omits (serde
+/// ignores unknown keys by default, so those are silently dropped rather
+/// than surfaced to the frontend).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PetManifestEntryInfo {
+    pub slug: String,
+    pub display_name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub submitted_by: Option<String>,
+    pub spritesheet_url: String,
 }
 
 #[cfg(test)]

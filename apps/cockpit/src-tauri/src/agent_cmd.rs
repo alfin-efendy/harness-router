@@ -404,6 +404,7 @@ mod tests {
             name: "Reviewer".to_owned(),
             description: "Reviews implementation quality and regressions.".to_owned(),
             avatar_color: "violet".to_owned(),
+            avatar_pet: Some("paperclip".to_owned()),
             model: AgentModelInfo::Route {
                 route: "free".to_owned(),
             },

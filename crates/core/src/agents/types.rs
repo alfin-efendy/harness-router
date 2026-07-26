@@ -31,6 +31,11 @@ pub enum AgentModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentAvatar {
     pub color: String,
+    /// Bundled (`apps/cockpit/public/pets/<slug>`) or downloaded
+    /// (`state_dir()/pets/<slug>`) pet slug shown alongside the avatar
+    /// color; `None` when no pet is configured. Free-form — no catalog
+    /// check against the petdex manifest happens on write.
+    pub pet: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

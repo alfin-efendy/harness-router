@@ -255,6 +255,13 @@ pub struct AgentIdentitySnapshot {
     pub id: String,
     pub name: String,
     pub avatar_color: String,
+    /// Bundled or downloaded pet slug, mirroring `AgentAvatar::pet` at the
+    /// time this session's owner identity was captured. `#[serde(default)]`
+    /// so an older `primary_agent_snapshot` JSON blob persisted before this
+    /// field existed still parses (as `None`) rather than failing to load.
+    #[serde(default)]
+    #[specta(optional)]
+    pub avatar_pet: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]

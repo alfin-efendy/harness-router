@@ -38,6 +38,13 @@ use serde_json::Value;
 /// registry.
 const FRESH_AGENT_ID: &str = "fresh";
 
+/// The bundled pet slug assigned to the Fresh Agent row's avatar. MUST stay
+/// exactly in sync with `FRESH_AGENT_PET` in
+/// `apps/cockpit/src/lib/pet-sprite.ts` (Task 3's chosen bundled pet) — that
+/// TS constant is the source of truth for which bundled `public/pets/<slug>`
+/// sheet the frontend renders for the Fresh Agent.
+pub(crate) const FRESH_AGENT_PET: &str = "sprout";
+
 /// Lookback windows for `AgentStatsInfo`'s cost/token and reliability
 /// aggregates, in milliseconds.
 const STATS_COST_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
@@ -350,6 +357,7 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
             description,
             avatar: AgentAvatar {
                 color: info.avatar_color.trim().to_owned(),
+                pet: clean_optional(info.avatar_pet),
             },
             model: info.model.try_into()?,
             personality: parse_personality(info.personality)?,
@@ -398,6 +406,7 @@ fn summary_info(
         name: profile.name.clone(),
         description: profile.description.clone(),
         avatar_color: profile.avatar.color.clone(),
+        avatar_pet: profile.avatar.pet.clone(),
         model: profile.model.clone().into(),
         builtin: false,
         skill_count: profile.skills.len() as u32,
@@ -427,6 +436,7 @@ fn fresh_agent_summary(registry: &AgentRegistrySnapshot) -> AgentSummaryInfo {
         name: "Fresh Agent".to_owned(),
         description: "Ephemeral, memoryless worker dispatched for delegated tasks.".to_owned(),
         avatar_color: "slate".to_owned(),
+        avatar_pet: Some(FRESH_AGENT_PET.to_owned()),
         model: registry.subagent_model.clone().into(),
         builtin: true,
         skill_count: 0,
@@ -2035,6 +2045,35 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn create_and_update_agent_round_trip_avatar_pet() {
+        let _skill_guard = InstalledSkillGuard::new();
+        let s = state_with_agents().await;
+
+        let mut input = reviewer_input("Reviewer");
+        input["avatarPet"] = json!("paperclip");
+        let created = dispatch(&s, "create_agent", json!({"input": input}))
+            .await
+            .unwrap();
+        assert_eq!(created["summary"]["avatarPet"], "paperclip");
+        let id = created["summary"]["id"].as_str().unwrap().to_string();
+
+        // A create/update payload with no `avatarPet` key clears it (the
+        // frontend always submits the full mutation shape, so a blank pet
+        // picker selection round-trips as an absent/null key here).
+        let mut update_input = reviewer_input("Reviewer");
+        update_input["avatarPet"] = Value::Null;
+        let updated = dispatch(
+            &s,
+            "update_agent",
+            json!({"agent_id": id, "input": update_input}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated["summary"]["avatarPet"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn delete_rejects_the_final_agent_without_mutation() {
         let s = state_with_agents().await;
         let list = dispatch(&s, "list_agents", json!({})).await.unwrap();
@@ -2802,6 +2841,7 @@ mod tests {
             "Ephemeral, memoryless worker dispatched for delegated tasks."
         );
         assert_eq!(fresh["avatarColor"], "slate");
+        assert_eq!(fresh["avatarPet"], super::FRESH_AGENT_PET);
         assert_eq!(fresh["builtin"], true);
         assert_eq!(fresh["executable"], true);
         assert_eq!(fresh["isDefault"], false);
@@ -2951,6 +2991,7 @@ mod tests {
                 id: owner.clone(),
                 name: "Ryuzi".into(),
                 avatar_color: "violet".into(),
+                avatar_pet: None,
             }),
             project_id: None,
             agent_session_id: None,
