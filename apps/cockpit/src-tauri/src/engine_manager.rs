@@ -91,6 +91,66 @@ impl EngineManager {
             })
     }
 
+    /// Spec B3 "Restart engine": gracefully cycle the LOCAL daemon and
+    /// re-attach, all in-process — replaces the old (and always wrong)
+    /// "restart Cockpit" advice, since the daemon is detached and survives an
+    /// app restart. Sequence: best-effort `shutdown_engine` RPC → abort the
+    /// local SSE bridge → wait for the old process to exit (SIGTERM fallback
+    /// after a grace period, mirroring `connect_or_spawn`'s takeover path) →
+    /// `connect_or_spawn` (which spawns a fresh daemon) → swap the client →
+    /// restart the bridge. Remote runners are untouched.
+    pub async fn restart_local(&self, app_handle: &tauri::AppHandle) -> Result<(), CmdError> {
+        let dir = ryuzi_core::paths::db_path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let old_pid = ryuzi_core::daemon_status::read_status(&dir).map(|s| s.pid);
+
+        // Best-effort: the daemon exits right after replying; an error here
+        // (already dead, older API version) falls through to the SIGTERM path.
+        if let Ok(client) = self.client("local") {
+            let _ = client
+                .rpc::<serde_json::Value>("shutdown_engine", serde_json::json!({}))
+                .await;
+        }
+        let bridge = self
+            .bridges
+            .write()
+            .expect("EngineManager::bridges lock poisoned")
+            .remove("local");
+        if let Some(handle) = bridge {
+            handle.abort();
+        }
+
+        // Wait up to 5s for a clean exit, then escalate once and wait again.
+        if let Some(pid) = old_pid.filter(|pid| *pid > 0) {
+            for i in 0..100u32 {
+                if !ryuzi_core::daemon_status::is_alive(pid) {
+                    break;
+                }
+                if i == 50 {
+                    ryuzi_core::daemon_status::send_sigterm(pid);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        let client =
+            std::sync::Arc::new(
+                crate::engine::connect_or_spawn()
+                    .await
+                    .map_err(|e| CmdError {
+                        message: format!("engine restart failed: {e}"),
+                    })?,
+            );
+        self.clients
+            .write()
+            .expect("EngineManager::clients lock poisoned")
+            .insert("local".to_string(), client.clone());
+        self.start_bridge("local".to_string(), client, app_handle);
+        Ok(())
+    }
+
     /// Spawn (and record the handle for) `runner_id`'s SSE bridge.
     pub fn start_bridge(
         &self,
