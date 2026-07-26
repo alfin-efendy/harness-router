@@ -238,8 +238,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "uninstall_plugin" => {
             let a: IdP = params(p)?;
-            uninstall(cp, &a.id).await?;
-            cp.mark_plugins_restart_required();
+            uninstall_and_reconcile(cp, &a.id).await?;
             ok(assemble_list(cp).await?)
         }
         "begin_plugin_install" => {
@@ -341,6 +340,7 @@ async fn begin_skill_install(cp: &ControlPlane, source: &str) -> anyhow::Result<
     let result = crate::skills_install::begin_install(source, cp.store()).await?;
     if matches!(result, crate::skills_install::BeginInstall::Completed(_)) {
         cp.mark_plugins_restart_required();
+        cp.emit(CoreEvent::PluginsChanged);
     }
     Ok(SkillInstallBegin::from(result))
 }
@@ -355,6 +355,7 @@ async fn confirm_skill_install(
 ) -> anyhow::Result<crate::skills_install::InstalledSkillPack> {
     let pack = crate::skills_install::confirm_install(token, cp.store()).await?;
     cp.mark_plugins_restart_required();
+    cp.emit(CoreEvent::PluginsChanged);
     Ok(pack)
 }
 
@@ -369,6 +370,7 @@ async fn update_plugin(
     let outcome = crate::skills_install::update_installed_pack(id, force, cp.store()).await?;
     if matches!(outcome, crate::skills_install::UpdateOutcome::Updated) {
         cp.mark_plugins_restart_required();
+        cp.emit(CoreEvent::PluginsChanged);
     }
     Ok(UpdateOutcomeDto::from(outcome))
 }
@@ -383,6 +385,7 @@ async fn update_all_plugins(cp: &ControlPlane) -> anyhow::Result<Vec<UpdateOutco
         .any(|(_, o)| matches!(o, crate::skills_install::UpdateOutcome::Updated))
     {
         cp.mark_plugins_restart_required();
+        cp.emit(CoreEvent::PluginsChanged);
     }
     Ok(results
         .into_iter()
@@ -1824,11 +1827,46 @@ async fn declared_component_tool_entries(
         .collect())
 }
 
+/// Re-run WASM provider discovery against the installed-bundle root (spec B1).
+/// The transport registry is a live `RwLock` with insert-or-replace semantics
+/// (`wasm_provider::register_wasm_provider`), so this is safe after any
+/// install/rollback/enable: an ENABLED provider bundle's transport is usable
+/// immediately, with no daemon restart. Disabled bundles and non-provider
+/// bundles are skipped inside discovery itself, so this is a no-op on the
+/// paths that shouldn't change anything (e.g. a fresh mimo install that the
+/// user hasn't enabled — the Phase-7 native default stays untouched).
+async fn hot_reload_provider_transports(cp: &ControlPlane) {
+    let settings = SettingsStore::new(cp.store().clone());
+    let registered = crate::plugins::wasm_provider::discover_provider_components(
+        cp.store().clone(),
+        &settings,
+        cp.telemetry(),
+        &crate::plugins::bundle::installed_bundle_root(),
+    )
+    .await;
+    if !registered.is_empty() {
+        tracing::info!(providers = ?registered, "hot-registered wasm provider transport(s)");
+    }
+}
+
 /// Same semantics as `ryuzi plugins enable/disable` — delegates to the shared
 /// core helper so the two surfaces never drift.
 async fn set_plugin_enabled(cp: &ControlPlane, id: String, enabled: bool) -> Result<(), ApiError> {
     let settings = SettingsStore::new(cp.store().clone());
     crate::plugins::toggle_enabled(cp.plugins(), &settings, &id, enabled).await?;
+    // Spec B1: provider transports are hot — enabling registers the transport
+    // now, disabling unregisters it. Other kinds keep their existing axes
+    // (connectors re-discover per session; gateways gate on enabled_gateways).
+    let kind = cp.plugins().get(&id);
+    let is_provider = kind.as_deref().and_then(derive_kind) == Some("provider");
+    if is_provider && crate::plugins::component_catalog::is_component_bundle(&id) {
+        if enabled {
+            hot_reload_provider_transports(cp).await;
+        } else {
+            crate::plugins::wasm_provider::unregister_wasm_provider(&id);
+        }
+    }
+    cp.emit(CoreEvent::PluginsChanged);
     Ok(())
 }
 
@@ -1912,6 +1950,37 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Kind-aware post-uninstall reconcile — the `uninstall_plugin` dispatch
+/// arm's body, extracted so the latch-granularity tests can call it directly
+/// against a bare `ControlPlane` (this module's tests never go through
+/// `dispatch`/`ApiState` for `uninstall`). Drops a live provider transport
+/// immediately (hot); leaves a connector alone (it re-discovers per
+/// session, hot next session); and falls back to the conservative restart
+/// latch for a gateway (frozen Router map), skill pack, or any id the host
+/// doesn't know. Always emits `PluginsChanged`.
+async fn uninstall_and_reconcile(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
+    // Kind decides the reconcile below; captured up front for clarity
+    // (host rows are startup-frozen, so before/after is equivalent).
+    let kind = cp
+        .plugins()
+        .get(id)
+        .as_deref()
+        .and_then(derive_kind)
+        .map(str::to_owned);
+    uninstall(cp, id).await?;
+    match kind.as_deref() {
+        // Hot: drop the live transport (no-op when none registered).
+        Some("provider") => crate::plugins::wasm_provider::unregister_wasm_provider(id),
+        // Hot next session: connector bundles re-discover per session.
+        Some("integration") => {}
+        // Gateway (frozen Router map), skill packs, and anything the
+        // host doesn't know keep the conservative latch.
+        _ => cp.mark_plugins_restart_required(),
+    }
+    cp.emit(CoreEvent::PluginsChanged);
+    Ok(())
 }
 
 async fn begin_plugin_oauth(
@@ -2193,7 +2262,16 @@ async fn install_component_plugin(
         version,
     )
     .await?;
-    cp.mark_plugins_restart_required();
+    // Spec B1 granular latch: only a GATEWAY bundle still needs a process
+    // restart (the Router's gateway map is immutable). Provider bundles are
+    // hot-reloaded just below; connector bundles re-discover per session. An
+    // id the host doesn't know latches conservatively.
+    match cp.plugins().get(plugin_id).as_deref().and_then(derive_kind) {
+        Some("provider") | Some("integration") => {}
+        _ => cp.mark_plugins_restart_required(),
+    }
+    hot_reload_provider_transports(cp).await;
+    cp.emit(CoreEvent::PluginsChanged);
     plugin_release_detail(cp, plugin_id).await
 }
 
@@ -2230,7 +2308,14 @@ async fn rollback_component_plugin(
             &format!("rolled back to {to_version}"),
         )
         .await?;
-    cp.mark_plugins_restart_required();
+    // Spec B1 granular latch: same rule as `install_component_plugin` — only
+    // a gateway (or an id the host doesn't know) still needs a process
+    // restart; a provider hot-swaps below, a connector re-discovers per
+    // session.
+    match cp.plugins().get(plugin_id).as_deref().and_then(derive_kind) {
+        Some("provider") | Some("integration") => {}
+        _ => cp.mark_plugins_restart_required(),
+    }
     // If the rolled-back plugin is a currently-running gateway, stop its
     // supervisor MID-SESSION at a safe boundary — the restart flag above only
     // reloads the (now good) bundle on the NEXT boot, so the revoked one would
@@ -2238,6 +2323,10 @@ async fn rollback_component_plugin(
     // connector/provider or a gateway not presently supervised.
     cp.stop_revoked_running_gateways(&std::iter::once(plugin_id.to_string()).collect())
         .await;
+    // A rolled-back ENABLED provider bundle hot-swaps to the restored release
+    // (discovery compiles the now-active version; replace semantics).
+    hot_reload_provider_transports(cp).await;
+    cp.emit(CoreEvent::PluginsChanged);
     plugin_release_detail(cp, plugin_id).await
 }
 
@@ -3839,14 +3928,19 @@ mod tests {
         let cp = test_cp().await;
         let settings = SettingsStore::new(cp.store().clone());
 
-        // anthropic is a manifest-only plugin (no harness/gateway/connector
-        // capability): `is_enabled` always reports it enabled regardless of any
-        // `plugin.<id>.enabled` write, so toggling it must error rather than
-        // silently no-op (see `toggle_enabled`'s doc).
-        let err = crate::plugins::toggle_enabled(cp.plugins(), &settings, "anthropic", true)
+        // "kiro" is a manifest-only CATALOG provider with no component/bundle
+        // backing (`is_component_bundle("kiro")` is false, unlike anthropic —
+        // see `plugin_tools_provider_lists_models`'s doc): `is_enabled`
+        // always reports it enabled regardless of any `plugin.<id>.enabled`
+        // write, so toggling it must error rather than silently no-op (see
+        // `toggle_enabled`'s doc). Anthropic itself is the wrong fixture
+        // here post-Task-2: it's in `COMPONENT_BACKED_PROVIDER_IDS`, so
+        // `toggle_enabled` now flips its transport-enable key instead of
+        // erroring.
+        let err = crate::plugins::toggle_enabled(cp.plugins(), &settings, "kiro", true)
             .await
             .unwrap_err();
-        assert_eq!(err.to_string(), "anthropic is always available");
+        assert_eq!(err.to_string(), "kiro is always available");
 
         settings
             .set("default_perm_mode", "acceptEdits")
@@ -3996,6 +4090,46 @@ mod tests {
     async fn uninstall_unknown_id_errors() {
         let cp = test_cp().await;
         assert!(uninstall(&cp, "definitely-not-a-plugin").await.is_err());
+    }
+
+    // ---------- uninstall latch granularity (spec B1) ----------
+    //
+    // These call `uninstall_and_reconcile` directly rather than through
+    // `dispatch`/`ApiState`: every other test in this module drives the
+    // handler fns (`uninstall`, `install_component_plugin`, ...) against a
+    // bare `ControlPlane` from `test_cp()`, not the RPC layer, so the
+    // dispatch arm's kind-aware reconcile logic is extracted into
+    // `uninstall_and_reconcile` to stay directly testable the same way.
+
+    #[tokio::test]
+    async fn uninstall_provider_does_not_latch_restart() {
+        // "mimo" is registered as a provider builtin (`install_providers`,
+        // via `test_cp()`'s `install_builtins`) — `derive_kind` reports it
+        // "provider" because `manifest.provider.is_some()`.
+        let cp = test_cp().await;
+        assert!(!cp.plugins_restart_required());
+        uninstall_and_reconcile(&cp, "mimo").await.unwrap();
+        assert!(
+            !cp.plugins_restart_required(),
+            "provider uninstall is hot (unregister) — must not latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_gateway_latches_restart() {
+        // `gateway_only("discord")` gives a real gateway capability (unlike
+        // `component_catalog_plugins()`'s manifest-only catalog entry for the
+        // same id), so `derive_kind` reports "gateway" — the same fixture
+        // `derive_kind_classifies_each_capability_shape` uses for this id.
+        // Registered via `test_cp_with` so it wins the "discord" id over the
+        // catalog's own manifest-only entry (first-registration-wins).
+        let cp = test_cp_with(vec![gateway_only("discord")]).await;
+        assert!(!cp.plugins_restart_required());
+        uninstall_and_reconcile(&cp, "discord").await.unwrap();
+        assert!(
+            cp.plugins_restart_required(),
+            "gateway uninstall still needs a restart"
+        );
     }
 
     // The positive skill-pack uninstall path (a real pack on disk removed via
@@ -4729,9 +4863,43 @@ writes = true
             .unwrap();
         assert!(bad.revoked, "the bad version must be revoked");
         assert!(!bad.active);
+        // Spec B1 granular latch: "mimo" is a provider (`derive_kind` sees
+        // `manifest.provider.is_some()`), so its rollback hot-swaps the WASM
+        // transport instead of latching a restart — see the identical
+        // provider/integration match in `install_component_plugin`.
+        assert!(
+            !cp.plugins_restart_required(),
+            "a provider rollback hot-swaps the transport — must not latch"
+        );
+    }
+
+    // A gateway rollback is the conservative counterpart to the provider case
+    // above: the Router's gateway map is built once at startup, so rolling a
+    // gateway bundle back still needs the restart latch.
+    #[tokio::test]
+    async fn rollback_gateway_still_latches_restart() {
+        let cp = test_cp_with(vec![gateway_only("discord")]).await;
+        for v in ["0.1.0", "0.2.0"] {
+            cp.store()
+                .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
+                    plugin_id: "discord".into(),
+                    ..component_release(v)
+                })
+                .await
+                .unwrap();
+        }
+        cp.store()
+            .set_active_component_release("discord", "0.2.0")
+            .await
+            .unwrap();
+
+        assert!(!cp.plugins_restart_required());
+        rollback_component_plugin(&cp, "discord", "0.2.0", "0.1.0")
+            .await
+            .unwrap();
         assert!(
             cp.plugins_restart_required(),
-            "rollback must signal a host reload"
+            "gateway rollback still needs a restart"
         );
     }
 

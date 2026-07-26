@@ -4,6 +4,7 @@
 //! its own copy until the proxy rewrite in Tasks 15-16.
 
 use super::{ok, params, ApiError};
+use crate::domain::CoreEvent;
 use crate::serve::ApiState;
 use serde::Deserialize;
 use serde_json::Value;
@@ -49,6 +50,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                     message: message.to_string(),
                 })?;
             cp.mark_plugins_restart_required();
+            cp.emit(CoreEvent::PluginsChanged);
             ok(pack)
         }
         // Ledger-aware remove: `remove_installed_skill_recorded` also deletes
@@ -65,6 +67,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                     message: message.to_string(),
                 })?;
             cp.mark_plugins_restart_required();
+            cp.emit(CoreEvent::PluginsChanged);
             ok(())
         }
         // Ledger-aware refresh: `refresh_installed_skill_recorded` keeps the
@@ -81,6 +84,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                     message: message.to_string(),
                 })?;
             cp.mark_plugins_restart_required();
+            cp.emit(CoreEvent::PluginsChanged);
             ok(pack)
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
