@@ -9,6 +9,22 @@ use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Built-in free-tier connections (spec A2): always present — re-seeded on
+/// every daemon start by `agents::bootstrap::ensure_free_providers_seeded` —
+/// hidden from account management, and refused by [`remove_connection`].
+/// `(provider id, connection label)`.
+pub const BUILTIN_FREE_PROVIDERS: &[(&str, &str)] = &[
+    ("mimo-free", "MiMo (free)"),
+    ("opencode-free", "OpenCode (free)"),
+];
+
+/// True when a connection row is one of the built-in free-tier rows. Keyed on
+/// provider AND auth_type so a paid `mimo` account (or a hypothetical api-key
+/// row on the same provider id) is never treated as builtin.
+pub fn is_builtin_free(provider: &str, auth_type: &str) -> bool {
+    auth_type == "free" && BUILTIN_FREE_PROVIDERS.iter().any(|(p, _)| *p == provider)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ConnectionData {
@@ -166,6 +182,14 @@ pub async fn set_connection_enabled(store: &Store, id: &str, enabled: bool) -> a
 }
 
 pub async fn remove_connection(store: &Store, id: &str) -> anyhow::Result<()> {
+    if let Some(row) = list_connections(store).await?.iter().find(|r| r.id == id) {
+        if is_builtin_free(&row.provider, &row.auth_type) {
+            anyhow::bail!(
+                "{} is a built-in connection and cannot be removed",
+                row.label
+            );
+        }
+    }
     let id = id.to_string();
     store
         .with_conn(move |c| {
@@ -615,5 +639,45 @@ mod tests {
             default_profile_arn("builder-id"),
             "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
         );
+    }
+
+    #[test]
+    fn builtin_free_matches_only_free_rows_of_builtin_providers() {
+        assert!(is_builtin_free("mimo-free", "free"));
+        assert!(is_builtin_free("opencode-free", "free"));
+        // Same provider id but a different auth_type is not builtin.
+        assert!(!is_builtin_free("mimo-free", "api_key"));
+        // Free-tier auth on a non-builtin provider is not builtin.
+        assert!(!is_builtin_free("some-future-free", "free"));
+    }
+
+    #[tokio::test]
+    async fn remove_connection_refuses_builtin_free_rows() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        add_connection(
+            &store,
+            ConnectionRow {
+                id: "builtin-1".into(),
+                provider: "mimo-free".into(),
+                auth_type: "free".into(),
+                label: "MiMo (free)".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = remove_connection(&store, "builtin-1").await.unwrap_err();
+        assert!(err.to_string().contains("built-in"), "got: {err}");
+        assert_eq!(list_connections(&store).await.unwrap().len(), 1);
+
+        // Removing a missing id is still fine (no lookup panic).
+        remove_connection(&store, "does-not-exist").await.unwrap();
     }
 }
