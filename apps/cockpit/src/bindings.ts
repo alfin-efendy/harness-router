@@ -1940,7 +1940,7 @@ export type AgentAccessInfo = { agentId: string; allowed: boolean }
  * [`crate::agents::catalog::AgentConfigurationCatalog`].
  */
 export type AgentConfigurationCatalogInfo = { skills: CatalogEntryInfo[]; nativeTools: CatalogEntryInfo[]; pluginTools: CatalogEntryInfo[]; apps: CatalogEntryInfo[] }
-export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
+export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: NativeToolDecisionInfo[]; pluginTools: string[]; apps: string[]; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
 /**
  * An immutable identity captured when an agent becomes the primary owner of a session.
  */
@@ -1961,7 +1961,7 @@ export type AgentModelInfo = { kind: "concrete"; name: string; effort: string | 
  * fields (`id`, counts, `executable`, `validation`, `is_default`) are
  * deliberately absent so the client can't submit them.
  */
-export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[] }
+export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: NativeToolDecisionInfo[]; pluginTools: string[]; apps: string[] }
 /**
  * An agent's personality selection: a preset name (matching
  * [`crate::agents::personality::PersonalityPreset`]'s `snake_case` variants,
@@ -1994,7 +1994,12 @@ export type AgentRunKind = "primary" | "main-delegate" | "subagent"
 export type AgentRunRosterInfo = { rootRunId: string | null; runs: AgentRun[] }
 export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted"
 export type AgentSkillUsageInfo = { skillId: string; uses: number; successes: number; conceptId: string }
-export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
+export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo;
+/**
+ * True for the built-in, non-editable rows (currently only the
+ * synthetic Fresh Agent row) — `false` for every registry-backed agent.
+ */
+builtin: boolean; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
 export type AgentValidationInfo = { field: string; message: string }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
@@ -2091,7 +2096,15 @@ family: string; color: string; initial: string; category: string; format: string
  * native tool, plugin tool, or app) — see
  * [`crate::agents::catalog::CatalogEntry`].
  */
-export type CatalogEntryInfo = { id: string; label: string; description: string; available: boolean; commandScoped: boolean }
+export type CatalogEntryInfo = { id: string; label: string; description: string; available: boolean; commandScoped: boolean;
+/**
+ * Skill entries only: the owning installed skill pack's display name,
+ * when this skill was installed as part of a multi-skill pack (a
+ * plugin-bundled skill pack). `None` for every non-skill entry, and for
+ * a standalone (not pack-installed) skill — the frontend groups `None`
+ * entries under a synthetic "Standalone" heading.
+ */
+pack: string | null }
 /**
  * `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
  * `catalog_feed_state` row plus counts from the cached
@@ -2509,6 +2522,14 @@ export type ModelStatusEntry = { family: string; model: string; status: string; 
  * One persisted probe verdict row for the provider Models card.
  */
 export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
+/**
+ * One explicit per-tool native permission entry — a tool id and its
+ * decision (`"allow"` | `"ask"` | `"off"`). Only tools with an explicit
+ * entry in the profile's decision map are represented; a tool absent from
+ * this list defaults to `"ask"` in the UI against the configuration
+ * catalog, mirroring [`crate::agents::types::AgentPermissions::native_decision`].
+ */
+export type NativeToolDecisionInfo = { tool: string; decision: string }
 export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"

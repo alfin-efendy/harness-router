@@ -26,6 +26,10 @@ pub struct CatalogEntry {
     pub description: String,
     pub available: bool,
     pub command_scoped: bool,
+    /// Skills only: the owning installed skill pack's display name, when
+    /// this skill was installed as part of a multi-skill pack. `None` for
+    /// every non-skill entry and for a standalone-installed skill.
+    pub pack: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -96,7 +100,7 @@ impl AgentConfigurationCatalog {
     ) -> Vec<AgentValidationIssue> {
         validate_references(
             &input.skills,
-            &input.tools.native,
+            &input.permissions.native,
             &input.tools.plugins,
             &input.tools.apps,
             &input.permissions.rules,
@@ -110,7 +114,7 @@ impl AgentConfigurationCatalog {
     ) -> Vec<AgentValidationIssue> {
         validate_references(
             &profile.skills,
-            &profile.tools.native,
+            &profile.permissions.native,
             &profile.tools.plugins,
             &profile.tools.apps,
             &profile.permissions.rules,
@@ -131,12 +135,13 @@ pub async fn build_live_catalog(
             description: tool.tool.description().to_string(),
             available: true,
             command_scoped: native_tool_is_command_scoped(id),
+            pack: None,
         })
         .collect::<Vec<_>>();
 
     let skills = list_installed_skills()?
         .into_iter()
-        .map(|skill| native(&skill.id, &skill.name))
+        .map(skill_catalog_entry)
         .collect::<Vec<_>>();
 
     let settings = SettingsStore::new(std::sync::Arc::new(store.clone()));
@@ -151,6 +156,7 @@ pub async fn build_live_catalog(
             description: plugin.manifest.description.clone(),
             available: true,
             command_scoped: false,
+            pack: None,
         });
     }
 
@@ -163,6 +169,7 @@ pub async fn build_live_catalog(
             description: row.description,
             available: true,
             command_scoped: false,
+            pack: None,
         })
         .collect::<Vec<_>>();
 
@@ -172,6 +179,25 @@ pub async fn build_live_catalog(
         plugin_tools,
         apps,
     })
+}
+
+/// Builds one skills-catalog entry from an installed skill (pack). `pack`
+/// carries the owning [`crate::skills_install::InstalledSkillPack`]'s
+/// display name — which is exactly this `InstalledSkillInfo`'s own `name`,
+/// since `list_installed_skills` already flattens one row per installed
+/// pack — whenever the pack is plugin-backed (`plugin_id.is_some()`); a
+/// standalone (not pack-installed) skill carries `None`, which the frontend
+/// renders under a synthetic "Standalone" heading.
+fn skill_catalog_entry(skill: crate::skills_install::InstalledSkillInfo) -> CatalogEntry {
+    let pack = skill.plugin_id.is_some().then(|| skill.name.clone());
+    CatalogEntry {
+        id: skill.id,
+        label: skill.name,
+        description: String::new(),
+        available: true,
+        command_scoped: false,
+        pack,
+    }
 }
 
 pub fn runtime_profile_executable(
@@ -185,7 +211,7 @@ pub fn runtime_profile_executable(
 
 fn validate_references(
     skills: &[String],
-    native_tools: &[String],
+    native_tools: &std::collections::BTreeMap<String, crate::agents::types::NativeToolDecision>,
     plugin_tools: &[String],
     apps: &[String],
     rules: &[PermissionRule],
@@ -202,10 +228,10 @@ fn validate_references(
         }
     }
 
-    for id in native_tools {
+    for id in native_tools.keys() {
         if !catalog.contains_native(id) {
             issues.push(AgentValidationIssue {
-                field: "tools.native".to_string(),
+                field: "permissions.native".to_string(),
                 message: format!("unknown or unavailable native tool: {id}"),
             });
         }
@@ -271,6 +297,7 @@ pub fn native(id: &str, label: &str) -> CatalogEntry {
         description: String::new(),
         available: true,
         command_scoped: false,
+        pack: None,
     }
 }
 
@@ -278,12 +305,13 @@ pub fn native(id: &str, label: &str) -> CatalogEntry {
 mod tests {
     use super::*;
     use crate::agents::personality::AgentPersonality;
-    use crate::agents::types::{AgentAvatar, AgentModel, AgentPermissions, AgentTools};
-    use crate::PermMode;
+    use crate::agents::types::{
+        AgentAvatar, AgentModel, AgentPermissions, AgentTools, NativeToolDecision,
+    };
 
     fn base_profile(native_tools: Vec<String>, rules: Vec<PermissionRule>) -> AgentProfile {
         AgentProfile {
-            schema_version: 1,
+            schema_version: 2,
             id: "test-agent".to_string(),
             name: "Test Agent".to_string(),
             description: String::new(),
@@ -295,12 +323,14 @@ mod tests {
             },
             personality: AgentPersonality::default_profile(),
             permissions: AgentPermissions {
-                mode: PermMode::Default,
+                native: native_tools
+                    .into_iter()
+                    .map(|id| (id, NativeToolDecision::Allow))
+                    .collect(),
                 rules,
             },
             skills: Vec::new(),
             tools: AgentTools {
-                native: native_tools,
                 plugins: Vec::new(),
                 apps: Vec::new(),
             },
@@ -317,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_native_tool_produces_tools_native_issue() {
+    fn missing_native_tool_produces_permissions_native_issue() {
         let catalog = AgentConfigurationCatalog::from_entries(vec![native("bash", "Bash")]);
         let profile = base_profile(vec!["bash".to_string(), "missing_tool".to_string()], vec![]);
 
@@ -325,7 +355,28 @@ mod tests {
 
         assert!(issues
             .iter()
-            .any(|issue| issue.field == "tools.native" && issue.message.contains("missing_tool")));
+            .any(|issue| issue.field == "permissions.native"
+                && issue.message.contains("missing_tool")));
+    }
+
+    #[test]
+    fn native_decision_off_for_an_unknown_tool_is_still_a_validation_issue() {
+        // An explicit `Off` entry still names a stale/unknown tool id and
+        // must surface, matching the brief's "unknown tool id -> issue"
+        // regardless of the decision (not just enabled entries).
+        let catalog = AgentConfigurationCatalog::from_entries(vec![native("bash", "Bash")]);
+        let mut profile = base_profile(vec!["bash".to_string()], vec![]);
+        profile
+            .permissions
+            .native
+            .insert("missing_tool".to_string(), NativeToolDecision::Off);
+
+        let issues = AgentConfigurationCatalog::validate_profile_references(&profile, &catalog);
+
+        assert!(issues
+            .iter()
+            .any(|issue| issue.field == "permissions.native"
+                && issue.message.contains("missing_tool")));
     }
 
     #[test]
@@ -349,7 +400,7 @@ mod tests {
             .iter()
             .any(|issue| { issue.field == "skills" && issue.message.contains("missing_skill") }));
         assert!(issues.iter().any(|issue| {
-            issue.field == "tools.native" && issue.message.contains("missing_tool")
+            issue.field == "permissions.native" && issue.message.contains("missing_tool")
         }));
     }
     #[test]
@@ -392,5 +443,44 @@ mod tests {
                 .any(|issue| issue.field == "permissions.rules"
                     && issue.message.contains("duplicate"))
         );
+    }
+
+    fn installed_skill_info(
+        id: &str,
+        name: &str,
+        plugin_id: Option<&str>,
+    ) -> crate::skills_install::InstalledSkillInfo {
+        crate::skills_install::InstalledSkillInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            source: "https://example.test/repo".to_string(),
+            plugin_id: plugin_id.map(str::to_string),
+            installed_at: "2026-01-01T00:00:00Z".to_string(),
+            skill_count: 1,
+        }
+    }
+
+    #[test]
+    fn standalone_installed_skill_carries_no_pack_name() {
+        let entry = skill_catalog_entry(installed_skill_info(
+            "requesting-code-review",
+            "requesting-code-review",
+            None,
+        ));
+
+        assert_eq!(entry.id, "requesting-code-review");
+        assert_eq!(entry.pack, None);
+    }
+
+    #[test]
+    fn plugin_backed_installed_skill_carries_its_owning_pack_name() {
+        let entry = skill_catalog_entry(installed_skill_info(
+            "superpowers",
+            "Superpowers",
+            Some("superpowers"),
+        ));
+
+        assert_eq!(entry.id, "superpowers");
+        assert_eq!(entry.pack, Some("Superpowers".to_string()));
     }
 }

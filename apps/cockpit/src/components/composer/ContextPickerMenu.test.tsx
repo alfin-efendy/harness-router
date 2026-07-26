@@ -12,7 +12,7 @@ const ada: AgentSummaryInfo = {
   description: "Accessibility review",
   avatarColor: "blue",
   model: { kind: "route", route: "free" },
-  permissionMode: "ask",
+  builtin: false,
   skillCount: 0,
   toolCount: 0,
   knowledgeCount: 0,

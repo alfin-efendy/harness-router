@@ -429,10 +429,10 @@ export function HomeView() {
                 }
               />
             )}
-            {registry?.agents.some((a) => a.executable) && (
+            {registry?.agents.some((a) => a.executable && !a.builtin) && (
               <Combobox
                 aria-label="Agent"
-                options={registry.agents.filter((a) => a.executable).map((a) => ({ value: a.id, label: a.name }))}
+                options={registry.agents.filter((a) => a.executable && !a.builtin).map((a) => ({ value: a.id, label: a.name }))}
                 value={primaryAgentId ?? ""}
                 onValueChange={(id) => {
                   localStorage.setItem(LAST_PRIMARY_AGENT_KEY, id);

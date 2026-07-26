@@ -234,7 +234,7 @@ function primary(id: string, executable = true): AgentSummaryInfo {
     description: "",
     avatarColor: "blue",
     model: { kind: "route", route: "free" },
-    permissionMode: "ask",
+    builtin: false,
     skillCount: 0,
     toolCount: 0,
     knowledgeCount: 0,

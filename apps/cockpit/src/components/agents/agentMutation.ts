@@ -7,7 +7,6 @@ export function mutationFromDetail(detail: AgentDetailInfo): AgentMutationInfo {
     avatarColor: detail.summary.avatarColor,
     model: detail.summary.model,
     personality: detail.personality,
-    permissionMode: detail.summary.permissionMode,
     permissionRules: detail.permissionRules,
     skills: detail.skills,
     nativeTools: detail.nativeTools,

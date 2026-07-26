@@ -188,7 +188,7 @@ test("choosePrimaryAgent prefers requested, then stored, default, then first exe
     description: "",
     avatarColor: "violet",
     model: { kind: "route", route: "free" },
-    permissionMode: "ask",
+    builtin: false,
     skillCount: 0,
     toolCount: 0,
     knowledgeCount: 0,
@@ -204,6 +204,29 @@ test("choosePrimaryAgent prefers requested, then stored, default, then first exe
   expect(choosePrimaryAgent(agents, "missing", "missing", "missing")).toBe("first");
   expect(choosePrimaryAgent([agent("invalid", false)], null, null, null)).toBeNull();
 });
+
+test("choosePrimaryAgent never falls back to built-in agent", () => {
+  const agent = (id: string, executable = true, builtin = false): AgentSummaryInfo => ({
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    model: { kind: "route", route: "free" },
+    builtin,
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable,
+    validation: [],
+    isDefault: false,
+  });
+  // Only built-in "fresh" agent is executable
+  const agents = [agent("fresh", true, true)];
+
+  // Should return null, not "fresh"
+  expect(choosePrimaryAgent(agents, null, null, null)).toBeNull();
+});
+
 test("consumePendingPrimaryAgentId is a one-shot handoff", () => {
   useNav.setState({ pendingPrimaryAgentId: "reviewer" });
   expect(useNav.getState().consumePendingPrimaryAgentId()).toBe("reviewer");

@@ -52,8 +52,8 @@ export function choosePrimaryAgent(
   lastId: string | null,
   defaultId: string | null,
 ): string | null {
-  const valid = (id: string | null) => id !== null && agents.some((agent) => agent.id === id && agent.executable);
-  return [requestedId, lastId, defaultId].find(valid) ?? agents.find((agent) => agent.executable)?.id ?? null;
+  const valid = (id: string | null) => id !== null && agents.some((agent) => agent.id === id && agent.executable && !agent.builtin);
+  return [requestedId, lastId, defaultId].find(valid) ?? agents.find((agent) => agent.executable && !agent.builtin)?.id ?? null;
 }
 
 function readBool(key: string, fallback: boolean): boolean {

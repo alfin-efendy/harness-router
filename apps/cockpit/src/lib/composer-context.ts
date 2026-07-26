@@ -88,6 +88,7 @@ export function contextPickerGroups(input: ContextPickerInput): ContextPickerGro
   const matchingAgents = input.agents.filter(
     (agent) =>
       agent.executable &&
+      !agent.builtin &&
       agent.id !== input.primaryAgentId &&
       (agent.name.toLocaleLowerCase().includes(normalizedQuery) || agent.description.toLocaleLowerCase().includes(normalizedQuery)),
   );

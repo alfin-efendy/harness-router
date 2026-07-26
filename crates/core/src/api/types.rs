@@ -1589,6 +1589,18 @@ pub struct AgentPersonalityInfo {
     pub custom: Option<String>,
 }
 
+/// One explicit per-tool native permission entry — a tool id and its
+/// decision (`"allow"` | `"ask"` | `"off"`). Only tools with an explicit
+/// entry in the profile's decision map are represented; a tool absent from
+/// this list defaults to `"ask"` in the UI against the configuration
+/// catalog, mirroring [`crate::agents::types::AgentPermissions::native_decision`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeToolDecisionInfo {
+    pub tool: String,
+    pub decision: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSummaryInfo {
@@ -1597,7 +1609,9 @@ pub struct AgentSummaryInfo {
     pub description: String,
     pub avatar_color: String,
     pub model: AgentModelInfo,
-    pub permission_mode: String,
+    /// True for the built-in, non-editable rows (currently only the
+    /// synthetic Fresh Agent row) — `false` for every registry-backed agent.
+    pub builtin: bool,
     pub skill_count: u32,
     pub tool_count: u32,
     pub knowledge_count: u32,
@@ -1612,7 +1626,7 @@ pub struct AgentDetailInfo {
     pub summary: AgentSummaryInfo,
     pub permission_rules: Vec<PermissionRuleInfo>,
     pub skills: Vec<String>,
-    pub native_tools: Vec<String>,
+    pub native_tools: Vec<NativeToolDecisionInfo>,
     pub plugin_tools: Vec<String>,
     pub apps: Vec<String>,
     pub model_info: Option<SelectableModelInfo>,
@@ -1630,10 +1644,9 @@ pub struct AgentMutationInfo {
     pub avatar_color: String,
     pub model: AgentModelInfo,
     pub personality: AgentPersonalityInfo,
-    pub permission_mode: String,
     pub permission_rules: Vec<PermissionRuleInfo>,
     pub skills: Vec<String>,
-    pub native_tools: Vec<String>,
+    pub native_tools: Vec<NativeToolDecisionInfo>,
     pub plugin_tools: Vec<String>,
     pub apps: Vec<String>,
 }
@@ -1658,6 +1671,12 @@ pub struct CatalogEntryInfo {
     pub description: String,
     pub available: bool,
     pub command_scoped: bool,
+    /// Skill entries only: the owning installed skill pack's display name,
+    /// when this skill was installed as part of a multi-skill pack (a
+    /// plugin-bundled skill pack). `None` for every non-skill entry, and for
+    /// a standalone (not pack-installed) skill — the frontend groups `None`
+    /// entries under a synthetic "Standalone" heading.
+    pub pack: Option<String>,
 }
 
 impl From<crate::agents::catalog::CatalogEntry> for CatalogEntryInfo {
@@ -1668,6 +1687,7 @@ impl From<crate::agents::catalog::CatalogEntry> for CatalogEntryInfo {
             description: entry.description,
             available: entry.available,
             command_scoped: entry.command_scoped,
+            pack: entry.pack,
         }
     }
 }
@@ -1930,10 +1950,10 @@ mod agent_management_dto_tests {
             "description":"Reviews changes",
             "avatarColor":"violet",
             "model":{"kind":"route","route":"free","effort":"high"},
-            "permissionMode":"ask",
+            "personality": {"preset": "helpful", "custom": null},
             "permissionRules":[],
             "skills":[],
-            "nativeTools":["read"],
+            "nativeTools":[{"tool":"read","decision":"allow"}],
             "pluginTools":[],
             "apps":[]
         }));
