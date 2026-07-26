@@ -1,17 +1,38 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import type { AgentRun, Message } from "@/bindings";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { AgentRun, AgentSummaryInfo, Message } from "@/bindings";
+import { __resetBundledPetsCacheForTests } from "@/lib/bundled-pets";
 
 const cancelChildRun = mock(() => Promise.resolve({ status: "ok", data: null }));
 const retryChildRun = mock(() => Promise.resolve({ status: "ok", data: run({ runId: "retry", status: "queued" }) }));
 const getChildTranscript = mock(() => Promise.resolve({ status: "ok", data: [] }));
 mock.module("@/bindings", () => ({ commands: { cancelChildRun, retryChildRun, getChildTranscript } }));
 
+import { useAgents } from "@/store-agents";
 import { useDelegation, delegationRunKey, delegationSessionKey } from "@/store-delegation";
 import { useStore } from "@/store";
 import { sessKey } from "@/lib/session-key";
 
 const { AgentRunDetail } = await import("./AgentRunDetail");
+
+function agentSummary(id: string, overrides: Partial<AgentSummaryInfo> = {}): AgentSummaryInfo {
+  return {
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    avatarPet: null,
+    model: { kind: "route", route: "free" },
+    builtin: false,
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable: true,
+    validation: [],
+    isDefault: false,
+    ...overrides,
+  };
+}
 
 function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Partial<AgentRun> = {}): AgentRun {
   return {
@@ -136,6 +157,38 @@ test("places the run identity and valid action in the detail header", () => {
     failed.container.querySelector("header") && within(failed.container.querySelector("header")!).getByRole("button", { name: "Retry" }),
   ).toBeTruthy();
   expect(within(failed.container.querySelector("header")!).queryByRole("button", { name: "Stop" })).toBeNull();
+});
+
+test("shows the executing agent's pet, posed for the run status, instead of the Bot icon when it has one", async () => {
+  const originalFetch = globalThis.fetch;
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: null }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    useAgents.setState({
+      registry: {
+        agents: [agentSummary("worker", { avatarPet: "sprout" })],
+        defaultAgentId: "worker",
+        recovery: [],
+        subagentModel: { kind: "route", route: "free" },
+      },
+    });
+
+    render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run({ status: "running" })} onRelatedChanges={() => {}} />);
+
+    const header = document.querySelector("header")!;
+    await waitFor(() => expect(within(header).getByTestId("pet-sprite")).toBeTruthy());
+    expect(within(header).queryByRole("img", { name: "Agent avatar for Researcher" })).toBeTruthy();
+    expect(header.querySelector("svg.lucide-bot")).toBeNull();
+  } finally {
+    globalThis.fetch = originalFetch;
+    useAgents.setState({ registry: null });
+  }
 });
 
 test("renders a grandchild dispatch card inside the child transcript", () => {

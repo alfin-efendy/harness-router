@@ -1,9 +1,11 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Plus } from "lucide-react";
 import { Badge, Button, SettingsCard, cn } from "@ryuzi/ui";
 import type { AgentModelInfo, AgentSummaryInfo } from "@/bindings";
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
+import { AgentAvatar } from "@/components/agents/AgentAvatar";
 import { AgentEditorModal } from "@/components/agents/AgentEditorModal";
+import { statsRowFragment } from "@/lib/agent-stats";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 
@@ -26,6 +28,10 @@ function modelLabel(model: AgentModelInfo): string {
 
 function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
   const nav = useNav();
+  // Lite stats load lazily and separately from the roster (see the
+  // `loadStatsBatch` effect in `AgentsView` below); the built-in row is
+  // never included in that batch, so it never has a fragment to show.
+  const stats = useAgents((s) => (agent.builtin ? undefined : s.statsByAgent[agent.id]));
   // Built-in rows (the synthetic Fresh Agent) are non-editable: dashed frame,
   // "Built-in" badge, no validation surface, and no actions menu. They still
   // open a detail page like every other row.
@@ -38,11 +44,7 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
         onClick={() => nav.navigate({ kind: "agentDetail", agentId: agent.id })}
         className="h-full min-w-0 flex-1 justify-start gap-3 rounded-none px-[18px] text-left font-normal hover:bg-accent/50"
       >
-        <span
-          aria-hidden
-          className="size-9 shrink-0 rounded-lg border border-white/10"
-          style={{ backgroundColor: AVATAR_COLORS[agent.avatarColor] ?? agent.avatarColor }}
-        />
+        <AgentAvatar pet={agent.avatarPet} colorHex={AVATAR_COLORS[agent.avatarColor] ?? agent.avatarColor} size={36} />
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
             <span className="truncate text-[13.5px] font-semibold text-foreground">{agent.name}</span>
@@ -60,6 +62,7 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
             <span>
               {agent.skillCount} {agent.skillCount === 1 ? "skill" : "skills"} · {agent.toolCount}{" "}
               {agent.toolCount === 1 ? "tool" : "tools"}
+              {stats ? ` · ${statsRowFragment(stats)}` : null}
             </span>
           </span>
         </span>
@@ -81,6 +84,16 @@ export function AgentsView() {
   // The registry appends the built-in Fresh Agent row last — render in order,
   // no re-sorting here.
   const agents = useMemo(() => registry?.agents ?? [], [registry]);
+
+  // Fire the lite-stats batch load lazily, after the registry has rendered —
+  // never blocks or reorders the list (see `loadStatsBatch`'s non-blocking,
+  // error-swallowing contract in store-agents.ts). Only re-fires when the
+  // registry's agent set actually changes, not on every render. The
+  // built-in Fresh Agent row is excluded — it has no stats to show.
+  useEffect(() => {
+    const ids = agents.filter((agent) => !agent.builtin).map((agent) => agent.id);
+    if (ids.length > 0) void useAgents.getState().loadStatsBatch(ids);
+  }, [agents]);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">

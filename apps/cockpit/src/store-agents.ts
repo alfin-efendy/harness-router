@@ -6,6 +6,8 @@ import {
   type AgentModelInfo,
   type AgentMutationInfo,
   type AgentRegistryInfo,
+  type AgentStatsInfo,
+  type AgentStatsLite,
   type SelectableModelInfo,
   type Session,
 } from "./bindings";
@@ -29,6 +31,20 @@ type AgentsState = {
   /** Sessions owned by each stable agent ID, capped by the backend query. */
   recentSessionsByAgent: Record<string, Session[]>;
   loadRecentSessions: (agentId: string) => Promise<void>;
+  /** Lightweight per-agent stats for roster rows, keyed by agent ID. Absent
+   *  entries just mean "not loaded (yet)" — never a poisoned placeholder. */
+  statsByAgent: Record<string, AgentStatsLite>;
+  /** Full per-agent stats for the detail view's Overview tab, keyed by
+   *  agent ID. Same absent-means-unloaded contract as `statsByAgent`. */
+  statsDetail: Record<string, AgentStatsInfo>;
+  /** Lazily fills `statsByAgent` for the given IDs. Non-blocking (never
+   *  touches `loading`/`saving`) and error-swallowing: a failed or thrown
+   *  batch fetch simply leaves those agents' entries absent — the roster
+   *  must never block or show a toast over supplementary stats. */
+  loadStatsBatch: (agentIds: string[]) => Promise<void>;
+  /** Lazily fills `statsDetail[agentId]`. Same non-blocking,
+   *  error-swallowing contract as `loadStatsBatch`. */
+  loadStatsDetail: (agentId: string) => Promise<void>;
   load: (agentId?: string) => Promise<void>;
   loadDetail: (agentId: string) => Promise<void>;
   create: (input: AgentMutationInfo) => Promise<AgentDetailInfo | null>;
@@ -65,6 +81,7 @@ function patchRosterFields(registry: AgentRegistryInfo, agentId: string, input: 
             name: input.name,
             description: input.description,
             avatarColor: input.avatarColor,
+            avatarPet: input.avatarPet,
             model: input.model,
           }
         : agent,
@@ -178,6 +195,8 @@ export const useAgents = create<AgentsState>((set, get) => {
     loading: false,
     saving: false,
     recentSessionsByAgent: {},
+    statsByAgent: {},
+    statsDetail: {},
 
     loadRecentSessions: async (agentId) => {
       try {
@@ -186,6 +205,35 @@ export const useAgents = create<AgentsState>((set, get) => {
         else toast.error(`Couldn't load recent sessions: ${result.error.message}`);
       } catch (error) {
         toast.error(`Couldn't load recent sessions: ${errorMessage(error)}`);
+      }
+    },
+
+    loadStatsBatch: async (agentIds) => {
+      if (agentIds.length === 0) return;
+      try {
+        const result = await commands.getAgentStatsBatch(LOCAL_RUNNER, agentIds);
+        if (result.status === "ok") {
+          // `result.data` is a `Partial` record (the generated binding for a
+          // Rust HashMap) — narrow away the theoretical `undefined` values
+          // before merging, so an absent key never poisons `statsByAgent`
+          // with an `undefined` entry.
+          const loaded = Object.entries(result.data).filter((entry): entry is [string, AgentStatsLite] => entry[1] !== undefined);
+          set((state) => ({ statsByAgent: { ...state.statsByAgent, ...Object.fromEntries(loaded) } }));
+        }
+        // Errors are swallowed on purpose: this is a lazy, supplementary
+        // enhancement of already-rendered rows — those agents' entries
+        // simply stay absent rather than surfacing a toast.
+      } catch {
+        // Same swallow as above, for a thrown (not just `status: "error"`) failure.
+      }
+    },
+
+    loadStatsDetail: async (agentId) => {
+      try {
+        const result = await commands.getAgentStats(LOCAL_RUNNER, agentId);
+        if (result.status === "ok") set((state) => ({ statsDetail: { ...state.statsDetail, [agentId]: result.data } }));
+      } catch {
+        // Swallowed — same contract as loadStatsBatch.
       }
     },
 
@@ -247,6 +295,7 @@ export const useAgents = create<AgentsState>((set, get) => {
                   name: input.name,
                   description: input.description,
                   avatarColor: input.avatarColor,
+                  avatarPet: input.avatarPet,
                   model: input.model,
                 },
                 permissionRules: input.permissionRules,

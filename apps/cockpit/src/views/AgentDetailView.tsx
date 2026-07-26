@@ -4,15 +4,20 @@ import { Badge, Button, Segmented, SettingsCard, SettingsCardTitle } from "@ryuz
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
 import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
 import { AgentAppsTab } from "@/components/agents/AgentAppsTab";
+import { AgentAvatar } from "@/components/agents/AgentAvatar";
+import { mutationFromDetail } from "@/components/agents/agentMutation";
 import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
 import { AgentPersonalityCard } from "@/components/agents/AgentPersonalityCard";
 import { AgentSkillsTab } from "@/components/agents/AgentSkillsTab";
 import { FreshAgentModelCard } from "@/components/agents/FreshAgentModelCard";
+import { PetPicker } from "@/components/agents/PetPicker";
 import { SaveIndicator } from "@/components/agents/SaveIndicator";
+import { considerOffCandidates, formatCompactTokens, formatLastActive, formatUsd, reliabilitySummary } from "@/lib/agent-stats";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
+import { useAgentConfigurationCatalog } from "@/store-agent-catalog";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 
@@ -47,7 +52,11 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
   const detail = useAgents((state) => (state.detail?.summary.id === agentId ? state.detail : null));
   const loading = useAgents((state) => state.loading);
   const [tab, setTab] = useState<Tab>("overview");
+  const [petPickerOpen, setPetPickerOpen] = useState(false);
   const recentSessions = useAgents((state) => state.recentSessionsByAgent[agentId] ?? []);
+  const stats = useAgents((state) => state.statsDetail[agentId]);
+  const catalog = useAgentConfigurationCatalog((state) => state.catalog);
+  const loadCatalog = useAgentConfigurationCatalog((state) => state.load);
   const setFocused = useStore((state) => state.setFocused);
   const nav = useNav();
   const leaveDeletedDetail = () => {
@@ -60,6 +69,12 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
   useEffect(() => {
     if (detail) void useAgents.getState().loadRecentSessions(agentId);
   }, [agentId, detail]);
+  useEffect(() => {
+    if (detail) void useAgents.getState().loadStatsDetail(agentId);
+  }, [agentId, detail]);
+  useEffect(() => {
+    void loadCatalog();
+  }, [loadCatalog]);
 
   if (!detail)
     return (
@@ -83,11 +98,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             <Button variant="ghost" size="icon-sm" aria-label="Back" title="Back" onClick={nav.goBack} className="-ml-1 shrink-0">
               <ArrowLeft aria-hidden size={15} />
             </Button>
-            <span
-              aria-hidden
-              className="size-8 shrink-0 rounded-lg border border-white/10"
-              style={{ backgroundColor: COLORS[summary.avatarColor] ?? summary.avatarColor }}
-            />
+            <AgentAvatar pet={summary.avatarPet} colorHex={COLORS[summary.avatarColor] ?? summary.avatarColor} size={32} />
             <div className="min-w-0 flex-1">
               <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
               <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
@@ -103,6 +114,20 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
     );
   }
 
+  // Overview stat cards derive from `statsDetail[agentId]`, which loads
+  // lazily and separately from `detail` (see the `loadStatsDetail` effect
+  // above). Before it lands — or if the lazy load ever fails — every figure
+  // must fall back to an em dash rather than throwing or showing stale
+  // zeros; a freshly created agent's stats are genuinely all-zero from the
+  // backend, which is exactly the "sane, non-crashing" state this renders.
+  const activitySessions = stats ? metric(stats.sessionCount, "session", "sessions") : "—";
+  const activityLastActive = stats ? formatLastActive(stats.lastActive) : "—";
+  const costLabel = stats ? formatUsd(stats.costUsd7d) : "—";
+  const tokensLabel = stats ? `${formatCompactTokens(stats.tokens7d)} tokens` : "—";
+  const reliability = stats ? reliabilitySummary(stats.runsTotal30d, stats.runsFailed30d) : { percent: "—", detail: "—" };
+  const topTools = stats?.topTools.slice(0, 6) ?? [];
+  const considerOff = stats ? considerOffCandidates(detail.nativeTools, catalog, stats.topTools, stats.runsTotal30d) : [];
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-5">
       <div className="mx-auto max-w-[920px]">
@@ -110,11 +135,14 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
           <Button variant="ghost" size="icon-sm" aria-label="Back" title="Back" onClick={nav.goBack} className="-ml-1 shrink-0">
             <ArrowLeft aria-hidden size={15} />
           </Button>
-          <span
-            aria-hidden
-            className="size-8 shrink-0 rounded-lg border border-white/10"
-            style={{ backgroundColor: COLORS[summary.avatarColor] ?? summary.avatarColor }}
-          />
+          <button
+            type="button"
+            aria-label={`Change ${summary.name}'s pet`}
+            onClick={() => setPetPickerOpen(true)}
+            className="shrink-0 rounded-lg focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+          >
+            <AgentAvatar pet={summary.avatarPet} colorHex={COLORS[summary.avatarColor] ?? summary.avatarColor} size={32} />
+          </button>
           <div className="min-w-0 flex-1">
             <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
             <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
@@ -152,19 +180,39 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             <AgentPersonalityCard detail={detail} />
             <div className="grid grid-cols-3 gap-3">
               <SettingsCard className="px-[18px] py-4">
-                <span className="block text-[11px] text-muted-foreground">Knowledge</span>
-                <strong className="mt-1 block text-[13px]">
-                  {metric(summary.knowledgeCount, "readable concept", "readable concepts")}
-                </strong>
+                <span className="block text-[11px] text-muted-foreground">Activity</span>
+                <strong className="mt-1 block text-[13px]">{activitySessions}</strong>
+                <span className="mt-1 block text-[11px] text-muted-foreground">{activityLastActive}</span>
               </SettingsCard>
               <SettingsCard className="px-[18px] py-4">
-                <span className="block text-[11px] text-muted-foreground">Skills</span>
-                <strong className="mt-1 block text-[13px]">{metric(summary.skillCount, "enabled skill", "enabled skills")}</strong>
+                <span className="block text-[11px] text-muted-foreground">Cost · 7 days</span>
+                <strong className="mt-1 block text-[13px]">{costLabel}</strong>
+                <span className="mt-1 block text-[11px] text-muted-foreground">{tokensLabel}</span>
               </SettingsCard>
               <SettingsCard className="px-[18px] py-4">
-                <span className="block text-[11px] text-muted-foreground">Tools</span>
-                <strong className="mt-1 block text-[13px]">{metric(summary.toolCount, "enabled tool", "enabled tools")}</strong>
+                <span className="block text-[11px] text-muted-foreground">Reliability</span>
+                <strong className="mt-1 block text-[13px]">{reliability.percent}</strong>
+                <span className="mt-1 block text-[11px] text-muted-foreground">{reliability.detail}</span>
               </SettingsCard>
+              {(topTools.length > 0 || considerOff.length > 0) && (
+                <SettingsCard className="col-span-3 px-[18px] py-4">
+                  <SettingsCardTitle>Tool usage</SettingsCardTitle>
+                  {topTools.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {topTools.map((toolUsage) => (
+                        <span key={toolUsage.tool} className="rounded-md bg-muted px-2 py-1 text-[11px] text-muted-foreground">
+                          {toolUsage.tool} ×{toolUsage.count}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {considerOff.length > 0 && (
+                    <p className="mb-0 mt-2 text-[11px] text-muted-foreground">
+                      Consider Off — unused in the last 30 days: {considerOff.map((candidate) => candidate.label).join(", ")}
+                    </p>
+                  )}
+                </SettingsCard>
+              )}
               <SettingsCard className="col-span-3 px-[18px] py-4">
                 <SettingsCardTitle>Recent sessions</SettingsCardTitle>
                 {recentSessions.length === 0 ? (
@@ -199,6 +247,12 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
         {tab === "learning" ? <AgentLearningTab agentId={agentId} /> : null}
         {tab === "advanced" ? <AgentAdvancedTab detail={detail} onDeleteSuccess={leaveDeletedDetail} /> : null}
       </div>
+      <PetPicker
+        open={petPickerOpen}
+        onClose={() => setPetPickerOpen(false)}
+        currentPet={summary.avatarPet}
+        onSelect={(avatarPet) => void useAgents.getState().update(detail.summary.id, { ...mutationFromDetail(detail), avatarPet })}
+      />
     </div>
   );
 }

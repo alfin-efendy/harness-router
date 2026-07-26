@@ -1,9 +1,12 @@
 import { useState } from "react";
-import { ArrowLeft, Bot, Copy, RotateCw, Square, Waypoints } from "lucide-react";
+import { ArrowLeft, Copy, RotateCw, Square, Waypoints } from "lucide-react";
 import type { AgentRun } from "@/bindings";
-import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
+import { AgentGlyph } from "@/components/agents/AgentGlyph";
+import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel, petSlugForRun } from "@/lib/agent-runs";
+import { poseForRunStatus } from "@/lib/pet-sprite";
 import { useNow } from "@/hooks/useNow";
 import { messageToRow } from "@/lib/transcript";
+import { useAgents } from "@/store-agents";
 import { useDelegation, delegationRunKey } from "@/store-delegation";
 import { Transcript } from "@/components/transcript/Transcript";
 import { Markdown } from "@/components/transcript/Markdown";
@@ -56,6 +59,10 @@ export function AgentRunDetail({
   );
   const active = activeStatuses.has(run.status);
   const status = agentRunStatusPresentation(run.status);
+  const pet = petSlugForRun(
+    run,
+    useAgents((s) => s.registry?.agents),
+  );
   const live = useStore((s) => s.runContextUsage[transcriptKey]);
   const liveCost = useStore((s) => s.runCost[transcriptKey]);
   const usage =
@@ -91,9 +98,9 @@ export function AgentRunDetail({
           <div
             role="img"
             aria-label={`Agent avatar for ${run.executingAgentNameSnapshot}`}
-            className="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground"
+            className="flex size-6 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted text-muted-foreground"
           >
-            <Bot aria-hidden size={13} />
+            <AgentGlyph pet={pet} pose={poseForRunStatus(run.status)} petSize={20} botSize={13} />
           </div>
           <span className="min-w-0 truncate font-medium">{run.executingAgentNameSnapshot}</span>
         </div>

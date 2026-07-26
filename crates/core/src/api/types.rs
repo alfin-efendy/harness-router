@@ -1612,6 +1612,9 @@ pub struct AgentSummaryInfo {
     pub name: String,
     pub description: String,
     pub avatar_color: String,
+    /// Bundled or downloaded pet slug shown alongside the avatar color;
+    /// `None` when no pet is configured.
+    pub avatar_pet: Option<String>,
     pub model: AgentModelInfo,
     /// True for the built-in, non-editable rows (currently only the
     /// synthetic Fresh Agent row) — `false` for every registry-backed agent.
@@ -1646,6 +1649,9 @@ pub struct AgentMutationInfo {
     pub name: String,
     pub description: String,
     pub avatar_color: String,
+    /// Bundled or downloaded pet slug; free-form (no catalog check against
+    /// the petdex manifest happens on write). `None`/blank clears it.
+    pub avatar_pet: Option<String>,
     pub model: AgentModelInfo,
     pub personality: AgentPersonalityInfo,
     pub permission_rules: Vec<PermissionRuleInfo>,
@@ -1662,6 +1668,56 @@ pub struct AgentRegistryInfo {
     pub default_agent_id: String,
     pub recovery: Vec<AgentRecoveryInfo>,
     pub subagent_model: AgentModelInfo,
+}
+
+/// One tool's lifetime usage counter for a single agent — see
+/// [`crate::store::AgentToolUsageRow`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolUsageInfo {
+    pub tool: String,
+    pub count: i64,
+    pub last_used: i64,
+}
+
+/// Per-agent stats surfaced on the agent detail view: sessions led, priced
+/// cost/tokens over the trailing 7 days, run reliability over the trailing
+/// 30 days, and the full per-tool usage breakdown (`top_tools`, count DESC).
+/// An unknown or synthetic agent id (including the Fresh Agent's `"fresh"`)
+/// simply has no matching rows anywhere, so every field zeroes out rather
+/// than erroring.
+// `specta`'s own camelCase inflector (the `inflector` crate) splits words at
+// digit→letter boundaries, unlike serde's `rename_all = "camelCase"` (which
+// only capitalizes the first character of each `_`-delimited segment) — left
+// alone it would emit `costUsd7D`/`tokens7D`/etc. in bindings.ts, one letter
+// off from the real wire key serde actually produces. Pin every digit-suffixed
+// field to its true serde-camelCase key so the generated TS type matches the
+// runtime JSON exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatsInfo {
+    pub session_count: i64,
+    pub last_active: Option<i64>,
+    #[specta(rename = "costUsd7d")]
+    pub cost_usd_7d: f64,
+    #[specta(rename = "tokens7d")]
+    pub tokens_7d: i64,
+    #[specta(rename = "runsTotal30d")]
+    pub runs_total_30d: i64,
+    #[specta(rename = "runsFailed30d")]
+    pub runs_failed_30d: i64,
+    pub top_tools: Vec<AgentToolUsageInfo>,
+}
+
+/// Lightweight per-agent stats for roster/list views (`get_agent_stats_batch`)
+/// — see [`AgentStatsInfo`] for the full detail-view shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatsLite {
+    pub session_count: i64,
+    pub last_active: Option<i64>,
+    #[specta(rename = "costUsd7d")]
+    pub cost_usd_7d: f64,
 }
 
 /// One selectable option in the agent configuration catalog (a skill,
@@ -1838,6 +1894,23 @@ pub struct ArtifactFileInfo {
     pub name: String,
     pub content_type: Option<String>,
     pub data_base64: String,
+}
+
+/// One pet in the petdex manifest (`pets_api::list_pet_manifest`). Doubles
+/// as the manifest JSON's own per-pet wire shape — `Deserialize`d straight
+/// out of `https://petdex.dev/api/manifest`'s `pets` array, which also
+/// carries `petJsonUrl`/`zipUrl` fields this DTO deliberately omits (serde
+/// ignores unknown keys by default, so those are silently dropped rather
+/// than surfaced to the frontend).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PetManifestEntryInfo {
+    pub slug: String,
+    pub display_name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub submitted_by: Option<String>,
+    pub spritesheet_url: String,
 }
 
 #[cfg(test)]

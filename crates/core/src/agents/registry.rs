@@ -1050,6 +1050,7 @@ fn recover_minimal_profile(raw: &str, directory_id: &str) -> Option<AgentProfile
         description: "Invalid agent profile".into(),
         avatar: AgentAvatar {
             color: "gray".into(),
+            pet: None,
         },
         model: AgentModel::Concrete {
             name: "invalid/missing".into(),
@@ -1389,6 +1390,7 @@ mod tests {
             description: "Updated".into(),
             avatar: AgentAvatar {
                 color: "blue".into(),
+                pet: None,
             },
             model: AgentModel::Concrete {
                 name: "anthropic/claude-opus-4-8".into(),
@@ -2095,6 +2097,7 @@ mod tests {
             description: "Updated".into(),
             avatar: AgentAvatar {
                 color: "blue".into(),
+                pet: None,
             },
             model: AgentModel::Concrete {
                 name: "anthropic/claude-opus-4-8".into(),
@@ -2131,6 +2134,7 @@ mod tests {
             description: "Updated".into(),
             avatar: AgentAvatar {
                 color: "blue".into(),
+                pet: None,
             },
             model: AgentModel::Concrete {
                 name: "anthropic/claude-opus-4-8".into(),

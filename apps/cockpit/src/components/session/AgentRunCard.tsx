@@ -1,8 +1,11 @@
-import { Bot, CircleAlert, Clock3, Wrench } from "lucide-react";
+import { CircleAlert, Clock3, Wrench } from "lucide-react";
 import { Button } from "@ryuzi/ui";
 import type { AgentRun } from "@/bindings";
-import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel, type AgentRunPreviewModel } from "@/lib/agent-runs";
+import { AgentGlyph } from "@/components/agents/AgentGlyph";
+import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel, petSlugForRun, type AgentRunPreviewModel } from "@/lib/agent-runs";
 import { useNow } from "@/hooks/useNow";
+import { poseForRunStatus } from "@/lib/pet-sprite";
+import { useAgents } from "@/store-agents";
 import { AgentRunPreview } from "./AgentRunPreview";
 
 export type AgentRunCardProps = {
@@ -29,6 +32,10 @@ export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }
     (value): value is string => Boolean(value),
   );
   const status = agentRunStatusPresentation(run.status);
+  const pet = petSlugForRun(
+    run,
+    useAgents((s) => s.registry?.agents),
+  );
 
   return (
     <Button
@@ -46,7 +53,13 @@ export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }
         selected ? "border-primary/50 bg-primary/5" : "border-border bg-background/40"
       }`}
     >
-      <Bot aria-hidden size={15} strokeWidth={2} className="mt-0.5 shrink-0 text-muted-foreground" />
+      <AgentGlyph
+        pet={pet}
+        pose={poseForRunStatus(run.status)}
+        petSize={20}
+        botSize={15}
+        botClassName="mt-0.5 shrink-0 text-muted-foreground"
+      />
       <span className="min-w-0 flex-1">
         <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
           <span className="truncate font-medium text-foreground">{run.executingAgentNameSnapshot}</span>

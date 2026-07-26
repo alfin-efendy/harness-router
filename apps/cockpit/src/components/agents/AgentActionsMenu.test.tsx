@@ -11,6 +11,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     name,
     description: "",
     avatarColor: "violet",
+    avatarPet: null,
     model: route("free"),
     builtin: false,
     skillCount: 0,

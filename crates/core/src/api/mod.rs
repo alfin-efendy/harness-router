@@ -15,6 +15,7 @@ pub mod extension_status_api;
 pub mod fsview_api;
 pub mod gateways_api;
 pub mod native_api;
+pub mod pets_api;
 pub mod plugins_api;
 pub mod remote_catalog_api;
 pub mod scheduler_api;
@@ -156,6 +157,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if endpoint_api::HANDLES.contains(&m) => endpoint_api::dispatch(state, m, p).await,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
+        m if pets_api::HANDLES.contains(&m) => pets_api::dispatch(state, m, p).await,
         m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
         m if remote_catalog_api::HANDLES.contains(&m) => {
             remote_catalog_api::dispatch(state, m, p).await

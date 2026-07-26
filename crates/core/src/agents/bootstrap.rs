@@ -149,6 +149,7 @@ pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
         description: "General-purpose coding and operations agent.".into(),
         avatar: AgentAvatar {
             color: "blue".into(),
+            pet: None,
         },
         model: AgentModel::Route {
             route: "free".into(),

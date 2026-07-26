@@ -376,6 +376,7 @@ mod tests {
             id: "ada".into(),
             name: "Ada at creation".into(),
             avatar_color: "violet".into(),
+            avatar_pet: None,
         };
         store
             .insert_session(Session {
@@ -431,6 +432,7 @@ mod tests {
                     id: "grace".into(),
                     name: "Grace".into(),
                     avatar_color: "blue".into(),
+                    avatar_pet: None,
                 }),
             ),
         ] {

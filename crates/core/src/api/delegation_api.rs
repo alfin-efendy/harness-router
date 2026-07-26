@@ -202,6 +202,7 @@ mod tests {
                 id: "ryuzi".into(),
                 name: "Ryuzi".into(),
                 avatar_color: "violet".into(),
+                avatar_pet: None,
             }),
             project_id: None,
             agent_session_id: None,
@@ -411,6 +412,7 @@ mod tests {
                 description: "retry target".into(),
                 avatar: crate::agents::types::AgentAvatar {
                     color: "blue".into(),
+                    pet: None,
                 },
                 model: crate::agents::types::AgentModel::Route {
                     route: "free".into(),
@@ -594,6 +596,7 @@ mod tests {
                 description: "Target agent".into(),
                 avatar: crate::agents::types::AgentAvatar {
                     color: "blue".into(),
+                    pet: None,
                 },
                 model: crate::agents::types::AgentModel::Route {
                     route: "free".into(),

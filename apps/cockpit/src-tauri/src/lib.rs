@@ -18,6 +18,7 @@ mod fsview_cmd;
 mod gateways_cmd;
 mod native_cmd;
 mod open_cmd;
+mod pets_cmd;
 mod plugins_cmd;
 mod scheduler_cmd;
 mod session_io;
@@ -89,6 +90,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             agent_cmd::replace_agent_concept_raw,
             agent_cmd::delete_invalid_agent_concept,
             agent_cmd::rollback_agent_learning,
+            agent_cmd::get_agent_stats,
+            agent_cmd::get_agent_stats_batch,
+            pets_cmd::list_pet_manifest,
+            pets_cmd::download_pet,
+            pets_cmd::get_pet_sprite,
             gateways_cmd::list_gateways,
             gateways_cmd::probe_gateways,
             gateways_cmd::add_gateway,

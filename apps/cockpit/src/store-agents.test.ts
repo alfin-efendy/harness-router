@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, expect, spyOn, test } from "bun:test";
+import { waitFor } from "@testing-library/react";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
 import type {
@@ -6,6 +7,8 @@ import type {
   AgentModelInfo,
   AgentMutationInfo,
   AgentRegistryInfo,
+  AgentStatsInfo,
+  AgentStatsLite,
   AgentSummaryInfo,
   CmdError,
   Result,
@@ -28,6 +31,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     name,
     description: "",
     avatarColor: "#7C5CFF",
+    avatarPet: null,
     model: route("free"),
     builtin: false,
     skillCount: 0,
@@ -72,6 +76,7 @@ function reviewerInput(): AgentMutationInfo {
     name: "Reviewer",
     description: "",
     avatarColor: "#7C5CFF",
+    avatarPet: null,
     model: route("free"),
     personality: { preset: "helpful", custom: null },
     permissionRules: [],
@@ -79,6 +84,23 @@ function reviewerInput(): AgentMutationInfo {
     nativeTools: [],
     pluginTools: [],
     apps: [],
+  };
+}
+
+function statsLite(overrides: Partial<AgentStatsLite> = {}): AgentStatsLite {
+  return { sessionCount: 3, lastActive: 1_000, costUsd7d: 1.23, ...overrides };
+}
+
+function statsInfo(overrides: Partial<AgentStatsInfo> = {}): AgentStatsInfo {
+  return {
+    sessionCount: 3,
+    lastActive: 1_000,
+    costUsd7d: 1.23,
+    tokens7d: 4_500,
+    runsTotal30d: 10,
+    runsFailed30d: 1,
+    topTools: [{ tool: "read", count: 5, lastUsed: 900 }],
+    ...overrides,
   };
 }
 
@@ -113,6 +135,8 @@ const setDefaultAgent = spyOn(commands, "setDefaultAgent");
 const updateSubagentModel = spyOn(commands, "updateSubagentModel");
 const listSelectableModels = spyOn(commands, "listSelectableModels");
 const listAgentSessions = spyOn(commands, "listAgentSessions");
+const getAgentStats = spyOn(commands, "getAgentStats");
+const getAgentStatsBatch = spyOn(commands, "getAgentStatsBatch");
 
 const resetCommandMocks = () => {
   listAgents.mockImplementation(async () => ok(registry()));
@@ -132,6 +156,8 @@ const resetCommandMocks = () => {
   updateSubagentModel.mockImplementation(async (_r, model) => ok({ ...registry(), subagentModel: model }));
   listAgentSessions.mockImplementation(async () => ok([]));
   listSelectableModels.mockImplementation(async () => ok([selectable("free"), selectable("free-2")]));
+  getAgentStats.mockImplementation(async () => ok(statsInfo()));
+  getAgentStatsBatch.mockImplementation(async () => ok({}));
 };
 
 const { useAgents } = await import("./store-agents");
@@ -148,6 +174,8 @@ const allMocks = [
   updateSubagentModel,
   listSelectableModels,
   listAgentSessions,
+  getAgentStats,
+  getAgentStatsBatch,
 ];
 
 beforeEach(() => {
@@ -158,6 +186,8 @@ beforeEach(() => {
     detail: null,
     models: [],
     recentSessionsByAgent: {},
+    statsByAgent: {},
+    statsDetail: {},
     loaded: false,
     loading: false,
     saving: false,
@@ -201,6 +231,58 @@ test("loadRecentSessions calls the generated command and stores sessions under t
 
   expect(listAgentSessions).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", 10);
   expect(useAgents.getState().recentSessionsByAgent).toEqual({ reviewer: sessions });
+});
+
+// ---------- loadStatsBatch / loadStatsDetail ----------
+
+test("loadStatsBatch fills the lite stats map from the batch command", async () => {
+  getAgentStatsBatch.mockResolvedValueOnce(ok({ reviewer: statsLite() }));
+  await useAgents.getState().loadStatsBatch(["reviewer"]);
+  expect(getAgentStatsBatch).toHaveBeenCalledWith(LOCAL_RUNNER, ["reviewer"]);
+  expect(useAgents.getState().statsByAgent).toEqual({ reviewer: statsLite() });
+});
+
+test("loadStatsBatch with an empty id list skips the call entirely", async () => {
+  await useAgents.getState().loadStatsBatch([]);
+  expect(getAgentStatsBatch).not.toHaveBeenCalled();
+  expect(useAgents.getState().statsByAgent).toEqual({});
+});
+
+test("a failed or thrown batch load leaves every entry absent, never blocks loading/saving, and never toasts", async () => {
+  const toastSpy = spyOn(toast, "error");
+
+  getAgentStatsBatch.mockResolvedValueOnce(err("stats unavailable"));
+  await useAgents.getState().loadStatsBatch(["reviewer"]);
+  expect(useAgents.getState().statsByAgent).toEqual({});
+
+  getAgentStatsBatch.mockRejectedValueOnce(new Error("transport closed"));
+  await useAgents.getState().loadStatsBatch(["reviewer"]);
+  expect(useAgents.getState().statsByAgent).toEqual({});
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(false);
+  expect(toastSpy).not.toHaveBeenCalled();
+  toastSpy.mockRestore();
+});
+
+test("loadStatsDetail stores the full per-agent stats", async () => {
+  getAgentStats.mockResolvedValueOnce(ok(statsInfo()));
+  await useAgents.getState().loadStatsDetail("reviewer");
+  expect(getAgentStats).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer");
+  expect(useAgents.getState().statsDetail).toEqual({ reviewer: statsInfo() });
+});
+
+test("a failed or thrown detail load leaves the entry absent and never toasts", async () => {
+  const toastSpy = spyOn(toast, "error");
+
+  getAgentStats.mockResolvedValueOnce(err("stats unavailable"));
+  await useAgents.getState().loadStatsDetail("reviewer");
+  expect(useAgents.getState().statsDetail).toEqual({});
+
+  getAgentStats.mockRejectedValueOnce(new Error("transport closed"));
+  await useAgents.getState().loadStatsDetail("reviewer");
+  expect(useAgents.getState().statsDetail).toEqual({});
+  expect(toastSpy).not.toHaveBeenCalled();
+  toastSpy.mockRestore();
 });
 
 test("load hydrates registry and selected detail in parallel", async () => {
@@ -653,7 +735,7 @@ test("update while a different agent's detail is focused never paints that detai
     }),
   );
   useAgents.setState({ registry: registry(), detail: detailOf(ryuziSummary()), loaded: true });
-  const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead" });
+  const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead", avatarPet: "sprout" });
   await Promise.resolve();
 
   const during = useAgents.getState();
@@ -661,6 +743,7 @@ test("update while a different agent's detail is focused never paints that detai
   const reviewerRow = during.registry?.agents.find((a) => a.id === "reviewer");
   expect(reviewerRow?.id).toBe("reviewer");
   expect(reviewerRow?.name).toBe("Lead"); // representable field previews the edit
+  expect(reviewerRow?.avatarPet).toBe("sprout"); // patchRosterFields carries avatarPet too
   expect(reviewerRow?.isDefault).toBe(false); // server-derived field untouched
   expect(during.registry?.agents.map((a) => a.id)).toEqual(["ryuzi", "reviewer"]);
   expect(during.detail?.summary.id).toBe("ryuzi");
@@ -670,6 +753,31 @@ test("update while a different agent's detail is focused never paints that detai
   expect(await pending).toBe(true);
   expect(useAgents.getState().registry?.agents[1]?.name).toBe("Lead");
   expect(useAgents.getState().detail?.summary.id).toBe("ryuzi");
+});
+
+test("update to the focused agent previews avatarPet optimistically in both detail and roster", async () => {
+  // Let any prior test's mutation-queue tail fully settle first — same
+  // guard as AgentActionsMenu.test.tsx's beforeEach, needed here because
+  // this test reads the optimistic (pre-response) window, which a still-
+  // draining prior mutation could otherwise delay past a single microtask.
+  await waitFor(() => expect(useAgents.getState().saving).toBe(false));
+
+  let resolveUpdate: (r: Result<AgentDetailInfo, CmdError>) => void = () => {};
+  updateAgent.mockReturnValueOnce(
+    new Promise<Result<AgentDetailInfo, CmdError>>((resolve) => {
+      resolveUpdate = resolve;
+    }),
+  );
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+  const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), avatarPet: "sprout" });
+
+  await waitFor(() => expect(useAgents.getState().detail?.summary.avatarPet).toBe("sprout"));
+  expect(useAgents.getState().registry?.agents.find((a) => a.id === "reviewer")?.avatarPet).toBe("sprout");
+
+  resolveUpdate(ok(detailOf(summary("reviewer", "Reviewer", { avatarPet: "sprout" }))));
+  expect(await pending).toBe(true);
+  expect(useAgents.getState().detail?.summary.avatarPet).toBe("sprout");
+  expect(useAgents.getState().registry?.agents[1]?.avatarPet).toBe("sprout");
 });
 
 // ---------- remove ----------

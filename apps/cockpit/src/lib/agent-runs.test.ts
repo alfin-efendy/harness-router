@@ -1,6 +1,25 @@
 import { expect, test } from "bun:test";
-import type { AgentRun, Message } from "../bindings";
-import { agentRunStatusPresentation, linkedDispatchSlots, projectAgentRunPreview } from "./agent-runs";
+import type { AgentRun, AgentSummaryInfo, Message } from "../bindings";
+import { agentRunStatusPresentation, linkedDispatchSlots, petSlugForRun, projectAgentRunPreview } from "./agent-runs";
+
+function agentSummary(id: string, overrides: Partial<AgentSummaryInfo> = {}): AgentSummaryInfo {
+  return {
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    avatarPet: null,
+    model: { kind: "route", route: "free" },
+    builtin: false,
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable: true,
+    validation: [],
+    isDefault: false,
+    ...overrides,
+  };
+}
 
 function run(overrides: Partial<AgentRun> = {}): AgentRun {
   return {
@@ -118,4 +137,17 @@ test("projects a bounded direct terminal excerpt and a reportless completion", (
   expect(completed.excerpt!.length).toBeLessThanOrEqual(280);
   expect(projectAgentRunPreview(run({ status: "completed", result: null }), []).excerpt).toBe("Completed with no report.");
   expect(projectAgentRunPreview(run({ status: "failed", error: "request timed out" }), []).excerpt).toBe("request timed out");
+});
+
+test("petSlugForRun resolves the executing agent's avatar pet from the roster", () => {
+  const agents = [agentSummary("worker", { avatarPet: "sprout" }), agentSummary("other")];
+  expect(petSlugForRun(run({ executingAgentId: "worker" }), agents)).toBe("sprout");
+});
+
+test("petSlugForRun falls back to null when there is no pet, no roster, no match, or no executing agent", () => {
+  const agents = [agentSummary("worker", { avatarPet: null })];
+  expect(petSlugForRun(run({ executingAgentId: "worker" }), agents)).toBeNull();
+  expect(petSlugForRun(run({ executingAgentId: "worker" }), undefined)).toBeNull();
+  expect(petSlugForRun(run({ executingAgentId: "ghost" }), agents)).toBeNull();
+  expect(petSlugForRun(run({ executingAgentId: null }), agents)).toBeNull();
 });

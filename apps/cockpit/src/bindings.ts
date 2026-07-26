@@ -483,6 +483,46 @@ async rollbackAgentLearning(agentId: string, snapshotId: string) : Promise<Resul
     else return { status: "error", error: e  as any };
 }
 },
+async getAgentStats(runnerId: string | null, agentId: string) : Promise<Result<AgentStatsInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_stats", { runnerId, agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getAgentStatsBatch(runnerId: string | null, agentIds: string[]) : Promise<Result<Partial<{ [key in string]: AgentStatsLite }>, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_stats_batch", { runnerId, agentIds }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listPetManifest() : Promise<Result<PetManifestEntryInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_pet_manifest") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async downloadPet(slug: string, spritesheetUrl: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_pet", { slug, spritesheetUrl }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getPetSprite(slug: string) : Promise<Result<string | null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_pet_sprite", { slug }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listGateways(runnerId: string | null) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_gateways", { runnerId }) };
@@ -1944,7 +1984,14 @@ export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: Perm
 /**
  * An immutable identity captured when an agent becomes the primary owner of a session.
  */
-export type AgentIdentitySnapshot = { id: string; name: string; avatarColor: string }
+export type AgentIdentitySnapshot = { id: string; name: string; avatarColor: string;
+/**
+ * Bundled or downloaded pet slug, mirroring `AgentAvatar::pet` at the
+ * time this session's owner identity was captured. `#[serde(default)]`
+ * so an older `primary_agent_snapshot` JSON blob persisted before this
+ * field existed still parses (as `None`) rather than failing to load.
+ */
+avatarPet?: string | null }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AgentLearningInfo = { concepts: KnowledgeConceptInfo[]; invalid: InvalidKnowledgeConceptInfo[]; journey: JourneyMilestoneInfo[]; skillUsage: AgentSkillUsageInfo[]; reviews: LearningReviewInfo[]; curator: CuratorStateInfo; curatorHistory: CuratorHistorySnapshotInfo[] }
 export type AgentMention = { agentId: string; labelSnapshot: string; startUtf16: number; endUtf16: number }
@@ -1961,7 +2008,12 @@ export type AgentModelInfo = { kind: "concrete"; name: string; effort: string | 
  * fields (`id`, counts, `executable`, `validation`, `is_default`) are
  * deliberately absent so the client can't submit them.
  */
-export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: NativeToolDecisionInfo[]; pluginTools: string[]; apps: string[] }
+export type AgentMutationInfo = { name: string; description: string; avatarColor: string;
+/**
+ * Bundled or downloaded pet slug; free-form (no catalog check against
+ * the petdex manifest happens on write). `None`/blank clears it.
+ */
+avatarPet: string | null; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: NativeToolDecisionInfo[]; pluginTools: string[]; apps: string[] }
 /**
  * An agent's personality selection: a preset name (matching
  * [`crate::agents::personality::PersonalityPreset`]'s `snake_case` variants,
@@ -1994,12 +2046,36 @@ export type AgentRunKind = "primary" | "main-delegate" | "subagent"
 export type AgentRunRosterInfo = { rootRunId: string | null; runs: AgentRun[] }
 export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted"
 export type AgentSkillUsageInfo = { skillId: string; uses: number; successes: number; conceptId: string }
-export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo;
+/**
+ * Per-agent stats surfaced on the agent detail view: sessions led, priced
+ * cost/tokens over the trailing 7 days, run reliability over the trailing
+ * 30 days, and the full per-tool usage breakdown (`top_tools`, count DESC).
+ * An unknown or synthetic agent id (including the Fresh Agent's `"fresh"`)
+ * simply has no matching rows anywhere, so every field zeroes out rather
+ * than erroring.
+ */
+export type AgentStatsInfo = { sessionCount: number; lastActive: number | null; costUsd7d: number; tokens7d: number; runsTotal30d: number; runsFailed30d: number; topTools: AgentToolUsageInfo[] }
+/**
+ * Lightweight per-agent stats for roster/list views (`get_agent_stats_batch`)
+ * — see [`AgentStatsInfo`] for the full detail-view shape.
+ */
+export type AgentStatsLite = { sessionCount: number; lastActive: number | null; costUsd7d: number }
+export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string;
+/**
+ * Bundled or downloaded pet slug shown alongside the avatar color;
+ * `None` when no pet is configured.
+ */
+avatarPet: string | null; model: AgentModelInfo;
 /**
  * True for the built-in, non-editable rows (currently only the
  * synthetic Fresh Agent row) — `false` for every registry-backed agent.
  */
 builtin: boolean; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
+/**
+ * One tool's lifetime usage counter for a single agent — see
+ * [`crate::store::AgentToolUsageRow`].
+ */
+export type AgentToolUsageInfo = { tool: string; count: number; lastUsed: number }
 export type AgentValidationInfo = { field: string; message: string }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
@@ -2540,6 +2616,15 @@ export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authori
 export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PermissionRuleInfo = { id: string; tool: string; decision: string; commandPrefix: string | null }
+/**
+ * One pet in the petdex manifest (`pets_api::list_pet_manifest`). Doubles
+ * as the manifest JSON's own per-pet wire shape — `Deserialize`d straight
+ * out of `https://petdex.dev/api/manifest`'s `pets` array, which also
+ * carries `petJsonUrl`/`zipUrl` fields this DTO deliberately omits (serde
+ * ignores unknown keys by default, so those are silently dropped rather
+ * than surfaced to the frontend).
+ */
+export type PetManifestEntryInfo = { slug: string; displayName: string; kind: string; submittedBy?: string | null; spritesheetUrl: string }
 export type PluginAuthInfo = {
 /**
  * `none` | `api-key` | `token` | `oauth`.

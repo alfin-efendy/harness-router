@@ -1,4 +1,4 @@
-import type { AgentRun, Message } from "../bindings";
+import type { AgentRun, AgentSummaryInfo, Message } from "../bindings";
 import { formatTurnDuration, groupRows, messageToRow, type ActivityItem } from "./transcript";
 
 const EXCERPT_LIMIT = 280;
@@ -126,6 +126,18 @@ export function projectAgentRunPreview(run: AgentRun, messages: Message[]): Agen
 
 export function kindLabel(run: AgentRun): "Subagent" | "Main agent" {
   return run.agentKind === "subagent" ? "Subagent" : "Main agent";
+}
+
+/**
+ * The avatar pet configured for a run's executing agent, resolved by
+ * `executingAgentId` against the agent roster — `null` when the run has no
+ * executing agent, the roster hasn't loaded, the agent isn't in it (e.g. it
+ * was since deleted), or it simply has no pet configured. Callers fall back
+ * to the generic Bot icon in every `null` case.
+ */
+export function petSlugForRun(run: AgentRun, agents: AgentSummaryInfo[] | undefined): string | null {
+  if (!run.executingAgentId || !agents) return null;
+  return agents.find((agent) => agent.id === run.executingAgentId)?.avatarPet ?? null;
 }
 
 export function formatAgentRunDuration(run: AgentRun, now = Date.now()): string {

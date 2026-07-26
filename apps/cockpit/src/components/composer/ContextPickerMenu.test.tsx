@@ -11,6 +11,7 @@ const ada: AgentSummaryInfo = {
   name: "Ada",
   description: "Accessibility review",
   avatarColor: "blue",
+  avatarPet: null,
   model: { kind: "route", route: "free" },
   builtin: false,
   skillCount: 0,

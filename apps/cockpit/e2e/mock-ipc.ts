@@ -6,6 +6,8 @@ import type {
   AgentRegistryInfo,
   AgentRun,
   AgentRunRosterInfo,
+  AgentStatsInfo,
+  AgentStatsLite,
   AgentSummaryInfo,
   CommandFileInfo,
   CommandFileInputDto,
@@ -15,6 +17,7 @@ import type {
   CoreEvent,
   Message,
   ModelRouteTargetCapability,
+  PetManifestEntryInfo,
   PluginDetail,
   PluginInfo,
   Session,
@@ -322,11 +325,18 @@ export const PROVIDER_FAMILY_ROUTE_SELECTIONS = [
  * history journeys: Ryuzi (the executable default) and Reviewer (a second
  * executable agent used as a delegation target and, in the history journey,
  * a session owner deliberately absent from a narrower registry override). */
+// avatarPet fixtures (Task 8): Ryuzi carries a bundled pet slug so pet-aware
+// surfaces (roster row, detail header, PetSprite) have a real case to render;
+// Reviewer stays pet-less (`null`) so the plain-color-tile fallback (still
+// the majority case in real rosters) is exercised too. "tennis-ball" is a
+// real bundled slug (`public/pets/tennis-ball/`), distinct from the Fresh
+// Agent's own bundled pet below so the two never collide in assertions.
 export const RYUZI_AGENT = {
   id: "ryuzi",
   name: "Ryuzi",
   description: "General-purpose coding agent",
   avatarColor: "violet",
+  avatarPet: "tennis-ball",
   model: { kind: "concrete", name: "fixture/model-alpha", effort: "high" },
   builtin: false,
   skillCount: 1,
@@ -342,6 +352,7 @@ export const REVIEWER_AGENT = {
   name: "Reviewer",
   description: "Reviews implementation quality and regressions",
   avatarColor: "amber",
+  avatarPet: null,
   model: { kind: "route", route: "safe" },
   builtin: false,
   skillCount: 1,
@@ -361,12 +372,17 @@ const SUBAGENT_MODEL: AgentModelInfo = { kind: "route", route: "smart" };
 
 /** The synthetic, non-editable Fresh Agent row — mirrors the backend's
  * `fresh_agent_summary`/`fresh_agent_detail` (crates/core/src/api/agent_api.rs):
- * always appended LAST to the registry, model-only detail, never mutable. */
+ * always appended LAST to the registry, model-only detail, never mutable.
+ * `avatarPet: "sprout"` MUST stay in sync with the backend's
+ * `FRESH_AGENT_PET` const (agent_api.rs) and the frontend's own
+ * `FRESH_AGENT_PET` const (lib/pet-sprite.ts) — the Fresh Agent's pet is
+ * hardcoded, never user-editable. */
 export const FRESH_AGENT = {
   id: "fresh",
   name: "Fresh Agent",
   description: "Ephemeral, memoryless worker dispatched for delegated tasks.",
   avatarColor: "slate",
+  avatarPet: "sprout",
   model: SUBAGENT_MODEL,
   builtin: true,
   skillCount: 0,
@@ -442,6 +458,92 @@ const AGENT_DETAILS: Record<string, AgentDetailInfo> = {
   reviewer: REVIEWER_DETAIL,
   fresh: FRESH_AGENT_DETAIL,
 };
+
+// ---------- Per-agent stats fixtures (PR3 Task 8) ----------
+//
+// `get_agent_stats`/`get_agent_stats_batch` back the detail view's Overview
+// stat cards and the roster row's lazy stats fragment respectively (see
+// AgentDetailView.tsx / AgentsView.tsx / lib/agent-stats.ts). Ryuzi carries
+// real, non-zero figures across every field (sessions/cost/tokens/
+// reliability/top-tools) so both surfaces have something concrete to render;
+// Reviewer is deliberately all-zero to exercise the "no data yet" branch
+// (`reliabilitySummary`'s em-dash fallback, `formatLastActive`'s "—") without
+// a separate never-loaded agent. `lastActive` is computed relative to fixture
+// module load, not hardcoded, so `formatRelativeTime`'s bucket ("Nd ago")
+// stays stable for the lifetime of a single e2e run.
+
+/** `get_agent_stats(agentId)`'s full detail-view shape for Ryuzi. */
+export const RYUZI_STATS = {
+  sessionCount: 5,
+  lastActive: Date.now() - 3 * 24 * 60 * 60 * 1000,
+  costUsd7d: 1.24,
+  tokens7d: 45_231,
+  runsTotal30d: 20,
+  runsFailed30d: 2,
+  topTools: [
+    { tool: "read_file", count: 14, lastUsed: Date.now() - 3 * 24 * 60 * 60 * 1000 },
+    { tool: "grep", count: 6, lastUsed: Date.now() - 4 * 24 * 60 * 60 * 1000 },
+  ],
+} satisfies AgentStatsInfo;
+
+/** All-zero — Reviewer has no recorded sessions/runs in this fixture set. */
+export const REVIEWER_STATS = {
+  sessionCount: 0,
+  lastActive: null,
+  costUsd7d: 0,
+  tokens7d: 0,
+  runsTotal30d: 0,
+  runsFailed30d: 0,
+  topTools: [],
+} satisfies AgentStatsInfo;
+
+/** Internal lookup bag for the dynamically-dispatched `get_agent_stats`
+ * command (see its branch in installMockIPC) — not a real Tauri command
+ * name, same pattern as `AGENT_DETAILS` above. An id with no entry here
+ * (including the Fresh Agent's "fresh") falls back to an inline all-zero
+ * `AgentStatsInfo` in the dispatch branch itself, mirroring the real
+ * backend's "unknown or synthetic agent id ... zeroes out" contract. */
+const AGENT_STATS: Record<string, AgentStatsInfo> = {
+  ryuzi: RYUZI_STATS,
+  reviewer: REVIEWER_STATS,
+};
+
+/** Internal lookup bag for the dynamically-dispatched `get_agent_stats_batch`
+ * command — the lite roster-row shape, sourced from the same figures as
+ * `AGENT_STATS` above so the list row's stats fragment and the detail view's
+ * Overview cards never disagree about the same agent. */
+const AGENT_STATS_LITE: Record<string, AgentStatsLite> = {
+  ryuzi: { sessionCount: RYUZI_STATS.sessionCount, lastActive: RYUZI_STATS.lastActive, costUsd7d: RYUZI_STATS.costUsd7d },
+  reviewer: { sessionCount: REVIEWER_STATS.sessionCount, lastActive: REVIEWER_STATS.lastActive, costUsd7d: REVIEWER_STATS.costUsd7d },
+};
+
+// ---------- Pet manifest fixtures (PR3 Task 8) ----------
+//
+// `list_pet_manifest` — a tiny STATIC stand-in for petdex.dev's real
+// `https://petdex.dev/api/manifest` response; no live network call happens
+// in e2e. One entry ("sprout") intentionally reuses a bundled slug so the
+// picker's "already-bundled entries are excluded from browse results" logic
+// has a real case, though exercising the picker's Browse flow itself is an
+// owed manual Tauri smoke, not part of this suite. The other two are
+// petdex-only (never downloaded in these specs) with dummy `https://` sheet
+// URLs that are never fetched.
+export const PET_MANIFEST = [
+  { slug: "sprout", displayName: "Sprout", kind: "plant", submittedBy: "Chen W.", spritesheetUrl: "/pets/sprout/sprite.webp" },
+  {
+    slug: "nebula-fox",
+    displayName: "Nebula Fox",
+    kind: "fox",
+    submittedBy: "petdex-community",
+    spritesheetUrl: "https://petdex.dev/pets/nebula-fox/sprite.webp",
+  },
+  {
+    slug: "pixel-koi",
+    displayName: "Pixel Koi",
+    kind: "fish",
+    submittedBy: null,
+    spritesheetUrl: "https://petdex.dev/pets/pixel-koi/sprite.webp",
+  },
+] satisfies PetManifestEntryInfo[];
 
 /** `get_agent_configuration_catalog` — backs the detail page's Skills/
  * Permissions/Apps & MCP tabs (`useAgentConfigurationCatalog`). Native-tool
@@ -1046,6 +1148,26 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   // (see its branch in installMockIPC) — not a real Tauri command name.
   agent_details: AGENT_DETAILS,
   get_agent_configuration_catalog: AGENT_CONFIGURATION_CATALOG,
+  // Internal lookup bags for the dynamically-dispatched `get_agent_stats`/
+  // `get_agent_stats_batch` commands (Task 8) — not real Tauri command names,
+  // same "not a closure, passed through `fixtures`" reasoning as
+  // `agent_details` above.
+  agent_stats: AGENT_STATS,
+  agent_stats_lite: AGENT_STATS_LITE,
+  // `list_pet_manifest` is a real, fixed-shape command (no per-call args) —
+  // a plain FIXTURES entry, not a dynamic-dispatch lookup bag.
+  list_pet_manifest: PET_MANIFEST,
+  // `get_pet_sprite` — downloaded-pet serving isn't e2e-testable (no real
+  // filesystem/network beneath the mock), so every slug resolves to `null`;
+  // PetSprite's `resolveSrc` treats that as "unavailable" and renders the
+  // color-tile fallback, same as a pet that was never downloaded on this
+  // machine. Bundled pets never hit this path (`bundled: true` resolves
+  // straight to the `/pets/<slug>/sprite.webp` public asset instead).
+  get_pet_sprite: null,
+  // `download_pet` — not exercised by any flow in this suite (browsing and
+  // downloading a petdex pet is an owed manual Tauri smoke), but stubbed to
+  // resolve so an incidental call never hangs a test.
+  download_pet: null,
   // Internal lookup bags for the dynamically-dispatched `plugin_detail`/
   // `plugin_release_detail` commands (Task 16) — not real Tauri command
   // names. `page.addInitScript`'s callback is serialized via `.toString()`
@@ -1401,6 +1523,43 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
             const { agentId } = args as { agentId: string };
             const details = fixtures.agent_details as Record<string, unknown>;
             return Promise.resolve(details[agentId] ?? null);
+          }
+          // Task 8: `get_agent_stats` — the detail view's Overview stat cards.
+          // An id with no entry in `agent_stats` (an unknown id, or the
+          // synthetic Fresh Agent's "fresh") resolves to an inline all-zero
+          // `AgentStatsInfo`, mirroring the real backend's "unknown or
+          // synthetic agent id ... zeroes out" contract rather than erroring.
+          if (cmd === "get_agent_stats") {
+            const { agentId } = args as { agentId: string };
+            const stats = fixtures.agent_stats as Record<string, AgentStatsInfo>;
+            return Promise.resolve(
+              stats[agentId] ?? {
+                sessionCount: 0,
+                lastActive: null,
+                costUsd7d: 0,
+                tokens7d: 0,
+                runsTotal30d: 0,
+                runsFailed30d: 0,
+                topTools: [],
+              },
+            );
+          }
+          // Task 8: `get_agent_stats_batch` — the roster row's lazy stats
+          // fragment. Real backend shape (see `agent_stats_batch_returns_
+          // entries_only_for_requested_ids` in crates/core/src/api/
+          // agent_api.rs): a map with exactly one entry per requested agent
+          // id — never more (unrequested agents are excluded), never fewer
+          // (an id with no stats, e.g. unknown or synthetic, still gets a
+          // zeroed `AgentStatsLite` entry, same "zeroes out" contract as
+          // `get_agent_stats` above) — mirrored here via `?? zeroed`.
+          if (cmd === "get_agent_stats_batch") {
+            const { agentIds } = args as { agentIds: string[] };
+            const lite = fixtures.agent_stats_lite as Record<string, AgentStatsLite>;
+            const batch: Record<string, AgentStatsLite> = {};
+            for (const id of agentIds) {
+              batch[id] = lite[id] ?? { sessionCount: 0, lastActive: null, costUsd7d: 0 };
+            }
+            return Promise.resolve(batch);
           }
           // The Fresh Agent is a synthetic, non-editable row — the real backend
           // rejects these four mutation commands for id "fresh" with a 409

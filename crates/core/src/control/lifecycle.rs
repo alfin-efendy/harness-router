@@ -213,6 +213,7 @@ impl ControlPlane {
             id: primary_agent.profile.id.clone(),
             name: primary_agent.profile.name.clone(),
             avatar_color: primary_agent.profile.avatar.color.clone(),
+            avatar_pet: primary_agent.profile.avatar.pet.clone(),
         };
         let session_pk = new_id();
         let now = now_ms();

@@ -233,6 +233,7 @@ function primary(id: string, executable = true): AgentSummaryInfo {
     name: "Renamed profile",
     description: "",
     avatarColor: "blue",
+    avatarPet: null,
     model: { kind: "route", route: "free" },
     builtin: false,
     skillCount: 0,

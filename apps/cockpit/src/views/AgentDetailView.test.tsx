@@ -7,12 +7,14 @@ import type {
   AgentMutationInfo,
   AgentRegistryInfo,
   AgentConfigurationCatalogInfo,
+  AgentStatsInfo,
   AgentSummaryInfo,
   CmdError,
   Result,
   SelectableModelInfo,
   Session,
 } from "@/bindings";
+import { __resetBundledPetsCacheForTests } from "@/lib/bundled-pets";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const getAgent = mock(async (_runner: string | null, id: string) => ({
@@ -40,6 +42,22 @@ const agentConfigurationCatalog: AgentConfigurationCatalogInfo = {
 };
 
 const getAgentConfigurationCatalog = mock(async () => ({ status: "ok" as const, data: agentConfigurationCatalog }));
+function statsInfo(overrides: Partial<AgentStatsInfo> = {}): AgentStatsInfo {
+  return {
+    sessionCount: 5,
+    lastActive: 1_700_000_000_000,
+    costUsd7d: 3.4,
+    tokens7d: 12_345,
+    runsTotal30d: 20,
+    runsFailed30d: 2,
+    topTools: [
+      { tool: "read", count: 40, lastUsed: 1_700_000_000_000 },
+      { tool: "bash", count: 12, lastUsed: 1_699_999_000_000 },
+    ],
+    ...overrides,
+  };
+}
+const getAgentStats = mock(async (_runner: string | null, _id: string) => ({ status: "ok" as const, data: statsInfo() }));
 const listApps = mock(async () => ({ status: "ok" as const, data: [] }));
 const updateAgent = mock(async (_runner: string | null, _id: string, input: AgentMutationInfo) => ({
   status: "ok" as const,
@@ -72,6 +90,7 @@ mock.module("@/bindings", () => ({
     duplicateAgent,
     getAgent,
     getAgentConfigurationCatalog,
+    getAgentStats,
     listAgentSessions,
     listApps,
     listMessages,
@@ -153,6 +172,7 @@ function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
       name: "Reviewer",
       description: "Reviews implementation quality.",
       avatarColor: "violet",
+      avatarPet: null,
       model: { kind: "route", route: "free" },
       builtin: false,
       skillCount: 1,
@@ -203,6 +223,8 @@ function seed(value = detail()) {
     loading: false,
     saving: false,
     recentSessionsByAgent: {},
+    statsByAgent: {},
+    statsDetail: {},
   });
   useNav.setState({ history: { back: [], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
 }
@@ -212,6 +234,8 @@ beforeEach(() => {
   listAgentSessions.mockResolvedValue({ status: "ok", data: [] });
   getAgentConfigurationCatalog.mockClear();
   useAgentConfigurationCatalog.setState({ catalog: null, loading: false, error: null });
+  getAgentStats.mockClear();
+  getAgentStats.mockImplementation(async () => ({ status: "ok" as const, data: statsInfo() }));
   deleteAgent.mockClear();
   duplicateAgent.mockClear();
   listApps.mockClear();
@@ -285,7 +309,7 @@ test("Advanced delete uses the same success-only detail navigation", async () =>
   await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agents" }));
 });
 
-test("detail has Back, identity, actions, seven tabs, and overview metrics", () => {
+test("detail has Back, identity, actions, seven tabs, and loaded overview stat cards", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
@@ -296,11 +320,132 @@ test("detail has Back, identity, actions, seven tabs, and overview metrics", () 
       .getAllByRole("button")
       .map((button) => button.textContent),
   ).toEqual(["Overview", "Model", "Permissions", "Skills", "Apps & MCP", "Learning", "Advanced"]);
-  expect(screen.getByText("12 readable concepts")).toBeTruthy();
-  expect(screen.getByText("1 enabled skill")).toBeTruthy();
-  expect(screen.getByText("3 enabled tools")).toBeTruthy();
+
+  // Activity / Cost · 7 days / Reliability, once the lazy stats load lands.
+  expect(await screen.findByText("5 sessions")).toBeTruthy();
+  expect(screen.getByText("$3.40")).toBeTruthy();
+  expect(screen.getByText("12.3k tokens")).toBeTruthy();
+  expect(screen.getByText("90%")).toBeTruthy();
+  expect(screen.getByText("2 of 20 runs")).toBeTruthy();
+  // Top-tools strip: "name ×count" for each of top_tools.
+  expect(screen.getByText(/read ×40/)).toBeTruthy();
+  expect(screen.getByText(/bash ×12/)).toBeTruthy();
+  // "grep" is explicitly allowed (see the default `detail()` fixture) but
+  // never appears in top_tools → the Consider Off hint names it by its
+  // catalog label.
+  expect(screen.getByText(/Consider Off/)).toBeTruthy();
+  expect(screen.getByText(/Grep/)).toBeTruthy();
+
   expect(screen.getByText("No owned sessions yet.")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Start chat" })).toBeNull();
+});
+
+test("Overview stat cards render em-dash placeholders before stats resolve, never partial or crashed", async () => {
+  let resolveStats!: (value: { status: "ok"; data: AgentStatsInfo }) => void;
+  getAgentStats.mockReturnValueOnce(
+    new Promise((resolve) => {
+      resolveStats = resolve;
+    }),
+  );
+  render(<AgentDetailView agentId="reviewer" />);
+
+  // Only the stat-card session count ("N session(s)") is under test here —
+  // "Recent sessions" (card title) and "No owned sessions yet." (its empty
+  // state) both legitimately contain "sessions" and must not be mistaken
+  // for a loaded Activity figure.
+  expect(screen.queryByText(/^\d+ sessions?$/)).toBeNull();
+  expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(6); // Activity ×2, Cost ×2, Reliability ×2
+
+  resolveStats({ status: "ok", data: statsInfo() });
+  expect(await screen.findByText("5 sessions")).toBeTruthy();
+});
+
+test("a fresh agent's all-zeroed stats render sane zero labels and an em-dash reliability, not crashes or NaN", async () => {
+  getAgentStats.mockResolvedValueOnce({
+    status: "ok",
+    data: { sessionCount: 0, lastActive: null, costUsd7d: 0, tokens7d: 0, runsTotal30d: 0, runsFailed30d: 0, topTools: [] },
+  });
+  render(<AgentDetailView agentId="reviewer" />);
+
+  expect(await screen.findByText("0 sessions")).toBeTruthy();
+  expect(screen.getByText("$0.00")).toBeTruthy();
+  expect(screen.getByText("0 tokens")).toBeTruthy();
+  // Last-active (no activity) and both reliability figures (zero runs) fall
+  // back to an em dash — "no data" must never render as "0%".
+  expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(3);
+  // No top tools and zero runs in the last 30 days → the whole "Tool usage"
+  // card (including the Consider Off hint) is omitted, not shown empty.
+  expect(screen.queryByText("Tool usage")).toBeNull();
+  expect(screen.queryByText(/Consider Off/)).toBeNull();
+});
+
+test("Consider Off hint is suppressed entirely when the agent had zero runs in the trailing 30 days, even with an unused, explicitly-on tool", async () => {
+  getAgentStats.mockResolvedValueOnce({
+    status: "ok",
+    data: statsInfo({ runsTotal30d: 0, runsFailed30d: 0, topTools: [] }),
+  });
+  render(<AgentDetailView agentId="reviewer" />);
+
+  await screen.findByText("5 sessions"); // stats have landed
+  expect(screen.queryByText(/Consider Off/)).toBeNull();
+  expect(screen.queryByText(/Grep/)).toBeNull();
+  // Reliability (percent + detail) is an em dash for zero runs, even though
+  // sessionCount > 0.
+  expect(screen.getAllByText("—")).toHaveLength(2);
+});
+
+test("the header avatar is a button that opens PetPicker; choosing a bundled pet persists it and preserves the rest of the mutation", async () => {
+  const originalFetch = globalThis.fetch;
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    render(<AgentDetailView agentId="reviewer" />);
+    fireEvent.click(screen.getByRole("button", { name: "Change Reviewer's pet" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: /Sprout/i }));
+
+    await waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith(
+        LOCAL_RUNNER,
+        "reviewer",
+        expect.objectContaining({
+          avatarPet: "sprout",
+          name: "Reviewer",
+          description: "Reviews implementation quality.",
+          skills: ["requesting-code-review"],
+        }),
+      ),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("the built-in Fresh Agent header shows its pet but is not a clickable picker trigger", async () => {
+  const originalFetch = globalThis.fetch;
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve([{ slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." }]),
+    } as Response),
+  ) as unknown as typeof fetch;
+
+  try {
+    seed(freshDetail({ summary: { avatarPet: "sprout" } }));
+    render(<AgentDetailView agentId="fresh" />);
+
+    await waitFor(() => expect(screen.getByTestId("pet-sprite")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Change Fresh Agent's pet" })).toBeNull();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("Back uses navigation history", () => {
@@ -384,6 +529,7 @@ test("model transitions preserve supported effort, clear unsupported effort, and
       name: "Reviewer",
       description: "Reviews implementation quality.",
       avatarColor: "violet",
+      avatarPet: null,
       model: { kind: "concrete", name: miniInfo.requestValue, effort: null },
       personality: { preset: "helpful", custom: null },
       permissionRules: [],

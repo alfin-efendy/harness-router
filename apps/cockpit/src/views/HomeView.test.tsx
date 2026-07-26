@@ -213,6 +213,7 @@ beforeEach(() => {
           name: "Ryuzi",
           description: "",
           avatarColor: "violet",
+          avatarPet: null,
           model: { kind: "route", route: "free" },
           builtin: false,
           skillCount: 0,

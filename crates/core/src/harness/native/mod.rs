@@ -789,6 +789,7 @@ mod tests {
                         id: "ryuzi".into(),
                         name: "Ryuzi".into(),
                         avatar_color: "blue".into(),
+                        avatar_pet: None,
                     }),
                     project_id: None,
                     agent_session_id: None,

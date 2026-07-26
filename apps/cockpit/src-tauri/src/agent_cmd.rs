@@ -13,15 +13,16 @@ use tauri::State;
 
 use ryuzi_core::api::types::{
     AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
-    AgentMutationInfo, AgentRegistryInfo, KnowledgeConceptInfo, KnowledgeConceptMutationInfo,
+    AgentMutationInfo, AgentRegistryInfo, AgentStatsInfo, AgentStatsLite, KnowledgeConceptInfo,
+    KnowledgeConceptMutationInfo,
 };
 
 // Re-exported by name for a complete, documented DTO surface; specta still
 // emits these via the command type graph either way.
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
-    AgentRecoveryInfo, AgentSkillUsageInfo, AgentSummaryInfo, AgentValidationInfo,
-    CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
+    AgentRecoveryInfo, AgentSkillUsageInfo, AgentSummaryInfo, AgentToolUsageInfo,
+    AgentValidationInfo, CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
     JourneyMilestoneInfo, LearningReviewInfo, PermissionRuleInfo,
 };
 
@@ -87,6 +88,10 @@ fn invalid_concept_params(agent_id: &str, relative_path: &str) -> serde_json::Va
 
 fn rollback_learning_params(agent_id: &str, snapshot_id: &str) -> serde_json::Value {
     serde_json::json!({ "agent_id": agent_id, "snapshot_id": snapshot_id })
+}
+
+fn agent_stats_batch_params(agent_ids: &[String]) -> serde_json::Value {
+    serde_json::json!({ "agent_ids": agent_ids })
 }
 
 // --- agent registry commands (runner-aware) ----------------------------------
@@ -215,6 +220,35 @@ pub async fn update_subagent_model(
         .rpc(
             "update_subagent_model",
             update_subagent_model_params(&model),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_agent_stats(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    agent_id: String,
+) -> R<AgentStatsInfo> {
+    engine
+        .client(runner_id.as_deref().unwrap_or("local"))?
+        .rpc("get_agent_stats", agent_id_params(&agent_id))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_agent_stats_batch(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    agent_ids: Vec<String>,
+) -> R<std::collections::HashMap<String, AgentStatsLite>> {
+    engine
+        .client(runner_id.as_deref().unwrap_or("local"))?
+        .rpc(
+            "get_agent_stats_batch",
+            agent_stats_batch_params(&agent_ids),
         )
         .await
 }
@@ -370,6 +404,7 @@ mod tests {
             name: "Reviewer".to_owned(),
             description: "Reviews implementation quality and regressions.".to_owned(),
             avatar_color: "violet".to_owned(),
+            avatar_pet: Some("paperclip".to_owned()),
             model: AgentModelInfo::Route {
                 route: "free".to_owned(),
             },
@@ -505,6 +540,14 @@ mod tests {
         assert_eq!(
             rollback_learning_params("reviewer", "snap-1"),
             serde_json::json!({"agent_id": "reviewer", "snapshot_id": "snap-1"})
+        );
+    }
+
+    #[test]
+    fn agent_stats_batch_payload_matches_core_rpc_contract() {
+        assert_eq!(
+            agent_stats_batch_params(&["reviewer".to_owned(), "fresh".to_owned()]),
+            serde_json::json!({"agent_ids": ["reviewer", "fresh"]})
         );
     }
 }
