@@ -8,6 +8,7 @@ function reset() {
     plugins: [],
     loaded: false,
     restartRequired: false,
+    restarting: false,
     doctorFindings: [],
     doctorLoaded: false,
     catalogStatus: null,
@@ -234,14 +235,23 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
 test("uninstall swaps in the returned list", async () => {
   reset();
   usePlugins.setState({ plugins: [github], loaded: true });
-  const spy = spyOn(commands, "uninstallPlugin").mockResolvedValue({
-    status: "ok",
-    data: [{ ...github, installed: false, enabled: false, configured: false }],
-  });
+  const uninstalled = { ...github, installed: false, enabled: false, configured: false };
+  const spy = spyOn(commands, "uninstallPlugin").mockResolvedValue({ status: "ok", data: [uninstalled] });
+  // uninstall() now reloads via load() afterwards (Spec B2 refresh gap) — stub
+  // its three RPCs too, mirroring the returned list so the post-reload state
+  // still reflects the uninstall.
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [uninstalled] });
+  const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
+
   const ok = await usePlugins.getState().uninstall("github");
+
   expect(ok).toBe(true);
   expect(usePlugins.getState().plugins[0].installed).toBe(false);
   spy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("uninstall failure toasts and keeps state", async () => {
@@ -386,6 +396,42 @@ test("load carries a persisted pinned flag straight from the server — no pin()
   catalogSpy.mockRestore();
 });
 
+test("restartEngine flips restarting and reloads on success", async () => {
+  reset();
+  const restartEngineSpy = spyOn(commands, "restartEngine").mockResolvedValue({ status: "ok", data: null });
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [] });
+  const restartSpy = stubRestartRequired(false);
+  const catalogSpy = stubCatalogStatus();
+
+  const ok = await usePlugins.getState().restartEngine();
+
+  expect(ok).toBe(true);
+  expect(usePlugins.getState().restarting).toBe(false);
+  // restartRequired refreshed from the mocked pluginsRestartRequired: false
+  expect(usePlugins.getState().restartRequired).toBe(false);
+  restartEngineSpy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+  catalogSpy.mockRestore();
+});
+
+test("uninstall refreshes restartRequired via load()", async () => {
+  reset();
+  usePlugins.setState({ plugins: [github], loaded: true });
+  const spy = spyOn(commands, "uninstallPlugin").mockResolvedValue({ status: "ok", data: [] });
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [] });
+  const restartSpy = stubRestartRequired(true);
+  const catalogSpy = stubCatalogStatus();
+
+  await usePlugins.getState().uninstall("discord");
+
+  expect(usePlugins.getState().restartRequired).toBe(true);
+  spy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+  catalogSpy.mockRestore();
+});
+
 test("summarizeUpdateAll counts updated/needsReack/failed outcomes", () => {
   const summary = summarizeUpdateAll([
     { id: "a", outcome: { kind: "updated" } },
@@ -494,6 +540,11 @@ test("installComponentPlugin installs, reloads componentPlugins, and returns the
   const installed = componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.2.0" });
   const installSpy = spyOn(commands, "installComponentPlugin").mockResolvedValue({ status: "ok", data: installed });
   const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: installed });
+  // installComponentPlugin now also reloads via load() afterwards (Spec B2
+  // refresh gap) — stub its three RPCs too.
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [] });
+  const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   const result = await usePlugins.getState().installComponentPlugin("mimo");
 
@@ -503,6 +554,9 @@ test("installComponentPlugin installs, reloads componentPlugins, and returns the
   expect(usePlugins.getState().componentPluginsLoaded).toBe(true);
   installSpy.mockRestore();
   detailSpy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("installComponentPlugin passes an explicit version through", async () => {
@@ -515,12 +569,18 @@ test("installComponentPlugin passes an explicit version through", async () => {
     status: "ok",
     data: componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" }),
   });
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [] });
+  const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   await usePlugins.getState().installComponentPlugin("mimo", "0.1.0");
 
   expect(installSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", "0.1.0");
   installSpy.mockRestore();
   detailSpy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("installComponentPlugin toasts the error and returns null without touching componentPlugins", async () => {
@@ -542,6 +602,11 @@ test("rollbackComponentPlugin dispatches from/to versions, reloads componentPlug
   const rolledBack = componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" });
   const rollbackSpy = spyOn(commands, "rollbackComponentPlugin").mockResolvedValue({ status: "ok", data: rolledBack });
   const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: rolledBack });
+  // rollbackComponentPlugin now also reloads via load() afterwards (Spec B2
+  // refresh gap) — stub its three RPCs too.
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [] });
+  const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   const result = await usePlugins.getState().rollbackComponentPlugin("mimo", "0.2.0", "0.1.0");
 
@@ -549,6 +614,9 @@ test("rollbackComponentPlugin dispatches from/to versions, reloads componentPlug
   expect(result).toEqual(rolledBack);
   expect(usePlugins.getState().componentPluginsLoaded).toBe(true);
   rollbackSpy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+  catalogSpy.mockRestore();
   detailSpy.mockRestore();
 });
 

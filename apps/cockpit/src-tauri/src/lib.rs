@@ -101,6 +101,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             gateways_cmd::add_runner,
             gateways_cmd::remove_gateway,
             gateways_cmd::update_gateway,
+            gateways_cmd::restart_engine,
             gateways_cmd::gateway_events,
             scheduler_cmd::list_jobs,
             scheduler_cmd::create_job,

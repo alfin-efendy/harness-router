@@ -32,6 +32,9 @@ type PluginsState = {
   loaded: boolean;
   /** Whether an install/update since app start needs a restart to apply. */
   restartRequired: boolean;
+  /** True while `restart_engine` is in flight — drives the banner button's
+   *  busy state so a second click can't fire mid-restart. */
+  restarting: boolean;
   /** `plugin_doctor` findings, cached so the Installed grid, the plugin
    *  detail attach-failure banner, and `DoctorPanel` all read the same
    *  snapshot instead of triggering their own redundant fetches. */
@@ -60,6 +63,10 @@ type PluginsState = {
    *  `PluginToolsList`'s "Declared by the plugin…" hint. */
   toolsLiveById: Record<string, boolean>;
   load: () => Promise<void>;
+  /** Spec B3: cycles the local daemon (Task 5's `restart_engine`), then
+   *  reloads everything this store caches — a fresh daemon clears the
+   *  `restartRequired` latch and may have a changed catalog/plugin set. */
+  restartEngine: () => Promise<boolean>;
   loadDoctor: () => Promise<void>;
   refreshCatalog: () => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
@@ -117,6 +124,7 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   plugins: [],
   loaded: false,
   restartRequired: false,
+  restarting: false,
   doctorFindings: [],
   doctorLoaded: false,
   catalogStatus: null,
@@ -140,6 +148,22 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     // stale (or empty) rather than blocking the plugin list on it.
     const catalogRes = await commands.catalogStatus("local");
     if (catalogRes.status === "ok") set({ catalogStatus: catalogRes.data });
+  },
+
+  restartEngine: async () => {
+    set({ restarting: true });
+    try {
+      const res = await commands.restartEngine();
+      if (res.status === "error") {
+        toast.error(`Engine restart failed: ${res.error.message}`);
+        return false;
+      }
+      // Fresh daemon → latch cleared; reload everything this store caches.
+      await get().load();
+      return true;
+    } finally {
+      set({ restarting: false });
+    }
   },
 
   loadDoctor: async () => {
@@ -181,6 +205,7 @@ export const usePlugins = create<PluginsState>((set, get) => ({
       return false;
     }
     set({ plugins: res.data, loaded: true });
+    await get().load();
     return true;
   },
 
@@ -276,6 +301,7 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     }
     toast.success(res.data.activeVersion ? `${id} installed — v${res.data.activeVersion}` : `${id} installed`);
     await get().loadComponentPlugins();
+    await get().load();
     return res.data;
   },
 
@@ -287,6 +313,7 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     }
     toast.success(`Rolled back ${id} to v${toVersion}`);
     await get().loadComponentPlugins();
+    await get().load();
     return res.data;
   },
 

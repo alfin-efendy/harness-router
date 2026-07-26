@@ -607,6 +607,17 @@ async updateGateway(runnerId: string | null, id: string, fsMode: string, paths: 
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Spec B3: in-app engine restart — see `EngineManager::restart_local`.
+ */
+async restartEngine() : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restart_engine") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async gatewayEvents(runnerId: string | null, id: string) : Promise<Result<GatewayEventInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("gateway_events", { runnerId, id }) };
@@ -2393,6 +2404,12 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * Same for a plugin OAuth flow.
  */
 { kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } |
+/**
+ * The installed/enabled plugin set changed (install, uninstall, update,
+ * rollback, enable/disable, skill install/remove/refresh). Payload-free:
+ * Cockpit reacts by refetching the plugin list + restart flag (spec B2).
+ */
+{ kind: "pluginsChanged" } |
 /**
  * Per-session accumulated cost: total USD and a per-model token+dollar
  * breakdown. Emitted alongside `ContextUsage`.

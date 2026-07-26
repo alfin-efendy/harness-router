@@ -176,6 +176,13 @@ pub async fn update_gateway(
         .await
 }
 
+/// Spec B3: in-app engine restart — see `EngineManager::restart_local`.
+#[tauri::command]
+#[specta::specta]
+pub async fn restart_engine(app: AppHandle, engine: Engine<'_>) -> R<()> {
+    engine.restart_local(&app).await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn gateway_events(

@@ -18,6 +18,7 @@ import {
 import { basename } from "./lib/paths";
 import { delegationRunKey, useDelegation } from "./store-delegation";
 import { useNative } from "./store-native";
+import { usePlugins } from "./store-plugins";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
@@ -661,6 +662,10 @@ export const useStore = create<State>((set, get) => ({
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
+      // Spec B2: the daemon emits pluginsChanged on every plugin mutation —
+      // refetch the plugin list + restart flag reactively instead of relying
+      // on each mutating action to remember to reload.
+      if (event.kind === "pluginsChanged") void usePlugins.getState().load();
     });
   },
 }));

@@ -83,6 +83,14 @@ pub trait WasmProviderRuntime: Send + Sync {
     /// `ProviderDescriptor.id`/`ConnectionRow.provider` a route resolves to.
     fn provider_id(&self) -> &str;
 
+    /// The plugin (bundle) id that OWNS this transport — distinct from
+    /// `provider_id()`, which is the router-facing alias a bundle declares
+    /// (`resolved_provider_ids`, e.g. mimo's bundle registers under
+    /// `"mimo-free"`). Callers that need to drop every transport a plugin
+    /// owns — uninstall/disable/hot-reload — must key off THIS, never
+    /// `provider_id()`, or an aliased bundle's transport survives.
+    fn plugin_id(&self) -> &str;
+
     /// Enumerate the provider's models. A guest `provider-error`, or any
     /// host-side trap/timeout/instantiation failure, becomes an `Err(String)` —
     /// never a panic.
@@ -139,6 +147,10 @@ impl WasmProviderTransport {
 impl WasmProviderRuntime for WasmProviderTransport {
     fn provider_id(&self) -> &str {
         &self.provider_id
+    }
+
+    fn plugin_id(&self) -> &str {
+        &self.ctx.plugin_id
     }
 
     async fn list_models(&self) -> Result<Vec<WasmModelInfo>, String> {
@@ -257,12 +269,26 @@ pub fn wasm_provider(provider_id: &str) -> Option<Arc<dyn WasmProviderRuntime>> 
         .cloned()
 }
 
-/// Drop a provider transport from the registry (e.g. on uninstall/disable).
+/// Drop ONE transport by its router provider id. Production uninstall/disable
+/// paths must use [`unregister_wasm_providers_for_plugin`] instead — a bundle's
+/// declared `provider-ids` may alias its plugin id (mimo → "mimo-free"), so
+/// removing by a single id string misses aliased registrations.
 pub fn unregister_wasm_provider(provider_id: &str) {
     provider_registry()
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(provider_id);
+}
+
+/// Drop EVERY live transport registered by `plugin_id`'s bundle, regardless of
+/// which router provider ids it declared (`resolved_provider_ids` may alias —
+/// mimo's bundle registers under "mimo-free"). Keyed off the transport's own
+/// capability context, so it works even after the bundle is gone from disk.
+pub fn unregister_wasm_providers_for_plugin(plugin_id: &str) {
+    provider_registry()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|_, transport| transport.plugin_id() != plugin_id);
 }
 
 /// Discover every active WASM component bundle under `root`, keep only the
@@ -383,6 +409,103 @@ pub(crate) fn provider_fixture_artifact() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/component-provider/target/wasm32-wasip2/release")
         .join("ryuzi_component_provider_fixture.wasm")
+}
+
+/// The prebuilt gateway fixture artifact (caller must build fixtures first via
+/// [`crate::plugins::build_fixture_components_once`]) — a real compiled
+/// component exporting `ryuzi:gateway/gateway`, not `ryuzi:provider/provider`.
+/// Module-level (not inside `mod tests`) so `api::plugins_api`'s test for
+/// [`crate::api::plugins_api`]'s `installed_bundle_is_gateway` positive path
+/// can reuse it instead of compiling its own throwaway gateway component.
+#[cfg(test)]
+pub(crate) fn gateway_fixture_artifact() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/component-gateway/target/wasm32-wasip2/release")
+        .join("ryuzi_component_gateway_fixture.wasm")
+}
+
+/// Lay a verified, active bundle onto `root` in the exact on-disk layout
+/// [`crate::plugins::bundle::load_active_bundles`] requires (versioned dir +
+/// `current` pointer + `ryuzi-plugin.toml` + `release.json` + the component,
+/// hashes all agreeing) and seed the matching active release row into
+/// `store`. Signed under the first-party key so
+/// `HostPolicy::for_installed_bundle` grants `allow_self_auth`, exactly like
+/// the real mimo/opencode bundles.
+///
+/// Module-level (not inside `mod tests`), same reason as
+/// [`gateway_fixture_artifact`]: `api::plugins_api`'s hermetic positive-path
+/// test for `installed_bundle_is_gateway` reuses this exact staging logic
+/// rather than duplicating it.
+#[cfg(test)]
+pub(crate) async fn install_bundle_on_disk(
+    root: &std::path::Path,
+    store: &Store,
+    plugin_id: &str,
+    component_artifact: &std::path::Path,
+    provider_ids: &[&str],
+) {
+    use crate::store::ComponentPluginReleaseRecord;
+    use sha2::{Digest, Sha256};
+
+    let version = "0.1.0";
+    let component_name = "plugin.wasm";
+    let version_dir = root.join(plugin_id).join(version);
+    std::fs::create_dir_all(&version_dir).unwrap();
+    let bytes = std::fs::read(component_artifact).unwrap();
+    std::fs::write(version_dir.join(component_name), &bytes).unwrap();
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+
+    let provider_ids_line = if provider_ids.is_empty() {
+        String::new()
+    } else {
+        let quoted = provider_ids
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("provider-ids = [{quoted}]\n")
+    };
+    let manifest = format!(
+        "id = \"{plugin_id}\"\n\
+         name = \"{plugin_id}\"\n\
+         version = \"{version}\"\n\
+         wit-api = \"^0.1.0\"\n\
+         lifecycle = \"per-call\"\n\
+         component = \"{component_name}\"\n\
+         {provider_ids_line}"
+    );
+    std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
+
+    let release = serde_json::json!({
+        "id": plugin_id,
+        "version": version,
+        "wit-api": "0.1.0",
+        "component_url": "https://example.invalid/x.wasm",
+        "component_sha256": sha,
+    });
+    std::fs::write(
+        version_dir.join("release.json"),
+        serde_json::to_vec(&release).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join(plugin_id).join("current"), version).unwrap();
+
+    let record = ComponentPluginReleaseRecord {
+        plugin_id: plugin_id.to_string(),
+        version: version.to_string(),
+        source_url: "https://example.invalid/x.wasm".to_string(),
+        sha256: sha,
+        signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
+        installed_at: 0,
+        active: false,
+        revoked: false,
+        revocation_reason: None,
+    };
+    store.upsert_component_release(&record).await.unwrap();
+    store
+        .set_active_component_release(plugin_id, version)
+        .await
+        .unwrap();
 }
 
 /// The extra capability grants + storage seeding
@@ -793,91 +916,7 @@ mod tests {
     // discover_provider_components: production discovery + registration
     // -----------------------------------------------------------------
 
-    use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
-
-    fn gateway_fixture_artifact() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/component-gateway/target/wasm32-wasip2/release")
-            .join("ryuzi_component_gateway_fixture.wasm")
-    }
-
-    /// Lay a verified, active bundle onto `root` in the exact on-disk layout
-    /// [`crate::plugins::bundle::load_active_bundles`] requires (versioned dir +
-    /// `current` pointer + `ryuzi-plugin.toml` + `release.json` + the component,
-    /// hashes all agreeing) and seed the matching active release row into
-    /// `store`. Signed under the first-party key so
-    /// `HostPolicy::for_installed_bundle` grants `allow_self_auth`, exactly like
-    /// the real mimo/opencode bundles.
-    async fn install_bundle_on_disk(
-        root: &std::path::Path,
-        store: &Store,
-        plugin_id: &str,
-        component_artifact: &std::path::Path,
-        provider_ids: &[&str],
-    ) {
-        use sha2::{Digest, Sha256};
-
-        let version = "0.1.0";
-        let component_name = "plugin.wasm";
-        let version_dir = root.join(plugin_id).join(version);
-        std::fs::create_dir_all(&version_dir).unwrap();
-        let bytes = std::fs::read(component_artifact).unwrap();
-        std::fs::write(version_dir.join(component_name), &bytes).unwrap();
-        let sha = format!("{:x}", Sha256::digest(&bytes));
-
-        let provider_ids_line = if provider_ids.is_empty() {
-            String::new()
-        } else {
-            let quoted = provider_ids
-                .iter()
-                .map(|p| format!("\"{p}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("provider-ids = [{quoted}]\n")
-        };
-        let manifest = format!(
-            "id = \"{plugin_id}\"\n\
-             name = \"{plugin_id}\"\n\
-             version = \"{version}\"\n\
-             wit-api = \"^0.1.0\"\n\
-             lifecycle = \"per-call\"\n\
-             component = \"{component_name}\"\n\
-             {provider_ids_line}"
-        );
-        std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
-
-        let release = serde_json::json!({
-            "id": plugin_id,
-            "version": version,
-            "wit-api": "0.1.0",
-            "component_url": "https://example.invalid/x.wasm",
-            "component_sha256": sha,
-        });
-        std::fs::write(
-            version_dir.join("release.json"),
-            serde_json::to_vec(&release).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(root.join(plugin_id).join("current"), version).unwrap();
-
-        let record = ComponentPluginReleaseRecord {
-            plugin_id: plugin_id.to_string(),
-            version: version.to_string(),
-            source_url: "https://example.invalid/x.wasm".to_string(),
-            sha256: sha,
-            signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
-            installed_at: 0,
-            active: false,
-            revoked: false,
-            revocation_reason: None,
-        };
-        store.upsert_component_release(&record).await.unwrap();
-        store
-            .set_active_component_release(plugin_id, version)
-            .await
-            .unwrap();
-    }
 
     /// A fresh temp store + a `SettingsStore` over it + a throwaway on-disk
     /// install root, all sharing one lifetime tempfile so nothing is dropped
@@ -1052,5 +1091,109 @@ mod tests {
             "a non-provider (gateway) bundle must register nothing: {registered:?}",
         );
         assert!(wasm_provider("disc-gateway").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // unregister_wasm_providers_for_plugin: fixes the aliased-id bug where
+    // callers unregistered by PLUGIN id even though discovery registers
+    // transports under the bundle's DECLARED router provider id(s), which may
+    // differ (mimo's bundle registers under "mimo-free", not "mimo").
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregister_for_plugin_removes_aliased_provider_ids() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        // "acme" the PLUGIN id declares "acme-free" as its router provider id
+        // — the exact mimo shape (bundle id != served provider id).
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "acme",
+            &provider_artifact(),
+            &["acme-free"],
+        )
+        .await;
+        enable(&store, "acme").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+        assert_eq!(registered, vec!["acme-free".to_string()]);
+        assert!(
+            wasm_provider("acme-free").is_some(),
+            "discovery must register the transport under the declared router id"
+        );
+
+        // Pin the ORIGINAL bug: unregistering by the bare plugin id ("acme")
+        // does NOT touch a transport registered under an aliased id
+        // ("acme-free") — this is exactly what left mimo's transport alive
+        // across disable/uninstall before this fix.
+        unregister_wasm_provider("acme");
+        assert!(
+            wasm_provider("acme-free").is_some(),
+            "unregister_wasm_provider keyed by plugin id must NOT remove an \
+             aliased router-id transport (this pins the original bug)"
+        );
+
+        // The fix: unregister by OWNING PLUGIN id drops every transport that
+        // plugin's bundle registered, regardless of declared router alias.
+        unregister_wasm_providers_for_plugin("acme");
+        assert!(
+            wasm_provider("acme-free").is_none(),
+            "unregister_wasm_providers_for_plugin must drop the aliased transport"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregister_for_plugin_then_rediscovery_with_bundle_disabled_leaves_registry_empty() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "acme2",
+            &provider_artifact(),
+            &["acme2-free"],
+        )
+        .await;
+        enable(&store, "acme2").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+        assert_eq!(registered, vec!["acme2-free".to_string()]);
+        assert!(wasm_provider("acme2-free").is_some());
+
+        // Simulate the fail-closed hot-reload sequence Fix 3 wires around
+        // install/rollback: drop every transport this plugin owns BEFORE
+        // re-running discovery. With the bundle now disabled (the
+        // uninstall/disable path this pins), re-discovery must not resurrect
+        // the transport — the registry stays empty for this plugin.
+        unregister_wasm_providers_for_plugin("acme2");
+        store
+            .set_setting_raw("plugin.acme2.enabled", "false")
+            .await
+            .unwrap();
+        let registered_again = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+        assert!(
+            registered_again.is_empty(),
+            "a disabled bundle must not re-register after unregister: {registered_again:?}"
+        );
+        assert!(wasm_provider("acme2-free").is_none());
     }
 }

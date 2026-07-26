@@ -149,6 +149,11 @@ pub struct ControlPlane {
     /// every startup, so a stale `true` surviving a restart would be
     /// meaningless).
     plugins_restart_required: std::sync::atomic::AtomicBool,
+    /// Woken by `request_shutdown` (the `shutdown_engine` RPC) so a daemon
+    /// binary's signal loop can exit gracefully without OS signals — the only
+    /// cross-platform way Cockpit can restart a detached engine process
+    /// (spec B3; Windows has no SIGTERM story for a detached child).
+    shutdown: tokio::sync::Notify,
     /// Track D's extension host — constructed empty here (no real subprocess
     /// spawn; see [`Self::spawn_extensions`]'s hermeticity doc) and shared
     /// as a single `Arc` between the daemon entry (which calls
@@ -297,6 +302,7 @@ impl ControlPlane {
             active_turns: std::sync::atomic::AtomicUsize::new(0),
             background: crate::harness::native::background::BackgroundRegistry::new(),
             plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
+            shutdown: tokio::sync::Notify::new(),
             extension_host: Arc::new(ExtensionHost::new()),
             agent_persistence: persistence.handles(),
             artifacts,
@@ -446,6 +452,14 @@ impl ControlPlane {
         &self.store
     }
 
+    /// The daemon's telemetry backend (Noop outside a wired daemon). Exposed
+    /// so API handlers can re-run `discover_provider_components` — which
+    /// takes the same telemetry the boot-time discovery got — after a
+    /// component install/enable (spec B1 hot activation).
+    pub fn telemetry(&self) -> Arc<dyn Telemetry> {
+        Arc::clone(&self.telemetry)
+    }
+
     /// The task-artifact service (metadata + payload), fixed at construction
     /// (see [`Self::new_full`]). Returns a borrow; callers that need
     /// ownership clone.
@@ -503,6 +517,19 @@ impl ControlPlane {
     pub fn plugins_restart_required(&self) -> bool {
         self.plugins_restart_required
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ask the owning daemon process to exit gracefully. `notify_one` stores
+    /// a permit, so a request that lands before the daemon reaches its signal
+    /// loop is not lost.
+    pub fn request_shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    /// Resolves once `request_shutdown` has been called. Awaited by the
+    /// engine-daemon's signal `select!` alongside SIGTERM/Ctrl-C.
+    pub async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
     }
 
     /// Dispatch one normalized automation event. Event sources call this narrow

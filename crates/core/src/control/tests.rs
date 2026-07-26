@@ -5727,6 +5727,19 @@ async fn restart_required_flag_defaults_false_and_latches_true() {
 }
 
 #[tokio::test]
+async fn shutdown_requested_completes_after_request() {
+    let (_db, path) = temp_db_path();
+    let store = Store::open(&path).await.unwrap();
+    let cp = test_control_plane(store, Registries::new()).await;
+    // Request BEFORE awaiting: Notify::notify_one stores a permit, so the
+    // daemon loop can never miss a request that raced ahead of its select.
+    cp.request_shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(1), cp.shutdown_requested())
+        .await
+        .expect("shutdown_requested never completed");
+}
+
+#[tokio::test]
 async fn drain_resolves_immediately_when_nothing_is_running() {
     let (_db, path) = temp_db_path();
     let store = Store::open(&path).await.unwrap();
