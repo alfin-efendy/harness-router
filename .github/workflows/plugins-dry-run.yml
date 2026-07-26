@@ -27,6 +27,12 @@ permissions:
 
 jobs:
   build-sign-verify:
+    # Dependabot-triggered runs only see Dependabot secrets, never the Actions
+    # secrets holding the signing keys, so the fail-closed guards below would
+    # trip on every dependabot bump of this file's pinned actions (its path
+    # filter matches itself). Skip those runs; maintainers can still rehearse
+    # any time via workflow_dispatch.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
