@@ -204,7 +204,11 @@ export function collapseProviderFamilies(plugins: PluginInfo[]): PluginInfo[] {
 export function buildHubItems(input: { plugins: PluginInfo[]; apps: AppInfo[]; skills: InstalledSkillInfo[] }): HubItem[] {
   const pluginIds = new Set(input.plugins.map((p) => p.id));
   const standaloneSkills = input.skills.filter((s) => !pluginIds.has(s.id) && !(s.pluginId && pluginIds.has(s.pluginId)));
-  return [...collapseProviderFamilies(input.plugins).map(pluginToHubItem), ...input.apps.map(appToHubItem), ...standaloneSkills.map(skillToHubItem)];
+  return [
+    ...collapseProviderFamilies(input.plugins).map(pluginToHubItem),
+    ...input.apps.map(appToHubItem),
+    ...standaloneSkills.map(skillToHubItem),
+  ];
 }
 
 const ATTENTION_STATUSES: ReadonlySet<HubStatus> = new Set(["needs-setup", "attach-failed", "blocked"]);

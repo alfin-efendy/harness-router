@@ -166,8 +166,22 @@ describe("buildHubItems: plugin mapping", () => {
 
 describe("buildHubItems: provider family collapse", () => {
   test("buildHubItems collapses provider families into the head row", () => {
-    const anthropic = mkPlugin({ id: "anthropic", name: "Anthropic", kind: "provider", family: "anthropic", installed: false, status: "not-installed" });
-    const anthropicOauth = mkPlugin({ id: "anthropic-oauth", name: "Anthropic (Claude subscription)", kind: "provider", family: "anthropic", installed: false, status: "not-installed" });
+    const anthropic = mkPlugin({
+      id: "anthropic",
+      name: "Anthropic",
+      kind: "provider",
+      family: "anthropic",
+      installed: false,
+      status: "not-installed",
+    });
+    const anthropicOauth = mkPlugin({
+      id: "anthropic-oauth",
+      name: "Anthropic (Claude subscription)",
+      kind: "provider",
+      family: "anthropic",
+      installed: false,
+      status: "not-installed",
+    });
     const items = buildHubItems({ plugins: [anthropic, anthropicOauth], apps: [], skills: [] });
     expect(items).toHaveLength(1);
     expect(items[0].id).toBe("anthropic");
@@ -176,7 +190,14 @@ describe("buildHubItems: provider family collapse", () => {
 
   test("collapsed family aggregates installed and status across members", () => {
     const head = mkPlugin({ id: "mimo-free", name: "MiMo", kind: "provider", family: "mimo-free", installed: true, status: "ok" });
-    const member = mkPlugin({ id: "mimo", name: "MiMo (Token Plan)", kind: "provider", family: "mimo-free", installed: true, status: "needs-setup" });
+    const member = mkPlugin({
+      id: "mimo",
+      name: "MiMo (Token Plan)",
+      kind: "provider",
+      family: "mimo-free",
+      installed: true,
+      status: "needs-setup",
+    });
     const items = buildHubItems({ plugins: [head, member], apps: [], skills: [] });
     expect(items).toHaveLength(1);
     expect(items[0].installed).toBe(true);
@@ -186,7 +207,14 @@ describe("buildHubItems: provider family collapse", () => {
 
   test("family with every member needing setup shows needs-setup", () => {
     const head = mkPlugin({ id: "openai", name: "OpenAI", kind: "provider", family: "openai", installed: true, status: "needs-setup" });
-    const member = mkPlugin({ id: "openai-oauth", name: "OpenAI (ChatGPT)", kind: "provider", family: "openai", installed: true, status: "needs-setup" });
+    const member = mkPlugin({
+      id: "openai-oauth",
+      name: "OpenAI (ChatGPT)",
+      kind: "provider",
+      family: "openai",
+      installed: true,
+      status: "needs-setup",
+    });
     const items = buildHubItems({ plugins: [head, member], apps: [], skills: [] });
     expect(items[0].status).toBe("needs-setup");
   });
