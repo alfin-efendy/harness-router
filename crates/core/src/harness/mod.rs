@@ -63,9 +63,11 @@ pub struct SessionCtx {
     /// this up per `mcp__<server>__<tool>` tool so approvals can attribute
     /// the call to its plugin (see [`crate::domain::Principal`]).
     pub mcp_principals: HashMap<String, Principal>,
-    /// Extra skill directories contributed by enabled user plugins (see
-    /// `crate::plugins::PluginHost::enabled_skill_dirs`), on top of the
-    /// native runtime's usual worktree/global skill dirs.
+    /// Extra skill directories folded in beside the native runtime's usual
+    /// project/global skill dirs. The daemon no longer feeds plugin-bundled
+    /// dirs here — installed skill packs reach sessions via the global root
+    /// (`~/.config/ryuzi/skills`) instead — but the field remains for tests
+    /// and embedders that want to inject skill dirs directly.
     pub extra_skill_dirs: Vec<PathBuf>,
     /// Live handle to the daemon's extension host (Track D) — every hook
     /// fire site (`harness::native::hooks::fire_hook`) dispatches to it

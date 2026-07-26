@@ -1,18 +1,25 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import type { CommandInfo, ProjectCommandInfo } from "./bindings";
-import { useNative } from "./store-native";
+import type { CommandFileInfo, SlashEntryInfo } from "./bindings";
+import { catalogKey, useNative } from "./store-native";
 import { commands } from "./bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const s1 = sessKey(LOCAL_RUNNER, "s1");
+const p1Agent1Key = catalogKey("p1", "agent-1");
 
 function reset() {
-  useNative.setState({ agentsByProject: {}, commandsByProject: {}, projectCommandsByProject: {}, todosBySession: {}, queuedBySession: {} });
+  useNative.setState({
+    agentsByProject: {},
+    slashCatalogByKey: {},
+    globalCommands: undefined,
+    todosBySession: {},
+    queuedBySession: {},
+  });
 }
 
 afterEach(reset);
 
-const projectCommand: ProjectCommandInfo = {
+const globalCommand: CommandFileInfo = {
   name: "review",
   description: "Review the change",
   template: "Review $ARGUMENTS",
@@ -22,16 +29,27 @@ const projectCommand: ProjectCommandInfo = {
   revision: "rev-1",
 };
 
-const effectiveGlobalCommand: CommandInfo = {
+const globalSlashEntry: SlashEntryInfo = {
   name: "review",
   description: "Global review",
+  kind: "command",
+  origin: "global",
+  home: false,
+  session: false,
+  requiresProject: false,
+  effective: true,
+  shadowsGlobal: false,
   agent: null,
   model: null,
   subtask: false,
-  origin: "global",
-  effective: true,
-  shadowsGlobal: false,
 };
+
+test("catalogKey formats project/agent pairings with a placeholder for null", () => {
+  expect(catalogKey("p1", "agent-1")).toBe("p1::agent-1");
+  expect(catalogKey(null, "agent-1")).toBe("-::agent-1");
+  expect(catalogKey("p1", null)).toBe("p1::-");
+  expect(catalogKey(null, null)).toBe("-::-");
+});
 
 test("loadAgents caches the project's agents", async () => {
   reset();
@@ -65,161 +83,224 @@ test("loadAgents drops out-of-order responses (a stale fetch can't clobber newer
   spy.mockRestore();
 });
 
-test("project command CRUD calls the generated APIs and updates only that project's cache", async () => {
+test("loadSlashCatalog drops out-of-order responses (a stale fetch can't clobber newer data)", async () => {
   reset();
-  const listed = spyOn(commands, "listProjectCommands").mockResolvedValue({ status: "ok", data: [projectCommand] });
-  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: projectCommand });
-  const updated = spyOn(commands, "updateProjectCommand").mockResolvedValue({
+  type CatalogResult = Awaited<ReturnType<typeof commands.slashCatalog>>;
+  const resolvers: Array<(v: CatalogResult) => void> = [];
+  const spy = spyOn(commands, "slashCatalog").mockImplementation(() => new Promise<CatalogResult>((resolve) => resolvers.push(resolve)));
+  const first = useNative.getState().loadSlashCatalog(LOCAL_RUNNER, "p1", "agent-1"); // older fetch…
+  const second = useNative.getState().loadSlashCatalog(LOCAL_RUNNER, "p1", "agent-1"); // …superseded by this one
+  resolvers[1]({ status: "ok", data: [{ ...globalSlashEntry, name: "newer" }] });
+  await second;
+  resolvers[0]({ status: "ok", data: [{ ...globalSlashEntry, name: "older" }] });
+  await first;
+  expect(useNative.getState().slashCatalogByKey[p1Agent1Key].map((e) => e.name)).toEqual(["newer"]);
+  spy.mockRestore();
+});
+
+test("global command CRUD calls the generated APIs and updates the global cache", async () => {
+  reset();
+  const deployCommand: CommandFileInfo = { ...globalCommand, name: "deploy", revision: "rev-deploy" };
+  // Successful mutations refresh `globalCommands` from the server afterwards
+  // (see refreshAfterGlobalCommandMutation), so each mutation's own reload
+  // is sequenced to reflect the post-mutation server state.
+  const listed = spyOn(commands, "globalCommandList")
+    .mockResolvedValueOnce({ status: "ok", data: [globalCommand] })
+    .mockResolvedValueOnce({ status: "ok", data: [globalCommand, deployCommand] })
+    .mockResolvedValueOnce({ status: "ok", data: [{ ...globalCommand, description: "Updated" }, deployCommand] })
+    .mockResolvedValueOnce({ status: "ok", data: [deployCommand] });
+  const created = spyOn(commands, "globalCommandCreate").mockResolvedValue({ status: "ok", data: deployCommand });
+  const updated = spyOn(commands, "globalCommandUpdate").mockResolvedValue({
     status: "ok",
-    data: { ...projectCommand, description: "Updated" },
+    data: { ...globalCommand, description: "Updated" },
   });
-  const deleted = spyOn(commands, "deleteProjectCommand").mockResolvedValue({ status: "ok", data: null });
+  const deleted = spyOn(commands, "globalCommandDelete").mockResolvedValue({ status: "ok", data: null });
+  // Defensive: guards against a slash catalog key tracked by an earlier test
+  // (module-level bookkeeping isn't reset between tests) triggering a real,
+  // unmocked IPC call during this test's mutation refreshes.
+  const slashCatalog = spyOn(commands, "slashCatalog").mockResolvedValue({ status: "ok", data: [] });
 
-  await useNative.getState().loadProjectCommands(LOCAL_RUNNER, "p1");
-  expect(listed).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
-  expect(useNative.getState().projectCommandsByProject.p1).toEqual([projectCommand]);
+  await useNative.getState().loadGlobalCommands(LOCAL_RUNNER);
+  expect(listed).toHaveBeenCalledWith(LOCAL_RUNNER);
+  expect(useNative.getState().globalCommands).toEqual([globalCommand]);
 
-  await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", {
-    name: "review",
-    description: "Review the change",
-    template: "Review $ARGUMENTS",
+  await useNative.getState().createGlobalCommand(LOCAL_RUNNER, {
+    name: "deploy",
+    description: deployCommand.description,
+    template: deployCommand.template,
     agent: null,
     model: null,
     subtask: false,
   });
-  expect(created).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", expect.objectContaining({ name: "review" }));
+  expect(created).toHaveBeenCalledWith(LOCAL_RUNNER, expect.objectContaining({ name: "deploy" }));
+  expect(
+    useNative
+      .getState()
+      .globalCommands?.map((c) => c.name)
+      .sort(),
+  ).toEqual(["deploy", "review"]);
 
-  await useNative.getState().updateProjectCommand(LOCAL_RUNNER, "p1", projectCommand, {
+  await useNative.getState().updateGlobalCommand(LOCAL_RUNNER, globalCommand, {
     description: "Updated",
-    template: projectCommand.template,
+    template: globalCommand.template,
     agent: null,
     model: null,
     subtask: false,
   });
-  expect(updated).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "review", "rev-1", expect.objectContaining({ description: "Updated" }));
-  expect(useNative.getState().projectCommandsByProject.p1[0]?.description).toBe("Updated");
+  expect(updated).toHaveBeenCalledWith(LOCAL_RUNNER, "review", "rev-1", expect.objectContaining({ description: "Updated" }));
+  expect(useNative.getState().globalCommands?.find((c) => c.name === "review")?.description).toBe("Updated");
 
-  await useNative.getState().deleteProjectCommand(LOCAL_RUNNER, "p1", { ...projectCommand, description: "Updated" });
-  expect(deleted).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "review", "rev-1");
-  expect(useNative.getState().projectCommandsByProject.p1).toEqual([]);
+  await useNative.getState().deleteGlobalCommand(LOCAL_RUNNER, { ...globalCommand, description: "Updated" });
+  expect(deleted).toHaveBeenCalledWith(LOCAL_RUNNER, "review", "rev-1");
+  expect(useNative.getState().globalCommands).toEqual([deployCommand]);
 
   listed.mockRestore();
   created.mockRestore();
   updated.mockRestore();
   deleted.mockRestore();
+  slashCatalog.mockRestore();
 });
-test("successful project command create and delete refresh effective command cache", async () => {
+
+test("successful global command create and delete refresh every loaded slash catalog", async () => {
   reset();
-  const globalCommand = { ...effectiveGlobalCommand, name: "deploy" };
-  const projectDeploy = { ...projectCommand, name: "deploy" };
-  const effectiveProjectDeploy: CommandInfo = { ...globalCommand, origin: "project", shadowsGlobal: true };
-  const nativeCommands = spyOn(commands, "nativeCommands")
-    .mockResolvedValueOnce({ status: "ok", data: [globalCommand] })
+  const deployGlobal = { ...globalSlashEntry, name: "deploy" };
+  const projectDeploy = { ...globalCommand, name: "deploy" };
+  const effectiveProjectDeploy: SlashEntryInfo = { ...deployGlobal, origin: "project", shadowsGlobal: true };
+  const slashCatalog = spyOn(commands, "slashCatalog")
+    .mockResolvedValueOnce({ status: "ok", data: [deployGlobal] })
     .mockResolvedValueOnce({ status: "ok", data: [effectiveProjectDeploy] })
-    .mockResolvedValueOnce({ status: "ok", data: [globalCommand] });
-  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: projectDeploy });
-  const deleted = spyOn(commands, "deleteProjectCommand").mockResolvedValue({ status: "ok", data: null });
+    .mockResolvedValueOnce({ status: "ok", data: [deployGlobal] });
+  const created = spyOn(commands, "globalCommandCreate").mockResolvedValue({ status: "ok", data: projectDeploy });
+  const deleted = spyOn(commands, "globalCommandDelete").mockResolvedValue({ status: "ok", data: null });
+  const listed = spyOn(commands, "globalCommandList").mockResolvedValue({ status: "ok", data: [] });
 
-  await useNative.getState().loadCommands(LOCAL_RUNNER, "p1");
-  await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", projectDeploy);
-  expect(useNative.getState().commandsByProject.p1).toEqual([effectiveProjectDeploy]);
+  await useNative.getState().loadSlashCatalog(LOCAL_RUNNER, "p1", "agent-1");
+  await useNative.getState().createGlobalCommand(LOCAL_RUNNER, projectDeploy);
+  expect(useNative.getState().slashCatalogByKey[p1Agent1Key]).toEqual([effectiveProjectDeploy]);
 
-  await useNative.getState().deleteProjectCommand(LOCAL_RUNNER, "p1", projectDeploy);
-  expect(useNative.getState().commandsByProject.p1).toEqual([globalCommand]);
-  expect(nativeCommands).toHaveBeenCalledTimes(3);
+  await useNative.getState().deleteGlobalCommand(LOCAL_RUNNER, projectDeploy);
+  expect(useNative.getState().slashCatalogByKey[p1Agent1Key]).toEqual([deployGlobal]);
+  expect(slashCatalog).toHaveBeenCalledTimes(3);
 
-  nativeCommands.mockRestore();
+  slashCatalog.mockRestore();
   created.mockRestore();
   deleted.mockRestore();
+  listed.mockRestore();
 });
 
-test("a successful command mutation invalidates a deferred stale load", async () => {
+test("a successful global command mutation invalidates a deferred stale slash catalog load", async () => {
   reset();
-  type CommandsResult = Awaited<ReturnType<typeof commands.nativeCommands>>;
-  const resolvers: Array<(result: CommandsResult) => void> = [];
-  const nativeCommands = spyOn(commands, "nativeCommands").mockImplementation(
-    () => new Promise<CommandsResult>((resolve) => resolvers.push(resolve)),
+  type CatalogResult = Awaited<ReturnType<typeof commands.slashCatalog>>;
+  const resolvers: Array<(result: CatalogResult) => void> = [];
+  const slashCatalog = spyOn(commands, "slashCatalog").mockImplementation(
+    () => new Promise<CatalogResult>((resolve) => resolvers.push(resolve)),
   );
-  const createdCommand = { ...projectCommand, name: "ship" };
-  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: createdCommand });
-  const staleLoad = useNative.getState().loadCommands(LOCAL_RUNNER, "p1");
-  const mutation = useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", createdCommand);
+  const createdCommand = { ...globalCommand, name: "ship" };
+  const created = spyOn(commands, "globalCommandCreate").mockResolvedValue({ status: "ok", data: createdCommand });
+  const listed = spyOn(commands, "globalCommandList").mockResolvedValue({ status: "ok", data: [] });
+  const staleLoad = useNative.getState().loadSlashCatalog(LOCAL_RUNNER, "p1", "agent-1");
+  const mutation = useNative.getState().createGlobalCommand(LOCAL_RUNNER, createdCommand);
 
   await Promise.resolve();
-  expect(nativeCommands).toHaveBeenCalledTimes(2);
-  resolvers[1]({ status: "ok", data: [{ ...effectiveGlobalCommand, name: "ship", origin: "project", shadowsGlobal: true }] });
+  expect(slashCatalog).toHaveBeenCalledTimes(2);
+  resolvers[1]({ status: "ok", data: [{ ...globalSlashEntry, name: "ship", origin: "project", shadowsGlobal: true }] });
   await mutation;
-  resolvers[0]({ status: "ok", data: [effectiveGlobalCommand] });
+  resolvers[0]({ status: "ok", data: [globalSlashEntry] });
   await staleLoad;
 
-  expect(useNative.getState().commandsByProject.p1).toEqual([
-    { ...effectiveGlobalCommand, name: "ship", origin: "project", shadowsGlobal: true },
+  expect(useNative.getState().slashCatalogByKey[p1Agent1Key]).toEqual([
+    { ...globalSlashEntry, name: "ship", origin: "project", shadowsGlobal: true },
   ]);
-  nativeCommands.mockRestore();
+  slashCatalog.mockRestore();
   created.mockRestore();
+  listed.mockRestore();
 });
 
-test("a successful command create ignores a failed effective-command reload", async () => {
+test("a successful global command create ignores a failed slash catalog reload", async () => {
   reset();
-  const cachedCommand = { ...effectiveGlobalCommand, name: "deploy" };
-  const createdCommand = { ...projectCommand, name: "deploy" };
-  const nativeCommands = spyOn(commands, "nativeCommands")
-    .mockResolvedValueOnce({ status: "ok", data: [cachedCommand] })
-    .mockRejectedValueOnce(new Error("effective commands unavailable"));
-  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: createdCommand });
+  const cachedEntry = { ...globalSlashEntry, name: "deploy" };
+  const createdCommand = { ...globalCommand, name: "deploy" };
+  const slashCatalog = spyOn(commands, "slashCatalog")
+    .mockResolvedValueOnce({ status: "ok", data: [cachedEntry] })
+    .mockRejectedValueOnce(new Error("slash catalog unavailable"));
+  const created = spyOn(commands, "globalCommandCreate").mockResolvedValue({ status: "ok", data: createdCommand });
+  const listed = spyOn(commands, "globalCommandList").mockResolvedValue({ status: "ok", data: [] });
 
-  await useNative.getState().loadCommands(LOCAL_RUNNER, "p1");
-  const result = await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", createdCommand);
+  await useNative.getState().loadSlashCatalog(LOCAL_RUNNER, "p1", "agent-1");
+  const result = await useNative.getState().createGlobalCommand(LOCAL_RUNNER, createdCommand);
 
   expect(result).toEqual({ status: "success" });
-  expect(useNative.getState().commandsByProject.p1).toEqual([cachedCommand]);
-  nativeCommands.mockRestore();
+  expect(useNative.getState().slashCatalogByKey[p1Agent1Key]).toEqual([cachedEntry]);
+  slashCatalog.mockRestore();
   created.mockRestore();
+  listed.mockRestore();
 });
 
-test("a successful command mutation invalidates a deferred stale project-command load", async () => {
+test("a successful global command mutation invalidates a deferred stale global command load", async () => {
   reset();
-  type CommandsResult = Awaited<ReturnType<typeof commands.listProjectCommands>>;
+  type CommandsResult = Awaited<ReturnType<typeof commands.globalCommandList>>;
   const resolvers: Array<(result: CommandsResult) => void> = [];
-  const listed = spyOn(commands, "listProjectCommands").mockImplementation(
+  const listed = spyOn(commands, "globalCommandList").mockImplementation(
     () => new Promise<CommandsResult>((resolve) => resolvers.push(resolve)),
   );
-  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: { ...projectCommand, name: "ship" } });
+  const created = spyOn(commands, "globalCommandCreate").mockResolvedValue({ status: "ok", data: { ...globalCommand, name: "ship" } });
+  // Defensive: guards against a slash catalog key tracked by an earlier test
+  // triggering a real, unmocked IPC call during this mutation's refresh.
+  const slashCatalog = spyOn(commands, "slashCatalog").mockResolvedValue({ status: "ok", data: [] });
 
-  const staleLoad = useNative.getState().loadProjectCommands(LOCAL_RUNNER, "p1");
-  await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", { ...projectCommand, name: "ship" });
-  resolvers[0]({ status: "ok", data: [projectCommand] });
+  const staleLoad = useNative.getState().loadGlobalCommands(LOCAL_RUNNER); // older fetch…
+  const mutation = useNative.getState().createGlobalCommand(LOCAL_RUNNER, { ...globalCommand, name: "ship" }); // …whose own refresh supersedes it
+
+  await Promise.resolve();
+  expect(listed).toHaveBeenCalledTimes(2);
+  // The mutation's own refresh (the newer fetch) resolves first with the authoritative list.
+  resolvers[1]({ status: "ok", data: [{ ...globalCommand, name: "ship" }] });
+  await mutation;
+  // The original stale load resolves late with outdated data — it must be ignored.
+  resolvers[0]({ status: "ok", data: [globalCommand] });
   await staleLoad;
 
-  expect(useNative.getState().projectCommandsByProject.p1.map((command) => command.name)).toEqual(["ship"]);
+  expect(useNative.getState().globalCommands?.map((command) => command.name)).toEqual(["ship"]);
   listed.mockRestore();
   created.mockRestore();
+  slashCatalog.mockRestore();
 });
 
-test("command conflicts return structured outcomes and reload the latest project cache", async () => {
+test("global command conflicts return structured outcomes and reload the latest global cache", async () => {
   reset();
-  const listed = spyOn(commands, "listProjectCommands").mockResolvedValue({
+  const listed = spyOn(commands, "globalCommandList").mockResolvedValue({
     status: "ok",
-    data: [{ ...projectCommand, description: "Latest", revision: "rev-2" }],
+    data: [{ ...globalCommand, description: "Latest", revision: "rev-2" }],
   });
-  const updated = spyOn(commands, "updateProjectCommand").mockResolvedValue({
+  const updated = spyOn(commands, "globalCommandUpdate").mockResolvedValue({
     status: "error",
     error: { message: "revision conflict" },
   });
 
-  const result = await useNative.getState().updateProjectCommand(LOCAL_RUNNER, "p1", projectCommand, {
+  const result = await useNative.getState().updateGlobalCommand(LOCAL_RUNNER, globalCommand, {
     description: "Mine",
-    template: projectCommand.template,
+    template: globalCommand.template,
     agent: null,
     model: null,
     subtask: false,
   });
 
   expect(result).toEqual({ status: "conflict", message: "revision conflict" });
-  expect(listed).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
-  expect(useNative.getState().projectCommandsByProject.p1[0]?.description).toBe("Latest");
+  expect(listed).toHaveBeenCalledWith(LOCAL_RUNNER);
+  expect(useNative.getState().globalCommands?.[0]?.description).toBe("Latest");
   listed.mockRestore();
   updated.mockRestore();
+});
+
+test("a failed slash catalog load leaves the cache untouched", async () => {
+  reset();
+  const spy = spyOn(commands, "slashCatalog").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+  await useNative.getState().loadSlashCatalog(LOCAL_RUNNER, "p1", "agent-1");
+  expect(useNative.getState().slashCatalogByKey[p1Agent1Key]).toBeUndefined();
+  spy.mockRestore();
 });
 
 test("loadTodos caches a session's todo list", async () => {
@@ -236,17 +317,6 @@ test("loadTodos caches a session's todo list", async () => {
   const todos = useNative.getState().todosBySession[s1];
   expect(todos).toHaveLength(2);
   expect(todos[1]).toEqual({ content: "step two", status: "in_progress" });
-  spy.mockRestore();
-});
-
-test("a failed command leaves the cache untouched", async () => {
-  reset();
-  const spy = spyOn(commands, "nativeCommands").mockResolvedValue({
-    status: "error",
-    error: { message: "boom" },
-  });
-  await useNative.getState().loadCommands(LOCAL_RUNNER, "p1");
-  expect(useNative.getState().commandsByProject.p1).toBeUndefined();
   spy.mockRestore();
 });
 

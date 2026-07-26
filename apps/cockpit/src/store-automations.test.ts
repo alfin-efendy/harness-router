@@ -30,7 +30,6 @@ const detail: AutomationHookDetail = {
 };
 
 const listAutomationHooks = mock(async () => ({ status: "ok" as const, data: [hook] }));
-const projectCommand = { name: "audit", description: "", template: "", agent: null, model: null, subtask: false, revision: "rev-1" };
 const automationHookDetail = mock(async () => ({ status: "ok" as const, data: detail }));
 const createAutomationHook = mock(async () => ({ status: "ok" as const, data: hook }));
 const updateAutomationHook = mock(async () => ({ status: "ok" as const, data: hook }));
@@ -54,11 +53,6 @@ mock.module("./bindings", () => ({
     deleteAutomationHook,
     testAutomationHook,
     nativeAgents: async () => ({ status: "ok" as const, data: [] }),
-    nativeCommands: async () => ({ status: "ok" as const, data: [] }),
-    listProjectCommands: async () => ({ status: "ok" as const, data: [] }),
-    createProjectCommand: async () => ({ status: "ok" as const, data: projectCommand }),
-    updateProjectCommand: async () => ({ status: "ok" as const, data: projectCommand }),
-    deleteProjectCommand: async () => ({ status: "ok" as const, data: null }),
     sessionTodos: async () => ({ status: "ok" as const, data: [] }),
     exportSession: async () => ({ status: "ok" as const, data: "" }),
     importSession: async () => ({ status: "ok" as const, data: null }),

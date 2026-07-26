@@ -103,8 +103,9 @@ pub struct RunnerDeps {
     pub attachments_dir: Option<PathBuf>,
     /// Task-artifact service shared with the control plane.
     pub artifacts: Arc<crate::artifacts::ArtifactService>,
-    /// Plugin-bundled skill directories folded in beside the worktree/global
-    /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
+    /// Extra skill directories folded in beside the worktree/global ones —
+    /// see `SessionCtx::extra_skill_dirs` for why this no longer carries
+    /// plugin-bundled dirs in production.
     pub extra_skill_dirs: Vec<PathBuf>,
     /// Live handle to the daemon's extension host (Track D), threaded
     /// straight from `SessionCtx::extension_events` at session start — see
@@ -487,18 +488,27 @@ async fn command_root(deps: &RunnerDeps) -> PathBuf {
     }
 }
 
-/// Resolve a slash command from its current project root. Agent overrides use
-/// the matching root's registry; absent command agent metadata leaves the
-/// session's active-worktree agent unchanged.
+/// Resolve a slash command or user-invocable skill from its current project
+/// root. Agent routing: explicit `agent:` frontmatter wins; otherwise the
+/// first `@name` mention of a known agent in the expanded prompt routes the
+/// turn. Absent both, the session's active agent is unchanged.
 async fn resolve_slash_command(
     deps: &RunnerDeps,
     input: &str,
 ) -> Option<(ResolvedCommand, Option<Agent>)> {
     let root = command_root(deps).await;
-    let commands = CommandRegistry::load(&root);
+    let catalog =
+        super::slash_catalog::SlashCatalog::load(Some(&root), deps.allowed_skills.as_deref());
     let agents = AgentRegistry::load(&root);
-    let resolved = commands.resolve(input)?;
-    let agent = resolved.agent.as_deref().and_then(|name| agents.get(name));
+    let resolved = catalog.resolve(input)?;
+    let agent = match resolved.agent.as_deref() {
+        Some(name) => agents.get(name),
+        None => {
+            let known: Vec<String> = agents.all().into_iter().map(|a| a.name).collect();
+            super::slash_catalog::first_agent_mention(&resolved.prompt, &known)
+                .and_then(|name| agents.get(name))
+        }
+    };
     Some((resolved, agent))
 }
 

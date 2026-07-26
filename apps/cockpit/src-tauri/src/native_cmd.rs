@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tauri::State;
 
 pub use ryuzi_core::api::types::{
-    AgentInfo, CommandInfo, ProjectCommandInfo, ProjectCommandInputDto, ProjectCommandMutationDto,
-    QueuedMessageInfo, TodoItem,
+    AgentInfo, CommandFileInfo, CommandFileInputDto, CommandFileMutationDto, QueuedMessageInfo,
+    SlashEntryInfo, TodoItem,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -32,19 +32,20 @@ pub async fn native_agents(
         .await
 }
 
-/// The slash commands available for a project.
+/// The unified "/" autocomplete catalog for a project/agent pairing.
 #[tauri::command]
 #[specta::specta]
-pub async fn native_commands(
+pub async fn slash_catalog(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    project_id: String,
-) -> R<Vec<CommandInfo>> {
+    project_id: Option<String>,
+    agent_id: Option<String>,
+) -> R<Vec<SlashEntryInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
-            "native_commands",
-            serde_json::json!({ "project_id": project_id }),
+            "slash_catalog",
+            serde_json::json!({ "project_id": project_id, "agent_id": agent_id }),
         )
         .await
 }
@@ -68,70 +69,59 @@ pub async fn session_todos(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_project_commands(
+pub async fn global_command_list(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    project_id: String,
-) -> R<Vec<ProjectCommandInfo>> {
+) -> R<Vec<CommandFileInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
-        .rpc(
-            "list_project_commands",
-            serde_json::json!({ "project_id": project_id }),
-        )
+        .rpc("global_command_list", serde_json::json!({}))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn read_project_command(
+pub async fn global_command_read(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    project_id: String,
     name: String,
-) -> R<ProjectCommandInfo> {
+) -> R<CommandFileInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("global_command_read", serde_json::json!({ "name": name }))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn global_command_create(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    input: CommandFileInputDto,
+) -> R<CommandFileInfo> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
-            "read_project_command",
-            serde_json::json!({ "project_id": project_id, "name": name }),
+            "global_command_create",
+            serde_json::json!({ "input": input }),
         )
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn create_project_command(
+pub async fn global_command_update(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    project_id: String,
-    input: ProjectCommandInputDto,
-) -> R<ProjectCommandInfo> {
-    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client
-        .rpc(
-            "create_project_command",
-            serde_json::json!({ "project_id": project_id, "input": input }),
-        )
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn update_project_command(
-    engine: Engine<'_>,
-    runner_id: Option<String>,
-    project_id: String,
     name: String,
     revision: String,
-    input: ProjectCommandMutationDto,
-) -> R<ProjectCommandInfo> {
+    input: CommandFileMutationDto,
+) -> R<CommandFileInfo> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
-            "update_project_command",
+            "global_command_update",
             serde_json::json!({
-                "project_id": project_id,
                 "name": name,
                 "revision": revision,
                 "input": input,
@@ -142,19 +132,17 @@ pub async fn update_project_command(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_project_command(
+pub async fn global_command_delete(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    project_id: String,
     name: String,
     revision: String,
 ) -> R<()> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
-            "delete_project_command",
+            "global_command_delete",
             serde_json::json!({
-                "project_id": project_id,
                 "name": name,
                 "revision": revision,
             }),

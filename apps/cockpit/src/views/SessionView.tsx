@@ -1,19 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
-import { Button, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
+import { Button, MenuPanel, Textarea } from "@ryuzi/ui";
 import { commands, type SearchEntryInfo, type TurnInput } from "@/bindings";
 import { useStore, type ChatOptions } from "@/store";
 import { LOCAL_RUNNER, isSession, refKey } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
-import { useNative } from "@/store-native";
+import { catalogKey, useNative } from "@/store-native";
 import { useAgents } from "@/store-agents";
 import { delegationSessionKey, useDelegation } from "@/store-delegation";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { sessionIsReadOnly, sessionPrimaryLabel } from "@/lib/session-primary";
 import { insertAgentMention, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
+import { activeSlashQuery, matchSlashEntries } from "@/lib/slash-autocomplete";
+import { SlashCommandMenu } from "@/components/composer/SlashCommandMenu";
 import { ContextPickerMenu } from "@/components/composer/ContextPickerMenu";
 import {
   activeContextQuery,
@@ -101,8 +103,8 @@ export function SessionView() {
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectId = project?.projectId;
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
-  const loadCommands = useNative((s) => s.loadCommands);
-  const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+  const loadSlashCatalog = useNative((s) => s.loadSlashCatalog);
+  const slashEntries = useNative((s) => s.slashCatalogByKey[catalogKey(projectId ?? null, session?.primaryAgentId ?? null)] ?? []);
 
   // Hydrate child-run metadata as soon as this transcript is mounted. The
   // store deduplicates requests, so opening the Agents panel never creates a
@@ -112,9 +114,8 @@ export function SessionView() {
   }, [loadDelegation, runnerId, mountedSessionPk]);
 
   useEffect(() => {
-    // Slash commands are project metadata on the local engine.
-    if (projectId) void loadCommands(LOCAL_RUNNER, projectId);
-  }, [projectId, loadCommands]);
+    void loadSlashCatalog(LOCAL_RUNNER, projectId ?? null, session?.primaryAgentId ?? null);
+  }, [projectId, session?.primaryAgentId, loadSlashCatalog]);
 
   // Refresh edit-card diff stats after every turn, independent of the right
   // panel (which only fetches while open/on its own "review" tab).
@@ -179,18 +180,11 @@ export function SessionView() {
     setDismissedSignature(null);
   }, [draftKey]);
 
-  const slashQuery = useMemo(() => {
-    const trimmed = draft.trimStart();
-    if (!trimmed.startsWith("/") || trimmed.includes(" ")) return null;
-    return trimmed.slice(1).toLowerCase();
-  }, [draft]);
-  const slashMatches = useMemo(() => {
-    if (slashQuery === null) return [];
-    return nativeCommands
-      .filter((c) => c.effective)
-      .filter((c) => c.name.toLowerCase().startsWith(slashQuery))
-      .slice(0, 6);
-  }, [nativeCommands, slashQuery]);
+  const slashQuery = useMemo(() => activeSlashQuery(draft), [draft]);
+  const slashMatches = useMemo(
+    () => matchSlashEntries(slashEntries, slashQuery, "session", projectId != null),
+    [slashEntries, slashQuery, projectId],
+  );
   const contextQuery = useMemo(() => activeContextQuery(draft, mentionCaret), [draft, mentionCaret]);
   const contextQueryText = contextQuery?.query ?? null;
   const contextPickerContextGroups = useMemo(
@@ -549,17 +543,7 @@ export function SessionView() {
                   <span className="text-[12px] text-muted-foreground">No matches.</span>
                 </MenuPanel>
               )}
-              {slashMatches.length > 0 && (
-                <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
-                  <MenuSectionLabel>Commands</MenuSectionLabel>
-                  {slashMatches.map((cmd) => (
-                    <MenuItem key={cmd.name} onClick={() => updateDraft(`/${cmd.name} `)} className="font-medium">
-                      <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
-                      <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
-                    </MenuItem>
-                  ))}
-                </MenuPanel>
-              )}
+              <SlashCommandMenu entries={slashMatches} onPick={(entry) => updateDraft(`/${entry.name} `)} />
 
               <div className="relative flex items-center gap-1.5 px-2.5 pb-2.5 pt-1.5">
                 <Button

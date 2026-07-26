@@ -6,13 +6,15 @@ import { commands, type AgentSummaryInfo, type BranchList } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useNav, choosePrimaryAgent, LAST_PRIMARY_AGENT_KEY } from "@/store-nav";
-import { useNative } from "@/store-native";
+import { catalogKey, useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS } from "@/constants";
 import { useAgents } from "@/store-agents";
 import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
 import { AgentMentionMenu } from "@/components/composer/AgentMentionMenu";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
+import { activeSlashQuery, matchSlashEntries } from "@/lib/slash-autocomplete";
+import { SlashCommandMenu } from "@/components/composer/SlashCommandMenu";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
 import { startVoiceDictation } from "@/lib/voice";
@@ -81,15 +83,14 @@ export function HomeView() {
     registry?.defaultAgentId ?? null,
   );
   const hasExecutablePrimary = primaryAgentId !== null;
-  const loadCommands = useNative((s) => s.loadCommands);
-  const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+  const loadSlashCatalog = useNative((s) => s.loadSlashCatalog);
+  const slashEntries = useNative((s) => s.slashCatalogByKey[catalogKey(projectId ?? null, primaryAgentId)] ?? []);
   const connectionsLoaded = useConnections((s) => s.loaded);
   const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
-    // Slash commands are project metadata on the local engine.
-    if (projectId) void loadCommands(LOCAL_RUNNER, projectId);
-  }, [projectId, loadCommands]);
+    void loadSlashCatalog(LOCAL_RUNNER, projectId ?? null, primaryAgentId);
+  }, [projectId, primaryAgentId, loadSlashCatalog]);
 
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
@@ -131,18 +132,11 @@ export function HomeView() {
     setContextHits([]);
   }, [draftKey]);
 
-  const slashQuery = useMemo(() => {
-    const trimmed = draft.trimStart();
-    if (!trimmed.startsWith("/") || trimmed.includes(" ")) return null;
-    return trimmed.slice(1).toLowerCase();
-  }, [draft]);
-  const slashMatches = useMemo(() => {
-    if (slashQuery === null) return [];
-    return nativeCommands
-      .filter((c) => c.effective)
-      .filter((c) => c.name.toLowerCase().startsWith(slashQuery))
-      .slice(0, 6);
-  }, [nativeCommands, slashQuery]);
+  const slashQuery = useMemo(() => activeSlashQuery(draft), [draft]);
+  const slashMatches = useMemo(
+    () => matchSlashEntries(slashEntries, slashQuery, "home", projectId != null),
+    [slashEntries, slashQuery, projectId],
+  );
   const mentionQuery = useMemo(() => activeAgentMentionQuery(draft, mentionCaret), [draft, mentionCaret]);
   const mentionMatches = useMemo(
     () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", primaryAgentId, mentions),
@@ -306,17 +300,7 @@ export function HomeView() {
               onClose={dismissMentionMenu}
             />
           )}
-          {slashMatches.length > 0 && (
-            <MenuPanel onClose={() => undefined} className="bottom-full left-3 z-50 mb-1.5 w-[320px]">
-              <MenuSectionLabel>Commands</MenuSectionLabel>
-              {slashMatches.map((cmd) => (
-                <MenuItem key={cmd.name} onClick={() => updateDraft(`/${cmd.name} `)} className="font-medium">
-                  <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
-                  <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
-                </MenuItem>
-              ))}
-            </MenuPanel>
-          )}
+          <SlashCommandMenu entries={slashMatches} onPick={(entry) => updateDraft(`/${entry.name} `)} />
           {contextHits.length > 0 && (
             <MenuPanel onClose={() => setContextHits([])} className="bottom-full left-3 z-50 mb-1.5 w-[360px]">
               <MenuSectionLabel>Context</MenuSectionLabel>

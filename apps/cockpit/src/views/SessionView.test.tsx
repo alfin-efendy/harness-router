@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AgentSummaryInfo, CmdError, CommandInfo, OpenTarget, Project, Result, SearchEntryInfo, Session } from "@/bindings";
+import type { AgentSummaryInfo, CmdError, OpenTarget, Project, Result, SearchEntryInfo, Session, SlashEntryInfo } from "@/bindings";
 import { LOCAL_RUNNER, refKey, sessKey } from "@/lib/session-key";
 import { useNative } from "@/store-native";
 
@@ -13,7 +13,10 @@ const openIn = mock((): Promise<Result<null, CmdError>> => Promise.resolve({ sta
 const sessionWorkdir = mock(
   (_runnerId: string, _sessionPk: string): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "C:\\code\\demo" }),
 );
-const nativeCommands = mock((): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+const slashCatalog = mock(
+  (_runnerId: string | null, _projectId: string | null, _agentId: string | null): Promise<Result<SlashEntryInfo[], CmdError>> =>
+    Promise.resolve({ status: "ok", data: [] }),
+);
 // TodoPanel (always mounted by SessionView) fires this on mount — stubbed ok:[]
 // so its effect resolves cleanly; TodoPanel itself renders null for an empty list.
 const sessionTodos = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
@@ -110,7 +113,7 @@ mock.module("@/bindings", () => ({
     listOpenTargets,
     openIn,
     sessionWorkdir,
-    nativeCommands,
+    slashCatalog,
     sessionTodos,
     sessionQueue,
     continueSession,
@@ -254,12 +257,13 @@ function seed(runnerId: string, sessionOverrides: Partial<Session> = {}, agents:
   });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ loaded: true });
-  useNative.setState({ commandsByProject: {}, queuedBySession: {} });
+  useNative.setState({ slashCatalogByKey: {}, queuedBySession: {} });
 }
 
 beforeEach(() => {
   drawerMounts.length = 0;
   listOpenTargets.mockClear();
+  slashCatalog.mockClear();
   // `mockClear()` only resets call history; a prior test's
   // `mockRejectedValueOnce`/`mockResolvedValue` override otherwise leaks
   // into later tests sharing this same module-level mock.
@@ -291,7 +295,7 @@ afterEach(() => {
   });
   useAgents.setState({ registry: null, models: [] });
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
-  useNative.setState({ commandsByProject: {}, queuedBySession: {} });
+  useNative.setState({ slashCatalogByKey: {}, queuedBySession: {} });
   useDelegation.setState({
     bySession: {},
     rootRunBySession: {},
@@ -449,60 +453,80 @@ test("resolves each primary turn dispatch against that row's durable owner", asy
 });
 
 test("only suggests each effective slash command from the catalog", async () => {
-  const catalog: CommandInfo[] = [
+  const catalog: SlashEntryInfo[] = [
     {
       name: "ship",
       description: "Project ship",
+      kind: "command",
+      origin: "project",
+      home: true,
+      session: true,
+      requiresProject: false,
+      effective: true,
+      shadowsGlobal: true,
       agent: null,
       model: null,
       subtask: false,
-      origin: "project",
-      effective: true,
-      shadowsGlobal: true,
     },
     {
       name: "ship",
       description: "Global ship",
+      kind: "command",
+      origin: "global",
+      home: true,
+      session: true,
+      requiresProject: false,
+      effective: false,
+      shadowsGlobal: false,
       agent: null,
       model: null,
       subtask: false,
-      origin: "global",
-      effective: false,
-      shadowsGlobal: false,
     },
     {
       name: "init",
       description: "Project init",
+      kind: "command",
+      origin: "project",
+      home: true,
+      session: true,
+      requiresProject: false,
+      effective: false,
+      shadowsGlobal: true,
       agent: null,
       model: null,
       subtask: false,
-      origin: "project",
-      effective: false,
-      shadowsGlobal: true,
     },
     {
       name: "init",
       description: "Global init",
+      kind: "command",
+      origin: "global",
+      home: true,
+      session: true,
+      requiresProject: false,
+      effective: false,
+      shadowsGlobal: false,
       agent: null,
       model: null,
       subtask: false,
-      origin: "global",
-      effective: false,
-      shadowsGlobal: false,
     },
     {
       name: "init",
       description: "Built-in init",
+      kind: "command",
+      origin: "builtin",
+      home: true,
+      session: true,
+      requiresProject: false,
+      effective: true,
+      shadowsGlobal: false,
       agent: null,
       model: null,
       subtask: false,
-      origin: "builtin",
-      effective: true,
-      shadowsGlobal: false,
     },
   ];
   seed(LOCAL_RUNNER);
-  nativeCommands.mockResolvedValueOnce({ status: "ok", data: catalog });
+  slashCatalog.mockResolvedValueOnce({ status: "ok", data: catalog });
   render(<SessionView />);
 
   fireEvent.change(screen.getByPlaceholderText("Ask for follow-up changes"), { target: { value: "/" } });
@@ -514,6 +538,54 @@ test("only suggests each effective slash command from the catalog", async () => 
   expect(screen.getAllByText("/init")).toHaveLength(1);
   expect(screen.queryByText("Project init")).toBeNull();
   expect(screen.queryByText("Global init")).toBeNull();
+});
+
+test("session: /re lists review, a skill entry renders its badge, and picking an entry inserts /name into the draft", async () => {
+  seed(LOCAL_RUNNER);
+  slashCatalog.mockResolvedValueOnce({
+    status: "ok",
+    data: [
+      {
+        name: "review",
+        description: "Review the diff",
+        kind: "command",
+        origin: "builtin",
+        home: false,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+      {
+        name: "research",
+        description: "Research helper skill",
+        kind: "skill",
+        origin: "project",
+        home: true,
+        session: true,
+        requiresProject: false,
+        effective: true,
+        shadowsGlobal: false,
+        agent: null,
+        model: null,
+        subtask: false,
+      },
+    ] satisfies SlashEntryInfo[],
+  });
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "/re" } });
+
+  expect(await screen.findByText("Review the diff")).toBeTruthy();
+  expect(screen.getByText("Research helper skill")).toBeTruthy();
+  expect(screen.getByText("Skill")).toBeTruthy();
+
+  fireEvent.click(screen.getByText("Review the diff"));
+  expect(composer.value).toBe("/review ");
 });
 
 test("normal sessions render their passed approval card only once", async () => {

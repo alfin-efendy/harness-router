@@ -1606,7 +1606,10 @@ impl ControlPlane {
         let mcp_principals = self
             .attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
             .await;
-        let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
+        // Plugin-bundled live skill dirs are no longer discovery sources —
+        // installed skill packs are materialized into ~/.config/ryuzi/skills
+        // by skills_install and reach sessions via the global root.
+        let extra_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
         // Track D: thread the daemon's extension host in only when it has
         // something spawned — `None` keeps every hook fire site a true
         // no-op (zero extra dispatch/await) for the common case, and for

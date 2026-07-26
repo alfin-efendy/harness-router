@@ -1,318 +1,288 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { CommandInfo, Project, ProjectCommandInfo, SelectableModelInfo } from "@/bindings";
+import type { CmdError, CommandFileInfo, Result, SlashEntryInfo } from "@/bindings";
 
-const command: ProjectCommandInfo = {
+const command: CommandFileInfo = {
   name: "audit",
   description: "Review the current change",
   template: "Review $ARGUMENTS and $1",
-  agent: "reviewer",
-  model: "free",
-  subtask: true,
+  agent: null,
+  model: null,
+  subtask: false,
   revision: "rev-1",
 };
 
-const project: Project = {
-  projectId: "p1",
-  name: "Cockpit",
-  workdir: "C:/cockpit",
-  source: null,
-  model: null,
-  effort: null,
-  permMode: "default",
-  createdAt: null,
-  isGit: true,
-};
+const createdCommand: CommandFileInfo = { ...command, name: "ship", description: "", template: "Ship $ARGUMENTS", revision: "rev-2" };
 
-const modelOption: SelectableModelInfo = {
-  kind: "namedRoute",
-  requestValue: "free",
-  displayName: "Smart",
-  preferenceKey: null,
-  supported: [],
-  configuredDefault: null,
-  resolvedDefault: null,
-  defaultSource: "none",
-};
-
-const createdCommand = { ...command, name: "ship", template: "Ship $ARGUMENTS" };
-const effectiveCommands: CommandInfo[] = [
+// "audit" mirrors the editable global command above (so the editor can
+// exclude it from its own "/" suggestions); "sync" and "deploy" are
+// builtin-origin catalog entries, deliberately distinct from the static
+// ["init", "review", "compact"] fallback so reserved-name tests can prove
+// the catalog — not the hardcoded list — wins once it's loaded.
+const catalog: SlashEntryInfo[] = [
   {
     name: "audit",
-    description: "Project audit",
+    description: "Review the current change",
+    kind: "command",
+    origin: "global",
+    home: true,
+    session: true,
+    requiresProject: false,
+    effective: true,
+    shadowsGlobal: false,
     agent: null,
     model: null,
     subtask: false,
-    origin: "project",
+  },
+  {
+    name: "sync",
+    description: "Sync the workspace",
+    kind: "command",
+    origin: "builtin",
+    home: true,
+    session: true,
+    requiresProject: false,
     effective: true,
-    shadowsGlobal: true,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
   },
   {
     name: "deploy",
     description: "Deploy everywhere",
-    agent: null,
-    model: null,
-    subtask: false,
-    origin: "global",
-    effective: true,
-    shadowsGlobal: false,
-  },
-  {
-    name: "init",
-    description: "Initialize the project",
-    agent: null,
-    model: null,
-    subtask: false,
+    kind: "command",
     origin: "builtin",
+    home: false,
+    session: true,
+    requiresProject: true,
     effective: true,
     shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
   },
 ];
-const listProjectCommands = mock(async () => ({ status: "ok" as const, data: [command] }));
-const nativeCommands = mock(async () => ({ status: "ok" as const, data: effectiveCommands }));
-const createProjectCommand = mock(async () => ({ status: "ok" as const, data: createdCommand }));
-const updateProjectCommand = mock(async () => ({ status: "ok" as const, data: command }));
-const deleteProjectCommand = mock(async () => ({ status: "ok" as const, data: null }));
-const nativeAgents = mock(async () => ({
-  status: "ok" as const,
-  data: [{ name: "reviewer", description: "Reviews changes", mode: "subagent", builtin: true }],
-}));
+
+const globalCommandList = mock(async () => ({ status: "ok" as const, data: [command] }));
+const globalCommandCreate = mock(async () => ({ status: "ok" as const, data: createdCommand }));
+const globalCommandUpdate = mock(async () => ({ status: "ok" as const, data: command }));
+const globalCommandDelete = mock((): Promise<Result<null, CmdError>> => Promise.resolve({ status: "ok", data: null }));
+const slashCatalog = mock(async () => ({ status: "ok" as const, data: catalog }));
+const searchFiles = mock(async () => ({ status: "ok" as const, data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { listProjectCommands, createProjectCommand, updateProjectCommand, deleteProjectCommand, nativeAgents, nativeCommands },
+  commands: { globalCommandList, globalCommandCreate, globalCommandUpdate, globalCommandDelete, slashCatalog, searchFiles },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 
-const { CommandsTab, projectCommandNameError, projectCommandPreview } = await import("./CommandsTab");
+const { CommandsTab, deriveReservedCommandNames, globalCommandNameError, globalCommandPreview } = await import("./CommandsTab");
 const { useNative } = await import("@/store-native");
-const { useAgents } = await import("@/store-agents");
-const nativeDeleteProjectCommand = useNative.getState().deleteProjectCommand;
+const { useStore } = await import("@/store");
 
 afterEach(() => {
   cleanup();
-  useNative.setState({
-    projectCommandsByProject: {},
-    commandsByProject: {},
-    agentsByProject: {},
-    deleteProjectCommand: nativeDeleteProjectCommand,
-  });
-  useAgents.setState({ models: [] });
-  listProjectCommands.mockClear();
-  createProjectCommand.mockClear();
-  updateProjectCommand.mockClear();
-  deleteProjectCommand.mockClear();
-  nativeAgents.mockClear();
-  nativeCommands.mockClear();
+  useNative.setState({ globalCommands: undefined, slashCatalogByKey: {}, agentsByProject: {} });
+  useStore.setState({ selectedProjectId: null });
+  globalCommandList.mockClear();
+  globalCommandCreate.mockClear();
+  globalCommandUpdate.mockClear();
+  globalCommandDelete.mockClear();
+  slashCatalog.mockClear();
+  searchFiles.mockClear();
 });
 
-test("disables command creation until a project is selected", () => {
-  render(<CommandsTab projects={[]} defaultProjectId={null} />);
+test("lists global commands with no Project combobox, alongside read-only built-in catalog rows", async () => {
+  render(<CommandsTab />);
 
-  expect(screen.getByText("Select a project to manage project commands")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "New command" }).hasAttribute("disabled")).toBe(true);
+  expect(await screen.findByText("/audit")).toBeTruthy();
+  expect(globalCommandList).toHaveBeenCalledWith("local");
+  expect(slashCatalog).toHaveBeenCalledWith("local", null, null);
+  expect(screen.queryByRole("combobox", { name: "Project" })).toBeNull();
+  expect(screen.getByText("Global commands are available in every project. Built-in commands are read-only.")).toBeTruthy();
+
+  expect(await screen.findByText("/sync")).toBeTruthy();
+  expect(screen.getByText("/deploy")).toBeTruthy();
+  expect(screen.getAllByText("Built-in")).toHaveLength(2);
+  expect(screen.queryByRole("button", { name: "Edit /sync" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Delete /sync" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Edit /audit" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Delete /audit" })).toBeTruthy();
 });
 
-test("validates backend command names and previews positional placeholders", () => {
-  expect(projectCommandNameError("Review")).toContain("lowercase");
-  expect(projectCommandNameError("init")).toContain("Built-in");
-  expect(projectCommandNameError("init", true)).toBeNull();
-  expect(projectCommandNameError("team/review")).toBeNull();
-  expect(projectCommandPreview("review", "Review $ARGUMENTS; compare $1 with $2")).toBe(
+test("validates global command names, previews positional placeholders, and derives reserved names from the loaded catalog with a static fallback", () => {
+  expect(globalCommandNameError("Review", false, new Set())).toContain("lowercase");
+  expect(globalCommandNameError("team/review", false, new Set())).toBeNull();
+  expect(globalCommandNameError("sync", false, new Set(["sync"]))).toContain("Built-in");
+  expect(globalCommandNameError("sync", true, new Set(["sync"]))).toBeNull();
+  expect(globalCommandPreview("review", "Review $ARGUMENTS; compare $1 with $2")).toBe(
     "/review <arguments>\nReview <arguments>; compare <argument 1> with <argument 2>",
+  );
+
+  expect(deriveReservedCommandNames(undefined)).toEqual(new Set(["init", "review", "compact"]));
+  expect(deriveReservedCommandNames([])).toEqual(new Set(["init", "review", "compact"]));
+  expect(deriveReservedCommandNames(catalog)).toEqual(new Set(["sync", "deploy"]));
+});
+
+test("opens a simplified editor with only Name, Description, and Template fields", async () => {
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
+
+  expect(screen.getByRole("button", { name: "New command" }).hasAttribute("disabled")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "New command" }));
+
+  expect(await screen.findByLabelText("Name")).toBeTruthy();
+  expect(screen.getByLabelText("Description")).toBeTruthy();
+  expect(screen.getByLabelText("Template")).toBeTruthy();
+  expect(screen.queryByRole("combobox", { name: "Agent" })).toBeNull();
+  expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
+  expect(screen.queryByText("Run as subtask")).toBeNull();
+  expect(screen.queryByRole("combobox", { name: "Project" })).toBeNull();
+});
+
+test("creates a global command with fixed agent/model/subtask defaults", async () => {
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
+
+  fireEvent.click(screen.getByRole("button", { name: "New command" }));
+  fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "ship" } });
+  fireEvent.change(screen.getByLabelText("Template"), { target: { value: "Ship $ARGUMENTS" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+  await waitFor(() =>
+    expect(globalCommandCreate).toHaveBeenCalledWith("local", {
+      name: "ship",
+      description: "",
+      template: "Ship $ARGUMENTS",
+      agent: null,
+      model: null,
+      subtask: false,
+    }),
   );
 });
 
-test("saves an existing reserved command after editing its template", async () => {
-  const initCommand: ProjectCommandInfo = {
-    ...command,
-    name: "init",
-    description: "Initialize this project",
-    template: "Initial template",
-  };
-  useNative.setState({ projectCommandsByProject: { p1: [initCommand] } });
-  listProjectCommands.mockResolvedValueOnce({ status: "ok", data: [initCommand] });
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
+test("saves an existing command via globalCommandUpdate, disabling the name field", async () => {
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
 
-  await screen.findByText("Initialize this project");
-  fireEvent.click(screen.getByRole("button", { name: "Edit /init" }));
-  expect((screen.getByLabelText("Name") as HTMLInputElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Edit /audit" }));
+  expect(((await screen.findByLabelText("Name")) as HTMLInputElement).disabled).toBe(true);
   fireEvent.change(screen.getByLabelText("Template"), { target: { value: "Updated template" } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
   await waitFor(() =>
-    expect(updateProjectCommand).toHaveBeenCalledWith(
+    expect(globalCommandUpdate).toHaveBeenCalledWith(
       "local",
-      "p1",
-      "init",
-      initCommand.revision,
-      expect.objectContaining({ template: "Updated template" }),
+      "audit",
+      "rev-1",
+      expect.objectContaining({ template: "Updated template", agent: null, model: null, subtask: false }),
     ),
   );
 });
 
-test("renders global and built-in commands as read-only with visible origins", async () => {
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
+test("preserves a legacy global command's hand-authored agent, model, and subtask on edit", async () => {
+  const legacyCommand: CommandFileInfo = { ...command, name: "legacy", agent: "plan", model: "m", subtask: true };
+  globalCommandList.mockResolvedValueOnce({ status: "ok", data: [legacyCommand] });
+  render(<CommandsTab />);
+  await screen.findByText("/legacy");
 
-  expect(await screen.findByText("/deploy")).toBeTruthy();
-  expect(screen.getByText("Global")).toBeTruthy();
-  expect(screen.getByText("/init")).toBeTruthy();
-  expect(screen.getByText("Built-in")).toBeTruthy();
-  const projectRow = screen.getByText("/audit").closest(".min-h-\\[88px\\]");
-  expect(projectRow?.textContent).toContain("Project");
-  expect(screen.queryByRole("button", { name: "Edit /deploy" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Delete /deploy" })).toBeNull();
-  expect(screen.getByText("Overrides global")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Edit /legacy" }));
+  fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Updated description" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() =>
+    expect(globalCommandUpdate).toHaveBeenCalledWith(
+      "local",
+      "legacy",
+      "rev-1",
+      expect.objectContaining({ description: "Updated description", agent: "plan", model: "m", subtask: true }),
+    ),
+  );
 });
 
-test("shows every colliding source with its effective status", async () => {
-  const catalog: CommandInfo[] = [
-    {
-      name: "ship",
-      description: "Project ship",
-      agent: null,
-      model: null,
-      subtask: false,
-      origin: "project",
-      effective: true,
-      shadowsGlobal: true,
-    },
-    {
-      name: "ship",
-      description: "Global ship",
-      agent: null,
-      model: null,
-      subtask: false,
-      origin: "global",
-      effective: false,
-      shadowsGlobal: false,
-    },
-    {
-      name: "init",
-      description: "Project init",
-      agent: null,
-      model: null,
-      subtask: false,
-      origin: "project",
-      effective: false,
-      shadowsGlobal: true,
-    },
-    {
-      name: "init",
-      description: "Global init",
-      agent: null,
-      model: null,
-      subtask: false,
-      origin: "global",
-      effective: false,
-      shadowsGlobal: false,
-    },
-    {
-      name: "init",
-      description: "Built-in init",
-      agent: null,
-      model: null,
-      subtask: false,
-      origin: "builtin",
-      effective: true,
-      shadowsGlobal: false,
-    },
-  ];
-  const projectCommands = [
-    { ...command, name: "ship", description: "Project ship" },
-    { ...command, name: "init", description: "Project init" },
-  ];
-  listProjectCommands.mockResolvedValueOnce({ status: "ok", data: projectCommands });
-  nativeCommands.mockResolvedValueOnce({ status: "ok", data: catalog });
+test("rejects a name reserved by the loaded catalog, even though the catalog can free up a name from the static fallback", async () => {
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
 
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
+  fireEvent.click(screen.getByRole("button", { name: "New command" }));
+  fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "sync" } });
+  expect(screen.getByText("Built-in commands cannot be created or updated.")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Create" }).hasAttribute("disabled")).toBe(true);
 
-  expect(await screen.findByText("Global ship")).toBeTruthy();
-  expect(screen.getByText("Global init")).toBeTruthy();
-  expect(screen.getByText("Built-in init")).toBeTruthy();
-  expect(screen.getByText("Overrides global")).toBeTruthy();
-  expect(screen.getAllByText("Shadowed by built-in")).toHaveLength(2);
-  expect(screen.getAllByText("Shadowed by project")).toHaveLength(1);
-  expect(screen.getAllByText("Effective")).toHaveLength(1);
-  expect(screen.queryByRole("button", { name: "Edit /ship" })).toBeTruthy();
-  expect(screen.getAllByRole("button", { name: "Edit /init" })).toHaveLength(1);
+  // "review" sits in the static fallback list, but the loaded catalog's
+  // builtin set (sync, deploy) takes precedence over it — proving the
+  // reserved set really is catalog-derived, not hardcoded.
+  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "review" } });
+  expect(screen.queryByText("Built-in commands cannot be created or updated.")).toBeNull();
+});
+
+test("falls back to the static reserved names when the catalog is empty", async () => {
+  slashCatalog.mockResolvedValueOnce({ status: "ok", data: [] });
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
+
+  fireEvent.click(screen.getByRole("button", { name: "New command" }));
+  fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "init" } });
+  expect(screen.getByText("Built-in commands cannot be created or updated.")).toBeTruthy();
+});
+
+test("search filters global command rows by name, description, or template text", async () => {
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
+
+  fireEvent.change(screen.getByLabelText("Search commands"), { target: { value: "nomatch" } });
+  expect(screen.getByText("No global commands match your search.")).toBeTruthy();
+
+  fireEvent.change(screen.getByLabelText("Search commands"), { target: { value: "audit" } });
+  expect(screen.getByText("/audit")).toBeTruthy();
 });
 
 test("opens deletion confirmation from a trigger and confirms or cancels the requested command", async () => {
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
-  await screen.findByText("Review the current change");
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
 
   const trigger = screen.getByRole("button", { name: "Delete /audit" });
   fireEvent.click(trigger);
   expect(await screen.findByRole("dialog", { name: "Delete /audit?" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   await waitFor(() => expect(document.activeElement).toBe(trigger));
-  expect(deleteProjectCommand).not.toHaveBeenCalled();
+  expect(globalCommandDelete).not.toHaveBeenCalled();
 
   fireEvent.click(trigger);
   fireEvent.click(screen.getByRole("button", { name: "Delete command" }));
-  await waitFor(() => expect(deleteProjectCommand).toHaveBeenCalledWith("local", "p1", "audit", "rev-1"));
+  await waitFor(() => expect(globalCommandDelete).toHaveBeenCalledWith("local", "audit", "rev-1"));
 });
 
 test("closes deletion confirmation after a conflict reloads the latest command", async () => {
-  const deleteConflict = mock(async () => ({ status: "conflict" as const, message: "Command changed externally." }));
-  useNative.setState({ deleteProjectCommand: deleteConflict });
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
-  await screen.findByText("Review the current change");
+  globalCommandDelete.mockResolvedValueOnce({ status: "error" as const, error: { message: "Command was modified externally." } });
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
 
   fireEvent.click(screen.getByRole("button", { name: "Delete /audit" }));
   expect(await screen.findByRole("dialog", { name: "Delete /audit?" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Delete command" }));
 
-  await waitFor(() => expect(deleteConflict).toHaveBeenCalledWith("local", "p1", command));
+  await waitFor(() => expect(globalCommandDelete).toHaveBeenCalledWith("local", "audit", "rev-1"));
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Delete /audit?" })).toBeNull());
 });
 
-test("loads agents and model registry for the selected local project and submits selected overrides", async () => {
-  useAgents.setState({ models: [modelOption] });
-  useNative.setState({ agentsByProject: { p1: [{ name: "reviewer", description: "Reviews changes", mode: "subagent", builtin: true }] } });
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
-  await waitFor(() => expect(nativeAgents).toHaveBeenCalledWith("local", "p1"));
-  await waitFor(() => expect(useNative.getState().agentsByProject.p1).toHaveLength(1));
-  fireEvent.click(screen.getByRole("button", { name: "New command" }));
-  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "ship" } });
-  fireEvent.change(screen.getByLabelText("Template"), { target: { value: "Ship $ARGUMENTS" } });
+test("suggests catalog commands (excluding the one being edited) from a fresh line while typing the template", async () => {
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
 
-  const agent = await screen.findByRole("combobox", { name: "Agent" });
-  fireEvent.click(agent);
-  fireEvent.click(await screen.findByRole("option", { name: /reviewer/ }));
-  const model = screen.getByRole("combobox", { name: "Model" });
-  fireEvent.click(model);
-  fireEvent.click(await screen.findByRole("option", { name: "Smart" }));
-  fireEvent.click(screen.getByRole("button", { name: "Create" }));
-
-  await waitFor(() => expect(nativeAgents).toHaveBeenCalledWith("local", "p1"));
-  expect(createProjectCommand).toHaveBeenCalledWith(
-    "local",
-    "p1",
-    expect.objectContaining({ name: "ship", agent: "reviewer", model: "free" }),
-  );
-});
-
-test("keeps an explicit null default project unselected and focuses enabled edit description", async () => {
-  render(<CommandsTab projects={[project]} defaultProjectId={null} />);
-  expect(screen.getAllByText("Select a project to manage project commands")[0]).toBeTruthy();
-  cleanup();
-
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
-  await screen.findByText("Review the current change");
   fireEvent.click(screen.getByRole("button", { name: "Edit /audit" }));
-  await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Description")));
-});
-test("loads project rows and creates a command through the generated API", async () => {
-  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
+  const template = (await screen.findByLabelText("Template")) as HTMLTextAreaElement;
+  const nextValue = `${command.template}\n/dep`;
+  fireEvent.change(template, { target: { value: nextValue, selectionStart: nextValue.length } });
 
-  await waitFor(() => expect(screen.getByText("Review the current change")).toBeTruthy());
-  expect(listProjectCommands).toHaveBeenCalledWith("local", "p1");
+  // "/deploy" appears twice while the menu is open — once in the read-only
+  // built-in row behind the modal, once as the suggestion — so the menu
+  // item (the only one that's a button) is what disambiguates it.
+  const suggestion = await screen.findByRole("button", { name: /\/deploy/ });
+  // "audit" is excluded from its own editor's suggestions — only its list
+  // row (not a second, menu-item copy) renders the text.
+  expect(screen.getAllByText("/audit")).toHaveLength(1);
 
-  fireEvent.click(screen.getByRole("button", { name: "New command" }));
-  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "ship" } });
-  fireEvent.change(screen.getByLabelText("Template"), { target: { value: "Ship $ARGUMENTS" } });
-  fireEvent.click(screen.getByRole("button", { name: "Create" }));
-
-  await waitFor(() => expect(createProjectCommand).toHaveBeenCalledWith("local", "p1", expect.objectContaining({ name: "ship" })));
+  fireEvent.click(suggestion);
+  expect(template.value).toBe(`${command.template}\n/deploy `);
 });

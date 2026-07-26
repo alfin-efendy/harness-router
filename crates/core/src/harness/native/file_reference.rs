@@ -1438,7 +1438,7 @@ mod tests {
     fn real_read_resolution_preserves_skill_worktree_attachment_precedence() {
         let work = tempfile::tempdir().unwrap();
         let attachments = tempfile::tempdir().unwrap();
-        let skill_dir = work.path().join(".ryuzi/skills/demo");
+        let skill_dir = work.path().join(".agents/skills/demo");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),

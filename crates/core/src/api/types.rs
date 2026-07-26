@@ -627,31 +627,36 @@ pub enum CommandOriginInfo {
     Project,
 }
 
-const fn default_command_effective() -> bool {
-    true
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SlashKindInfo {
+    Command,
+    Skill,
 }
 
+/// One "/" autocomplete entry: a slash command or a user-invocable skill.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct CommandInfo {
+pub struct SlashEntryInfo {
     pub name: String,
     pub description: String,
-    pub agent: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub subtask: bool,
+    pub kind: SlashKindInfo,
     pub origin: CommandOriginInfo,
-    #[serde(default = "default_command_effective")]
+    pub home: bool,
+    pub session: bool,
+    pub requires_project: bool,
     pub effective: bool,
     pub shadows_global: bool,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub subtask: bool,
 }
 
-/// Editable fields for a project-owned slash command. The command name is
+/// Editable fields for a global slash command. The command name is
 /// supplied separately for updates so a save cannot rename a file by accident.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProjectCommandMutationDto {
+pub struct CommandFileMutationDto {
     pub description: String,
     pub template: String,
     pub agent: Option<String>,
@@ -662,13 +667,13 @@ pub struct ProjectCommandMutationDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProjectCommandInputDto {
+pub struct CommandFileInputDto {
     pub name: String,
     #[serde(flatten)]
-    pub command: ProjectCommandMutationDto,
+    pub command: CommandFileMutationDto,
 }
 
-impl ProjectCommandMutationDto {
+impl CommandFileMutationDto {
     pub fn with_name(self, name: &str) -> ProjectCommandInput {
         ProjectCommandInput {
             name: name.to_string(),
@@ -681,16 +686,16 @@ impl ProjectCommandMutationDto {
     }
 }
 
-impl From<ProjectCommandInputDto> for ProjectCommandInput {
-    fn from(value: ProjectCommandInputDto) -> Self {
+impl From<CommandFileInputDto> for ProjectCommandInput {
+    fn from(value: CommandFileInputDto) -> Self {
         value.command.with_name(&value.name)
     }
 }
 
-/// A project command and the revision that must accompany update or delete.
+/// A command file and the revision that must accompany update or delete.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct ProjectCommandInfo {
+pub struct CommandFileInfo {
     pub name: String,
     pub description: String,
     pub template: String,
@@ -700,7 +705,7 @@ pub struct ProjectCommandInfo {
     pub revision: String,
 }
 
-impl From<ProjectCommandRead> for ProjectCommandInfo {
+impl From<ProjectCommandRead> for CommandFileInfo {
     fn from(value: ProjectCommandRead) -> Self {
         Self {
             name: value.name,
