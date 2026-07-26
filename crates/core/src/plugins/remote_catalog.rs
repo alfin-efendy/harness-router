@@ -552,7 +552,7 @@ fn release_base_url_for(build_tag: Option<&str>, version: Option<&str>) -> Strin
 
 /// Settings key that, once present, marks first-party component bootstrap as
 /// fully completed (every first-party bundle installed or already present).
-/// Mirrors `agents::bootstrap`'s `FREE_PROVIDERS_SEEDED_MARKER`: once set, a
+/// One-shot bootstrap marker (unlike the free-connection seeding in `agents::bootstrap`, which is self-healing): once set, a
 /// later user uninstall is respected and bootstrap never re-runs. It stays
 /// ABSENT while any bundle is still missing, so a transient failure is retried
 /// on the next boot.

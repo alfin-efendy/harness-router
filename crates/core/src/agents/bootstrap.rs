@@ -34,11 +34,6 @@ pub const AGENT_PERSISTENCE_MARKER: &str = "agent_persistence_schema";
 /// The only schema value this build understands.
 const AGENT_PERSISTENCE_SCHEMA: &str = "1";
 
-/// Settings marker: the one-time auto-seed of the MiMo/OpenCode free-tier
-/// connections has run. Kept separate from the agent-persistence marker so a
-/// user who deletes the seeded rows is not re-seeded on the next boot.
-const FREE_PROVIDERS_SEEDED_MARKER: &str = "free_providers_seeded_v1";
-
 /// Legacy settings-KV keys that once held the single native agent's default
 /// model / permission mode. The runtime that read them is gone; only
 /// [`legacy_agent_data_exists`] still probes these rows to decide whether a
@@ -238,30 +233,31 @@ pub(crate) async fn ensure_default_routes(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Idempotently create enabled, credential-less `free` connections for the
-/// MiMo and OpenCode free tiers so a fresh install has working models with no
-/// "Add account" click. Guarded by [`FREE_PROVIDERS_SEEDED_MARKER`] so deleting
-/// the rows is respected.
+/// Ensure the built-in free-tier connections exist (spec A2, self-healing):
+/// every daemon start recreates any missing `mimo-free`/`opencode-free` row so
+/// a fresh install — and any install that lost the rows — has working free
+/// models with no "Add account" click. Existing rows are left untouched
+/// (including a user's `enabled = false`); rows are also guarded against
+/// deletion in `connections::remove_connection`.
 pub(crate) async fn ensure_free_providers_seeded(store: &Store) -> anyhow::Result<()> {
-    if store
-        .get_setting_raw(FREE_PROVIDERS_SEEDED_MARKER)
+    let existing: std::collections::HashSet<String> = connections::list_connections(store)
         .await?
-        .is_some()
-    {
-        return Ok(());
-    }
-    for (provider, label) in [
-        ("mimo-free", "MiMo (free)"),
-        ("opencode-free", "OpenCode (free)"),
-    ] {
+        .into_iter()
+        .filter(|c| c.auth_type == "free")
+        .map(|c| c.provider)
+        .collect();
+    for (provider, label) in connections::BUILTIN_FREE_PROVIDERS {
+        if existing.contains(*provider) {
+            continue;
+        }
         let now = crate::paths::now_ms();
         connections::add_connection(
             store,
             ConnectionRow {
                 id: crate::paths::new_id(),
-                provider: provider.into(),
+                provider: (*provider).into(),
                 auth_type: "free".into(),
-                label: label.into(),
+                label: (*label).into(),
                 priority: 0,
                 enabled: true,
                 data: ConnectionData::default(),
@@ -271,9 +267,6 @@ pub(crate) async fn ensure_free_providers_seeded(store: &Store) -> anyhow::Resul
         )
         .await?;
     }
-    store
-        .set_setting_raw(FREE_PROVIDERS_SEEDED_MARKER, "1")
-        .await?;
     Ok(())
 }
 
@@ -1225,14 +1218,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_free_providers_seeded_does_not_readd_after_user_deletes() {
+    async fn ensure_free_providers_seeded_heals_missing_rows() {
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db.path()).await.unwrap();
         ensure_free_providers_seeded(&store).await.unwrap();
         let conns = crate::llm_router::connections::list_connections(&store)
             .await
             .unwrap();
-        // Bypass the builtin delete guard: this models a legacy install whose rows vanished pre-guard.
+        // Simulate a legacy install that lost the rows (deleted before the
+        // rows became guarded): remove them at the SQL level, bypassing the
+        // remove_connection builtin guard.
         for c in &conns {
             let id = c.id.clone();
             store
@@ -1246,11 +1241,39 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Marker is set, so re-seeding is a no-op even though the rows are gone.
+        // Spec A2: seeding is self-healing — the built-in rows come back.
         ensure_free_providers_seeded(&store).await.unwrap();
         let after = crate::llm_router::connections::list_connections(&store)
             .await
             .unwrap();
-        assert!(after.is_empty());
+        let providers: std::collections::HashSet<_> =
+            after.iter().map(|c| c.provider.as_str()).collect();
+        assert!(providers.contains("mimo-free"));
+        assert!(providers.contains("opencode-free"));
+    }
+
+    #[tokio::test]
+    async fn ensure_free_providers_seeded_does_not_flip_disabled_rows() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        ensure_free_providers_seeded(&store).await.unwrap();
+        let conns = crate::llm_router::connections::list_connections(&store)
+            .await
+            .unwrap();
+        let mimo = conns.iter().find(|c| c.provider == "mimo-free").unwrap();
+        crate::llm_router::connections::set_connection_enabled(&store, &mimo.id, false)
+            .await
+            .unwrap();
+        // Healing must only recreate MISSING rows, never re-enable existing ones.
+        ensure_free_providers_seeded(&store).await.unwrap();
+        let after = crate::llm_router::connections::list_connections(&store)
+            .await
+            .unwrap();
+        let mimo_after = after.iter().find(|c| c.provider == "mimo-free").unwrap();
+        assert!(!mimo_after.enabled);
+        assert_eq!(
+            after.iter().filter(|c| c.provider == "mimo-free").count(),
+            1
+        );
     }
 }
