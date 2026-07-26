@@ -161,11 +161,19 @@ async fn run_inner() -> i32 {
         tokio::select! {
             _ = sigterm.recv() => {}
             _ = sigint.recv() => {}
+            _ = daemon.cp.shutdown_requested() => {
+                println!("engine-daemon: shutdown requested via control API");
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = daemon.cp.shutdown_requested() => {
+                println!("engine-daemon: shutdown requested via control API");
+            }
+        }
     }
     daemon.stop().await;
     clear_status(&dir);

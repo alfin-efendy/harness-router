@@ -70,6 +70,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "set_plugin_pin",
     "plugin_doctor",
     "plugins_restart_required",
+    "shutdown_engine",
     // Component-plugin (WASM bundle) release management — Task 11a.
     "plugin_release_detail",
     "install_component_plugin",
@@ -282,6 +283,14 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 .collect::<Vec<_>>())
         }
         "plugins_restart_required" => ok(cp.plugins_restart_required()),
+        // Spec B3: graceful process exit on request. The response is sent
+        // before the signal loop unwinds (the RPC returns immediately; the
+        // daemon's select-loop then runs `daemon.stop()` and exits), so the
+        // caller gets a clean 200 rather than a dropped connection.
+        "shutdown_engine" => {
+            cp.request_shutdown();
+            ok(())
+        }
         "plugin_release_detail" => {
             let a: IdP = params(p)?;
             ok(plugin_release_detail(cp, &a.id).await?)
