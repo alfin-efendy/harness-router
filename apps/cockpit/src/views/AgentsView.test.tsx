@@ -19,7 +19,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     description: "",
     avatarColor: "violet",
     model: route("free"),
-    permissionMode: "ask",
+    builtin: false,
     skillCount: 0,
     toolCount: 0,
     knowledgeCount: 0,
@@ -36,9 +36,17 @@ const reviewer = summary("reviewer", "Reviewer", {
   toolCount: 3,
 });
 const ryuzi = summary("ryuzi", "Ryuzi");
+// Synthetic, non-registry row the backend always appends last (see
+// fresh_agent_summary in crates/core/src/api/agent_api.rs) — ephemeral,
+// memoryless, never invalid, never deletable.
+const fresh = summary("fresh", "Fresh Agent", {
+  description: "Ephemeral worker for one-off delegated work.",
+  builtin: true,
+  isDefault: false,
+});
 
 function registry(): AgentRegistryInfo {
-  return { agents: [ryuzi, reviewer], defaultAgentId: "ryuzi", recovery: [], subagentModel: route("free") };
+  return { agents: [ryuzi, reviewer, fresh], defaultAgentId: "ryuzi", recovery: [], subagentModel: route("free") };
 }
 
 const selectable: SelectableModelInfo = {
@@ -61,7 +69,6 @@ function detail(input: AgentMutationInfo): AgentDetailInfo {
       description: input.description,
       avatarColor: input.avatarColor,
       model: input.model,
-      permissionMode: input.permissionMode,
     }),
     permissionRules: input.permissionRules,
     skills: input.skills,
@@ -125,35 +132,48 @@ test("management flow creates through the generated command store and opens deta
   await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" }));
 });
 
-test("Main Agent tab renders roster metadata and opens dedicated detail", () => {
+test("renders roster metadata for every agent and opens a real agent's dedicated detail", () => {
   render(<AgentsView />);
-  expect(screen.getByRole("button", { name: "Main Agent" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Sub Agent" })).toBeTruthy();
   expect(screen.getByText("Reviews implementation quality and regressions.")).toBeTruthy();
   expect(screen.getAllByText("free").length).toBeGreaterThan(0);
-  expect(screen.getAllByText("Ask").length).toBeGreaterThan(0);
   expect(screen.getByText("1 skill · 3 tools")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Open Reviewer" }));
   expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" });
 });
 
-test("Sub Agent tab exposes one shared model and no create affordance", () => {
+test("renders a single list — no Main/Sub segmented control and no subagent settings section", () => {
   render(<AgentsView />);
-  fireEvent.click(screen.getByRole("button", { name: "Sub Agent" }));
-  expect(screen.getByText(/ephemeral, memoryless runtime workers/)).toBeTruthy();
-  expect(screen.getByRole("combobox", { name: "Shared subagent model" })).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "New agent" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Main Agent" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Sub Agent" })).toBeNull();
+  expect(screen.queryByText(/ephemeral, memoryless runtime workers/)).toBeNull();
+  expect(screen.queryByRole("combobox", { name: "Shared subagent model" })).toBeNull();
+  // "New agent" is no longer tab-gated — it is always present.
+  expect(screen.getByRole("button", { name: "New agent" })).toBeTruthy();
+  expect(screen.getByText("Manage the agents available in this workspace.")).toBeTruthy();
 });
 
-test("shared concrete subagent model shows only its supported effort options", async () => {
-  useAgents.setState({ registry: { ...registry(), subagentModel: { kind: "concrete", name: selectable.requestValue, effort: "high" } } });
+test("pins the built-in Fresh Agent row last, with a Built-in badge, dashed styling, and no actions menu", () => {
   render(<AgentsView />);
-  fireEvent.click(screen.getByRole("button", { name: "Sub Agent" }));
-  const effort = screen.getByRole("combobox", { name: "Shared subagent effort" });
-  fireEvent.click(effort);
-  expect(await screen.findByRole("option", { name: "Model default" })).toBeTruthy();
-  expect(screen.getByRole("option", { name: "Low" })).toBeTruthy();
-  expect(screen.getByRole("option", { name: "High" })).toBeTruthy();
+  const openButtons = screen.getAllByRole("button", { name: /^Open / });
+  expect(openButtons[openButtons.length - 1]?.getAttribute("aria-label")).toBe("Open Fresh Agent");
+
+  const freshButton = screen.getByRole("button", { name: "Open Fresh Agent" });
+  expect(freshButton.closest(".border-dashed")).toBeTruthy();
+  expect(screen.getByText("Built-in")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Actions for Fresh Agent" })).toBeNull();
+});
+
+test("omits the Invalid badge for the built-in row even when it is marked non-executable", () => {
+  useAgents.setState({ registry: { ...registry(), agents: [ryuzi, reviewer, { ...fresh, executable: false }] } });
+  render(<AgentsView />);
+  expect(screen.queryByText("Invalid")).toBeNull();
+  expect(screen.getByText("Built-in")).toBeTruthy();
+});
+
+test("clicking the built-in Fresh Agent row navigates to its detail like any other row", () => {
+  render(<AgentsView />);
+  fireEvent.click(screen.getByRole("button", { name: "Open Fresh Agent" }));
+  expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "fresh" });
 });
 
 test("create modal sends the complete initial mutation and opens the new detail", async () => {
@@ -172,7 +192,6 @@ test("create modal sends the complete initial mutation and opens the new detail"
       avatarColor: "violet",
       model: route("free"),
       personality: { preset: "helpful", custom: null },
-      permissionMode: "ask",
       permissionRules: [],
       skills: [],
       nativeTools: [],

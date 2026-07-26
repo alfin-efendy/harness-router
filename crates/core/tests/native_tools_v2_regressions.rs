@@ -215,7 +215,9 @@ async fn fixture_context(
     profile.model = AgentModel::Route {
         route: requested_model.into(),
     };
-    profile.permissions.mode = PermMode::BypassPermissions;
+    // The profile no longer carries a permission mode (it is session-owned);
+    // this is a no-op now anyway since `default_ryuzi_profile` already grants
+    // every builtin native tool `Allow`.
     let primary_agent = Arc::new(AgentSnapshot {
         profile,
         executable: true,

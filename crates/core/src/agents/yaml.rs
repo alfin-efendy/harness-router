@@ -4,6 +4,8 @@
 // dead-code so the intermediate commits stay clippy-clean.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -65,9 +67,38 @@ struct PermissionRuleWire {
     command_prefix: Option<String>,
 }
 
+/// A native tool's decision on the wire. `NativeToolDecision` covers the
+/// current `allow`/`ask`/`off` vocabulary; a bare `off` scalar always lands
+/// directly in this arm (this crate's `serde_yaml` follows the YAML 1.2
+/// core schema, so unquoted `off`/`no`/`on`/`yes` are plain strings, never
+/// booleans — only `true`/`false` resolve as booleans). `Legacy(bool)`
+/// exists purely to tolerate a hand-edited literal boolean `false` (as
+/// opposed to the string `"false"`), folding it to `Off` so a profile is
+/// never bricked by that. `true` has no meaning here (there is no boolean
+/// "on" decision) and is rejected at parse time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum NativeToolDecisionWire {
+    Decision(NativeToolDecision),
+    Legacy(bool),
+}
+
+impl NativeToolDecisionWire {
+    fn resolve(self, tool: &str) -> anyhow::Result<NativeToolDecision> {
+        match self {
+            Self::Decision(decision) => Ok(decision),
+            Self::Legacy(false) => Ok(NativeToolDecision::Off),
+            Self::Legacy(true) => bail!(
+                "native tool `{tool}` cannot be set to `true`; use \"allow\" or remove the entry"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PermissionsWire {
-    mode: AgentPermissionMode,
+    #[serde(default)]
+    native: BTreeMap<String, NativeToolDecisionWire>,
     #[serde(default)]
     rules: Vec<PermissionRuleWire>,
     #[serde(flatten)]
@@ -84,8 +115,6 @@ struct SkillsWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolsWire {
-    #[serde(default)]
-    native: Vec<String>,
     #[serde(default)]
     plugins: Vec<String>,
     #[serde(default)]
@@ -309,13 +338,64 @@ fn profile_from_wire(
     wire: AgentProfileWire,
 ) -> anyhow::Result<(AgentProfile, IndexMap<String, Value>)> {
     let (model, model_extensions) = model_from_wire(wire.model)?;
+    let schema_version = wire.schema_version;
+    let profile_id = wire.id.trim().to_owned();
+
+    let mut permissions_extensions = wire.permissions.extensions;
+    let mut tools_extensions = wire.tools.extensions;
+
+    let rules: Vec<PermissionRule> = wire
+        .permissions
+        .rules
+        .into_iter()
+        .map(|rule| PermissionRule {
+            id: rule.id.trim().to_owned(),
+            tool: rule.tool.trim().to_owned(),
+            decision: rule.decision,
+            command_prefix: trim_option(rule.command_prefix),
+        })
+        .collect();
+    let native: BTreeMap<String, NativeToolDecision> = wire
+        .permissions
+        .native
+        .into_iter()
+        .map(|(tool, decision)| {
+            let resolved = decision.resolve(&tool)?;
+            Ok((tool, resolved))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    // Schema 1 documents carry the retired `permissions.mode` and
+    // `tools.native` keys as unrecognized extensions (the v2 wire structs no
+    // longer declare those fields). Fold them into the v2 per-tool decision
+    // map once, here, and drop the legacy keys so they do not linger forever
+    // as phantom "vendor extensions" on every later render.
+    let (native, rules) = if schema_version == 1 {
+        let mode = permissions_extensions
+            .shift_remove("mode")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "ask".to_owned());
+        let old_native_raw = tools_extensions
+            .shift_remove("native")
+            .and_then(|value| value.as_sequence().cloned())
+            .unwrap_or_default();
+        let old_native: Vec<String> = old_native_raw
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect();
+        let builtin = crate::harness::native::tools::ToolRegistry::builtin_ids();
+        migrate_v1_permissions(&profile_id, &mode, &old_native, rules, &builtin)
+    } else {
+        (native, rules)
+    };
+
     let mut extensions = wire.extensions;
     add_nested(&mut extensions, "avatar", wire.avatar.extensions);
     add_nested(&mut extensions, "model", model_extensions);
     add_nested(&mut extensions, "personality", wire.personality.extensions);
-    add_nested(&mut extensions, "permissions", wire.permissions.extensions);
+    add_nested(&mut extensions, "permissions", permissions_extensions);
     add_nested(&mut extensions, "skills", wire.skills.extensions);
-    add_nested(&mut extensions, "tools", wire.tools.extensions);
+    add_nested(&mut extensions, "tools", tools_extensions);
 
     let personality = AgentPersonality {
         preset: wire.personality.preset,
@@ -333,28 +413,112 @@ fn profile_from_wire(
         },
         model,
         personality,
-        permissions: AgentPermissions {
-            mode: wire.permissions.mode.runtime_mode(),
-            rules: wire
-                .permissions
-                .rules
-                .into_iter()
-                .map(|rule| PermissionRule {
-                    id: rule.id.trim().to_owned(),
-                    tool: rule.tool.trim().to_owned(),
-                    decision: rule.decision,
-                    command_prefix: trim_option(rule.command_prefix),
-                })
-                .collect(),
-        },
+        permissions: AgentPermissions { native, rules },
         skills: trim_vec(wire.skills.enabled),
         tools: AgentTools {
-            native: trim_vec(wire.tools.native),
             plugins: trim_vec(wire.tools.plugins),
             apps: trim_vec(wire.tools.apps),
         },
     };
     Ok((profile, extensions))
+}
+
+/// Upgrades a schema-1 agent's permission table to schema 2's per-tool
+/// native decision map.
+///
+/// - The built-in `ryuzi` id always gets every builtin tool set to `Allow`,
+///   overriding whatever the old mode/native list said (mirrors the old
+///   bootstrap behavior where Ryuzi's native harness always ran unrestricted).
+/// - A non-`ryuzi` profile with an empty native allow-list inherited its
+///   effective permissions purely from `mode`: `full` allowed everything,
+///   `accept_edits` allowed only the edit-class tools, `ask`/`plan` allowed
+///   nothing (both collapse to the same "prompt for everything" behavior, so
+///   an absent map entry — which now means `Ask` — is the correct migration
+///   target and nothing needs inserting).
+/// - A non-empty native allow-list was an explicit table: listed tools keep
+///   their mode-derived decision (`Allow` under `full`, `Ask` otherwise —
+///   `accept_edits` on a listed non-edit tool degrades to `Ask`, not `Off`,
+///   since the old runtime still exposed it, just gated by prompt), and every
+///   other builtin tool becomes `Off` since it was never exposed at all.
+/// - Whole-tool permission rules (no `command_prefix`) folded into the same
+///   base decision table (`deny`→`Off`, `allow`→`Allow`, `ask`→`Ask`) and are
+///   dropped. Command-prefix-scoped rules survive as explicit rules, except
+///   an `ask`-decision prefix rule: `Ask` was always a runtime no-op (rules
+///   only ever resolved to allow/deny), so those are dropped too rather than
+///   migrated forward as an unrenderable rule.
+fn migrate_v1_permissions(
+    profile_id: &str,
+    mode: &str,
+    old_native: &[String],
+    old_rules: Vec<PermissionRule>,
+    builtin: &[String],
+) -> (BTreeMap<String, NativeToolDecision>, Vec<PermissionRule>) {
+    use NativeToolDecision::*;
+    // The lowercase policy.rs EDIT_TOOLS ids that actually exist as builtin
+    // tool ids in this registry. `multiedit`/`notebookedit` are named in
+    // policy.rs's EDIT_TOOLS but have no corresponding builtin tool.
+    const EDIT_CLASS: &[&str] = &["edit", "write"];
+    let mode_decision = |tool: &str| match mode {
+        "full" => Allow,
+        "accept_edits" if EDIT_CLASS.contains(&tool) => Allow,
+        _ => Ask, // ask, plan, accept_edits non-edit
+    };
+    let mut map = BTreeMap::new();
+    if profile_id == "ryuzi" {
+        for id in builtin {
+            map.insert(id.clone(), Allow);
+        }
+    } else if old_native.is_empty() {
+        for id in builtin {
+            if mode_decision(id) == Allow {
+                map.insert(id.clone(), Allow);
+            } // Ask stays absent
+        }
+    } else {
+        for id in old_native {
+            match mode_decision(id) {
+                Allow => {
+                    map.insert(id.clone(), Allow);
+                }
+                _ => {
+                    map.insert(id.clone(), Ask);
+                }
+            }
+        }
+        for id in builtin {
+            if !old_native.contains(id) {
+                map.insert(id.clone(), Off);
+            }
+        }
+    }
+    let mut kept = Vec::new();
+    for rule in old_rules {
+        if rule.command_prefix.is_some() {
+            // `Ask` was always a runtime no-op (the rules engine only ever
+            // resolved a matching rule to allow/deny); carrying it forward
+            // just leaves an unrenderable rule for the allow/deny-only
+            // Permissions UI. Drop it here instead of migrating it.
+            if rule.decision != PermissionDecision::Ask {
+                kept.push(rule);
+            }
+            continue;
+        }
+        if profile_id == "ryuzi" {
+            continue; // all-Allow override wins
+        }
+        match rule.decision {
+            PermissionDecision::Deny => {
+                map.insert(rule.tool, Off);
+            }
+            PermissionDecision::Allow => {
+                map.insert(rule.tool, Allow);
+            }
+            PermissionDecision::Ask => {
+                map.insert(rule.tool, Ask);
+            }
+        }
+    }
+    (map, kept)
 }
 
 fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -> AgentProfileWire {
@@ -374,7 +538,12 @@ fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -
             extensions: nested_extensions(extensions, "personality"),
         },
         permissions: PermissionsWire {
-            mode: AgentPermissionMode::from_runtime(value.permissions.mode),
+            native: value
+                .permissions
+                .native
+                .iter()
+                .map(|(tool, decision)| (tool.clone(), NativeToolDecisionWire::Decision(*decision)))
+                .collect(),
             rules: value
                 .permissions
                 .rules
@@ -393,7 +562,6 @@ fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -
             extensions: nested_extensions(extensions, "skills"),
         },
         tools: ToolsWire {
-            native: value.tools.native.clone(),
             plugins: value.tools.plugins.clone(),
             apps: value.tools.apps.clone(),
             extensions: nested_extensions(extensions, "tools"),
@@ -479,8 +647,14 @@ fn index_to_wire(value: &AgentIndex) -> AgentIndexWire {
     }
 }
 
+/// Accepts any schema version from 1 up to the current
+/// [`AGENT_SCHEMA_VERSION`]. Version 1 profile documents are upgraded in
+/// place by [`profile_from_wire`]; index/subagent documents have not changed
+/// shape between 1 and 2, so an old-but-still-1 file loads unmodified and is
+/// simply written back out at the current version on its next save (both
+/// already always render `schema_version: AGENT_SCHEMA_VERSION`).
 fn ensure_schema(version: u32) -> anyhow::Result<()> {
-    if version != AGENT_SCHEMA_VERSION {
+    if version == 0 || version > AGENT_SCHEMA_VERSION {
         bail!("unsupported agent schema version {version}");
     }
     Ok(())
@@ -546,8 +720,39 @@ fn merge_and_render<T: Serialize>(raw: &Value, typed: &T) -> anyhow::Result<Stri
     let replacement = serde_yaml::to_value(typed)?;
     remove_stale_model_keys(&mut merged, &replacement);
     remove_stale_personality_keys(&mut merged, &replacement);
+    remove_stale_v1_permission_keys(&mut merged);
     merge_value(&mut merged, replacement);
     render_yaml(&merged)
+}
+
+/// `permissions.mode` and `tools.native` are retired schema-1 keys with no
+/// v2 replacement field (the migration folds them into
+/// `permissions.native` once, in [`profile_from_wire`]). `merge_value` only
+/// overwrites/inserts keys present in the replacement and never deletes a
+/// target-only key, so re-rendering a still schema-1-shaped `raw` document
+/// (a profile edited before its first clean re-render) would otherwise carry
+/// these two dead keys forward forever as phantom "vendor extensions".
+/// Dropping them unconditionally here is safe: neither key is ever a
+/// legitimate v2 field.
+fn remove_stale_v1_permission_keys(target: &mut Value) {
+    let permissions_key = Value::String("permissions".into());
+    let mode_key = Value::String("mode".into());
+    if let Some(permissions) = target
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(&permissions_key))
+        .and_then(Value::as_mapping_mut)
+    {
+        permissions.remove(&mode_key);
+    }
+    let tools_key = Value::String("tools".into());
+    let native_key = Value::String("native".into());
+    if let Some(tools) = target
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(&tools_key))
+        .and_then(Value::as_mapping_mut)
+    {
+        tools.remove(&native_key);
+    }
 }
 
 fn remove_stale_model_keys(target: &mut Value, replacement: &Value) {
@@ -614,6 +819,22 @@ fn merge_value(target: &mut Value, replacement: Value) {
     }
 }
 
+/// No post-processing of the rendered text happens here on purpose: an
+/// earlier version of this function used to rewrite every line ending in
+/// `: off` to `: "off"`, on the theory that `serde_yaml`'s YAML 1.1-style
+/// resolver would otherwise read an unquoted `off` back as the boolean
+/// `false`. That rewrite was both unnecessary and unsafe — unnecessary
+/// because this crate's `serde_yaml` (0.9) follows the YAML 1.2 core
+/// schema, under which only bareword `true`/`false` resolve as booleans;
+/// `off`/`no`/`on`/`yes` always parse back as plain strings (see
+/// [`NativeToolDecision::Off`] and `NativeToolDecisionWire`), so a bare
+/// `off` scalar in `permissions.native` already round-trips correctly with
+/// no quoting at all. It was unsafe because the line-based rewrite matched
+/// *any* line in the document ending in `: off`, including interior
+/// content lines of a multi-line literal block scalar (e.g. an agent
+/// description containing a sentence like "turn logging: off") — silently
+/// corrupting user text on every save. Emit exactly what `serde_yaml`
+/// produces.
 fn render_yaml<T: Serialize>(value: &T) -> anyhow::Result<String> {
     let rendered = serde_yaml::to_string(value)?;
     Ok(format!("{}\n", rendered.trim_end()))
@@ -849,6 +1070,222 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
                 .unwrap()
                 .extensions["x_sync"],
             "manual"
+        );
+    }
+
+    // --- v1 -> v2 permission migration -------------------------------------
+    //
+    // Shape copied from the pre-change `render_agent_profile` output (see
+    // `LEGACY_AGENT_YAML` above): `permissions: { mode, rules }` and
+    // `tools: { native, plugins, apps }`, with `skills: { enabled: [] }`
+    // (the brief's draft used a bare `skills: []`, which does not match the
+    // real `SkillsWire` mapping shape and was corrected here).
+    fn v1_doc(mode: &str, native: &[&str], rules_yaml: &str) -> String {
+        format!(
+            "schema_version: 1\nid: tester\nname: Tester\ndescription: d\navatar:\n  color: blue\nmodel:\n  route: free\npersonality:\n  preset: helpful\npermissions:\n  mode: {mode}\n{rules_yaml}skills:\n  enabled: []\ntools:\n  native: [{}]\n  plugins: []\n  apps: []\n",
+            native.join(", ")
+        )
+    }
+
+    #[test]
+    fn v1_full_empty_native_migrates_to_all_allow() {
+        let profile = parse_agent_profile_document(&v1_doc("full", &[], "")).unwrap();
+        assert_eq!(profile.typed().schema_version, 2);
+        for id in crate::harness::native::tools::ToolRegistry::builtin_ids() {
+            assert_eq!(
+                profile.typed().permissions.native_decision(&id),
+                NativeToolDecision::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn v1_ask_empty_native_migrates_to_empty_map() {
+        // absent = Ask
+        let profile = parse_agent_profile_document(&v1_doc("ask", &[], "")).unwrap();
+        assert!(profile.typed().permissions.native.is_empty());
+    }
+
+    #[test]
+    fn v1_accept_edits_empty_native_allows_edit_class_only() {
+        let profile = parse_agent_profile_document(&v1_doc("accept_edits", &[], "")).unwrap();
+        assert_eq!(
+            profile.typed().permissions.native_decision("edit"),
+            NativeToolDecision::Allow
+        );
+        assert_eq!(
+            profile.typed().permissions.native_decision("write"),
+            NativeToolDecision::Allow
+        );
+        assert_eq!(
+            profile.typed().permissions.native_decision("bash"),
+            NativeToolDecision::Ask
+        );
+    }
+
+    #[test]
+    fn v1_plan_migrates_like_ask() {
+        let profile = parse_agent_profile_document(&v1_doc("plan", &[], "")).unwrap();
+        assert!(profile.typed().permissions.native.is_empty());
+    }
+
+    #[test]
+    fn v1_nonempty_native_list_maps_listed_and_offs_unlisted() {
+        let profile = parse_agent_profile_document(&v1_doc("full", &["read", "bash"], "")).unwrap();
+        assert_eq!(
+            profile.typed().permissions.native_decision("read"),
+            NativeToolDecision::Allow
+        );
+        assert_eq!(
+            profile.typed().permissions.native_decision("bash"),
+            NativeToolDecision::Allow
+        );
+        // every OTHER builtin id must be explicitly Off
+        assert_eq!(
+            profile.typed().permissions.native_decision("write"),
+            NativeToolDecision::Off
+        );
+    }
+
+    #[test]
+    fn v1_whole_tool_rules_fold_into_base_decision() {
+        let rules = "  rules:\n    - id: r1\n      tool: bash\n      decision: allow\n    - id: r2\n      tool: read\n      decision: deny\n    - id: r3\n      tool: bash\n      decision: allow\n      command_prefix: \"git \"\n    - id: r4\n      tool: bash\n      decision: ask\n      command_prefix: \"npm \"\n";
+        let profile = parse_agent_profile_document(&v1_doc("ask", &[], rules)).unwrap();
+        assert_eq!(
+            profile.typed().permissions.native_decision("bash"),
+            NativeToolDecision::Allow
+        ); // allow rule folds
+        assert_eq!(
+            profile.typed().permissions.native_decision("read"),
+            NativeToolDecision::Off
+        ); // deny rule -> Off
+        assert_eq!(
+            profile.typed().permissions.rules.len(),
+            1,
+            "only the allow-decision prefix rule survives; the ask-decision prefix rule (r4) is dropped as a runtime no-op"
+        );
+        // `profile_from_wire` trims every parsed `command_prefix` (pre-existing
+        // behavior, unrelated to this migration: `trim_option(rule.command_prefix)`
+        // already ran on schema-1 profiles before this task). The brief's
+        // draft literal was `Some("git ")` with a trailing space; adjusted to
+        // the real trimmed value.
+        assert_eq!(
+            profile.typed().permissions.rules[0]
+                .command_prefix
+                .as_deref(),
+            Some("git")
+        );
+    }
+
+    #[test]
+    fn v1_ryuzi_id_overrides_table_to_all_allow() {
+        let doc = v1_doc("ask", &["read"], "").replace("id: tester", "id: ryuzi");
+        let profile = parse_agent_profile_document(&doc).unwrap();
+        for id in crate::harness::native::tools::ToolRegistry::builtin_ids() {
+            assert_eq!(
+                profile.typed().permissions.native_decision(&id),
+                NativeToolDecision::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn v2_round_trips_and_quotes_off() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("t".into());
+        profile
+            .permissions
+            .native
+            .insert("write".into(), NativeToolDecision::Off);
+        let rendered = render_agent_profile(&profile).unwrap();
+        // The `off` scalar is never quoted (serde_yaml 0.9 follows the YAML
+        // 1.2 core schema, where only `true`/`false` bareword scalars
+        // resolve as booleans — `off` always round-trips as a plain
+        // string). The requirement is that it parses back to `Off`, not
+        // that it carries any particular quote style.
+        let back = parse_agent_profile(&rendered).unwrap();
+        assert_eq!(back.permissions, profile.permissions);
+    }
+
+    #[test]
+    fn description_content_line_ending_in_colon_off_is_not_corrupted() {
+        // Regression test: a multi-line description forces serde_yaml to
+        // emit it as a literal block scalar. A content line that happens to
+        // end in ": off" (e.g. a sentence about a logging toggle) must
+        // survive render -> parse byte-for-byte; it must never be rewritten
+        // into `...: "off"` the way a real `permissions.native` decision is.
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("t".into());
+        profile.description =
+            "Handles alerts.\nRuntime toggle for turn logging: off\nAlso handles greetings."
+                .to_string();
+        let rendered = render_agent_profile(&profile).unwrap();
+        assert!(
+            rendered.contains("Runtime toggle for turn logging: off"),
+            "description content line must survive unquoted: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Runtime toggle for turn logging: \"off\""),
+            "description content must not be quoted like a permission decision: {rendered}"
+        );
+        let back = parse_agent_profile(&rendered).unwrap();
+        assert_eq!(back.description, profile.description);
+    }
+
+    #[test]
+    fn bool_false_parses_as_off() {
+        // A rendered `off` is already a bare, unquoted plain-string scalar
+        // (see `render_yaml`'s doc comment), so replacing quote characters
+        // around it is a no-op. To actually exercise the `Legacy(bool)`
+        // hand-edit tolerance path (someone types a literal `false` instead
+        // of `off`/`"off"`), rewrite the rendered scalar to `false` — that's
+        // the only spelling `NativeToolDecisionWire::Legacy` ever sees.
+        // Verified this discriminates: temporarily deleting the `Legacy`
+        // variant (and its `resolve` arm) makes this test fail to compile /
+        // fail to parse, since `false` no longer deserializes into
+        // `NativeToolDecisionWire` at all.
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("t".into());
+        profile
+            .permissions
+            .native
+            .insert("write".into(), NativeToolDecision::Off);
+        let rendered = render_agent_profile(&profile)
+            .unwrap()
+            .replace("write: \"off\"", "write: false")
+            .replace("write: 'off'", "write: false")
+            .replace("write: off", "write: false");
+        assert!(
+            rendered.contains("write: false"),
+            "replace must have matched the rendered `write` line: {rendered}"
+        );
+        let back = parse_agent_profile(&rendered).unwrap();
+        assert_eq!(
+            back.permissions.native_decision("write"),
+            NativeToolDecision::Off
+        );
+    }
+
+    #[test]
+    fn stale_v1_permission_keys_do_not_survive_a_merge_typed_render() {
+        // A profile edited (via merge_typed + render_agent_profile_document)
+        // before it has ever been cleanly re-rendered still has a schema-1
+        // `raw` tree. The stale `permissions.mode`/`tools.native` keys must
+        // not leak into the merged output as phantom extensions.
+        let raw = v1_doc("full", &[], "");
+        let mut doc = parse_agent_profile_document(&raw).unwrap();
+        let typed = doc.typed().clone();
+        doc.merge_typed(typed);
+        let rendered = render_agent_profile_document(&doc).unwrap();
+        // A plain `contains("mode:")` false-positives on the legitimate
+        // builtin tool id `exitplanmode` (`    exitplanmode: allow`); anchor
+        // on the 2-space `permissions:`-child indentation the retired
+        // top-level `mode:` key would have rendered at.
+        assert!(
+            !rendered.contains("\n  mode:"),
+            "stale mode key in:\n{rendered}"
+        );
+        let reparsed = parse_agent_profile_document(&rendered).unwrap();
+        assert!(
+            !reparsed.extensions().contains_key("permissions")
+                || reparsed.extensions()["permissions"].get("mode").is_none()
         );
     }
 }

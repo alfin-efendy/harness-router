@@ -1,6 +1,8 @@
 import type { Page } from "@playwright/test";
 import type {
+  AgentConfigurationCatalogInfo,
   AgentDetailInfo,
+  AgentModelInfo,
   AgentRegistryInfo,
   AgentRun,
   AgentRunRosterInfo,
@@ -317,7 +319,7 @@ export const RYUZI_AGENT = {
   description: "General-purpose coding agent",
   avatarColor: "violet",
   model: { kind: "concrete", name: "fixture/model-alpha", effort: "high" },
-  permissionMode: "ask",
+  builtin: false,
   skillCount: 1,
   toolCount: 4,
   knowledgeCount: 1,
@@ -332,7 +334,7 @@ export const REVIEWER_AGENT = {
   description: "Reviews implementation quality and regressions",
   avatarColor: "amber",
   model: { kind: "route", route: "safe" },
-  permissionMode: "ask",
+  builtin: false,
   skillCount: 1,
   toolCount: 4,
   knowledgeCount: 1,
@@ -341,11 +343,36 @@ export const REVIEWER_AGENT = {
   isDefault: false,
 } satisfies AgentSummaryInfo;
 
+/** Backing store for both the Fresh Agent row's `model` and the registry's
+ * `subagentModel` — the real backend mirrors the registry-wide subagent
+ * model into `fresh_agent_summary`'s `model` field (see `agent_api.rs`), so
+ * FRESH_AGENT.model derives from this single source instead of repeating
+ * the literal (Task 9 review: was a duplicate literal that could drift). */
+const SUBAGENT_MODEL: AgentModelInfo = { kind: "route", route: "smart" };
+
+/** The synthetic, non-editable Fresh Agent row — mirrors the backend's
+ * `fresh_agent_summary`/`fresh_agent_detail` (crates/core/src/api/agent_api.rs):
+ * always appended LAST to the registry, model-only detail, never mutable. */
+export const FRESH_AGENT = {
+  id: "fresh",
+  name: "Fresh Agent",
+  description: "Ephemeral, memoryless worker dispatched for delegated tasks.",
+  avatarColor: "slate",
+  model: SUBAGENT_MODEL,
+  builtin: true,
+  skillCount: 0,
+  toolCount: 0,
+  knowledgeCount: 0,
+  executable: true,
+  validation: [],
+  isDefault: false,
+} satisfies AgentSummaryInfo;
+
 const AGENT_REGISTRY = {
-  agents: [RYUZI_AGENT, REVIEWER_AGENT],
+  agents: [RYUZI_AGENT, REVIEWER_AGENT, FRESH_AGENT],
   defaultAgentId: RYUZI_AGENT.id,
   recovery: [],
-  subagentModel: { kind: "route", route: "smart" },
+  subagentModel: SUBAGENT_MODEL,
 } satisfies AgentRegistryInfo;
 
 /** Same registry with Reviewer removed — the deleted-owner history journey
@@ -353,14 +380,17 @@ const AGENT_REGISTRY = {
  * the live roster (session-primary.ts's "deleted" branch). */
 export const REGISTRY_WITHOUT_REVIEWER = {
   ...AGENT_REGISTRY,
-  agents: [RYUZI_AGENT],
+  agents: [RYUZI_AGENT, FRESH_AGENT],
 } satisfies AgentRegistryInfo;
 
 export const RYUZI_DETAIL = {
   summary: RYUZI_AGENT,
   permissionRules: [],
   skills: ["general-coding"],
-  nativeTools: ["read_file", "grep"],
+  nativeTools: [
+    { tool: "read_file", decision: "allow" },
+    { tool: "grep", decision: "allow" },
+  ],
   pluginTools: [],
   apps: [],
   modelInfo: null,
@@ -371,7 +401,24 @@ export const REVIEWER_DETAIL = {
   summary: REVIEWER_AGENT,
   permissionRules: [],
   skills: ["code-review"],
-  nativeTools: ["read_file", "grep"],
+  nativeTools: [
+    { tool: "read_file", decision: "allow" },
+    { tool: "grep", decision: "allow" },
+  ],
+  pluginTools: [],
+  apps: [],
+  modelInfo: null,
+  personality: { preset: "helpful", custom: null },
+} satisfies AgentDetailInfo;
+
+/** `get_agent("fresh")`'s detail: everything but the summary/model is empty
+ * so the frontend renders a model-only view — mirrors the backend's
+ * `fresh_agent_detail`. */
+export const FRESH_AGENT_DETAIL = {
+  summary: FRESH_AGENT,
+  permissionRules: [],
+  skills: [],
+  nativeTools: [],
   pluginTools: [],
   apps: [],
   modelInfo: null,
@@ -384,7 +431,44 @@ export const REVIEWER_DETAIL = {
 const AGENT_DETAILS: Record<string, AgentDetailInfo> = {
   ryuzi: RYUZI_DETAIL,
   reviewer: REVIEWER_DETAIL,
+  fresh: FRESH_AGENT_DETAIL,
 };
+
+/** `get_agent_configuration_catalog` — backs the detail page's Skills/
+ * Permissions/Apps & MCP tabs (`useAgentConfigurationCatalog`). Native-tool
+ * ids line up with `RYUZI_DETAIL`/`REVIEWER_DETAIL.nativeTools` above
+ * (`read_file`, `grep`, both `allow`) so the Permissions tab's rows render
+ * with a real, non-default decision; `bash` adds a `commandScoped` row for
+ * completeness even though no fixture agent has an explicit decision for it
+ * (renders "Ask", the documented absent-decision default). Skill ids line up
+ * with `RYUZI_DETAIL`/`REVIEWER_DETAIL.skills`. */
+export const AGENT_CONFIGURATION_CATALOG = {
+  skills: [
+    {
+      id: "general-coding",
+      label: "General coding",
+      description: "General-purpose coding guidance",
+      available: true,
+      commandScoped: false,
+      pack: null,
+    },
+    {
+      id: "code-review",
+      label: "Code review",
+      description: "Reviews implementation quality and regressions",
+      available: true,
+      commandScoped: false,
+      pack: null,
+    },
+  ],
+  nativeTools: [
+    { id: "read_file", label: "Read file", description: "Read files from disk", available: true, commandScoped: false, pack: null },
+    { id: "grep", label: "Grep", description: "Search file contents", available: true, commandScoped: false, pack: null },
+    { id: "bash", label: "Bash", description: "Run shell commands", available: true, commandScoped: true, pack: null },
+  ],
+  pluginTools: [],
+  apps: [],
+} satisfies AgentConfigurationCatalogInfo;
 
 const EMPTY_AGENT_RUN_ROSTER: AgentRunRosterInfo = { rootRunId: null, runs: [] };
 type ChildRunMockState = {
@@ -847,6 +931,7 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   // Internal lookup bag for the dynamically-dispatched `get_agent` command
   // (see its branch in installMockIPC) — not a real Tauri command name.
   agent_details: AGENT_DETAILS,
+  get_agent_configuration_catalog: AGENT_CONFIGURATION_CATALOG,
   // Internal lookup bags for the dynamically-dispatched `plugin_detail`/
   // `plugin_release_detail` commands (Task 16) — not real Tauri command
   // names. `page.addInitScript`'s callback is serialized via `.toString()`
@@ -1192,6 +1277,20 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
             const { agentId } = args as { agentId: string };
             const details = fixtures.agent_details as Record<string, unknown>;
             return Promise.resolve(details[agentId] ?? null);
+          }
+          // The Fresh Agent is a synthetic, non-editable row — the real backend
+          // rejects these four mutation commands for id "fresh" with a 409
+          // conflict ("fresh agent is built-in", the `FRESH_AGENT_ID` guards in
+          // `crates/core/src/api/agent_api.rs`). Mirrored here so e2e can't
+          // silently pass against a mock that would otherwise let the mutation
+          // through (previously these commands had no mock handling at all and
+          // fell through to the generic `Promise.resolve(null)` default below
+          // for every id, fresh included).
+          if (
+            (cmd === "update_agent" || cmd === "delete_agent" || cmd === "set_default_agent" || cmd === "duplicate_agent") &&
+            (args as { agentId?: string } | undefined)?.agentId === "fresh"
+          ) {
+            return Promise.reject({ message: "fresh agent is built-in" });
           }
           // Task 12: PluginsView (bootstrap-retry banner + "Component plugins"
           // section) and PluginDetailView's component-only fallback both call

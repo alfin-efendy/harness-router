@@ -10,6 +10,7 @@ export type MentionAgent = {
   name: string;
   description: string;
   executable: boolean;
+  builtin: boolean;
 };
 
 export type AgentMentionQuery = {
@@ -41,6 +42,7 @@ export function matchMentionAgents<T extends MentionAgent>(
   return agents.filter(
     (agent) =>
       agent.executable &&
+      !agent.builtin &&
       agent.id !== primaryAgentId &&
       (agent.name.toLocaleLowerCase().includes(normalizedQuery) || agent.description.toLocaleLowerCase().includes(normalizedQuery)),
   );

@@ -11,12 +11,13 @@
 //! [`SessionPermOverrides`] (dropped with the session), project-scoped ones
 //! persist a `tool_policies` row via `Store::set_tool_policy`.
 
+use crate::agents::types::NativeToolDecision;
 use crate::approval::{ApprovalHub, ApprovalKey};
 use crate::domain::{ApprovalKind, ApprovalResponse, ApprovalScope, CoreEvent, PermMode};
 use crate::harness::native::tools::PermissionSpec;
 use crate::policy::{decide_tool_permission, is_safe_tool, PolicyOutcome};
 use crate::store::Store;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -61,11 +62,33 @@ impl SessionPermOverrides {
 /// Everything one permission check needs. Borrowed from `RunnerDeps` at the
 /// dispatch site so the check itself stays a pure function of its inputs.
 pub struct PermGate<'a> {
-    /// Order (top wins): Plan hard-deny → profile rules → session overrides → project
-    /// `tool_policies` (allowAlways AND rejectAlways) → mode auto-allow → prompt.
-    /// Plan sits above every other rule so no profile/session choice can punch
-    /// through Plan's read-only guarantee.
+    /// Order (top wins): Plan hard-deny → profile rules (a matching scoped
+    /// prefix rule always wins, even over a `Allow`/`Off` base decision) →
+    /// native per-tool decision (`Allow`/`Off` only; `Ask` falls through) →
+    /// session overrides → project `tool_policies` (allowAlways AND
+    /// rejectAlways) → mode auto-allow → prompt. Plan sits above every other
+    /// rule so no profile/session choice can punch through Plan's read-only
+    /// guarantee.
     pub permission_rules: &'a [crate::agents::types::PermissionRule],
+    /// The active profile's per-tool native decision map (`AgentPermissions::
+    /// native`), keyed by the tool's registry id (the same lowercase key
+    /// `tool_filter_for_profile` resolves against) — not the permission-CLASS
+    /// key (`spec.key`/`key_to_policy_tool`). It MUST be looked up via
+    /// [`Self::tool_id`], never `spec.key`: several tools share a
+    /// permission-class key with unrelated tools (`grep`/`glob`/`ls`/`skill`/
+    /// `lsp`/`session_search`/`delegate_agent` all report class `"read"`;
+    /// `write`/`revert` both report class `"edit"`), so keying this map by
+    /// `spec.key` would alias their per-tool `Off`/`Allow` entries onto each
+    /// other. Consulted only for non-namespaced (native) tools;
+    /// `mcp__`/`ext__`/`wasm__` calls never match an entry here.
+    pub native_decisions: &'a BTreeMap<String, NativeToolDecision>,
+    /// The registry id of the tool actually being invoked (`Tool::name()`,
+    /// e.g. `"write"`, `"grep"`, `"mcp__acme__search"`) — the ONLY key
+    /// [`Self::native_decisions`] is looked up by. Distinct from
+    /// `spec.key`, which is the tool's permission-CLASS key and stays the
+    /// vocabulary for `key_to_policy_tool`, project `tool_policies`, and
+    /// session overrides.
+    pub tool_id: &'a str,
     pub perm_mode: PermMode,
     pub project_id: Option<&'a str>,
     pub store: &'a Store,
@@ -78,6 +101,15 @@ pub struct PermGate<'a> {
     pub approvals: &'a ApprovalHub,
     pub events: &'a broadcast::Sender<CoreEvent>,
     pub cancel: &'a CancellationToken,
+}
+
+/// Whether `key` names a plugin-provided tool (MCP, extension, or WASM
+/// component) rather than a native builtin — mirrors the same three-prefix
+/// check `tool_filter_for_profile` uses to resolve the native/plugin split.
+/// A namespaced key never has a `native_decisions` entry: the decision map
+/// only governs native (registry) tool ids.
+fn is_namespaced_tool_key(key: &str) -> bool {
+    key.starts_with("mcp__") || key.starts_with("ext__") || key.starts_with("wasm__")
 }
 
 /// Map a native permission key to the canonical tool name `policy` recognizes,
@@ -120,10 +152,12 @@ fn profile_rule_decision(
 
 /// Decide whether a native tool call may proceed.
 ///
-/// Order (top wins): Plan hard-deny → session overrides → project
-/// `tool_policies` (allowAlways AND rejectAlways) → mode auto-allow → prompt.
-/// Plan sits above the session sets so "allow for this session" can never
-/// punch through Plan's read-only guarantee.
+/// Order (top wins): Plan hard-deny → profile rules (a matching scoped
+/// prefix rule always wins over the tool's base decision) → native per-tool
+/// decision → session overrides → project `tool_policies` (allowAlways AND
+/// rejectAlways) → mode auto-allow → prompt. Plan sits above the session
+/// sets so "allow for this session" can never punch through Plan's
+/// read-only guarantee.
 pub async fn evaluate(
     spec: &PermissionSpec,
     input: &serde_json::Value,
@@ -133,8 +167,33 @@ pub async fn evaluate(
     if gate.perm_mode == PermMode::Plan && !is_safe_tool(tool) {
         return PermDecision::Deny;
     }
+    // A matching scoped prefix rule applies ON TOP OF the tool's base
+    // decision, so it must be consulted before the base-decision check
+    // below — otherwise a tool whose base decision is `Allow` could bypass
+    // its own scoped `Deny` rule (e.g. `bash` base=Allow with a `rm `-prefix
+    // Deny rule must still deny `rm -rf`).
     if let Some(decision) = profile_rule_decision(gate.permission_rules, &spec.key, input) {
         return decision;
+    }
+    if !is_namespaced_tool_key(&spec.key) {
+        match gate
+            .native_decisions
+            // Registry id, not `spec.key`: see `PermGate::tool_id`'s doc for
+            // why the permission-CLASS key would silently alias unrelated
+            // tools (e.g. `write`'s Off would also gate `revert`, since both
+            // report class `"edit"`).
+            .get(gate.tool_id)
+            .copied()
+            .unwrap_or(NativeToolDecision::Ask)
+        {
+            NativeToolDecision::Allow => return PermDecision::Allow,
+            // Defense in depth: `tool_filter_for_profile` already excludes an
+            // `Off` tool from advertisement, so a live call reaching here
+            // means something bypassed the filter (a stale prompt-cached
+            // tool list, a directly-constructed call). Deny it outright.
+            NativeToolDecision::Off => return PermDecision::Deny,
+            NativeToolDecision::Ask => {}
+        }
     }
     match gate.overrides.lock().unwrap().decision_for(tool) {
         Some(true) => return PermDecision::Allow,
@@ -239,6 +298,10 @@ mod tests {
         approvals: Arc<ApprovalHub>,
         events: broadcast::Sender<CoreEvent>,
         cancel: CancellationToken,
+        /// Empty by default: every key is absent, so `evaluate` treats every
+        /// native tool as `Ask` and falls through to the rest of the gate,
+        /// matching every pre-existing test's expectations unchanged.
+        native_decisions: BTreeMap<String, NativeToolDecision>,
     }
 
     impl Fixture {
@@ -252,12 +315,21 @@ mod tests {
                 approvals: Arc::new(ApprovalHub::new()),
                 events,
                 cancel: CancellationToken::new(),
+                native_decisions: BTreeMap::new(),
             }
         }
 
         fn gate(&self, perm_mode: PermMode, project_id: Option<&'static str>) -> PermGate<'_> {
             PermGate {
                 permission_rules: &[],
+                native_decisions: &self.native_decisions,
+                // Every pre-existing test in this fixture calls `spec("bash")`
+                // against a native-decisions map keyed by `"bash"` too, where
+                // registry id and permission-class key happen to coincide —
+                // so this default keeps every one of them unchanged. Tests
+                // that need a different executing tool override this field
+                // via struct-update syntax, same as `native_decisions` above.
+                tool_id: "bash",
                 perm_mode,
                 project_id,
                 store: &self.store,
@@ -272,6 +344,226 @@ mod tests {
                 cancel: &self.cancel,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn allow_decision_auto_allows_without_prompt() {
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("bash".to_string(), NativeToolDecision::Allow)]);
+        let gate = PermGate {
+            native_decisions: &native,
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(&spec("bash"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn matching_prefix_deny_rule_wins_over_base_allow_decision() {
+        // Base decision Allow + a matching scoped prefix rule Deny: the rule
+        // applies ON TOP OF the base decision, so the deny must win — a tool
+        // whose base decision is Allow must not bypass its own scoped
+        // prefix rules (e.g. `bash` base=Allow with `rm ` → Deny must still
+        // deny `rm -rf`).
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("bash".to_string(), NativeToolDecision::Allow)]);
+        let rules = [crate::agents::types::PermissionRule {
+            id: "rm-deny".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Deny,
+            command_prefix: Some("rm ".into()),
+        }];
+        let gate = PermGate {
+            native_decisions: &native,
+            permission_rules: &rules,
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "rm -rf /"}),
+            &gate,
+        )
+        .await;
+        assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn non_matching_prefix_deny_rule_falls_through_to_base_allow_decision() {
+        // Base decision Allow + a Deny rule that does NOT match this
+        // command's prefix: the rule doesn't apply, so the base Allow
+        // decision governs.
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("bash".to_string(), NativeToolDecision::Allow)]);
+        let rules = [crate::agents::types::PermissionRule {
+            id: "rm-deny".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Deny,
+            command_prefix: Some("rm ".into()),
+        }];
+        let gate = PermGate {
+            native_decisions: &native,
+            permission_rules: &rules,
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "git status"}),
+            &gate,
+        )
+        .await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn ask_decision_still_prompts_and_prefix_rules_apply() {
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("bash".to_string(), NativeToolDecision::Ask)]);
+        let rules = [crate::agents::types::PermissionRule {
+            id: "git-allow".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Allow,
+            command_prefix: Some("git ".into()),
+        }];
+        let gate = PermGate {
+            native_decisions: &native,
+            permission_rules: &rules,
+            ..f.gate(PermMode::Default, None)
+        };
+        // A matching prefix rule allows without a prompt.
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "git status"}),
+            &gate,
+        )
+        .await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+
+        // A non-matching command falls through the rule to the normal prompt
+        // path — nothing here auto-resolves it, so it parks pending.
+        let bash = spec("bash");
+        let input = serde_json::json!({"command": "rm -rf /"});
+        let fut = evaluate(&bash, &input, &gate);
+        tokio::pin!(fut);
+        assert!(futures::poll!(fut.as_mut()).is_pending());
+        assert!(f.approvals.has_pending());
+        f.cancel.cancel();
+        assert_eq!(fut.await, PermDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn off_decision_denies_without_prompt() {
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("bash".to_string(), NativeToolDecision::Off)]);
+        let gate = PermGate {
+            native_decisions: &native,
+            ..f.gate(PermMode::BypassPermissions, None)
+        };
+        let d = evaluate(&spec("bash"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn native_decision_lookup_uses_the_tool_id_not_the_shared_class_key() {
+        // `write`'s own `permission()` reports class key `"edit"` (shared
+        // with `revert` and the literal `edit` tool) — never `"write"`. A
+        // map keyed by `spec.key` would therefore never see this `"write"`
+        // entry at all, and BypassPermissions' unconditional mode-based
+        // auto-allow would wrongly grant the call once the (mis-keyed) native
+        // check falls through to `Ask`. Regression-tests the CRITICAL-1
+        // review finding directly: "map {"write": Off} ... write call
+        // Denied without prompting".
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("write".to_string(), NativeToolDecision::Off)]);
+        let gate = PermGate {
+            native_decisions: &native,
+            tool_id: "write",
+            ..f.gate(PermMode::BypassPermissions, None)
+        };
+        let d = evaluate(&spec("edit"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn native_decision_lookup_is_immune_to_a_same_named_class_key_collision() {
+        // `grep`'s class key is `"read"` — the SAME string as the registry
+        // id of the actual `read` (file-read) tool. A map keyed by
+        // `spec.key` would have the `read` tool's own `Off` decision
+        // silently gate every `"read"`-classed tool (grep/glob/ls/skill/
+        // lsp/session_search/delegate_agent) too. Map both entries under
+        // their real registry ids — `read` tool Off, `grep` tool Allow —
+        // and call `grep`: only `grep`'s own entry must govern.
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([
+            ("read".to_string(), NativeToolDecision::Off),
+            ("grep".to_string(), NativeToolDecision::Allow),
+        ]);
+        let gate = PermGate {
+            native_decisions: &native,
+            tool_id: "grep",
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(&spec("read"), &serde_json::json!({}), &gate).await;
+        assert_eq!(
+            d,
+            PermDecision::Allow,
+            "the `read` tool's Off must not leak onto grep's own Allow"
+        );
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn class_key_entry_is_never_consulted_for_the_native_decision_map() {
+        // Map `{"write": Allow}` with no `"edit"` entry at all, PLUS a
+        // project `rejectAlways` row for the canonical `"Edit"` name (the
+        // outcome a `spec.key`-keyed lookup would fall through to once it
+        // missed on `"edit"`). A `write` call must resolve straight from its
+        // own registry-id entry — `Allow`, no prompt — and never even reach
+        // the project-policy fallback that would otherwise deny it.
+        let f = Fixture::new().await;
+        f.store
+            .set_tool_policy(WriteOrigin::User, "p1", "Edit", "rejectAlways")
+            .await
+            .unwrap();
+        let native = BTreeMap::from([("write".to_string(), NativeToolDecision::Allow)]);
+        assert!(!native.contains_key("edit"));
+        let gate = PermGate {
+            native_decisions: &native,
+            tool_id: "write",
+            ..f.gate(PermMode::Default, Some("p1"))
+        };
+        let d = evaluate(&spec("edit"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn native_decision_is_only_consulted_for_non_namespaced_keys() {
+        // An `mcp__`/`ext__`/`wasm__` key never has a `native_decisions`
+        // entry, so an `Allow` mapped under its bare-looking key (which would
+        // never actually occur, but proves the namespace guard) must not
+        // short-circuit an MCP tool call.
+        let f = Fixture::new().await;
+        let native = BTreeMap::from([("mcp__acme__search".to_string(), NativeToolDecision::Allow)]);
+        let gate = PermGate {
+            native_decisions: &native,
+            ..f.gate(PermMode::Default, None)
+        };
+        let mcp_spec = spec("mcp__acme__search");
+        let input = serde_json::json!({});
+        let fut = evaluate(&mcp_spec, &input, &gate);
+        tokio::pin!(fut);
+        assert!(
+            futures::poll!(fut.as_mut()).is_pending(),
+            "a namespaced key must fall through to the normal gate, not auto-allow"
+        );
+        f.cancel.cancel();
+        assert_eq!(fut.await, PermDecision::Deny);
     }
 
     #[tokio::test]

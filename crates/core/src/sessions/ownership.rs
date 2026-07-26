@@ -286,12 +286,14 @@ mod tests {
                     },
                     personality: crate::agents::personality::AgentPersonality::default_profile(),
                     permissions: crate::agents::types::AgentPermissions {
-                        mode: PermMode::Default,
+                        native: std::collections::BTreeMap::from([(
+                            "read".into(),
+                            crate::agents::types::NativeToolDecision::Allow,
+                        )]),
                         rules: Vec::new(),
                     },
                     skills: Vec::new(),
                     tools: crate::agents::types::AgentTools {
-                        native: vec!["read".into()],
                         plugins: Vec::new(),
                         apps: Vec::new(),
                     },

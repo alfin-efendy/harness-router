@@ -53,59 +53,57 @@ struct AdaptedPrimary {
     allowed_skills: Option<Vec<String>>,
 }
 
+/// Which native tools this profile advertises, plus its plugin/app bindings
+/// resolved against the LIVE registry (`available`).
+///
+/// Native tools: every non-namespaced id in `available` whose decision is
+/// `enabled()` (`Allow` or the default-absent `Ask`) — only an explicit `Off`
+/// excludes it. There is no "everything empty" shortcut to `ToolFilter::All`:
+/// an empty decision map already means every native tool is `Ask` (enabled),
+/// so an agent with no plugin/app bindings still resolves to exactly the
+/// native registry, not a blanket allow that would also sweep in
+/// `mcp__`/`ext__`/`wasm__` tools it never configured.
 fn tool_filter_for_profile(
     profile: &crate::agents::types::AgentProfile,
     available: &[String],
 ) -> agents::ToolFilter {
-    if profile.tools.native.is_empty()
-        && profile.tools.plugins.is_empty()
-        && profile.tools.apps.is_empty()
-    {
-        return agents::ToolFilter::All;
-    }
-
-    let mut configured = profile
-        .tools
-        .native
+    let namespaced = |name: &str| {
+        name.starts_with("mcp__") || name.starts_with("ext__") || name.starts_with("wasm__")
+    };
+    let mut allowed: Vec<String> = available
         .iter()
-        .filter(|name| {
-            available
-                .iter()
-                .any(|available_name| available_name == *name)
-        })
+        .filter(|name| !namespaced(name))
+        .filter(|name| profile.permissions.native_decision(name).enabled())
         .cloned()
-        .collect::<Vec<_>>();
+        .collect();
     for plugin in &profile.tools.plugins {
         if available.iter().any(|name| name == plugin) {
-            configured.push(plugin.clone());
+            allowed.push(plugin.clone());
             continue;
         }
         let (provider, tool) = plugin.split_once('.').unwrap_or((plugin, ""));
-        configured.extend(
+        allowed.extend(
             available
                 .iter()
                 .filter(|name| {
                     *name == &format!("mcp__{provider}__{tool}")
                         || *name == &format!("ext__{provider}__{tool}")
+                        || *name == &format!("wasm__{provider}__{tool}")
                 })
                 .cloned(),
         );
     }
     for app in &profile.tools.apps {
-        configured.extend(
+        allowed.extend(
             available
                 .iter()
                 .filter(|name| name.starts_with(&format!("mcp__{app}__")))
                 .cloned(),
         );
     }
-    configured.sort();
-    configured.dedup();
-    if configured.is_empty() {
-        agents::ToolFilter::Only(Vec::new())
-    } else {
-        agents::ToolFilter::Only(configured)
-    }
+    allowed.sort();
+    allowed.dedup();
+    agents::ToolFilter::Only(allowed)
 }
 
 fn adapt_primary_profile(
@@ -138,6 +136,7 @@ pub(crate) fn primary_turn_config(
     agent: Arc<crate::agents::types::AgentSnapshot>,
     run_id: String,
     root_run_id: String,
+    perm_mode: crate::domain::PermMode,
 ) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
     let adapted = adapt_primary_profile(&agent.profile)?;
     let (model, effort) = match &agent.profile.model {
@@ -147,7 +146,7 @@ pub(crate) fn primary_turn_config(
         crate::agents::types::AgentModel::Route { route } => (Some(route.clone()), None),
     };
     Ok(crate::harness::PrimaryTurnConfig {
-        perm_mode: agent.profile.permissions.mode,
+        perm_mode,
         agent,
         run_id,
         root_run_id,
@@ -162,9 +161,10 @@ pub(crate) fn primary_turn_config_with_tools(
     agent: Arc<crate::agents::types::AgentSnapshot>,
     run_id: String,
     root_run_id: String,
+    perm_mode: crate::domain::PermMode,
     available_tools: &[String],
 ) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
-    let mut config = primary_turn_config(agent.clone(), run_id, root_run_id)?;
+    let mut config = primary_turn_config(agent.clone(), run_id, root_run_id, perm_mode)?;
     config.agent_tools.tools = tool_filter_for_profile(&agent.profile, available_tools);
     Ok(config)
 }
@@ -384,6 +384,7 @@ impl Harness for NativeHarness {
             ctx.primary_agent.clone(),
             ctx.run_id.clone(),
             ctx.root_run_id.clone(),
+            ctx.perm_mode,
             &tools.names(),
         )?;
         let agent = primary_turn.agent_tools.clone();
@@ -727,11 +728,36 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::types::NativeToolDecision;
     use crate::approval::ApprovalHub;
     use crate::domain::PermMode;
     use crate::llm_router::client::AnthropicEvent;
     use crate::store::Store;
+    use std::collections::BTreeMap;
     use tokio::sync::broadcast;
+
+    /// Builds a `permissions.native` decision map where every listed tool is
+    /// `Allow`. NOTE: tools NOT listed here are `Ask` (still enabled, per
+    /// `tool_filter_for_profile`'s absent-entry semantics) — use [`off_map`]
+    /// when a fixture needs to positively EXCLUDE every other builtin.
+    fn allow_map(tools: &[&str]) -> BTreeMap<String, NativeToolDecision> {
+        tools
+            .iter()
+            .map(|tool| (tool.to_string(), NativeToolDecision::Allow))
+            .collect()
+    }
+
+    /// Builds a `permissions.native` decision map where every listed tool is
+    /// `Off` (excluded from both advertisement and the permission gate). Used
+    /// to positively narrow a profile to a small allow-set under the new
+    /// absent-means-`Ask`-means-enabled semantics, where clearing the map no
+    /// longer means "no natives" — it means "every native is enabled".
+    fn off_map(tools: &[String]) -> BTreeMap<String, NativeToolDecision> {
+        tools
+            .iter()
+            .map(|tool| (tool.clone(), NativeToolDecision::Off))
+            .collect()
+    }
 
     /// A factory that hands every session the same scripted conversation.
     struct ScriptedFactory {
@@ -909,7 +935,7 @@ mod tests {
     #[test]
     fn durable_primary_adapter_still_filters_skills_without_build_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
-        profile.tools.native = vec!["read".into()];
+        profile.permissions.native = allow_map(&["read"]);
         profile.skills = vec!["release".into()];
         let adapted = adapt_primary_profile(&profile).unwrap();
 
@@ -939,7 +965,7 @@ mod tests {
         let mut target = (*ctx.primary_agent).clone();
         target.profile.id = "mentioned-target".into();
         target.profile.name = "Mentioned target".into();
-        target.profile.tools.native = vec!["read".into(), "app_projects".into()];
+        target.profile.permissions.native = allow_map(&["read", "app_projects"]);
         target.profile.tools.plugins.clear();
         target.profile.tools.apps.clear();
         ctx.primary_agent = Arc::new(target);
@@ -1015,7 +1041,13 @@ mod tests {
         let mut target = (*ctx.primary_agent).clone();
         target.profile.id = "mentioned-target".into();
         target.profile.name = "Mentioned target".into();
-        target.profile.tools.native.clear();
+        // Under the new absent=Ask=enabled semantics, clearing the map no
+        // longer means "no natives" — every builtin would default to `Ask`
+        // (still enabled). Explicitly `Off` every builtin so this fixture
+        // keeps testing its original intent: a target with plugin/app
+        // bindings that never resolve against the (empty) registry must not
+        // fall back to advertising the native tool registry.
+        target.profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
         target.profile.tools.plugins = vec!["github.search".into()];
         target.profile.tools.apps = vec!["slack".into()];
         ctx.primary_agent = Arc::new(target);
@@ -1067,7 +1099,11 @@ mod tests {
         let mut ctx = ctx_for(store, work_dir.path().to_path_buf()).await;
         let mut primary = (*ctx.primary_agent).clone();
         primary.profile.id = "plugin-app-only".into();
-        primary.profile.tools.native.clear();
+        // See the sibling `isolated_target_uses_complete_profile_tool_allowlist_
+        // after_registry_attach` fixture comment: clearing the map now means
+        // every builtin defaults to `Ask` (enabled), not excluded, so this
+        // "plugin/app-only" fixture must `Off` every builtin explicitly.
+        primary.profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
         primary.profile.tools.plugins = vec!["github.search".into()];
         primary.profile.tools.apps = vec!["slack".into()];
         ctx.primary_agent = Arc::new(primary);
@@ -1098,7 +1134,8 @@ mod tests {
 
         // Exactly what `continue_session_with_primary_turn` does per prompt:
         // build a registry-blind config and push it at the live session.
-        let registry_blind = primary_turn_config(refresh_agent, run_id, root_run_id).unwrap();
+        let registry_blind =
+            primary_turn_config(refresh_agent, run_id, root_run_id, PermMode::Default).unwrap();
         session.refresh_primary_turn(registry_blind).await;
         session
             .send_prompt(TurnPrompt::text("second", "second"))
@@ -1219,7 +1256,17 @@ mod tests {
         let mut primary = (*ctx.primary_agent).clone();
         primary.profile.id = "plugin-bound-target".into();
         primary.profile.name = "Plugin bound target".into();
-        primary.profile.tools.native = vec!["read".into()];
+        // Under the new absent=Ask=enabled semantics, `allow_map(&["read"])`
+        // alone would leave every OTHER builtin absent (still enabled), so
+        // the advertised set would balloon past the two tools this test
+        // asserts on. `Off` every builtin except `read` to keep the fixture
+        // narrowed to exactly the two-element expectation below.
+        primary.profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
+        primary
+            .profile
+            .permissions
+            .native
+            .insert("read".into(), NativeToolDecision::Allow);
         primary.profile.tools.plugins = vec!["github.search".into()];
         ctx.primary_agent = Arc::new(primary);
         ctx.main_agent_id = "plugin-bound-target".into();
@@ -1246,7 +1293,8 @@ mod tests {
             .send_prompt(TurnPrompt::text("first", "first"))
             .await
             .unwrap();
-        let registry_blind = primary_turn_config(refresh_agent, run_id, root_run_id).unwrap();
+        let registry_blind =
+            primary_turn_config(refresh_agent, run_id, root_run_id, PermMode::Default).unwrap();
         session.refresh_primary_turn(registry_blind).await;
         session
             .send_prompt(TurnPrompt::text("second", "second"))
@@ -1281,7 +1329,15 @@ mod tests {
     #[test]
     fn profile_tool_filter_resolves_native_plugin_and_app_tools_without_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
-        profile.tools.native = vec!["read".into()];
+        // Absent = `Ask` = enabled now, so narrowing to exactly `read` (plus
+        // the plugin/app bindings below) requires explicitly `Off`-ing every
+        // other builtin — otherwise `write` (present in `available` and
+        // unmapped) would also resolve as enabled.
+        profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
+        profile
+            .permissions
+            .native
+            .insert("read".into(), NativeToolDecision::Allow);
         profile.tools.plugins = vec!["github.search".into(), "lint.check".into()];
         profile.tools.apps = vec!["slack".into()];
         let available = vec![
@@ -1302,13 +1358,44 @@ mod tests {
             ])
         );
 
-        profile.tools.native = vec!["missing-native".into()];
+        // A configuration with every native explicitly `Off` and unbound
+        // plugin/app entries must never broaden to every registered tool —
+        // same guard as above, restated under the new semantics (previously
+        // this relied on an empty/non-matching native list; now it requires
+        // an explicit `Off` map since absence alone no longer excludes).
+        profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
         profile.tools.plugins = vec!["missing.tool".into()];
         profile.tools.apps = vec!["missing-app".into()];
         assert_eq!(
             tool_filter_for_profile(&profile, &available),
             agents::ToolFilter::Only(Vec::new()),
             "a nonempty configuration must never broaden to every registered tool"
+        );
+    }
+
+    /// Step 1 of the brief: the new absent-entry semantics — an unmapped
+    /// native tool defaults to `Ask` (still enabled/advertised), and only an
+    /// explicit `Off` excludes it. `write` here is `Off`, so it drops out
+    /// even though it's present in `available`; `read` is absent (never
+    /// mentioned in the map) and still resolves as enabled.
+    #[test]
+    fn filter_includes_unmapped_natives_and_excludes_off() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("t".into());
+        profile.permissions.native.clear();
+        profile
+            .permissions
+            .native
+            .insert("write".into(), NativeToolDecision::Off);
+        profile.tools.plugins = vec!["github.search".into()];
+        let available = vec![
+            "read".into(),
+            "write".into(),
+            "mcp__github__search".into(),
+            "ext__lint__check".into(),
+        ];
+        assert_eq!(
+            tool_filter_for_profile(&profile, &available),
+            agents::ToolFilter::Only(vec!["mcp__github__search".into(), "read".into()])
         );
     }
 

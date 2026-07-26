@@ -212,7 +212,7 @@ beforeEach(() => {
           description: "",
           avatarColor: "violet",
           model: { kind: "route", route: "free" },
-          permissionMode: "ask",
+          builtin: false,
           skillCount: 0,
           toolCount: 0,
           knowledgeCount: 0,
@@ -601,6 +601,54 @@ test("starts a chat without a project using the selected primary", async () => {
       git: null,
     }),
   );
+});
+
+test("agent picker offers executable agents but never the built-in Fresh Agent", async () => {
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        {
+          ...useAgents.getState().registry!.agents[0],
+          id: "fresh",
+          name: "Fresh Agent",
+          description: "Ephemeral worker",
+          builtin: true,
+          isDefault: false,
+        },
+      ],
+    },
+  });
+  render(<HomeView />);
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent" }));
+  expect(await screen.findByRole("option", { name: "Ryuzi" })).toBeTruthy();
+  expect(screen.queryByRole("option", { name: "Fresh Agent" })).toBeNull();
+});
+
+test("hides the agent picker entirely when only the built-in row is executable", () => {
+  useAgents.setState({
+    registry: {
+      agents: [
+        { ...useAgents.getState().registry!.agents[0], executable: false },
+        {
+          ...useAgents.getState().registry!.agents[0],
+          id: "fresh",
+          name: "Fresh Agent",
+          description: "Ephemeral worker",
+          builtin: true,
+          isDefault: false,
+        },
+      ],
+      defaultAgentId: "ryuzi",
+      recovery: [],
+      subagentModel: { kind: "route", route: "free" },
+    },
+  });
+  render(<HomeView />);
+
+  expect(screen.queryByRole("combobox", { name: "Agent" })).toBeNull();
 });
 
 test("preserves project, branch, context, voice, and attachment controls while model controls stay removed", () => {

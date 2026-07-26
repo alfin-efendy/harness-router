@@ -20,7 +20,11 @@ export function DeleteAgentModal({
   onSuccess?: () => void;
 }) {
   const registry = useAgents((state) => state.registry);
-  const canDelete = (registry?.agents.length ?? 0) > 1;
+  // Only count real (non-`builtin`) agents: the registry always appends the
+  // synthetic, non-deletable Fresh Agent row last, so `agents.length` alone
+  // overcounts by one and would let the sole remaining real agent's Delete
+  // button enable — the backend then 409s on that delete.
+  const canDelete = (registry?.agents.filter((a) => !a.builtin).length ?? 0) > 1;
   return (
     <ConfirmActionModal
       open={open}

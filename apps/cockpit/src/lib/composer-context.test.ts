@@ -35,10 +35,11 @@ test("uniqueContextRefs dedupes and drops blanks, preserving first-seen order", 
 
 const project: ContextPickerProject = { projectId: "proj1", name: "Acme Web" };
 
-const ada = { id: "ada", name: "Ada", description: "Accessibility review", executable: true } as AgentSummaryInfo;
-const lin = { id: "lin", name: "Lin", description: "Systems planner", executable: true } as AgentSummaryInfo;
-const blocked = { id: "blocked", name: "Blocked", description: "Unavailable", executable: false } as AgentSummaryInfo;
-const agents = [ada, lin, blocked];
+const ada = { id: "ada", name: "Ada", description: "Accessibility review", executable: true, builtin: false } as AgentSummaryInfo;
+const lin = { id: "lin", name: "Lin", description: "Systems planner", executable: true, builtin: false } as AgentSummaryInfo;
+const blocked = { id: "blocked", name: "Blocked", description: "Unavailable", executable: false, builtin: false } as AgentSummaryInfo;
+const fresh = { id: "fresh", name: "Fresh Agent", description: "Ephemeral worker", executable: true, builtin: true } as AgentSummaryInfo;
+const agents = [ada, lin, blocked, fresh];
 
 const entries: SearchEntryInfo[] = [
   { path: "src/views", dir: true },
@@ -90,7 +91,7 @@ test("matches project name case-insensitively and hides sections with no matches
   expect(groups).toEqual([{ section: "project", label: "Project", items: [{ kind: "project", id: "proj1", name: "Acme Web" }] }]);
 });
 
-test("excludes the primary agent and non-executable agents from the Agents section", () => {
+test("excludes the primary agent, non-executable agents, and built-in agents from the Agents section", () => {
   const groups = contextPickerGroups({ query: "", project: null, agents, primaryAgentId: "ada", entries: [] });
 
   expect(groups).toEqual([{ section: "agents", label: "Agents", items: [{ kind: "agent", agent: lin }] }]);

@@ -12,7 +12,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     description: "",
     avatarColor: "violet",
     model: route("free"),
-    permissionMode: "ask",
+    builtin: false,
     skillCount: 0,
     toolCount: 0,
     knowledgeCount: 0,
@@ -155,6 +155,22 @@ test("Delete failure keeps the confirmation open and stays on the hub", async ()
 
 test("Delete confirmation is disabled when only one agent remains", async () => {
   useAgents.setState({ registry: { ...registry(), agents: [reviewerSummary()], defaultAgentId: "reviewer" } });
+  render(<AgentActionsMenu agent={reviewerSummary()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+  await screen.findByRole("dialog", { name: "Delete Reviewer?" });
+  expect((screen.getByRole("button", { name: "Delete agent" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Delete agent" }));
+  expect(deleteAgent).not.toHaveBeenCalled();
+});
+
+test("Delete confirmation is disabled with one real agent plus the synthetic Fresh row", async () => {
+  // The registry always appends a synthetic, non-deletable Fresh Agent row
+  // (builtin: true) last. `agents.length` alone would count it as a second
+  // agent and wrongly enable Delete on the sole real one.
+  const fresh = summary("fresh", "Fresh Agent", { builtin: true, isDefault: false });
+  useAgents.setState({ registry: { ...registry(), agents: [reviewerSummary(), fresh], defaultAgentId: "reviewer" } });
   render(<AgentActionsMenu agent={reviewerSummary()} />);
   fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer" }));
   fireEvent.click(screen.getByRole("button", { name: "Delete" }));

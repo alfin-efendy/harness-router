@@ -3,9 +3,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import type {
   AgentDetailInfo,
   AgentLearningInfo,
+  AgentModelInfo,
   AgentMutationInfo,
   AgentRegistryInfo,
   AgentConfigurationCatalogInfo,
+  AgentSummaryInfo,
   CmdError,
   Result,
   SelectableModelInfo,
@@ -25,15 +27,16 @@ const agentConfigurationCatalog: AgentConfigurationCatalogInfo = {
       description: "Review guidance",
       available: true,
       commandScoped: false,
+      pack: null,
     },
   ],
   nativeTools: [
-    { id: "read", label: "Read", description: "Read files", available: true, commandScoped: false },
-    { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false },
-    { id: "bash", label: "Bash", description: "Run commands", available: true, commandScoped: true },
+    { id: "read", label: "Read", description: "Read files", available: true, commandScoped: false, pack: null },
+    { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false, pack: null },
+    { id: "bash", label: "Bash", description: "Run commands", available: true, commandScoped: true, pack: null },
   ],
-  pluginTools: [{ id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false }],
-  apps: [{ id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false }],
+  pluginTools: [{ id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false, pack: null }],
+  apps: [{ id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false, pack: null }],
 };
 
 const getAgentConfigurationCatalog = mock(async () => ({ status: "ok" as const, data: agentConfigurationCatalog }));
@@ -58,6 +61,10 @@ const listAgentSessions = mock(async (_runner: string | null, _agentId: string, 
   data: [] as Session[],
 }));
 const listMessages = mock(async (_runner: string | null, _sessionPk: string) => ({ status: "ok" as const, data: [] }));
+const updateSubagentModel = mock(async (_runner: string | null, model: AgentModelInfo) => ({
+  status: "ok" as const,
+  data: { ...registry, subagentModel: model },
+}));
 
 mock.module("@/bindings", () => ({
   commands: {
@@ -69,6 +76,7 @@ mock.module("@/bindings", () => ({
     listApps,
     listMessages,
     updateAgent,
+    updateSubagentModel,
   },
   events: {},
 }));
@@ -146,7 +154,7 @@ function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
       description: "Reviews implementation quality.",
       avatarColor: "violet",
       model: { kind: "route", route: "free" },
-      permissionMode: "ask",
+      builtin: false,
       skillCount: 1,
       toolCount: 3,
       knowledgeCount: 12,
@@ -156,7 +164,11 @@ function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
     },
     permissionRules: [],
     skills: ["requesting-code-review"],
-    nativeTools: ["read", "grep", "bash"],
+    nativeTools: [
+      { tool: "read", decision: "allow" },
+      { tool: "grep", decision: "allow" },
+      { tool: "bash", decision: "allow" },
+    ],
     pluginTools: [],
     apps: [],
     modelInfo: routeInfo,
@@ -204,6 +216,7 @@ beforeEach(() => {
   duplicateAgent.mockClear();
   listApps.mockClear();
   updateAgent.mockClear();
+  updateSubagentModel.mockClear();
   useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
   useLearning.setState({
     byAgent: { reviewer: learningSnapshot },
@@ -272,7 +285,7 @@ test("Advanced delete uses the same success-only detail navigation", async () =>
   await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agents" }));
 });
 
-test("detail has Back, identity, actions, six tabs, and overview metrics", () => {
+test("detail has Back, identity, actions, seven tabs, and overview metrics", () => {
   render(<AgentDetailView agentId="reviewer" />);
   expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
@@ -282,7 +295,7 @@ test("detail has Back, identity, actions, six tabs, and overview metrics", () =>
     within(tabs)
       .getAllByRole("button")
       .map((button) => button.textContent),
-  ).toEqual(["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]);
+  ).toEqual(["Overview", "Model", "Permissions", "Skills", "Apps & MCP", "Learning", "Advanced"]);
   expect(screen.getByText("12 readable concepts")).toBeTruthy();
   expect(screen.getByText("1 enabled skill")).toBeTruthy();
   expect(screen.getByText("3 enabled tools")).toBeTruthy();
@@ -316,17 +329,14 @@ test("concrete model renders resolver-supported effort values and route has no e
   expect(screen.queryByRole("combobox", { name: "Agent effort" })).toBeNull();
 });
 
-test("explicit permission rule editing persists catalog-selected tools", async () => {
+test("adding a prefix rule under Bash autosaves it immediately (no Save button)", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-  fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-  await waitFor(() => expect(screen.getByRole("combobox", { name: "Rule tool" }).hasAttribute("disabled")).toBe(false));
-  fireEvent.click(screen.getByRole("combobox", { name: "Rule tool" }));
-  fireEvent.click(await screen.findByRole("option", { name: /^Bash/ }));
-  fireEvent.click(screen.getByRole("combobox", { name: "Rule decision" }));
-  fireEvent.click(await screen.findByRole("option", { name: "Allow" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Command prefix" }), { target: { value: "cargo test" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
+  const bashRow = await screen.findByTestId("tool-row-bash");
+  fireEvent.click(within(bashRow).getByRole("button", { name: "Expand Bash prefix rules" }));
+  fireEvent.click(screen.getByRole("button", { name: "＋ Add prefix rule" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "New prefix rule for Bash" }), { target: { value: "cargo test" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm new rule" }));
   await waitFor(() =>
     expect(updateAgent).toHaveBeenCalledWith(
       LOCAL_RUNNER,
@@ -338,21 +348,58 @@ test("explicit permission rule editing persists catalog-selected tools", async (
   );
 });
 
-test("permission rules keep unknown stable tool IDs unavailable until removed", async () => {
+test("permission rules for tools no longer in the catalog are preserved untouched across unrelated autosaves", async () => {
   seed(detail({ permissionRules: [{ id: "custom-rule", tool: "plugin__acme__deploy", decision: "deny", commandPrefix: null }] }));
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-  await waitFor(() => expect(screen.getByText("Unavailable")).toBeTruthy());
-  expect(screen.queryByRole("textbox", { name: "Rule tool ID" })).toBeNull();
-  expect(screen.getByRole("button", { name: "Save permissions" }).hasAttribute("disabled")).toBe(true);
-  fireEvent.click(screen.getByRole("button", { name: "Remove unavailable rule plugin__acme__deploy" }));
-  await waitFor(() => expect(screen.queryByText("Unavailable")).toBeNull());
-  expect(screen.getByRole("button", { name: "Save permissions" }).hasAttribute("disabled")).toBe(false);
-  fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
-  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", expect.objectContaining({ permissionRules: [] })));
+  const readRow = await screen.findByTestId("tool-row-read");
+  fireEvent.click(within(readRow).getByRole("button", { name: "Off" }));
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "reviewer",
+      expect.objectContaining({
+        permissionRules: [{ id: "custom-rule", tool: "plugin__acme__deploy", decision: "deny", commandPrefix: null }],
+      }),
+    ),
+  );
 });
 
-test("model transitions preserve supported effort, clear unsupported effort, and save a complete mutation", async () => {
+test("model transitions preserve supported effort, clear unsupported effort, and autosave a complete mutation (no Save button)", async () => {
+  const concrete = detail({
+    summary: { ...detail().summary, model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
+    modelInfo: opusInfo,
+  });
+  seed(concrete);
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.queryByRole("button", { name: "Save model" })).toBeNull();
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
+  fireEvent.click(await screen.findByRole("option", { name: miniInfo.requestValue }));
+  expect((screen.getByRole("combobox", { name: "Agent effort" }) as HTMLButtonElement).textContent).toContain("Model default");
+
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", {
+      name: "Reviewer",
+      description: "Reviews implementation quality.",
+      avatarColor: "violet",
+      model: { kind: "concrete", name: miniInfo.requestValue, effort: null },
+      personality: { preset: "helpful", custom: null },
+      permissionRules: [],
+      skills: ["requesting-code-review"],
+      nativeTools: [
+        { tool: "read", decision: "allow" },
+        { tool: "grep", decision: "allow" },
+        { tool: "bash", decision: "allow" },
+      ],
+      pluginTools: [],
+      apps: [],
+    }),
+  );
+});
+
+test("reselecting the current model or effort fires no update; a genuine change fires exactly one", async () => {
   const concrete = detail({
     summary: { ...detail().summary, model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
     modelInfo: opusInfo,
@@ -362,24 +409,28 @@ test("model transitions preserve supported effort, clear unsupported effort, and
   fireEvent.click(screen.getByRole("button", { name: "Model" }));
 
   fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
-  fireEvent.click(await screen.findByRole("option", { name: miniInfo.requestValue }));
-  expect((screen.getByRole("combobox", { name: "Agent effort" }) as HTMLButtonElement).textContent).toContain("Model default");
+  fireEvent.click(await screen.findByRole("option", { name: opusInfo.requestValue }));
 
-  fireEvent.click(screen.getByRole("button", { name: "Save model" }));
-  await waitFor(() =>
-    expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", {
-      name: "Reviewer",
-      description: "Reviews implementation quality.",
-      avatarColor: "violet",
-      model: { kind: "concrete", name: miniInfo.requestValue, effort: null },
-      personality: { preset: "helpful", custom: null },
-      permissionMode: "ask",
-      permissionRules: [],
-      skills: ["requesting-code-review"],
-      nativeTools: ["read", "grep", "bash"],
-      pluginTools: [],
-      apps: [],
-    }),
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "High" }));
+
+  // The store queues the actual `commands.updateAgent` call on a microtask
+  // (store-agents.ts's `enqueueMutation`: `mutationTail.then(operation, ...)`),
+  // so asserting `not.toHaveBeenCalled()` synchronously right after the two
+  // no-op reselects above can't tell a correctly-guarded no-op from a broken
+  // guard whose deferred save just hasn't landed yet — both read as "not
+  // called yet". Fire one GENUINE effort change and assert the call COUNT
+  // once it lands: if either no-op above had (wrongly) queued a save, the
+  // count would be 2 or 3 instead of 1, and the no-ops are proven innocent
+  // only by that count staying at exactly 1.
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Max" }));
+
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
+  expect(updateAgent).toHaveBeenCalledWith(
+    LOCAL_RUNNER,
+    "reviewer",
+    expect.objectContaining({ model: { kind: "concrete", name: opusInfo.requestValue, effort: "max" } }),
   );
 });
 
@@ -398,7 +449,7 @@ test("Overview loads owned sessions and opens a selected session", async () => {
 test("changing agent resets the local tab to Overview", async () => {
   const { rerender } = render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-  expect(screen.getByText("Explicit rules")).toBeTruthy();
+  expect(await screen.findByRole("textbox", { name: "Search tools" })).toBeTruthy();
 
   const ryuzi = detail({ summary: { ...detail().summary, id: "ryuzi", name: "Ryuzi", isDefault: true } });
   act(() => {
@@ -406,17 +457,22 @@ test("changing agent resets the local tab to Overview", async () => {
     rerender(<AgentDetailView agentId="ryuzi" />);
   });
   await waitFor(() => expect(screen.getByText("Recent sessions")).toBeTruthy());
-  expect(screen.queryByText("Explicit rules")).toBeNull();
+  expect(screen.queryByRole("textbox", { name: "Search tools" })).toBeNull();
 });
 
-test("Skills & Tools and Advanced tabs render their owned settings", async () => {
+test("Skills tab renders the pack-grouped skills settings", async () => {
   render(<AgentDetailView agentId="reviewer" />);
-  fireEvent.click(screen.getByRole("button", { name: "Skills & Tools" }));
-  await waitFor(() => expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy());
-  expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Save skills and tools" })).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-  expect(screen.getByRole("button", { name: "Delete Reviewer" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  await waitFor(() => expect(screen.getByRole("textbox", { name: "Search skills" })).toBeTruthy());
+  expect(screen.getByTestId("skill-group-Standalone")).toBeTruthy();
+  expect(screen.queryByTestId("app-card-github")).toBeNull();
+});
+
+test("Apps & MCP tab renders the apps settings", async () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Apps & MCP" }));
+  await waitFor(() => expect(screen.getByTestId("app-card-github")).toBeTruthy());
+  expect(screen.queryByRole("textbox", { name: "Search skills" })).toBeNull();
 });
 
 test("Learning renders the selected agent's Learning tab", () => {
@@ -424,4 +480,90 @@ test("Learning renders the selected agent's Learning tab", () => {
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   expect(screen.getByRole("button", { name: "Add memory" })).toBeTruthy();
   expect(screen.getByText("No memory concepts yet.")).toBeTruthy();
+});
+
+function freshDetail(overrides: Omit<Partial<AgentDetailInfo>, "summary"> & { summary?: Partial<AgentSummaryInfo> } = {}): AgentDetailInfo {
+  // `summary` is merged field-by-field (not overwritten wholesale) so a
+  // caller can override just e.g. `model` without having to repeat every
+  // fresh-specific base field (id/name/builtin/…) itself.
+  const { summary: summaryOverrides, ...rest } = overrides;
+  return detail({
+    summary: {
+      ...detail().summary,
+      id: "fresh",
+      name: "Fresh Agent",
+      description: "Ephemeral, memoryless worker dispatched for delegated tasks.",
+      avatarColor: "slate",
+      builtin: true,
+      skillCount: 0,
+      toolCount: 0,
+      knowledgeCount: 0,
+      isDefault: false,
+      ...summaryOverrides,
+    },
+    permissionRules: [],
+    skills: [],
+    nativeTools: [],
+    pluginTools: [],
+    apps: [],
+    personality: { preset: "helpful", custom: null },
+    ...rest,
+  });
+}
+
+test("Fresh Agent detail renders only the header and the shared model editor", () => {
+  seed(freshDetail());
+  render(<AgentDetailView agentId="fresh" />);
+
+  expect(screen.getByRole("heading", { name: "Fresh Agent" })).toBeTruthy();
+  expect(screen.getByText("Built-in")).toBeTruthy();
+  expect(screen.queryByTestId("agent-detail-tabs")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Actions for Fresh Agent" })).toBeNull();
+  expect(screen.queryByText("Executable")).toBeNull();
+  expect(screen.queryByText("Invalid")).toBeNull();
+  expect(screen.queryByRole("combobox", { name: "Personality preset" })).toBeNull();
+  expect(screen.queryByRole("textbox", { name: "Search tools" })).toBeNull();
+  expect(screen.getByRole("combobox", { name: "Agent model" })).toBeTruthy();
+});
+
+test("Fresh Agent model change autosaves via updateSubagentModel, not updateAgent", async () => {
+  seed(freshDetail());
+  render(<AgentDetailView agentId="fresh" />);
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
+  fireEvent.click(await screen.findByRole("option", { name: miniInfo.requestValue }));
+
+  await waitFor(() =>
+    expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, { kind: "concrete", name: miniInfo.requestValue, effort: null }),
+  );
+  expect(updateAgent).not.toHaveBeenCalled();
+});
+
+test("reselecting the Fresh Agent's current model or effort fires no updateSubagentModel; a genuine change fires exactly one", async () => {
+  seed(
+    freshDetail({
+      summary: { model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
+      modelInfo: opusInfo,
+    }),
+  );
+  render(<AgentDetailView agentId="fresh" />);
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
+  fireEvent.click(await screen.findByRole("option", { name: opusInfo.requestValue }));
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "High" }));
+
+  // Same count-hardened pattern as the regular-agent Model tab test above: a
+  // synchronous "not called" check right after the no-op reselects can't
+  // distinguish a correctly-guarded no-op from a broken guard whose deferred
+  // `updateSubagentModel` call just hasn't landed yet (store-agents.ts queues
+  // it via the same `enqueueMutation` microtask as `update`). Fire a genuine
+  // change and assert the call count once it lands.
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Max" }));
+
+  await waitFor(() => expect(updateSubagentModel).toHaveBeenCalledTimes(1));
+  expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, { kind: "concrete", name: opusInfo.requestValue, effort: "max" });
+  expect(updateAgent).not.toHaveBeenCalled();
 });

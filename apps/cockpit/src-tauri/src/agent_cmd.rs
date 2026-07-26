@@ -363,7 +363,7 @@ pub async fn list_selectable_models(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ryuzi_core::api::types::{AgentModelInfo, AgentPersonalityInfo};
+    use ryuzi_core::api::types::{AgentModelInfo, AgentPersonalityInfo, NativeToolDecisionInfo};
 
     fn fixture_mutation() -> AgentMutationInfo {
         AgentMutationInfo {
@@ -377,10 +377,22 @@ mod tests {
                 preset: "helpful".to_owned(),
                 custom: None,
             },
-            permission_mode: "ask".to_owned(),
             permission_rules: Vec::new(),
             skills: vec!["requesting-code-review".to_owned()],
-            native_tools: vec!["read".to_owned(), "grep".to_owned(), "bash".to_owned()],
+            native_tools: vec![
+                NativeToolDecisionInfo {
+                    tool: "read".to_owned(),
+                    decision: "allow".to_owned(),
+                },
+                NativeToolDecisionInfo {
+                    tool: "grep".to_owned(),
+                    decision: "allow".to_owned(),
+                },
+                NativeToolDecisionInfo {
+                    tool: "bash".to_owned(),
+                    decision: "allow".to_owned(),
+                },
+            ],
             plugin_tools: Vec::new(),
             apps: Vec::new(),
         }
