@@ -445,6 +445,8 @@ impl Router {
             // signal — Discord has no matching surface.
             | CoreEvent::OauthAuthorizeUrl { .. }
             | CoreEvent::PluginOauthAuthorizeUrl { .. }
+            // Plugin-changed event is a Cockpit-only signal for refresh.
+            | CoreEvent::PluginsChanged
             // Per-session/per-run cost telemetry is a Cockpit-only surface too.
             | CoreEvent::SessionCost { .. }
             | CoreEvent::AgentRunCost { .. } => {}

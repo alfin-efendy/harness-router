@@ -918,6 +918,10 @@ pub enum CoreEvent {
         plugin_id: String,
         authorize_url: String,
     },
+    /// The installed/enabled plugin set changed (install, uninstall, update,
+    /// rollback, enable/disable, skill install/remove/refresh). Payload-free:
+    /// Cockpit reacts by refetching the plugin list + restart flag (spec B2).
+    PluginsChanged,
     /// Per-session accumulated cost: total USD and a per-model token+dollar
     /// breakdown. Emitted alongside `ContextUsage`.
     ///
@@ -1106,6 +1110,14 @@ mod tests {
         assert_eq!(v["kind"], "pluginOauthAuthorizeUrl");
         assert_eq!(v["plugin_id"], "acme");
         assert_eq!(v["authorize_url"], "https://y");
+    }
+
+    #[test]
+    fn plugins_changed_event_serializes_with_kind_tag_only() {
+        let v = serde_json::to_value(&CoreEvent::PluginsChanged).unwrap();
+        assert_eq!(v["kind"], "pluginsChanged");
+        // Payload-free: the object carries nothing but the tag.
+        assert_eq!(v.as_object().unwrap().len(), 1);
     }
 
     #[test]

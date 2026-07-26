@@ -446,6 +446,14 @@ impl ControlPlane {
         &self.store
     }
 
+    /// The daemon's telemetry backend (Noop outside a wired daemon). Exposed
+    /// so API handlers can re-run `discover_provider_components` — which
+    /// takes the same telemetry the boot-time discovery got — after a
+    /// component install/enable (spec B1 hot activation).
+    pub fn telemetry(&self) -> Arc<dyn Telemetry> {
+        Arc::clone(&self.telemetry)
+    }
+
     /// The task-artifact service (metadata + payload), fixed at construction
     /// (see [`Self::new_full`]). Returns a borrow; callers that need
     /// ownership clone.
