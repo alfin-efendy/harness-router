@@ -3790,6 +3790,24 @@ async fn complete_tool_call(
         context.duration_ms,
     );
 
+    // Pets+stats tool-usage counter. `deps.main_agent_id` is the EXECUTING
+    // durable agent — reassigned for delegated main children (see the
+    // reassignment around the main-delegate dispatch path); ephemeral
+    // subagents carry their parent's id, which is intended (their tool use
+    // counts toward the agent that dispatched them). Fire-and-forget: stats
+    // must never fail or delay the tool call itself.
+    if let Err(e) = deps
+        .store
+        .increment_agent_tool_usage(
+            &deps.main_agent_id,
+            context.tool_name,
+            crate::paths::now_ms(),
+        )
+        .await
+    {
+        tracing::warn!("native[{NATIVE_ID}]: increment_agent_tool_usage failed: {e}");
+    }
+
     let mut hook_summary = json!({
         "ok": !is_error,
         "output": truncate_utf8_bytes(
@@ -8416,6 +8434,44 @@ mod tests {
             "payload missing duration_ms: {}",
             row.payload
         );
+    }
+
+    #[tokio::test]
+    async fn completing_a_tool_call_increments_agent_tool_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        // todowrite exercises tool completion WITHOUT spawning any process
+        // (bash-based turns fail on sh-less Windows dev boxes).
+        let turn1 = vec![
+            tool_use_start(0, "call-1", "todowrite"),
+            input_json_delta(
+                0,
+                "{\"todos\":[{\"content\":\"first\",\"status\":\"pending\"}]}",
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("plan it", "plan it"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let usage = deps
+            .store
+            .list_agent_tool_usage(&deps.main_agent_id)
+            .await
+            .unwrap();
+        let todowrite = usage
+            .iter()
+            .find(|row| row.tool_name == "todowrite")
+            .expect("todowrite usage row");
+        assert_eq!(todowrite.count, 1);
     }
 
     #[test]

@@ -26,8 +26,29 @@ use std::sync::Arc;
 /// `baseline_matches_pre_squash_golden` test guards this schema against drift.
 const BASELINE_SQL: &str = include_str!("store_baseline.sql");
 
+/// v1 -> v2: per-agent tool-usage counters (pets+stats), plus lookup indexes
+/// for the aggregate queries that drive per-agent activity/reliability
+/// stats. Deliberately NOT folded into `BASELINE_SQL`/`store_baseline.sql`
+/// (which stays pinned to the pre-squash v1 golden) — `Migrations::to_latest`
+/// runs every `M::up` in order even on a brand-new database, so duplicating
+/// this `CREATE TABLE` there would make a fresh install apply it twice and
+/// fail. The combined v1+v2 schema is instead captured by the
+/// `baseline_matches_pre_squash_golden` golden fixture (regenerated via
+/// `regenerate_baseline_golden_fixture`).
+const AGENT_STATS_MIGRATION_SQL: &str = "
+CREATE TABLE agent_tool_usage (
+  agent_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  last_used INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (agent_id, tool_name)
+);
+CREATE INDEX agent_runs_primary_agent_idx ON agent_runs(primary_agent_id, started_at);
+CREATE INDEX sessions_primary_agent_idx ON sessions(primary_agent_id);
+";
+
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(BASELINE_SQL)])
+    Migrations::new(vec![M::up(BASELINE_SQL), M::up(AGENT_STATS_MIGRATION_SQL)])
 }
 
 pub struct Store {
@@ -165,6 +186,30 @@ pub struct UsageTotalRow {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+}
+
+/// One tool's lifetime usage counter for a single agent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentToolUsageRow {
+    pub tool_name: String,
+    pub count: i64,
+    pub last_used: i64,
+}
+
+/// How many sessions an agent has led, and when it was last active.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentActivityStats {
+    pub session_count: i64,
+    pub last_active: Option<i64>,
+}
+
+/// Run outcome tally for an agent over a lookback window. `total` excludes
+/// runs still in flight (`queued`/`running`); `failed` counts `status =
+/// 'failed'` only (cancelled/interrupted are not treated as failures).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRunReliability {
+    pub total: i64,
+    pub failed: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -542,21 +587,22 @@ impl Store {
         let mut cfg = Config::new(path);
         cfg.pool = Some(deadpool_sqlite::PoolConfig::new(1));
         let pool = cfg.create_pool(Runtime::Tokio1)?;
-        // A database newer than this build's single-migration baseline (for
+        // A database newer than this build's latest known migration (for
         // example a pre-squash install left at user_version ~49) cannot be
         // upgraded: the squash removed the intermediate migrations, so
         // `to_latest` would otherwise fail with an opaque "database too far
         // ahead". Detect it up front and return an actionable error instead.
-        // (0 = fresh file, 1 = current baseline.)
-        const BASELINE_VERSION: i64 = 1;
+        // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage.)
+        // MUST track the number of `M::up` entries in `migrations()` above.
+        const LATEST_VERSION: i64 = 2;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
         .await?;
-        if current_version > BASELINE_VERSION {
+        if current_version > LATEST_VERSION {
             anyhow::bail!(
                 "database at {} has schema version {current_version}, which is newer than this \
-                 build supports (baseline v{BASELINE_VERSION}). This release squashed the schema \
+                 build supports (latest v{LATEST_VERSION}). This release squashed the schema \
                  migrations, so databases created by older builds can't be upgraded in place. \
                  Back up and remove the database file, then restart to create a fresh one.",
                 path.display()
@@ -2868,6 +2914,123 @@ impl Store {
                 params![older_than_ms],
             )?;
             Ok(n)
+        })
+        .await
+    }
+
+    /// Upsert-increment one agent's per-tool usage counter. Called from the
+    /// tool-completion choke point as a fire-and-forget stats write — the
+    /// caller must log and swallow any error rather than fail the tool call.
+    pub async fn increment_agent_tool_usage(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        let agent_id = agent_id.to_string();
+        let tool_name = tool_name.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO agent_tool_usage(agent_id, tool_name, count, last_used) \
+                 VALUES (?1, ?2, 1, ?3) \
+                 ON CONFLICT(agent_id, tool_name) DO UPDATE SET \
+                   count = count + 1, \
+                   last_used = excluded.last_used",
+                params![agent_id, tool_name, now_ms],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// One agent's per-tool usage counters, most-used first.
+    pub async fn list_agent_tool_usage(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<Vec<AgentToolUsageRow>> {
+        let agent_id = agent_id.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT tool_name, count, last_used FROM agent_tool_usage \
+                 WHERE agent_id = ?1 ORDER BY count DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![agent_id], |r| {
+                    Ok(AgentToolUsageRow {
+                        tool_name: r.get(0)?,
+                        count: r.get(1)?,
+                        last_used: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// How many sessions this agent has led as `primary_agent_id`, and the
+    /// most recent `last_active` among them.
+    pub async fn agent_activity_stats(&self, agent_id: &str) -> anyhow::Result<AgentActivityStats> {
+        let agent_id = agent_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT COUNT(*), MAX(last_active) FROM sessions WHERE primary_agent_id = ?1",
+                params![agent_id],
+                |r| {
+                    Ok(AgentActivityStats {
+                        session_count: r.get(0)?,
+                        last_active: r.get(1)?,
+                    })
+                },
+            )
+        })
+        .await
+    }
+
+    /// Run outcome tally for this agent's runs started at or after
+    /// `since_ms`. `total` excludes `queued`/`running` (still in flight);
+    /// `failed` counts `status = 'failed'` only.
+    pub async fn agent_run_reliability(
+        &self,
+        agent_id: &str,
+        since_ms: i64,
+    ) -> anyhow::Result<AgentRunReliability> {
+        let agent_id = agent_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT \
+                   COALESCE(SUM(CASE WHEN status NOT IN ('queued','running') THEN 1 ELSE 0 END), 0), \
+                   COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) \
+                 FROM agent_runs WHERE primary_agent_id = ?1 AND started_at >= ?2",
+                params![agent_id, since_ms],
+                |r| {
+                    Ok(AgentRunReliability {
+                        total: r.get(0)?,
+                        failed: r.get(1)?,
+                    })
+                },
+            )
+        })
+        .await
+    }
+
+    /// Non-null `cost_models` JSON blobs for this agent's runs started at or
+    /// after `since_ms`, for the caller to price and total.
+    pub async fn list_agent_run_cost_blobs(
+        &self,
+        agent_id: &str,
+        since_ms: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let agent_id = agent_id.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT cost_models FROM agent_runs \
+                 WHERE primary_agent_id = ?1 AND started_at >= ?2 AND cost_models IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map(params![agent_id, since_ms], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
         .await
     }
@@ -6533,6 +6696,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_tool_usage_increments_and_orders_by_count() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .increment_agent_tool_usage("a1", "read", 100)
+            .await
+            .unwrap();
+        store
+            .increment_agent_tool_usage("a1", "read", 200)
+            .await
+            .unwrap();
+        store
+            .increment_agent_tool_usage("a1", "bash", 300)
+            .await
+            .unwrap();
+        let rows = store.list_agent_tool_usage("a1").await.unwrap();
+        assert_eq!(rows[0].tool_name, "read");
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].last_used, 200);
+        assert_eq!(rows[1].tool_name, "bash");
+        assert!(store
+            .list_agent_tool_usage("other")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_activity_and_reliability_aggregate_by_primary_agent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // Two sessions led by "a1" (last_active 100, 300), one led by "b".
+        let mut sess_a1_early = sample_session();
+        sess_a1_early.session_pk = "sess-a1-early".into();
+        sess_a1_early.primary_agent_id = Some("a1".into());
+        sess_a1_early.last_active = Some(100);
+        store.insert_session(sess_a1_early).await.unwrap();
+
+        let mut sess_a1_late = sample_session();
+        sess_a1_late.session_pk = "sess-a1-late".into();
+        sess_a1_late.primary_agent_id = Some("a1".into());
+        sess_a1_late.last_active = Some(300);
+        store.insert_session(sess_a1_late).await.unwrap();
+
+        let mut sess_b = sample_session();
+        sess_b.session_pk = "sess-b".into();
+        sess_b.primary_agent_id = Some("b".into());
+        sess_b.last_active = Some(999);
+        store.insert_session(sess_b).await.unwrap();
+
+        async fn insert_run(
+            store: &Store,
+            run_id: &str,
+            session_pk: &str,
+            agent_id: &str,
+            status: AgentRunStatus,
+            started_at: i64,
+        ) {
+            store
+                .insert_primary_agent_run(NewAgentRun {
+                    run_id: run_id.into(),
+                    session_pk: session_pk.into(),
+                    parent_run_id: None,
+                    retry_of: None,
+                    source_tool_call_id: None,
+                    dispatch_index: None,
+                    primary_agent_id: agent_id.into(),
+                    executing_agent_id: Some(agent_id.into()),
+                    executing_agent_name_snapshot: "Agent".into(),
+                    agent_kind: AgentRunKind::Primary,
+                    task: "t".into(),
+                    status,
+                    resolved_model: None,
+                    resolved_effort: None,
+                })
+                .await
+                .unwrap();
+            let run_id = run_id.to_string();
+            store
+                .with_conn(move |c| {
+                    c.execute(
+                        "UPDATE agent_runs SET started_at=?1 WHERE run_id=?2",
+                        params![started_at, run_id],
+                    )
+                    .map(|_| ())
+                })
+                .await
+                .unwrap();
+        }
+
+        // "a1" runs: completed@t1, failed@t2, running@t3, and a failed@t0
+        // that predates the reliability window.
+        insert_run(
+            &store,
+            "run-completed",
+            "sess-a1-early",
+            "a1",
+            AgentRunStatus::Completed,
+            100,
+        )
+        .await;
+        insert_run(
+            &store,
+            "run-failed",
+            "sess-a1-early",
+            "a1",
+            AgentRunStatus::Failed,
+            200,
+        )
+        .await;
+        insert_run(
+            &store,
+            "run-running",
+            "sess-a1-early",
+            "a1",
+            AgentRunStatus::Running,
+            300,
+        )
+        .await;
+        insert_run(
+            &store,
+            "run-failed-before-since",
+            "sess-a1-early",
+            "a1",
+            AgentRunStatus::Failed,
+            50,
+        )
+        .await;
+
+        let activity = store.agent_activity_stats("a1").await.unwrap();
+        assert_eq!(activity.session_count, 2);
+        assert_eq!(activity.last_active, Some(300));
+
+        let reliability = store.agent_run_reliability("a1", 100).await.unwrap();
+        assert_eq!(reliability.total, 2, "queued/running excluded from total");
+        assert_eq!(reliability.failed, 1, "pre-since failure excluded");
+    }
+
+    #[tokio::test]
     async fn malformed_primary_agent_snapshot_errors_on_read() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -9285,8 +9588,9 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 1 database whose schema + seeded rows exactly
-    // match the pre-squash golden captured from the original 49 migrations.
+    // produce a `user_version` 2 database (v1 squashed baseline + v2
+    // agent_tool_usage/pets-stats migration) whose schema + seeded rows
+    // exactly match the golden fixture.
     //
     // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
     // version, messages_fts_data blocks), which are artifacts of the bundled
@@ -9299,8 +9603,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 1,
-            "squashed baseline DB must be user_version 1"
+            user_version, 2,
+            "squashed baseline + agent_stats migration DB must be user_version 2"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

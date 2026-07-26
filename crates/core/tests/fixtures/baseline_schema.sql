@@ -3,6 +3,13 @@ CREATE TABLE agent_learning_queue (event_id TEXT PRIMARY KEY NOT NULL,agent_id T
 CREATE TABLE agent_learning_state (agent_id TEXT PRIMARY KEY NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 1,enqueue_blocked INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE agent_run_messages (session_pk TEXT NOT NULL,message_seq INTEGER NOT NULL,run_id TEXT NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,PRIMARY KEY(session_pk,message_seq),FOREIGN KEY(session_pk,message_seq) REFERENCES messages(session_pk,seq) ON DELETE CASCADE);
 CREATE TABLE agent_runs (run_id TEXT PRIMARY KEY,session_pk TEXT NOT NULL REFERENCES sessions(session_pk) ON DELETE CASCADE,parent_run_id TEXT REFERENCES agent_runs(run_id),retry_of TEXT REFERENCES agent_runs(run_id),primary_agent_id TEXT NOT NULL,executing_agent_id TEXT,executing_agent_name_snapshot TEXT NOT NULL,agent_kind TEXT NOT NULL CHECK(agent_kind IN ('primary','main-delegate','subagent')),task TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','cancelled','interrupted')),started_at INTEGER,finished_at INTEGER,tool_count INTEGER NOT NULL DEFAULT 0 CHECK(tool_count >= 0),resolved_model TEXT,resolved_effort TEXT,result TEXT,error TEXT, source_tool_call_id TEXT, dispatch_index INTEGER CHECK(dispatch_index IS NULL OR dispatch_index >= 0), context_active_tokens INTEGER, context_usable_window INTEGER, context_percent_left INTEGER, context_window INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER, output_tokens INTEGER, cost_models TEXT);
+CREATE TABLE agent_tool_usage (
+  agent_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  last_used INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (agent_id, tool_name)
+);
 CREATE TABLE artifact_references (id TEXT PRIMARY KEY,artifact_id TEXT NOT NULL,target_session_pk TEXT NOT NULL,shared_from_session_pk TEXT NOT NULL,shared_by TEXT,parent_reference_id TEXT,created_at INTEGER NOT NULL,UNIQUE(artifact_id, target_session_pk));
 CREATE TABLE artifact_storage_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,source_root TEXT NOT NULL,target_root TEXT NOT NULL,total_count INTEGER NOT NULL DEFAULT 0 CHECK(total_count >= 0),completed_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_count >= 0),current_artifact_id TEXT,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE artifacts (id TEXT PRIMARY KEY,source_session_pk TEXT NOT NULL,source_message_seq INTEGER,source_run_id TEXT,creator TEXT NOT NULL CHECK(creator IN ('user','agent')),creator_id TEXT,name TEXT NOT NULL,description TEXT,content_type TEXT,size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),sha256 TEXT NOT NULL,storage_key TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('available','source-archived','deleted')),created_at INTEGER NOT NULL,deleted_at INTEGER);
@@ -91,6 +98,7 @@ CREATE TABLE usage_daily (day TEXT NOT NULL,connection_id TEXT NOT NULL,model TE
 CREATE INDEX agent_run_messages_run_idx ON agent_run_messages(run_id,message_seq);
 CREATE INDEX agent_runs_dispatch_idx ON agent_runs(session_pk,parent_run_id,source_tool_call_id,dispatch_index);
 CREATE INDEX agent_runs_parent_idx ON agent_runs(session_pk,parent_run_id,started_at);
+CREATE INDEX agent_runs_primary_agent_idx ON agent_runs(primary_agent_id, started_at);
 CREATE INDEX agent_runs_status_idx ON agent_runs(session_pk,status);
 CREATE INDEX artifact_references_artifact_idx ON artifact_references(artifact_id);
 CREATE INDEX artifact_references_target_idx ON artifact_references(target_session_pk, created_at);
@@ -108,6 +116,7 @@ CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);
 CREATE INDEX idx_request_log_conn ON request_log(connection_id, ts);
 CREATE INDEX idx_request_log_ts ON request_log(ts);
 CREATE INDEX idx_session_prompt_queue_pending ON session_prompt_queue(session_pk, status, position);
+CREATE INDEX sessions_primary_agent_idx ON sessions(primary_agent_id);
 CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN DELETE FROM messages_fts WHERE session_pk = old.session_pk AND seq = old.seq; END;
 CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages WHEN new.role IN ('user','assistant') AND new.block_type='text' AND json_extract(new.payload,'$.text') IS NOT NULL BEGIN INSERT INTO messages_fts(text, session_pk, seq) VALUES (json_extract(new.payload,'$.text'), new.session_pk, new.seq); END;
 -- seed --
