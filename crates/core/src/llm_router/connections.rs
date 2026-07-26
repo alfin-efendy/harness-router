@@ -9,9 +9,9 @@ use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Built-in free-tier connections (spec A2): always present — re-seeded on
-/// every daemon start by `agents::bootstrap::ensure_free_providers_seeded` —
-/// hidden from account management, and refused by [`remove_connection`].
+/// Built-in free-tier connections (spec A2): guaranteed present by
+/// `agents::bootstrap::ensure_free_providers_seeded` — hidden from account
+/// management, and refused by [`remove_connection`].
 /// `(provider id, connection label)`.
 pub const BUILTIN_FREE_PROVIDERS: &[(&str, &str)] = &[
     ("mimo-free", "MiMo (free)"),
@@ -182,7 +182,7 @@ pub async fn set_connection_enabled(store: &Store, id: &str, enabled: bool) -> a
 }
 
 pub async fn remove_connection(store: &Store, id: &str) -> anyhow::Result<()> {
-    if let Some(row) = list_connections(store).await?.iter().find(|r| r.id == id) {
+    if let Some(row) = get_connection(store, id).await? {
         if is_builtin_free(&row.provider, &row.auth_type) {
             anyhow::bail!(
                 "{} is a built-in connection and cannot be removed",

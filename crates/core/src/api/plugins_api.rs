@@ -1866,9 +1866,13 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
         Some("provider") => {
             let family = provider_family(id);
             for row in crate::llm_router::connections::list_connections(cp.store()).await? {
-                if provider_family(&row.provider) == family {
-                    crate::llm_router::connections::remove_connection(cp.store(), &row.id).await?;
+                if provider_family(&row.provider) != family {
+                    continue;
                 }
+                if crate::llm_router::connections::is_builtin_free(&row.provider, &row.auth_type) {
+                    continue; // spec A2: builtin free rows are infrastructure and survive uninstall
+                }
+                crate::llm_router::connections::remove_connection(cp.store(), &row.id).await?;
             }
             Ok(())
         }
@@ -3893,6 +3897,62 @@ mod tests {
             providers,
             vec!["openai"],
             "family (anthropic + anthropic-oauth) removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_provider_survives_builtin_free_row_but_removes_paid_family_connection() {
+        // Regression for the guard added in connections.rs: `mimo`'s family
+        // is `mimo-free` (see registry::family_of), the same family as the
+        // built-in free row. Before this fix, uninstalling the `mimo`
+        // provider plugin tried to delete the builtin row via
+        // `remove_connection` and the whole uninstall failed with "MiMo
+        // (free) is a built-in connection and cannot be removed".
+        let cp = test_cp().await;
+        let now = crate::paths::now_ms();
+        crate::llm_router::connections::add_connection(
+            cp.store(),
+            crate::llm_router::connections::ConnectionRow {
+                id: "builtin-mimo".into(),
+                provider: "mimo-free".into(),
+                auth_type: "free".into(),
+                label: "MiMo (free)".into(),
+                priority: 0,
+                enabled: true,
+                data: Default::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        crate::llm_router::connections::add_connection(
+            cp.store(),
+            crate::llm_router::connections::ConnectionRow {
+                id: "paid-mimo".into(),
+                provider: "mimo".into(),
+                auth_type: "api_key".into(),
+                label: "My MiMo account".into(),
+                priority: 0,
+                enabled: true,
+                data: Default::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        uninstall(&cp, "mimo").await.unwrap();
+
+        let left = crate::llm_router::connections::list_connections(cp.store())
+            .await
+            .unwrap();
+        let ids: Vec<_> = left.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["builtin-mimo"],
+            "builtin free row survives; paid family row is removed"
         );
     }
 

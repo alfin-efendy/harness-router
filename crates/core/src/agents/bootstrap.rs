@@ -1232,8 +1232,17 @@ mod tests {
         let conns = crate::llm_router::connections::list_connections(&store)
             .await
             .unwrap();
+        // Bypass the builtin delete guard: this models a legacy install whose rows vanished pre-guard.
         for c in &conns {
-            crate::llm_router::connections::remove_connection(&store, &c.id)
+            let id = c.id.clone();
+            store
+                .with_conn(move |conn| {
+                    conn.execute(
+                        "DELETE FROM provider_connections WHERE id=?1",
+                        rusqlite::params![id],
+                    )
+                    .map(|_| ())
+                })
                 .await
                 .unwrap();
         }
