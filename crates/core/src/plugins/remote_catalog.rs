@@ -552,8 +552,9 @@ fn release_base_url_for(build_tag: Option<&str>, version: Option<&str>) -> Strin
 
 /// Settings key that, once present, marks first-party component bootstrap as
 /// fully completed (every first-party bundle installed or already present).
-/// One-shot bootstrap marker (unlike the free-connection seeding in `agents::bootstrap`, which is self-healing): once set, a
-/// later user uninstall is respected and bootstrap never re-runs. It stays
+/// One-shot bootstrap marker (unlike the free-connection seeding in
+/// `agents::bootstrap`, which is self-healing): once set, a later user uninstall
+/// is respected and bootstrap never re-runs. It stays
 /// ABSENT while any bundle is still missing, so a transient failure is retried
 /// on the next boot.
 pub const FIRST_PARTY_BOOTSTRAP_MARKER: &str = "first_party_components_bootstrapped_v1";
@@ -750,7 +751,7 @@ pub struct FirstPartyBootstrapOutcome {
 
 /// Best-effort first-run bootstrap of the first-party component bundles.
 /// Idempotent and respectful of user deletion via [`FIRST_PARTY_BOOTSTRAP_MARKER`]
-/// (mirrors `ensure_free_providers_seeded`). Never returns an `Err`: the daemon
+/// (unlike `ensure_free_providers_seeded`, which self-heals). Never returns an `Err`: the daemon
 /// wires this as warn-and-continue so a download failure never fails
 /// `build_daemon`.
 ///
