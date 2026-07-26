@@ -9,17 +9,11 @@ use crate::store::Store;
 const SETTING_KEY: &str = "installed_providers";
 const SEEDED_MARKER: &str = "installed_providers_seeded_v1";
 
-/// Providers installed by default on a fresh install.
-const DEFAULT_INSTALLED: &[&str] = &[
-    "anthropic",
-    "openai",
-    "mimo-free",
-    "opencode-free",
-    "google",
-    "openrouter",
-    "groq",
-    "ollama",
-];
+/// Providers installed by default on a fresh install. Deliberately only the
+/// two zero-config free tiers — every other family stays visible in the
+/// Plugins hub as an installable catalog entry (spec A1). Existing installs
+/// are untouched: seeding is one-shot via `SEEDED_MARKER`.
+const DEFAULT_INSTALLED: &[&str] = &["mimo-free", "opencode-free"];
 
 pub async fn list_installed_providers(store: &Store) -> anyhow::Result<Vec<String>> {
     let Some(raw) = store.get_setting_raw(SETTING_KEY).await? else {
@@ -133,8 +127,9 @@ mod tests {
 
         ensure_default_installed_providers(&store).await.unwrap();
         let set = list_installed_providers(&store).await.unwrap();
-        assert!(is_installed(&set, "anthropic")); // default
         assert!(is_installed(&set, "mimo-free")); // default
+        assert!(is_installed(&set, "opencode-free")); // default
+        assert!(!is_installed(&set, "anthropic")); // no longer pre-installed
         assert!(is_installed(&set, "kiro")); // migrated from an existing connection
 
         // Idempotent: seeding again does not change the set.

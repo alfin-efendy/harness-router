@@ -2823,10 +2823,10 @@ mod tests {
             .unwrap();
         let ctx = installed_ctx(&store).await.unwrap();
 
-        // `anthropic` is in DEFAULT_INSTALLED; no connection exists.
-        let anthropic = provider_only("anthropic");
+        // `mimo-free` is in DEFAULT_INSTALLED; no connection exists.
+        let mimo_free = provider_only("mimo-free");
         assert!(
-            compute_installed(&store, &anthropic, "provider", false, false, &ctx)
+            compute_installed(&store, &mimo_free, "provider", false, false, &ctx)
                 .await
                 .unwrap(),
             "a default-installed provider is installed with zero connections"
