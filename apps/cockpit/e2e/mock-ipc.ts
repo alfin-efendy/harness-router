@@ -125,6 +125,7 @@ const CONNECTIONS = [
     quotaCapability: null,
     models: ["model-alpha", "model-beta"],
     needsRelogin: false,
+    builtin: false,
   },
 ] satisfies ConnectionInfo[];
 
@@ -187,6 +188,7 @@ export const ACCOUNT_CONNECTIONS = [
     quotaCapability: "claude",
     models: ["claude-sonnet-4"],
     needsRelogin: true,
+    builtin: false,
   },
   {
     id: "codex-primary",
@@ -201,6 +203,7 @@ export const ACCOUNT_CONNECTIONS = [
     quotaCapability: "codex",
     models: ["gpt-5.5"],
     needsRelogin: false,
+    builtin: false,
   },
   {
     id: "codex-backup",
@@ -215,6 +218,7 @@ export const ACCOUNT_CONNECTIONS = [
     quotaCapability: "codex",
     models: ["gpt-5.5"],
     needsRelogin: false,
+    builtin: false,
   },
   {
     id: "kiro-device",
@@ -229,6 +233,7 @@ export const ACCOUNT_CONNECTIONS = [
     quotaCapability: null,
     models: ["kiro-auto"],
     needsRelogin: true,
+    builtin: false,
   },
 ] satisfies ConnectionInfo[];
 

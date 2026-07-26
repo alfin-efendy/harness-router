@@ -37,6 +37,7 @@ const connection: ConnectionInfo = {
   quotaCapability: null,
   models: ["gpt-4.1", "o3"],
   needsRelogin: false,
+  builtin: false,
 };
 
 const secondConnection: ConnectionInfo = {
@@ -60,6 +61,7 @@ const claudeConnection: ConnectionInfo = {
   quotaCapability: "claude",
   models: ["claude-opus-4-8"],
   needsRelogin: false,
+  builtin: false,
 };
 
 // Cloudflare Workers AI ids carry slashes ("@cf/meta/llama-3.1-8b-instruct")
@@ -78,6 +80,7 @@ const cloudflareConnection: ConnectionInfo = {
   quotaCapability: null,
   models: ["@cf/meta/llama-3.1-8b-instruct"],
   needsRelogin: false,
+  builtin: false,
 };
 
 const anthropicApiConnection: ConnectionInfo = {
@@ -93,6 +96,7 @@ const anthropicApiConnection: ConnectionInfo = {
   quotaCapability: null,
   models: ["claude-sonnet-4-5"],
   needsRelogin: false,
+  builtin: false,
 };
 
 const catalog: CatalogEntry[] = [

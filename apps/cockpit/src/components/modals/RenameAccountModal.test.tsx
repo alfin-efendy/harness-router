@@ -16,6 +16,7 @@ const connection = {
   quotaCapability: "codex",
   models: [],
   needsRelogin: false,
+  builtin: false,
 } satisfies ConnectionInfo;
 
 afterEach(cleanup);

@@ -20,6 +20,7 @@ const account = {
   quotaCapability: null,
   models: [],
   needsRelogin: false,
+  builtin: false,
 } satisfies ConnectionInfo;
 
 const catalogEntry = {
