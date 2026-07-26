@@ -15,10 +15,10 @@ use crate::agents::types::{
 use crate::api::types::{
     AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
     AgentMutationInfo, AgentPersonalityInfo, AgentRecoveryInfo, AgentRegistryInfo,
-    AgentSkillUsageInfo, AgentSummaryInfo, AgentValidationInfo, CuratorHistorySnapshotInfo,
-    CuratorStateInfo, InvalidKnowledgeConceptInfo, JourneyMilestoneInfo, KnowledgeConceptInfo,
-    KnowledgeConceptMutationInfo, LearningReviewInfo, NativeToolDecisionInfo, PermissionRuleInfo,
-    SessionRuntimeInfo,
+    AgentSkillUsageInfo, AgentStatsInfo, AgentStatsLite, AgentSummaryInfo, AgentToolUsageInfo,
+    AgentValidationInfo, CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
+    JourneyMilestoneInfo, KnowledgeConceptInfo, KnowledgeConceptMutationInfo, LearningReviewInfo,
+    NativeToolDecisionInfo, PermissionRuleInfo, SessionRuntimeInfo,
 };
 use crate::llm_router::model_effort::{
     self, EffectiveEffortSource, ModelDefaultSource, ModelPreferenceKey, ProjectRuntimeInfo,
@@ -37,6 +37,11 @@ use serde_json::Value;
 /// `set_default_agent`/`duplicate_agent`) rejects this id before touching the
 /// registry.
 const FRESH_AGENT_ID: &str = "fresh";
+
+/// Lookback windows for `AgentStatsInfo`'s cost/token and reliability
+/// aggregates, in milliseconds.
+const STATS_COST_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
+const STATS_RELIABILITY_WINDOW_MS: i64 = 30 * 24 * 3600 * 1000;
 
 pub(crate) const HANDLES: &[&str] = &[
     "list_selectable_models",
@@ -64,6 +69,8 @@ pub(crate) const HANDLES: &[&str] = &[
     "delete_invalid_agent_concept",
     "rollback_agent_learning",
     "get_agent_configuration_catalog",
+    "get_agent_stats",
+    "get_agent_stats_batch",
 ];
 
 #[derive(Deserialize)]
@@ -105,6 +112,11 @@ struct UpdateSessionRuntimeP {
 #[derive(Deserialize)]
 struct AgentIdP {
     agent_id: String,
+}
+
+#[derive(Deserialize)]
+struct AgentStatsBatchP {
+    agent_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1099,6 +1111,109 @@ async fn agent_configuration_catalog(
     crate::agents::catalog::build_live_catalog(state.cp.store(), state.cp.plugins()).await
 }
 
+/// Merge every parseable `cost_models` blob for `agent_id` started at or
+/// after `since_ms` into one token tally. Parses each blob the same way
+/// [`crate::store::Store::get_agent_run_cost_models`] does (plain
+/// `serde_json::Value`, not a redefined struct) — a blob that fails to
+/// parse is skipped with a `warn!` rather than failing the whole stats read.
+async fn agent_cost_tally_since(
+    store: &crate::store::Store,
+    agent_id: &str,
+    since_ms: i64,
+) -> anyhow::Result<crate::harness::native::cost::Tally> {
+    let blobs = store.list_agent_run_cost_blobs(agent_id, since_ms).await?;
+    let mut tally = crate::harness::native::cost::Tally::default();
+    for blob in blobs {
+        let models = match serde_json::from_str::<serde_json::Value>(&blob) {
+            Ok(models) => models,
+            Err(error) => {
+                tracing::warn!(
+                    "agent stats: unparseable cost_models blob for {agent_id}, skipping: {error}"
+                );
+                continue;
+            }
+        };
+        let parsed = crate::harness::native::cost::Tally::from_payload(&serde_json::json!({
+            "models": models,
+        }));
+        for model in parsed.model_ids() {
+            if let Some(buckets) = parsed.get(&model) {
+                tally.add(
+                    &model,
+                    buckets.input,
+                    buckets.output,
+                    buckets.cache_read,
+                    buckets.cache_creation,
+                );
+            }
+        }
+    }
+    Ok(tally)
+}
+
+/// Total billed tokens (all four buckets, every model) accumulated in `tally`.
+fn tally_total_tokens(tally: &crate::harness::native::cost::Tally) -> i64 {
+    tally
+        .model_ids()
+        .iter()
+        .filter_map(|model| tally.get(model))
+        .map(|buckets| {
+            (buckets.input + buckets.output + buckets.cache_read + buckets.cache_creation) as i64
+        })
+        .sum()
+}
+
+/// The full per-agent stats surface for the agent detail view. Unknown and
+/// synthetic ids (including [`FRESH_AGENT_ID`]) are never rejected — they
+/// simply have no matching rows in any of the underlying aggregates, so
+/// every field zeroes out naturally.
+async fn agent_stats_info(state: &ApiState, agent_id: &str) -> Result<AgentStatsInfo, ApiError> {
+    let store = state.cp.store();
+    let now = crate::paths::now_ms();
+    let tally = agent_cost_tally_since(store, agent_id, now - STATS_COST_WINDOW_MS).await?;
+    let tokens_7d = tally_total_tokens(&tally);
+    let (cost_usd_7d, _models) = crate::harness::native::cost::price_tally(store, &tally).await;
+    let activity = store.agent_activity_stats(agent_id).await?;
+    let reliability = store
+        .agent_run_reliability(agent_id, now - STATS_RELIABILITY_WINDOW_MS)
+        .await?;
+    let top_tools = store
+        .list_agent_tool_usage(agent_id)
+        .await?
+        .into_iter()
+        .map(|row| AgentToolUsageInfo {
+            tool: row.tool_name,
+            count: row.count,
+            last_used: row.last_used,
+        })
+        .collect();
+    Ok(AgentStatsInfo {
+        session_count: activity.session_count,
+        last_active: activity.last_active,
+        cost_usd_7d,
+        tokens_7d,
+        runs_total_30d: reliability.total,
+        runs_failed_30d: reliability.failed,
+        top_tools,
+    })
+}
+
+/// The lightweight per-agent stats surface for roster/list views
+/// (`get_agent_stats_batch`) — same zeroed-for-unknown behavior as
+/// [`agent_stats_info`].
+async fn agent_stats_lite(state: &ApiState, agent_id: &str) -> Result<AgentStatsLite, ApiError> {
+    let store = state.cp.store();
+    let now = crate::paths::now_ms();
+    let tally = agent_cost_tally_since(store, agent_id, now - STATS_COST_WINDOW_MS).await?;
+    let (cost_usd_7d, _models) = crate::harness::native::cost::price_tally(store, &tally).await;
+    let activity = store.agent_activity_stats(agent_id).await?;
+    Ok(AgentStatsLite {
+        session_count: activity.session_count,
+        last_active: activity.last_active,
+        cost_usd_7d,
+    })
+}
+
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
     match method {
@@ -1425,6 +1540,22 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "get_agent_configuration_catalog" => {
             let catalog = agent_configuration_catalog(state).await?;
             ok(AgentConfigurationCatalogInfo::from(catalog))
+        }
+        "get_agent_stats" => {
+            let a: AgentIdP = params(p)?;
+            let agent_id = a.agent_id.trim().to_string();
+            ok(agent_stats_info(state, &agent_id).await?)
+        }
+        "get_agent_stats_batch" => {
+            let a: AgentStatsBatchP = params(p)?;
+            let mut out: std::collections::HashMap<String, AgentStatsLite> =
+                std::collections::HashMap::with_capacity(a.agent_ids.len());
+            for agent_id in a.agent_ids {
+                let agent_id = agent_id.trim().to_string();
+                let lite = agent_stats_lite(state, &agent_id).await?;
+                out.insert(agent_id, lite);
+            }
+            ok(out)
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
@@ -2935,5 +3066,253 @@ mod tests {
             apps.iter().any(|entry| entry["id"] == "seeded-app"),
             "seeded app must appear in the apps catalog"
         );
+    }
+
+    // --- get_agent_stats / get_agent_stats_batch --------------------------
+
+    fn stats_session(session_pk: &str, agent_id: &str, last_active: i64) -> crate::domain::Session {
+        crate::domain::Session {
+            session_pk: session_pk.into(),
+            primary_agent_id: Some(agent_id.into()),
+            primary_agent_snapshot: None,
+            project_id: Some("p1".into()),
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status: crate::domain::SessionStatus::Idle,
+            started_by: None,
+            created_at: Some(1),
+            last_active: Some(last_active),
+            resume_attempts: 0,
+            branch_owned: false,
+            perm_mode: PermMode::Default,
+            kind: crate::domain::SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+            archived_at: None,
+        }
+    }
+
+    async fn insert_stats_run(
+        store: &crate::store::Store,
+        run_id: &str,
+        session_pk: &str,
+        agent_id: &str,
+        status: crate::domain::AgentRunStatus,
+        started_at: i64,
+    ) {
+        use crate::domain::{AgentRunKind, NewAgentRun};
+        store
+            .insert_primary_agent_run(NewAgentRun {
+                run_id: run_id.into(),
+                session_pk: session_pk.into(),
+                parent_run_id: None,
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: agent_id.into(),
+                executing_agent_id: Some(agent_id.into()),
+                executing_agent_name_snapshot: "Agent".into(),
+                agent_kind: AgentRunKind::Primary,
+                task: "t".into(),
+                status,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+        let run_id = run_id.to_string();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE agent_runs SET started_at=?1 WHERE run_id=?2",
+                    rusqlite::params![started_at, run_id],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Seeds agent "a1" with: two sessions (session_count=2, last_active=300),
+    /// a recent completed run priced at $6 over 1.2M tokens on a
+    /// settings-overridden synthetic model (deterministic, no dependency on
+    /// vendored/live pricing data), a recent failed run, a recent running run
+    /// (excluded from reliability totals despite being in-window), a failed
+    /// run from 35 days ago (excluded from the 30d reliability window), and
+    /// tool usage read=2/bash=1 (count DESC order).
+    async fn seed_agent_a1_stats(store: &crate::store::Store) {
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(stats_session("sess-a1-early", "a1", 100))
+            .await
+            .unwrap();
+        store
+            .insert_session(stats_session("sess-a1-late", "a1", 300))
+            .await
+            .unwrap();
+
+        insert_stats_run(
+            store,
+            "run-completed",
+            "sess-a1-early",
+            "a1",
+            crate::domain::AgentRunStatus::Completed,
+            now - 1_000,
+        )
+        .await;
+        insert_stats_run(
+            store,
+            "run-failed",
+            "sess-a1-early",
+            "a1",
+            crate::domain::AgentRunStatus::Failed,
+            now - 2_000,
+        )
+        .await;
+        insert_stats_run(
+            store,
+            "run-running",
+            "sess-a1-early",
+            "a1",
+            crate::domain::AgentRunStatus::Running,
+            now - 3_000,
+        )
+        .await;
+        insert_stats_run(
+            store,
+            "run-failed-old",
+            "sess-a1-early",
+            "a1",
+            crate::domain::AgentRunStatus::Failed,
+            now - 35 * 24 * 3600 * 1000,
+        )
+        .await;
+
+        store
+            .set_setting_raw(
+                "models.meta.stats-test-model",
+                r#"{"cost_input":3.0,"cost_output":15.0}"#,
+            )
+            .await
+            .unwrap();
+        store
+            .update_agent_run_cost_models(
+                "run-completed",
+                &json!({
+                    "stats-test-model": {
+                        "input": 1_000_000,
+                        "output": 200_000,
+                        "cache_read": 0,
+                        "cache_creation": 0
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        store
+            .increment_agent_tool_usage("a1", "read", now - 5_000)
+            .await
+            .unwrap();
+        store
+            .increment_agent_tool_usage("a1", "read", now - 4_000)
+            .await
+            .unwrap();
+        store
+            .increment_agent_tool_usage("a1", "bash", now - 4_500)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_agent_stats_aggregates_sessions_tools_reliability_and_priced_cost() {
+        let s = state().await;
+        seed_agent_a1_stats(s.cp.store()).await;
+
+        let stats = dispatch(&s, "get_agent_stats", json!({"agent_id": "a1"}))
+            .await
+            .unwrap();
+
+        assert_eq!(stats["sessionCount"], 2);
+        assert_eq!(stats["lastActive"], 300);
+        assert!(
+            (stats["costUsd7d"].as_f64().unwrap() - 6.0).abs() < 1e-9,
+            "costUsd7d {stats:?}"
+        );
+        assert_eq!(stats["tokens7d"], 1_200_000);
+        assert_eq!(
+            stats["runsTotal30d"], 2,
+            "queued/running excluded from total"
+        );
+        assert_eq!(
+            stats["runsFailed30d"], 1,
+            "pre-window failure excluded, in-window failure counted"
+        );
+
+        let top_tools = stats["topTools"].as_array().unwrap();
+        assert_eq!(top_tools.len(), 2);
+        assert_eq!(top_tools[0]["tool"], "read");
+        assert_eq!(top_tools[0]["count"], 2);
+        assert_eq!(top_tools[1]["tool"], "bash");
+        assert_eq!(top_tools[1]["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn get_agent_stats_returns_zeroed_for_fresh_and_unknown_agent_ids() {
+        let s = state().await;
+
+        for agent_id in ["fresh", "totally-unknown-agent"] {
+            let stats = dispatch(&s, "get_agent_stats", json!({"agent_id": agent_id}))
+                .await
+                .unwrap_or_else(|e| panic!("get_agent_stats({agent_id}) must not error: {e:?}"));
+            assert_eq!(stats["sessionCount"], 0, "{agent_id}");
+            assert!(stats["lastActive"].is_null(), "{agent_id}");
+            assert_eq!(stats["costUsd7d"], 0.0, "{agent_id}");
+            assert_eq!(stats["tokens7d"], 0, "{agent_id}");
+            assert_eq!(stats["runsTotal30d"], 0, "{agent_id}");
+            assert_eq!(stats["runsFailed30d"], 0, "{agent_id}");
+            assert!(
+                stats["topTools"].as_array().unwrap().is_empty(),
+                "{agent_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_agent_stats_batch_returns_entries_only_for_requested_ids() {
+        let s = state().await;
+        seed_agent_a1_stats(s.cp.store()).await;
+        // A second agent with its own data, deliberately NOT requested below —
+        // it must be absent from the batch result.
+        s.cp.store()
+            .insert_session(stats_session("sess-b", "b", 999))
+            .await
+            .unwrap();
+
+        let batch = dispatch(
+            &s,
+            "get_agent_stats_batch",
+            json!({"agent_ids": ["a1", "unknown-agent"]}),
+        )
+        .await
+        .unwrap();
+
+        let entries = batch.as_object().unwrap();
+        assert_eq!(
+            entries.keys().collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([&"a1".to_string(), &"unknown-agent".to_string()]),
+            "batch must return entries only for requested ids"
+        );
+
+        assert_eq!(entries["a1"]["sessionCount"], 2);
+        assert_eq!(entries["a1"]["lastActive"], 300);
+        assert!((entries["a1"]["costUsd7d"].as_f64().unwrap() - 6.0).abs() < 1e-9);
+
+        assert_eq!(entries["unknown-agent"]["sessionCount"], 0);
+        assert!(entries["unknown-agent"]["lastActive"].is_null());
+        assert_eq!(entries["unknown-agent"]["costUsd7d"], 0.0);
     }
 }

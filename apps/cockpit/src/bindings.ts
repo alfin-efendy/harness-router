@@ -483,6 +483,22 @@ async rollbackAgentLearning(agentId: string, snapshotId: string) : Promise<Resul
     else return { status: "error", error: e  as any };
 }
 },
+async getAgentStats(runnerId: string | null, agentId: string) : Promise<Result<AgentStatsInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_stats", { runnerId, agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getAgentStatsBatch(runnerId: string | null, agentIds: string[]) : Promise<Result<Partial<{ [key in string]: AgentStatsLite }>, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_stats_batch", { runnerId, agentIds }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listGateways(runnerId: string | null) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_gateways", { runnerId }) };
@@ -1994,12 +2010,31 @@ export type AgentRunKind = "primary" | "main-delegate" | "subagent"
 export type AgentRunRosterInfo = { rootRunId: string | null; runs: AgentRun[] }
 export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted"
 export type AgentSkillUsageInfo = { skillId: string; uses: number; successes: number; conceptId: string }
+/**
+ * Per-agent stats surfaced on the agent detail view: sessions led, priced
+ * cost/tokens over the trailing 7 days, run reliability over the trailing
+ * 30 days, and the full per-tool usage breakdown (`top_tools`, count DESC).
+ * An unknown or synthetic agent id (including the Fresh Agent's `"fresh"`)
+ * simply has no matching rows anywhere, so every field zeroes out rather
+ * than erroring.
+ */
+export type AgentStatsInfo = { sessionCount: number; lastActive: number | null; costUsd7d: number; tokens7d: number; runsTotal30d: number; runsFailed30d: number; topTools: AgentToolUsageInfo[] }
+/**
+ * Lightweight per-agent stats for roster/list views (`get_agent_stats_batch`)
+ * — see [`AgentStatsInfo`] for the full detail-view shape.
+ */
+export type AgentStatsLite = { sessionCount: number; lastActive: number | null; costUsd7d: number }
 export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo;
 /**
  * True for the built-in, non-editable rows (currently only the
  * synthetic Fresh Agent row) — `false` for every registry-backed agent.
  */
 builtin: boolean; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
+/**
+ * One tool's lifetime usage counter for a single agent — see
+ * [`crate::store::AgentToolUsageRow`].
+ */
+export type AgentToolUsageInfo = { tool: string; count: number; lastUsed: number }
 export type AgentValidationInfo = { field: string; message: string }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**

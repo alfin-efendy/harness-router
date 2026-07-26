@@ -1660,6 +1660,56 @@ pub struct AgentRegistryInfo {
     pub subagent_model: AgentModelInfo,
 }
 
+/// One tool's lifetime usage counter for a single agent — see
+/// [`crate::store::AgentToolUsageRow`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolUsageInfo {
+    pub tool: String,
+    pub count: i64,
+    pub last_used: i64,
+}
+
+/// Per-agent stats surfaced on the agent detail view: sessions led, priced
+/// cost/tokens over the trailing 7 days, run reliability over the trailing
+/// 30 days, and the full per-tool usage breakdown (`top_tools`, count DESC).
+/// An unknown or synthetic agent id (including the Fresh Agent's `"fresh"`)
+/// simply has no matching rows anywhere, so every field zeroes out rather
+/// than erroring.
+// `specta`'s own camelCase inflector (the `inflector` crate) splits words at
+// digit→letter boundaries, unlike serde's `rename_all = "camelCase"` (which
+// only capitalizes the first character of each `_`-delimited segment) — left
+// alone it would emit `costUsd7D`/`tokens7D`/etc. in bindings.ts, one letter
+// off from the real wire key serde actually produces. Pin every digit-suffixed
+// field to its true serde-camelCase key so the generated TS type matches the
+// runtime JSON exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatsInfo {
+    pub session_count: i64,
+    pub last_active: Option<i64>,
+    #[specta(rename = "costUsd7d")]
+    pub cost_usd_7d: f64,
+    #[specta(rename = "tokens7d")]
+    pub tokens_7d: i64,
+    #[specta(rename = "runsTotal30d")]
+    pub runs_total_30d: i64,
+    #[specta(rename = "runsFailed30d")]
+    pub runs_failed_30d: i64,
+    pub top_tools: Vec<AgentToolUsageInfo>,
+}
+
+/// Lightweight per-agent stats for roster/list views (`get_agent_stats_batch`)
+/// — see [`AgentStatsInfo`] for the full detail-view shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatsLite {
+    pub session_count: i64,
+    pub last_active: Option<i64>,
+    #[specta(rename = "costUsd7d")]
+    pub cost_usd_7d: f64,
+}
+
 /// One selectable option in the agent configuration catalog (a skill,
 /// native tool, plugin tool, or app) — see
 /// [`crate::agents::catalog::CatalogEntry`].
