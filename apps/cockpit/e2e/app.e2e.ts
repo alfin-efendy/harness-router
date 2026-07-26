@@ -646,6 +646,14 @@ test("agents: manage a non-default agent and start a chat session for it", async
   await expect(page.getByRole("heading", { name: "Fresh Agent" })).toBeVisible();
   await expect(page.getByTestId("agent-detail-tabs")).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "Agent model" })).toBeVisible();
+  // PR3 Task 8: the Fresh Agent's pet is hardcoded (FRESH_AGENT_PET =
+  // "sprout" in both agent_api.rs and lib/pet-sprite.ts, mirrored on
+  // FRESH_AGENT.avatarPet in mock-ipc.ts) and rendered plain — the builtin
+  // detail branch has no "Change pet" button wrapping the avatar at all
+  // (unlike a real agent's header below), since nothing about the Fresh
+  // Agent's identity is editable.
+  await expect(page.getByTestId("pet-sprite")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Change .* pet/ })).toHaveCount(0);
   // Scoped to "main": the app shell has its own unrelated "Back" control
   // elsewhere in the layout with the same accessible name.
   await page.getByRole("main").getByRole("button", { name: "Back" }).click();
@@ -701,6 +709,70 @@ test("agents: manage a non-default agent and start a chat session for it", async
   await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_chat_session")).toBe(true);
   const start = (await mockCalls(page)).find((c) => c.cmd === "start_chat_session");
   expect(start?.args).toMatchObject({ primaryAgentId: "reviewer", turn: { text: "kick off the review" } });
+});
+
+// PR3 (pets + per-agent insight) journeys: roster-row pet avatars and lazy
+// stats, the detail Overview stat cards, and the Fresh Agent's hardcoded
+// pet (covered above, in the "manage" journey). Figures below mirror
+// RYUZI_STATS/REVIEWER_STATS in mock-ipc.ts exactly — see that file for the
+// source numbers this test's formatted-string expectations derive from.
+
+test("agents: roster rows render pet avatars and lazy-loaded stats", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Agents", { exact: true }).first().click();
+
+  // Ryuzi (RYUZI_AGENT.avatarPet = "tennis-ball", a real bundled slug)
+  // renders a PetSprite in its row, not the plain color tile.
+  const ryuziRow = page.getByRole("button", { name: "Open Ryuzi" });
+  await expect(ryuziRow.getByTestId("pet-sprite")).toBeVisible();
+  await expect(ryuziRow.getByTestId("agent-avatar-color-tile")).toHaveCount(0);
+
+  // Reviewer (avatarPet: null) stays on the plain color-tile fallback.
+  const reviewerRow = page.getByRole("button", { name: "Open Reviewer" });
+  await expect(reviewerRow.getByTestId("agent-avatar-color-tile")).toBeVisible();
+  await expect(reviewerRow.getByTestId("pet-sprite")).toHaveCount(0);
+
+  // get_agent_stats_batch populates each non-built-in row's lazy stats
+  // fragment (statsRowFragment, lib/agent-stats.ts) once it resolves.
+  await expect(ryuziRow).toContainText("5 sessions");
+  await expect(ryuziRow).toContainText("$1.24 7d");
+  await expect(reviewerRow).toContainText("0 sessions");
+  await expect(reviewerRow).toContainText("$0.00 7d");
+
+  // The built-in Fresh Agent row is excluded from the batch entirely — it
+  // never gets a stats fragment appended to its metadata line.
+  const freshRow = page.getByRole("button", { name: "Open Fresh Agent" });
+  await expect(freshRow).not.toContainText("sessions");
+
+  const batchCall = (await mockCalls(page)).find((c) => c.cmd === "get_agent_stats_batch");
+  const requestedIds = (batchCall?.args as { agentIds?: string[] } | undefined)?.agentIds ?? [];
+  expect(requestedIds).toEqual(expect.arrayContaining(["ryuzi", "reviewer"]));
+  expect(requestedIds).not.toContain("fresh");
+});
+
+test("agents: detail Overview shows Activity/Cost/Reliability stat cards", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Agents", { exact: true }).first().click();
+  await page.getByRole("button", { name: "Open Ryuzi" }).click();
+
+  // Overview is the default tab — no tab click needed. Each stat card is a
+  // label/value/detail triple of sibling elements (AgentDetailView.tsx); the
+  // label's parent is the whole card, so scoping assertions off the label
+  // text also covers its value and detail line.
+  const activityCard = page.getByText("Activity", { exact: true }).locator("xpath=..");
+  await expect(activityCard).toContainText("5 sessions");
+
+  const costCard = page.getByText("Cost · 7 days", { exact: true }).locator("xpath=..");
+  await expect(costCard).toContainText("$1.24");
+  await expect(costCard).toContainText("45.2k tokens");
+
+  const reliabilityCard = page.getByText("Reliability", { exact: true }).locator("xpath=..");
+  await expect(reliabilityCard).toContainText("90%");
+  await expect(reliabilityCard).toContainText("2 of 20 runs");
+
+  // Tool usage strip, from the same fixture's `topTools`.
+  await expect(page.getByText("read_file ×14", { exact: true })).toBeVisible();
+  await expect(page.getByText("grep ×6", { exact: true })).toBeVisible();
 });
 
 test("delegation: mention-selected child run opens its transcript and returns to the roster", async ({ page }) => {
