@@ -70,11 +70,15 @@ jobs:
       # `--skip=validate` (on the goreleaser step below) is kept deliberately:
       # this job only runs on the release-please merge commit, where goreleaser's
       # tag cross-check adds nothing but flake surface.
+      # `--timeout=120m`: goreleaser's default 30m deadline killed v0.8.0 —
+      # wasmtime (WASM plugin platform) pushed the 6-target build to ~66m, and
+      # the deadline only fires between pipes, so it aborted AFTER the builds
+      # finished but before upload. v0.7.0 already sat at ~30m.
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --skip=validate
+          args: release --clean --skip=validate --timeout=120m
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -37,7 +37,9 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --skip=validate
+          # --timeout=120m mirrors release.yml: the 30m default is smaller
+          # than the ~66m six-target build since wasmtime landed (v0.8.0).
+          args: release --clean --skip=validate --timeout=120m
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ inputs.tag }}
