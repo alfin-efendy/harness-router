@@ -1,6 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { MonitorUp } from "lucide-react";
-import { SettingsCard as Card } from "@ryuzi/ui";
+import { Button, SettingsCard as Card } from "@ryuzi/ui";
 import { useStore } from "./store";
 import { useAgents } from "./store-agents";
 import { useModelStatuses } from "./store-model-statuses";
@@ -10,6 +10,7 @@ import { useDisableContextMenu } from "./lib/contextMenu";
 import { TitleBar } from "./components/shell/TitleBar";
 import { Sidebar } from "./components/shell/Sidebar";
 import { ProjectSettingsModal } from "./components/modals/ProjectSettingsModal";
+import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { HomeView } from "./views/HomeView";
 import { InboxView } from "./views/InboxView";
 import { SessionView } from "./views/SessionView";
@@ -77,6 +78,18 @@ export default function App() {
   const init = useStore((s) => s.init);
   const hydrateModelStatuses = useModelStatuses((s) => s.hydrate);
   const restartRequired = usePlugins((s) => s.restartRequired);
+  const restarting = usePlugins((s) => s.restarting);
+  const restartEngine = usePlugins((s) => s.restartEngine);
+  // Spec B3 guard: warn-and-confirm when any session is actively running —
+  // the restart interrupts it (reconcile resumes interrupted turns on boot,
+  // but the user should choose). No hard refusal: a stuck session is a
+  // legitimate reason to restart.
+  const hasRunningSession = useStore((s) => s.sessions.some((sess) => sess.status === "running"));
+  const [confirmRestart, setConfirmRestart] = useState<HTMLButtonElement | null>(null);
+  const onRestartEngine = (e: React.MouseEvent<HTMLButtonElement>) => {
+    if (hasRunningSession) setConfirmRestart(e.currentTarget);
+    else void restartEngine();
+  };
   useDisableContextMenu();
   useEffect(() => {
     init();
@@ -103,13 +116,29 @@ export default function App() {
           {restartRequired && (
             <Card className="m-2.5 mb-0 flex shrink-0 items-center gap-2.5 px-[18px] py-2.5 text-[12.5px]">
               <MonitorUp aria-hidden size={15} strokeWidth={2} className="shrink-0" style={{ color: WARN }} />
-              <span className="min-w-0 flex-1">Restart Cockpit to apply plugin changes.</span>
+              <span className="min-w-0 flex-1">Plugin changes pending — restart the engine to apply.</span>
+              <Button size="sm" variant="outline" disabled={restarting} onClick={onRestartEngine}>
+                {restarting ? "Restarting…" : "Restart engine"}
+              </Button>
             </Card>
           )}
           <MainView />
         </main>
       </div>
       <ProjectSettingsModal />
+      <ConfirmActionModal
+        open={confirmRestart !== null}
+        title="Restart engine?"
+        description="A session is still running — restarting the engine will interrupt it. Restart anyway?"
+        confirmLabel="Restart"
+        busyLabel="Restarting…"
+        trigger={confirmRestart}
+        onClose={() => setConfirmRestart(null)}
+        onConfirm={async () => {
+          await restartEngine();
+          return true;
+        }}
+      />
       <Toaster richColors position="bottom-right" />
     </div>
   );
