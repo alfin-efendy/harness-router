@@ -440,6 +440,7 @@ pub(crate) fn load_skill_pack_plugins_from(
 ///   `is_enabled` always reports it disabled regardless of any
 ///   `plugin.<id>.enabled` write (see that method's doc) — toggling would
 ///   silently no-op
+/// - component-backed provider → set the TRANSPORT key `plugin.<id>.enabled` (display axis unchanged; see body comment)
 /// - no harness/gateway/connector capability (manifest-only, e.g. a
 ///   provider metadata entry) → an error, since `is_enabled`
 ///   always reports it enabled regardless of any `plugin.<id>.enabled`
@@ -473,6 +474,26 @@ pub async fn toggle_enabled(
     // component could never be turned on through the UI. Mirrors
     // `PluginHost::is_enabled`'s component branch.
     if plugin.source == PluginSource::Component {
+        return settings
+            .set(
+                &format!("plugin.{id}.enabled"),
+                if enable { "true" } else { "false" },
+            )
+            .await;
+    }
+    // A component-BACKED provider (mimo/opencode + COMPONENT_BACKED_PROVIDER_IDS):
+    // its plugin-list row is the CATALOG builtin (that registration won the id),
+    // so there is no Component-source row — but its WASM transport still gates
+    // on `plugin.<id>.enabled` (`component_plugin_enabled`, read by
+    // `discover_provider_components`). Flip that key instead of falling through
+    // to the manifest-only bail below, which made the transport un-enableable
+    // from every surface. NOTE the two-axis rule: `is_enabled` deliberately
+    // keeps reporting these rows manifest-only (always enabled) — this key is
+    // the TRANSPORT axis, not the list-row display axis; flipping display too
+    // would show every provider "Disabled" on a fresh install.
+    if plugin.manifest.provider.is_some()
+        && crate::plugins::component_catalog::is_component_bundle(id)
+    {
         return settings
             .set(
                 &format!("plugin.{id}.enabled"),
@@ -1166,6 +1187,52 @@ mod toggle_enabled_tests {
         assert!(!host::component_plugin_enabled(&settings, "github")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn toggle_enabled_flips_transport_key_for_component_backed_provider() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        for p in crate::plugins::providers::provider_plugins() {
+            host.add(p);
+        }
+        // mimo is FIRST_PARTY + opencode too; anthropic is in
+        // COMPONENT_BACKED_PROVIDER_IDS — all three must toggle.
+        for id in ["mimo", "opencode", "anthropic"] {
+            toggle_enabled(&host, &settings, id, true).await.unwrap();
+            assert_eq!(
+                settings
+                    .get(&format!("plugin.{id}.enabled"))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("true"),
+                "{id} transport key not written"
+            );
+            toggle_enabled(&host, &settings, id, false).await.unwrap();
+            assert_eq!(
+                settings
+                    .get(&format!("plugin.{id}.enabled"))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("false")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn toggle_enabled_still_bails_for_non_component_provider() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        for p in crate::plugins::providers::provider_plugins() {
+            host.add(p);
+        }
+        // kiro has no component bundle — the manifest-only bail must survive.
+        let err = toggle_enabled(&host, &settings, "kiro", true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("always available"), "got: {err}");
     }
 }
 
