@@ -7,6 +7,8 @@ import type {
   AgentModelInfo,
   AgentMutationInfo,
   AgentRegistryInfo,
+  AgentStatsInfo,
+  AgentStatsLite,
   AgentSummaryInfo,
   CmdError,
   Result,
@@ -85,6 +87,23 @@ function reviewerInput(): AgentMutationInfo {
   };
 }
 
+function statsLite(overrides: Partial<AgentStatsLite> = {}): AgentStatsLite {
+  return { sessionCount: 3, lastActive: 1_000, costUsd7d: 1.23, ...overrides };
+}
+
+function statsInfo(overrides: Partial<AgentStatsInfo> = {}): AgentStatsInfo {
+  return {
+    sessionCount: 3,
+    lastActive: 1_000,
+    costUsd7d: 1.23,
+    tokens7d: 4_500,
+    runsTotal30d: 10,
+    runsFailed30d: 1,
+    topTools: [{ tool: "read", count: 5, lastUsed: 900 }],
+    ...overrides,
+  };
+}
+
 const selectable = (requestValue: string): SelectableModelInfo => ({
   kind: "concrete",
   requestValue,
@@ -116,6 +135,8 @@ const setDefaultAgent = spyOn(commands, "setDefaultAgent");
 const updateSubagentModel = spyOn(commands, "updateSubagentModel");
 const listSelectableModels = spyOn(commands, "listSelectableModels");
 const listAgentSessions = spyOn(commands, "listAgentSessions");
+const getAgentStats = spyOn(commands, "getAgentStats");
+const getAgentStatsBatch = spyOn(commands, "getAgentStatsBatch");
 
 const resetCommandMocks = () => {
   listAgents.mockImplementation(async () => ok(registry()));
@@ -135,6 +156,8 @@ const resetCommandMocks = () => {
   updateSubagentModel.mockImplementation(async (_r, model) => ok({ ...registry(), subagentModel: model }));
   listAgentSessions.mockImplementation(async () => ok([]));
   listSelectableModels.mockImplementation(async () => ok([selectable("free"), selectable("free-2")]));
+  getAgentStats.mockImplementation(async () => ok(statsInfo()));
+  getAgentStatsBatch.mockImplementation(async () => ok({}));
 };
 
 const { useAgents } = await import("./store-agents");
@@ -151,6 +174,8 @@ const allMocks = [
   updateSubagentModel,
   listSelectableModels,
   listAgentSessions,
+  getAgentStats,
+  getAgentStatsBatch,
 ];
 
 beforeEach(() => {
@@ -161,6 +186,8 @@ beforeEach(() => {
     detail: null,
     models: [],
     recentSessionsByAgent: {},
+    statsByAgent: {},
+    statsDetail: {},
     loaded: false,
     loading: false,
     saving: false,
@@ -204,6 +231,58 @@ test("loadRecentSessions calls the generated command and stores sessions under t
 
   expect(listAgentSessions).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", 10);
   expect(useAgents.getState().recentSessionsByAgent).toEqual({ reviewer: sessions });
+});
+
+// ---------- loadStatsBatch / loadStatsDetail ----------
+
+test("loadStatsBatch fills the lite stats map from the batch command", async () => {
+  getAgentStatsBatch.mockResolvedValueOnce(ok({ reviewer: statsLite() }));
+  await useAgents.getState().loadStatsBatch(["reviewer"]);
+  expect(getAgentStatsBatch).toHaveBeenCalledWith(LOCAL_RUNNER, ["reviewer"]);
+  expect(useAgents.getState().statsByAgent).toEqual({ reviewer: statsLite() });
+});
+
+test("loadStatsBatch with an empty id list skips the call entirely", async () => {
+  await useAgents.getState().loadStatsBatch([]);
+  expect(getAgentStatsBatch).not.toHaveBeenCalled();
+  expect(useAgents.getState().statsByAgent).toEqual({});
+});
+
+test("a failed or thrown batch load leaves every entry absent, never blocks loading/saving, and never toasts", async () => {
+  const toastSpy = spyOn(toast, "error");
+
+  getAgentStatsBatch.mockResolvedValueOnce(err("stats unavailable"));
+  await useAgents.getState().loadStatsBatch(["reviewer"]);
+  expect(useAgents.getState().statsByAgent).toEqual({});
+
+  getAgentStatsBatch.mockRejectedValueOnce(new Error("transport closed"));
+  await useAgents.getState().loadStatsBatch(["reviewer"]);
+  expect(useAgents.getState().statsByAgent).toEqual({});
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(false);
+  expect(toastSpy).not.toHaveBeenCalled();
+  toastSpy.mockRestore();
+});
+
+test("loadStatsDetail stores the full per-agent stats", async () => {
+  getAgentStats.mockResolvedValueOnce(ok(statsInfo()));
+  await useAgents.getState().loadStatsDetail("reviewer");
+  expect(getAgentStats).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer");
+  expect(useAgents.getState().statsDetail).toEqual({ reviewer: statsInfo() });
+});
+
+test("a failed or thrown detail load leaves the entry absent and never toasts", async () => {
+  const toastSpy = spyOn(toast, "error");
+
+  getAgentStats.mockResolvedValueOnce(err("stats unavailable"));
+  await useAgents.getState().loadStatsDetail("reviewer");
+  expect(useAgents.getState().statsDetail).toEqual({});
+
+  getAgentStats.mockRejectedValueOnce(new Error("transport closed"));
+  await useAgents.getState().loadStatsDetail("reviewer");
+  expect(useAgents.getState().statsDetail).toEqual({});
+  expect(toastSpy).not.toHaveBeenCalled();
+  toastSpy.mockRestore();
 });
 
 test("load hydrates registry and selected detail in parallel", async () => {

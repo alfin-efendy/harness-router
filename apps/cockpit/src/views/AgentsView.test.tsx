@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type {
   AgentDetailInfo,
   AgentModelInfo,
   AgentMutationInfo,
   AgentRegistryInfo,
+  AgentStatsLite,
   AgentSummaryInfo,
   SelectableModelInfo,
 } from "@/bindings";
@@ -87,9 +88,13 @@ const updateSubagentModel = mock(async (_runnerId: string | null, model: AgentMo
   status: "ok" as const,
   data: { ...registry(), subagentModel: model },
 }));
+const getAgentStatsBatch = mock(async (_runnerId: string | null, _agentIds: string[]) => ({
+  status: "ok" as const,
+  data: {} as Record<string, AgentStatsLite>,
+}));
 
 mock.module("@/bindings", () => ({
-  commands: { createAgent, updateSubagentModel },
+  commands: { createAgent, updateSubagentModel, getAgentStatsBatch },
   events: {},
 }));
 
@@ -105,6 +110,8 @@ function seedAgents() {
     loaded: true,
     loading: false,
     saving: false,
+    statsByAgent: {},
+    statsDetail: {},
   });
   useNav.setState({
     history: { back: [], current: { kind: "agents" }, forward: [] },
@@ -115,6 +122,8 @@ function seedAgents() {
 beforeEach(() => {
   createAgent.mockClear();
   updateSubagentModel.mockClear();
+  getAgentStatsBatch.mockClear();
+  getAgentStatsBatch.mockImplementation(async () => ({ status: "ok" as const, data: {} }));
   seedAgents();
 });
 
@@ -224,4 +233,50 @@ test("create modal sends the complete initial mutation and opens the new detail"
     }),
   );
   await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "architect" }));
+});
+
+test("row stats fragment renders only once lazily-loaded batch stats resolve, without blocking or reordering the list", async () => {
+  getAgentStatsBatch.mockImplementationOnce(async () => ({
+    status: "ok" as const,
+    data: { reviewer: { sessionCount: 3, lastActive: Date.now() - 5 * 60_000, costUsd7d: 1.5 } },
+  }));
+  render(<AgentsView />);
+
+  // The roster renders immediately, in its original order, before stats
+  // resolve — and the batch load never touches the shared loading flag.
+  const rowsBefore = screen.getAllByRole("button", { name: /^Open / }).map((button) => button.getAttribute("aria-label"));
+  expect(rowsBefore).toEqual(["Open Ryuzi", "Open Reviewer", "Open Fresh Agent"]);
+  expect(screen.queryByText(/sessions ·/)).toBeNull();
+  expect(useAgents.getState().loading).toBe(false);
+
+  await waitFor(() => expect(getAgentStatsBatch).toHaveBeenCalledWith(LOCAL_RUNNER, ["ryuzi", "reviewer"]));
+  expect(await screen.findByText(/3 sessions · 5m ago · \$1\.50 7d/)).toBeTruthy();
+
+  // Still the same order after stats land.
+  const rowsAfter = screen.getAllByRole("button", { name: /^Open / }).map((button) => button.getAttribute("aria-label"));
+  expect(rowsAfter).toEqual(rowsBefore);
+});
+
+test("the built-in Fresh Agent row is excluded from the stats batch call and never renders a fragment even if data existed for it", async () => {
+  render(<AgentsView />);
+  await waitFor(() => expect(getAgentStatsBatch).toHaveBeenCalledWith(LOCAL_RUNNER, ["ryuzi", "reviewer"]));
+
+  // Simulate stray stats keyed under the built-in id (e.g. a hypothetical
+  // future backend quirk) — the skip must be enforced by `agent.builtin`,
+  // not merely by "did the batch response happen to omit it".
+  act(() => {
+    useAgents.setState((s) => ({
+      statsByAgent: { ...s.statsByAgent, fresh: { sessionCount: 9, lastActive: Date.now(), costUsd7d: 9 } },
+    }));
+  });
+  expect(screen.queryByText(/9 sessions/)).toBeNull();
+});
+
+test("a rejected stats batch load never crashes the roster render and leaves rows without a fragment", async () => {
+  getAgentStatsBatch.mockImplementationOnce(() => Promise.reject(new Error("transport closed")));
+  render(<AgentsView />);
+
+  await waitFor(() => expect(getAgentStatsBatch).toHaveBeenCalled());
+  expect(screen.getByText("Reviews implementation quality and regressions.")).toBeTruthy();
+  expect(screen.queryByText(/sessions ·/)).toBeNull();
 });
