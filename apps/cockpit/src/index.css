@@ -50,6 +50,21 @@ html[data-opaque] {
   }
 }
 
+/* Pet spritesheet run-cycle (see PetSprite.tsx). The 0% keyframe is
+   intentionally omitted: CSS animations fall back to the element's own
+   underlying `background-position-x` (set inline to 0) as the implicit
+   start, so only the end-of-loop offset needs declaring here. That offset
+   depends on the rendered frame width, which is a runtime prop (`size`) —
+   not a fixed value — so it comes in via the `--pet-sprite-total-w` custom
+   property PetSprite sets inline (frame count * rendered frame width).
+   `animation-timing-function: steps(PET_COLS)` (set inline, using the real
+   constant) turns the loop into discrete per-frame jumps. */
+@keyframes pet-sprite-cycle {
+  to {
+    background-position-x: calc(-1 * var(--pet-sprite-total-w, 0px));
+  }
+}
+
 /* Reduced-motion: neutralize the decorative infinite loops (status pulses,
    spinners) and enter/exit animations so the compositor can idle when the OS
    asks for less motion. Only `animation` is touched — functional transitions
