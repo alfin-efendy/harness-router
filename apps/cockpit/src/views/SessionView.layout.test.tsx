@@ -31,6 +31,9 @@ mock.module("@/bindings", () => ({
   commands: {
     sessionWorkdir: async () => ({ status: "ok" as const, data: "/work/demo" }),
     searchFiles: async () => ({ status: "ok" as const, data: [] }),
+    // SessionView loads the slash catalog unconditionally on mount (a
+    // project-less chat session is a valid catalog pairing).
+    slashCatalog: async () => ({ status: "ok" as const, data: [] }),
     listProviderCatalog: async () => [],
     listConnections: async () => [],
     // Not reached from any mount path here (Transcript is mocked away below),
