@@ -375,9 +375,11 @@ impl PluginHost {
     }
 }
 
-/// Whether an installed WASM component bundle (Task 9+) is enabled, per the
-/// same `plugin.<id>.enabled == "true"` convention (default `false`)
-/// [`PluginHost::is_enabled`] applies to connector/extension plugins.
+/// Whether an installed WASM component bundle (Task 9+) is enabled. Mirrors
+/// [`PluginHost::is_enabled`]'s logic for Component bundles: an installed
+/// (active-release-on-disk) component is enabled unless the user explicitly
+/// disabled it (explicit `plugin.<id>.enabled == "false"`). Explicit settings
+/// always win, in either direction.
 ///
 /// Component bundles are discovered off-disk
 /// ([`crate::plugins::bundle::load_active_bundles`]) rather than registered as
@@ -388,7 +390,18 @@ impl PluginHost {
 /// component.
 pub async fn component_plugin_enabled(settings: &SettingsStore, id: &str) -> anyhow::Result<bool> {
     let key = format!("plugin.{id}.enabled");
-    Ok(settings.get(&key).await?.as_deref() == Some("true"))
+    match settings.get(&key).await?.as_deref() {
+        Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        _ => {
+            let active = settings
+                .store()
+                .active_component_release(id)
+                .await?
+                .is_some();
+            Ok(active)
+        }
+    }
 }
 
 /// The extension registries, plus the plugin host recording every
@@ -964,6 +977,58 @@ mod tests {
             .unwrap();
         assert!(
             host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "an explicit true setting must enable"
+        );
+    }
+
+    // ---------- component_plugin_enabled ----------
+
+    // Mirrors component_with_active_release_defaults_enabled but tests the
+    // standalone function rather than the PluginHost::is_enabled path.
+    #[tokio::test]
+    async fn component_plugin_enabled_defaults_to_active_release_state() {
+        let (store, settings, _tmp) = open_settings().await;
+
+        // No active release and no `plugin.<id>.enabled` setting → disabled.
+        assert!(
+            !component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
+            "no active release and no setting must default to disabled"
+        );
+
+        // An active release with no setting written → enabled by default:
+        // the install succeeded, so runtime may bind it without an explicit
+        // enable write.
+        seed_active_component_release(&store, "acme-component").await;
+        assert!(
+            component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
+            "an active release on disk must default to enabled"
+        );
+
+        // Explicit "false" still disables, even with an active release.
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "false")
+            .await
+            .unwrap();
+        assert!(
+            !component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
+            "an explicit false setting must win over an active release"
+        );
+
+        // Explicit "true" enables (unchanged from before this fix).
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "true")
+            .await
+            .unwrap();
+        assert!(
+            component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
             "an explicit true setting must enable"
         );
     }

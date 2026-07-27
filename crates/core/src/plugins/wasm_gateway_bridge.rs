@@ -2885,10 +2885,17 @@ mod gateway_impl_tests {
         let settings = SettingsStore::new(store.clone());
         let root = tempfile::tempdir().unwrap();
 
-        // One ENABLED and one DISABLED (never enabled -> default false) generic,
-        // NON-Discord long-lived gateway bundle, both installed + active.
+        // One ENABLED and one DISABLED (PR-2 fix: active bundles default to
+        // enabled, so we must explicitly disable to test the disabled path)
+        // generic, NON-Discord long-lived gateway bundle, both installed + active.
         install_active_gateway_bundle(root.path(), &store, "acme-gateway", true).await;
         install_active_gateway_bundle(root.path(), &store, "beta-gateway", false).await;
+
+        // Explicitly disable the beta-gateway bundle.
+        store
+            .set_setting_raw("plugin.beta-gateway.enabled", "false")
+            .await
+            .unwrap();
 
         let gateways = build_wasm_gateways(
             Arc::clone(&store),

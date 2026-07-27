@@ -1035,8 +1035,8 @@ mod tests {
     async fn disabled_provider_bundle_registers_nothing() {
         build_fixtures();
         let (store, settings, root, _tmp) = discovery_env().await;
-        // Installed + active but NOT enabled (component plugins default to
-        // disabled — no auto-enable for providers).
+        // Installed + active but explicitly disabled (PR-2 fix: active bundles
+        // default to enabled, so we must explicitly disable to test the disabled path).
         install_bundle_on_disk(
             root.path(),
             &store,
@@ -1045,6 +1045,12 @@ mod tests {
             &["disc-disabled-served"],
         )
         .await;
+
+        // Explicitly disable the bundle.
+        store
+            .set_setting_raw("plugin.disc-disabled.enabled", "false")
+            .await
+            .unwrap();
 
         let registered = super::discover_provider_components(
             store.clone(),
