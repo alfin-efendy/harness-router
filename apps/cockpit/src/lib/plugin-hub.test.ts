@@ -4,7 +4,6 @@ import {
   appStatusToHubStatus,
   buildHubItems,
   declaredToolEntries,
-  featuredItems,
   filterHubItems,
   fixTargetTab,
   type HubItem,
@@ -587,33 +586,6 @@ test("kindCounts pre-seeds all kinds and aggregates to zero even when absent fro
   expect(counts["skill-pack"]).toBe(0);
   expect(counts["mcp-server"]).toBe(0);
   expect(counts.integrations).toBe(1);
-});
-
-// ---------------------------------------------------------------------------
-// featuredItems
-// ---------------------------------------------------------------------------
-
-describe("featuredItems", () => {
-  test("only not-installed, verified, non-mcp-server rows qualify", () => {
-    const data = buildHubItems({
-      plugins: [
-        mkPlugin({ id: "a", installed: false, verified: true, kind: "integration" }),
-        mkPlugin({ id: "b", installed: true, verified: true, kind: "integration" }), // installed, excluded
-        mkPlugin({ id: "c", installed: false, verified: false, kind: "integration" }), // not verified, excluded
-      ],
-      apps: [mkApp({ id: "d" })], // installed:true always for apps -> excluded anyway
-      skills: [],
-    });
-    const result = featuredItems(data);
-    expect(result.map((i) => i.id)).toEqual(["a"]);
-  });
-
-  test("caps at 6 even when more qualify", () => {
-    const plugins = Array.from({ length: 9 }, (_, i) => mkPlugin({ id: `p${i}`, installed: false, verified: true, kind: "integration" }));
-    const data = buildHubItems({ plugins, apps: [], skills: [] });
-    const result = featuredItems(data);
-    expect(result).toHaveLength(6);
-  });
 });
 
 // ---------------------------------------------------------------------------

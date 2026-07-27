@@ -83,7 +83,12 @@ export function HubRail({
   const categories = Array.from(new Set(items.flatMap((i) => i.categories))).sort();
 
   return (
-    <aside className="flex w-[190px] shrink-0 flex-col gap-4">
+    // Sticky within the view's scroll container: `top-7` mirrors the
+    // container's `py-7` so the pinned position keeps the resting vertical
+    // rhythm, and the max-height (viewport minus the 44px title bar, the
+    // main panel's 10px bottom margin, and that same `top-7` inset) lets the
+    // rail scroll internally instead of clipping on short windows.
+    <aside className="sticky top-7 flex max-h-[calc(100dvh-54px-1.75rem)] w-[190px] shrink-0 flex-col gap-4 self-start overflow-y-auto">
       <div className="flex flex-col gap-0.5">
         {STATE_ORDER.map((state) => (
           <RailRow
