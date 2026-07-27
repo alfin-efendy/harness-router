@@ -1623,7 +1623,9 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
           if (cmd === "plugin_release_detail") {
             const { id } = args as { id: string };
             const releases = fixtures.component_releases as Record<string, unknown>;
-            return Promise.resolve(releases[id] ?? { pluginId: id, releases: [], activeVersion: null, activeManifest: null, declaredManifest: null });
+            return Promise.resolve(
+              releases[id] ?? { pluginId: id, releases: [], activeVersion: null, activeManifest: null, declaredManifest: null },
+            );
           }
           // Task 16: `plugin_detail` — pre-install support (Task 7) means this
           // resolves for a registered-but-not-yet-installed plugin too (the hub's
