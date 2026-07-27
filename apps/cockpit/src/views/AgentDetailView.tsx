@@ -137,6 +137,9 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             <AgentAvatar pet={summary.avatarPet} size={32} />
           </button>
           <div className="min-w-0 flex-1">
+            {/* Heading semantics live here (visually hidden): the editable
+                IdentityField inputs below cannot be headings themselves. */}
+            <h2 className="sr-only">{summary.name}</h2>
             <IdentityField
               value={summary.name}
               ariaLabel="Agent name"

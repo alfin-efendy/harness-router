@@ -770,3 +770,10 @@ test("re-committing an unchanged name is a no-op", async () => {
   fireEvent.blur(description);
   await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
 });
+
+test("the header still exposes the agent name as a heading for assistive tech", () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
+  // The editable field remains a separate, labeled textbox.
+  expect((screen.getByRole("textbox", { name: "Agent name" }) as HTMLInputElement).value).toBe("Reviewer");
+});
