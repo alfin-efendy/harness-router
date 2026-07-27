@@ -130,17 +130,26 @@ fn manifest_from_bundle(bundle: PluginBundleManifest) -> PluginManifest {
     }
 }
 
+/// Parse `id`'s embedded first-party bundle manifest (PR-1). The single
+/// lookup+parse `declared_tool_count`/`declared_tools` always did, exposed
+/// whole so `plugin_release_detail` can preview a never-installed
+/// component's full manifest (tools, domains, oauth) without any fetch.
+/// `None` when `id` has no embedded manifest in
+/// [`COMPONENT_BUNDLE_MANIFESTS`] or its TOML fails to parse.
+pub fn declared_bundle_manifest(id: &str) -> Option<PluginBundleManifest> {
+    COMPONENT_BUNDLE_MANIFESTS
+        .iter()
+        .find(|(got, _)| *got == id)
+        .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
+}
+
 /// The number of tools `id`'s embedded first-party bundle manifest declares
 /// (Task 1) — feeds `PluginInfo.tool_count`. `None` when `id` has no embedded
 /// manifest in [`COMPONENT_BUNDLE_MANIFESTS`] (e.g. a provider bundle
 /// represented by its builtin row, see [`COMPONENT_BACKED_PROVIDER_IDS`]) or
 /// its embedded TOML fails to parse.
 pub fn declared_tool_count(id: &str) -> Option<u32> {
-    COMPONENT_BUNDLE_MANIFESTS
-        .iter()
-        .find(|(got, _)| *got == id)
-        .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
-        .map(|m| m.tools.len() as u32)
+    declared_bundle_manifest(id).map(|m| m.tools.len() as u32)
 }
 
 /// The full declared-tool detail (name, description, writes) `id`'s embedded
@@ -150,10 +159,7 @@ pub fn declared_tool_count(id: &str) -> Option<u32> {
 /// Empty (never an error) when `id` has no embedded manifest here or its
 /// embedded TOML fails to parse — same fallback `declared_tool_count` uses.
 pub fn declared_tools(id: &str) -> Vec<DeclaredTool> {
-    COMPONENT_BUNDLE_MANIFESTS
-        .iter()
-        .find(|(got, _)| *got == id)
-        .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
+    declared_bundle_manifest(id)
         .map(|m| m.tools)
         .unwrap_or_default()
 }
