@@ -14,7 +14,7 @@ function rowContent(item: ContextPickerItem) {
       };
     case "agent":
       return {
-        icon: <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: item.agent.avatarColor }} />,
+        icon: <span className="size-2.5 shrink-0 rounded-full bg-muted-foreground/40" />,
         label: item.agent.name,
         detail: null,
       };

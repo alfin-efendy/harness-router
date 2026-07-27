@@ -3,10 +3,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Button, Input, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 import { commands, type PetManifestEntryInfo } from "@/bindings";
 import { useBundledPets } from "@/lib/bundled-pets";
+import { NEUTRAL_AVATAR_COLOR } from "@/lib/pet-sprite";
 import { PetSprite } from "./PetSprite";
 
 const BROWSE_RESULTS_CAP = 40;
-const FALLBACK_COLOR = "#8B5CF6";
 
 type ManifestState = "idle" | "loading" | "ready" | "error";
 type DownloadState = "idle" | "downloading" | "error";
@@ -134,7 +134,7 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
                 currentPet === pet.slug ? "border-primary/60 bg-primary/5" : "border-border"
               }`}
             >
-              <PetSprite slug={pet.slug} bundled size={40} fallbackColor={FALLBACK_COLOR} />
+              <PetSprite slug={pet.slug} bundled size={40} fallbackColor={NEUTRAL_AVATAR_COLOR} />
               <span className="w-full truncate text-[11px] font-medium">{pet.displayName}</span>
             </button>
           ))}
@@ -177,7 +177,7 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
                             aria-pressed={currentPet === entry.slug}
                             className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
                           >
-                            <PetSprite slug={entry.slug} bundled={false} size={32} fallbackColor={FALLBACK_COLOR} />
+                            <PetSprite slug={entry.slug} bundled={false} size={32} fallbackColor={NEUTRAL_AVATAR_COLOR} />
                             <span className="min-w-0 flex-1">
                               <span className="block truncate text-[12.5px] font-medium">{entry.displayName}</span>
                               {entry.submittedBy && (

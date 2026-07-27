@@ -8,15 +8,6 @@ import { statsRowFragment } from "@/lib/agent-stats";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 
-const AVATAR_COLORS: Record<string, string> = {
-  violet: "#8B5CF6",
-  blue: "#3B82F6",
-  cyan: "#06B6D4",
-  emerald: "#10B981",
-  amber: "#F59E0B",
-  rose: "#F43F5E",
-};
-
 function modelValue(model: AgentModelInfo): string {
   return model.kind === "route" ? model.route : model.name;
 }
@@ -44,7 +35,7 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
         onClick={() => nav.navigate({ kind: "agentDetail", agentId: agent.id })}
         className="h-full min-w-0 flex-1 justify-start gap-3 rounded-none px-[18px] text-left font-normal hover:bg-accent/50"
       >
-        <AgentAvatar pet={agent.avatarPet} colorHex={AVATAR_COLORS[agent.avatarColor] ?? agent.avatarColor} size={36} />
+        <AgentAvatar pet={agent.avatarPet} size={36} />
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
             <span className="truncate text-[13.5px] font-semibold text-foreground">{agent.name}</span>

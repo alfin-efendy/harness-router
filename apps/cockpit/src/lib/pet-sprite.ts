@@ -88,3 +88,10 @@ export interface BundledPet {
 
 /** Slug of the bundled pet assigned to the Fresh Agent's default avatar. */
 export const FRESH_AGENT_PET = "sprout";
+
+/**
+ * The single neutral avatar fallback color, now that pets ARE the avatar
+ * identity. Per-agent `avatarColor` values (violet/blue/…) are inert
+ * backend fields the UI no longer renders anywhere.
+ */
+export const NEUTRAL_AVATAR_COLOR = "#71717A";

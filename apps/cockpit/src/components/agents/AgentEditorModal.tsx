@@ -15,16 +15,6 @@ const COLOR_OPTIONS = [
   { value: "rose", label: "Rose" },
 ];
 
-// Mirrors AgentsView.tsx / AgentDetailView.tsx's own avatar-color maps.
-const COLOR_HEX: Record<string, string> = {
-  violet: "#8B5CF6",
-  blue: "#3B82F6",
-  cyan: "#06B6D4",
-  emerald: "#10B981",
-  amber: "#F59E0B",
-  rose: "#F43F5E",
-};
-
 function initialMutation(registry: AgentRegistryInfo): AgentMutationInfo {
   return {
     name: "",
@@ -104,7 +94,7 @@ export function AgentEditorModal({ open, onClose }: { open: boolean; onClose: ()
             onClick={() => setPetPickerOpen(true)}
             className="flex items-center gap-2.5 rounded-md border border-border px-3 py-2 text-left hover:bg-accent"
           >
-            <AgentAvatar pet={draft.avatarPet} colorHex={COLOR_HEX[draft.avatarColor] ?? draft.avatarColor} size={28} />
+            <AgentAvatar pet={draft.avatarPet} size={28} />
             <span aria-hidden className="text-[12.5px] font-medium">
               {draft.avatarPet ? "Change pet" : "Choose a pet"}
             </span>
