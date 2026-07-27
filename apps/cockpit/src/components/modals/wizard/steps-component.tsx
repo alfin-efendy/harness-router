@@ -48,10 +48,11 @@ export function useMountedRef() {
 export function OverviewStep({ ctx }: { ctx: WizardCtx; onNext: () => void }) {
   const info = ctx.detail?.info;
   // Shared `declaredToolEntries` (`@/lib/plugin-hub`) — same manifest→
-  // PluginToolEntry mapping `PluginDetailView`'s pre-install fallback uses —
-  // the wizard has no live `plugin_tools` fetch of its own pre-install, so
-  // this is always the declared (not live) list.
-  const tools = declaredToolEntries(ctx.releaseDetail?.activeManifest ?? null);
+  // PluginToolEntry mapping `PluginDetailView`'s pre-install fallback uses.
+  // Pre-install `activeManifest` is null, so this falls back to the
+  // EMBEDDED declared manifest (PR-1) — always the declared (not live)
+  // list either way; the Done step is the one that fetches live tools.
+  const tools = declaredToolEntries(ctx.releaseDetail?.activeManifest ?? ctx.releaseDetail?.declaredManifest ?? null);
 
   return (
     <div className="flex flex-col gap-3">
@@ -74,7 +75,9 @@ export function OverviewStep({ ctx }: { ctx: WizardCtx; onNext: () => void }) {
  *  later step's Continue stuck disabled. */
 export function PermissionsStep({ ctx }: { ctx: WizardCtx; onNext: () => void }) {
   const [accepted, setAccepted] = useState(false);
-  const rows = permissionSummaryRows(ctx.releaseDetail?.activeManifest ?? null);
+  const rows = permissionSummaryRows(ctx.releaseDetail?.activeManifest ?? ctx.releaseDetail?.declaredManifest ?? null, {
+    verified: (ctx.releaseDetail?.activeManifest ?? null) !== null,
+  });
 
   useEffect(() => {
     ctx.setContinueDisabled(!accepted);
