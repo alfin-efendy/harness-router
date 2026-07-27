@@ -30,15 +30,16 @@ const agentConfigurationCatalog: AgentConfigurationCatalogInfo = {
       available: true,
       commandScoped: false,
       pack: null,
+      kind: null,
     },
   ],
   nativeTools: [
-    { id: "read", label: "Read", description: "Read files", available: true, commandScoped: false, pack: null },
-    { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false, pack: null },
-    { id: "bash", label: "Bash", description: "Run commands", available: true, commandScoped: true, pack: null },
+    { id: "read", label: "Read", description: "Read files", available: true, commandScoped: false, pack: null, kind: null },
+    { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false, pack: null, kind: null },
+    { id: "bash", label: "Bash", description: "Run commands", available: true, commandScoped: true, pack: null, kind: null },
   ],
-  pluginTools: [{ id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false, pack: null }],
-  apps: [{ id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false, pack: null }],
+  pluginTools: [{ id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false, pack: null, kind: null }],
+  apps: [{ id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false, pack: null, kind: null }],
 };
 
 const getAgentConfigurationCatalog = mock(async () => ({ status: "ok" as const, data: agentConfigurationCatalog }));

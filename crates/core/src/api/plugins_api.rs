@@ -414,28 +414,12 @@ fn source_label(source: &PluginSource) -> &'static str {
 }
 
 /// The catalog kind for a plugin, or `None` when it must not be listed
-/// (runtimes). Order matters: a provider manifest wins over runtime meta
-/// (ollama is both), and a skill-pack source wins over connector shape.
+/// (runtimes). Classification itself lives in [`crate::plugins::plugin_kind`].
 fn derive_kind(plugin: &CorePlugin) -> Option<&'static str> {
-    if plugin.manifest.provider.is_some() {
-        return Some("provider");
+    match crate::plugins::plugin_kind(plugin) {
+        "runtime" => None,
+        kind => Some(kind),
     }
-    if plugin.harness.is_some() {
-        return None;
-    }
-    if matches!(plugin.source, PluginSource::SkillPack(_)) {
-        return Some("skill-pack");
-    }
-    if plugin.gateway.is_some()
-        || plugin
-            .manifest
-            .categories
-            .iter()
-            .any(|c| c == "chat-gateway")
-    {
-        return Some("gateway");
-    }
-    Some("integration")
 }
 
 /// Family head id for a provider plugin (`anthropic-oauth` → `anthropic`).

@@ -94,7 +94,7 @@ export function AgentAppsTab({ detail }: { detail: AgentDetailInfo }) {
   const knownToolIds = new Set(catalog.pluginTools.map((entry) => entry.id));
   for (const id of detail.pluginTools) {
     if (knownToolIds.has(id)) continue;
-    addTool({ id, label: id, description: "", available: false, commandScoped: false, pack: null });
+    addTool({ id, label: id, description: "", available: false, commandScoped: false, pack: null, kind: null });
   }
 
   const appById = new Map(catalog.apps.map((app) => [app.id, app]));

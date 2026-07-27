@@ -10,7 +10,7 @@ import {
 } from "./agent-stats";
 
 function entry(id: string, overrides: Partial<CatalogEntryInfo> = {}): CatalogEntryInfo {
-  return { id, label: id, description: "", available: true, commandScoped: false, pack: null, ...overrides };
+  return { id, label: id, description: "", available: true, commandScoped: false, pack: null, kind: null, ...overrides };
 }
 
 function tool(name: string, count: number, lastUsed = 0): AgentToolUsageInfo {
