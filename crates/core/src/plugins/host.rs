@@ -332,24 +332,11 @@ impl PluginHost {
             return Ok(true);
         }
         if plugin.source == PluginSource::Component {
-            // PR-2 fix A: an installed (active-release-on-disk) component is
-            // enabled unless the user explicitly disabled it. This aligns the
-            // agent catalog with the Plugins hub's installed predicate and
-            // kills the "install succeeded but the final enable write didn't"
-            // wedge. Explicit settings always win, in either direction.
-            let key = format!("plugin.{id}.enabled");
-            match settings.get(&key).await?.as_deref() {
-                Some("false") => return Ok(false),
-                Some("true") => return Ok(true),
-                _ => {
-                    let active = settings
-                        .store()
-                        .active_component_release(id)
-                        .await?
-                        .is_some();
-                    return Ok(active);
-                }
-            }
+            // PR-2 fix A — one rule, one implementation: the catalog gate and
+            // the runtime-attach gate must never disagree (a wedged install
+            // would be bindable but never attach), so this delegates to the
+            // same function the daemon-build path uses.
+            return component_plugin_enabled(settings, id).await;
         }
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());

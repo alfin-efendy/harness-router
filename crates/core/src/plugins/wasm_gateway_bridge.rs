@@ -2928,6 +2928,40 @@ mod gateway_impl_tests {
             .expect("the daemon start path starts the constructed gateway");
     }
 
+    /// PR-2 fix A: an installed+ACTIVE gateway bundle without an explicit
+    /// `plugin.<id>.enabled` setting is ENABLED by default (the positive
+    /// counterpart of the test above). This kills the "install succeeded but
+    /// the final enable write didn't" wedge — agents may bind the bundle
+    /// without a separate enable write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_path_enables_active_gateway_bundle_without_explicit_setting() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+
+        // Install an active bundle but do NOT write `plugin.<id>.enabled`.
+        // The `enabled` parameter is false, so the fixture doesn't auto-write
+        // the setting — this tests the positive path where a fresh install
+        // counts as enabled without an explicit enable write.
+        install_active_gateway_bundle(root.path(), &store, "acme-gateway", false).await;
+
+        let gateways = build_wasm_gateways(
+            Arc::clone(&store),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(
+            gateways.len(),
+            1,
+            "an active release without explicit enable must be constructed + registered"
+        );
+        assert_eq!(gateways[0].id(), "acme-gateway");
+    }
+
     // -------------------------------------------------------------
     // Task 6: teardown — no leaked background tasks (Arc-cycle regression)
     // -------------------------------------------------------------
