@@ -579,7 +579,13 @@ export const AGENT_CONFIGURATION_CATALOG = {
     { id: "grep", label: "Grep", description: "Search file contents", available: true, commandScoped: false, pack: null, kind: null },
     { id: "bash", label: "Bash", description: "Run shell commands", available: true, commandScoped: true, pack: null, kind: null },
   ],
-  pluginTools: [],
+  // Hidden kinds only (provider/runtime): the Apps & MCP tab must not list
+  // these, and nothing in the fixtures enables them — so the whole flat
+  // Plugins section stays absent and the tab shows its empty state.
+  pluginTools: [
+    { id: "native", label: "Ryuzi", description: "Built-in agent runtime", available: true, commandScoped: false, pack: null, kind: "runtime" },
+    { id: "anthropic", label: "Anthropic", description: "Model provider", available: true, commandScoped: false, pack: null, kind: "provider" },
+  ],
   apps: [],
 } satisfies AgentConfigurationCatalogInfo;
 

@@ -13,12 +13,14 @@ const getAgentConfigurationCatalog = mock(async () => ({
     skills: [],
     nativeTools: [],
     pluginTools: [
-      { id: "github", label: "GitHub tools", description: "GitHub plugin tools", available: true, commandScoped: false, pack: null },
-      { id: "lint", label: "Lint", description: "Lint plugin", available: true, commandScoped: false, pack: null },
+      { id: "github", label: "GitHub tools", description: "GitHub plugin tools", available: true, commandScoped: false, pack: null, kind: "integration" },
+      { id: "lint", label: "Lint", description: "Lint plugin", available: true, commandScoped: false, pack: null, kind: "integration" },
+      { id: "anthropic", label: "Anthropic", description: "Model provider", available: true, commandScoped: false, pack: null, kind: "provider" },
+      { id: "native", label: "Ryuzi", description: "Built-in agent runtime", available: true, commandScoped: false, pack: null, kind: "runtime" },
     ],
     apps: [
-      { id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false, pack: null },
-      { id: "notion", label: "Notion", description: "Notion MCP", available: true, commandScoped: false, pack: null },
+      { id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false, pack: null, kind: null },
+      { id: "notion", label: "Notion", description: "Notion MCP", available: true, commandScoped: false, pack: null, kind: null },
     ],
   },
 }));
@@ -175,4 +177,21 @@ test("no update fires from a master, nested, or flat toggle while a save is alre
   fireEvent.click(within(plugins).getByRole("switch", { name: "Enable plugin tool lint" }));
 
   expect(updateAgent).not.toHaveBeenCalled();
+});
+
+test("provider and runtime plugins are hidden from the Plugins section", async () => {
+  render(<AgentAppsTab detail={reviewerDetail} />);
+  const plugins = await screen.findByTestId("plugins-section");
+  expect(within(plugins).getByText("Lint")).toBeTruthy();
+  expect(within(plugins).queryByText("Anthropic")).toBeNull();
+  expect(within(plugins).queryByText("Ryuzi")).toBeNull();
+});
+
+test("a hidden-kind plugin the profile already enables stays visible and can be toggled off", async () => {
+  render(<AgentAppsTab detail={{ ...reviewerDetail, pluginTools: ["github", "anthropic"] }} />);
+  const plugins = await screen.findByTestId("plugins-section");
+  expect(within(plugins).getByText("Anthropic")).toBeTruthy();
+
+  fireEvent.click(within(plugins).getByRole("switch", { name: "Enable plugin tool anthropic" }));
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ pluginTools: ["github"] })));
 });

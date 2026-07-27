@@ -676,6 +676,15 @@ test("agents: manage a non-default agent and start a chat session for it", async
   }
   await expect(readFileRow.getByRole("button", { name: "Allow", exact: true })).toHaveAttribute("aria-pressed", "true");
 
+  // Apps & MCP: the fixture's provider ("Anthropic") and runtime ("Ryuzi")
+  // plugin entries are filtered out of the tab — with no MCP apps either,
+  // only the empty state remains.
+  await tabs.getByRole("button", { name: "Apps & MCP", exact: true }).click();
+  await expect(page.getByText("No apps available.")).toBeVisible();
+  await expect(page.getByTestId("plugins-section")).toHaveCount(0);
+  await expect(page.getByText("Anthropic", { exact: true })).toHaveCount(0);
+  await tabs.getByRole("button", { name: "Permissions", exact: true }).click();
+
   // Only the DETAIL header's action menu drives "Start chat" — the list rows
   // have no menu and there is no separate start button.
   await page.getByRole("button", { name: "Actions for Reviewer" }).click();
