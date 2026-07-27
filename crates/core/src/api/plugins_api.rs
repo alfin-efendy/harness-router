@@ -3159,12 +3159,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_integration_with_active_release_reports_installed_disabled() {
-        // The discord wedge: the install itself succeeded (active release in
-        // the ledger, bundle on disk) but the plugin was never enabled and has
-        // no auth to configure — so `configured || enabled` is false. The row
-        // must still read installed (status "disabled"), NOT "not-installed",
-        // which would keep offering Install for an already-installed bundle.
+    async fn component_integration_with_active_release_and_no_setting_reports_installed_enabled() {
+        // PR-2 fix A (Task 1): the install itself succeeded (active release
+        // in the ledger, bundle on disk) and `plugin.discord.enabled` was
+        // never written. `PluginHost::is_enabled` now treats an installed
+        // component with no explicit setting as enabled, so the row reads
+        // installed AND enabled. Discord's bundle manifest carries no `auth`
+        // block (component auth is read at runtime by key, not declared —
+        // see `plugins/discord/ryuzi-plugin.toml`), so `auth_kind` is "none"
+        // and status falls through to "ok" rather than "needs-setup".
+        //
+        // Before this fix, `is_enabled` defaulted an unset component to
+        // `false`, and this same scenario asserted `status == "disabled"` —
+        // that was the "install succeeded but the final enable write didn't"
+        // wedge this task closes.
         let cp = test_cp().await;
         seed_active_component_release(&cp, "discord").await;
 
@@ -3177,11 +3185,16 @@ mod tests {
             row.installed,
             "an active component release means the plugin IS installed"
         );
-        assert_eq!(row.status, "disabled");
+        assert!(
+            row.enabled,
+            "an active release with no plugin.<id>.enabled setting now defaults to enabled"
+        );
+        assert_eq!(row.status, "ok");
 
         let detail = assemble_detail(&cp, "discord").await.unwrap();
         assert!(detail.info.installed, "detail must agree with the list");
-        assert_eq!(detail.info.status, "disabled");
+        assert!(detail.info.enabled, "detail must agree with the list");
+        assert_eq!(detail.info.status, "ok");
     }
 
     // ---------- plugin_info ----------

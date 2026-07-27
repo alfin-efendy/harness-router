@@ -313,8 +313,11 @@ impl PluginHost {
     /// - harness-capable → always `true` (the native runtime cannot be
     ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
-    /// - component bundle → the setting `plugin.<id>.enabled == "true"`
-    ///   (defaults to `false`), matching `component_plugin_enabled`
+    /// - component bundle → explicit `plugin.<id>.enabled` wins in either
+    ///   direction (`"false"` disables, `"true"` enables); with no setting,
+    ///   enabled iff an active release exists on disk
+    ///   (`Store::active_component_release`) — a successful install counts as
+    ///   enabled without a separate enable write
     /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector/extension capability)
     ///   → always `true`
@@ -329,15 +332,24 @@ impl PluginHost {
             return Ok(true);
         }
         if plugin.source == PluginSource::Component {
-            // A first-party WASM component bundle is registered manifest-only
-            // (its connector/gateway/provider capability runs off-disk), but
-            // ALL of those gate on `plugin.<id>.enabled` via
-            // `component_plugin_enabled`. Report that same gate so the UI
-            // reflects the real switch instead of the manifest-only
-            // "always on" default below — and so `toggle_enabled` has a switch
-            // to flip.
+            // PR-2 fix A: an installed (active-release-on-disk) component is
+            // enabled unless the user explicitly disabled it. This aligns the
+            // agent catalog with the Plugins hub's installed predicate and
+            // kills the "install succeeded but the final enable write didn't"
+            // wedge. Explicit settings always win, in either direction.
             let key = format!("plugin.{id}.enabled");
-            return Ok(settings.get(&key).await?.as_deref() == Some("true"));
+            match settings.get(&key).await?.as_deref() {
+                Some("false") => return Ok(false),
+                Some("true") => return Ok(true),
+                _ => {
+                    let active = settings
+                        .store()
+                        .active_component_release(id)
+                        .await?
+                        .is_some();
+                    return Ok(active);
+                }
+            }
         }
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());
@@ -622,11 +634,47 @@ mod tests {
         }
     }
 
+    fn component_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            provider: None,
+            source: PluginSource::Component,
+        }
+    }
+
     async fn open_settings() -> (Arc<Store>, SettingsStore, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
         let settings = SettingsStore::new(store.clone());
         (store, settings, tmp)
+    }
+
+    /// Seeds an installed, active `component_plugin_releases` row for `id` —
+    /// the ledger state a successful component-bundle install leaves behind.
+    /// Mirrors `plugins_api.rs`'s `seed_active_component_release` test helper.
+    async fn seed_active_component_release(store: &Store, id: &str) {
+        store
+            .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
+                plugin_id: id.into(),
+                version: "0.1.0".into(),
+                source_url: format!("https://example.com/{id}.wasm"),
+                sha256: "aa".into(),
+                signing_key_id: "first-party".into(),
+                installed_at: 1,
+                active: false,
+                revoked: false,
+                revocation_reason: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_active_component_release(id, "0.1.0")
+            .await
+            .unwrap();
     }
 
     // ---------- PluginHost::add/get/list ----------
@@ -873,6 +921,51 @@ mod tests {
             .await
             .unwrap();
         assert!(host.is_enabled(&settings, "acme-ext").await.unwrap());
+    }
+
+    // PR-2 fix A: a component bundle with an ACTIVE release on disk counts as
+    // enabled even when `plugin.<id>.enabled` was never written — the install
+    // succeeded, so agents may bind it. Explicit "false" still disables.
+    #[tokio::test]
+    async fn component_with_active_release_defaults_enabled() {
+        let (store, settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(component_only("acme-component"));
+
+        // No active release and no `plugin.<id>.enabled` setting → disabled.
+        assert!(
+            !host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "no active release and no setting must default to disabled"
+        );
+
+        // An active release with no setting written → enabled by default:
+        // the install succeeded, so agents may bind it without an explicit
+        // enable write.
+        seed_active_component_release(&store, "acme-component").await;
+        assert!(
+            host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "an active release on disk must default to enabled"
+        );
+
+        // Explicit "false" still disables, even with an active release.
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "false")
+            .await
+            .unwrap();
+        assert!(
+            !host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "an explicit false setting must win over an active release"
+        );
+
+        // Explicit "true" enables (unchanged from before this fix).
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "true")
+            .await
+            .unwrap();
+        assert!(
+            host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "an explicit true setting must enable"
+        );
     }
 
     #[test]
