@@ -4,19 +4,17 @@ import { toast } from "sonner";
 import { Button, Input, Menu, MenuContent, MenuItem, MenuTrigger, SettingsCard as Card } from "@ryuzi/ui";
 import { commands, type ComponentBootstrapStatus } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
-import { IconChip } from "@/components/common/bits";
 import { DoctorPanel } from "@/components/DoctorPanel";
 import { HubRail } from "@/components/plugins/HubRail";
 import { HubRow } from "@/components/plugins/HubRow";
 import { useApps } from "@/store-apps";
 import { summarizeUpdateAll, usePlugins } from "@/store-plugins";
 import { useSkills } from "@/store-skills";
-import { pluginIcon } from "@/lib/plugin-icons";
 import { AddAppModal } from "@/components/modals/AddAppModal";
 import { SkillInstallModal } from "@/components/modals/SkillInstallModal";
 import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
 import { useNav } from "@/store-nav";
-import { buildHubItems, featuredItems, filterHubItems, type HubItem, type RailFilter } from "@/lib/plugin-hub";
+import { buildHubItems, filterHubItems, type HubItem, type RailFilter } from "@/lib/plugin-hub";
 
 const WARN = "#F59E0B";
 
@@ -80,7 +78,6 @@ export function PluginsView() {
 
   const items = useMemo(() => buildHubItems({ plugins, apps, skills }), [plugins, apps, skills]);
   const rows = useMemo(() => filterHubItems(items, filter, query), [items, filter, query]);
-  const featured = useMemo(() => featuredItems(items), [items]);
   const updateAllEnabled = useMemo(
     () => items.some((i) => i.status === "update-available") || items.some((i) => i.kind === "skill-pack" && i.installed),
     [items],
@@ -188,21 +185,6 @@ export function PluginsView() {
             onUpdateAll={() => void runUpdateAll()}
           />
           <div className="min-w-0 flex-1">
-            {(filter.state === "all" || filter.state === "discover") && featured.length > 0 && (
-              <div className="mb-4 flex gap-2 overflow-x-auto pb-1">
-                {featured.map((item) => (
-                  <button
-                    key={item.rowKey}
-                    type="button"
-                    onClick={() => openItem(item)}
-                    className="flex shrink-0 items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-left hover:bg-muted"
-                  >
-                    <IconChip icon={pluginIcon(item.icon)} size={28} />
-                    <span className="text-[12.5px] font-medium">{item.name}</span>
-                  </button>
-                ))}
-              </div>
-            )}
             {rows.map((item) => (
               <HubRow key={item.rowKey} item={item} onInstall={() => startInstall(item)} onOpen={(tab) => openItem(item, tab)} />
             ))}

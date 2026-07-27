@@ -291,12 +291,6 @@ export function kindCounts(items: HubItem[]): Record<string, number> {
   return counts;
 }
 
-/** Discover-surface spotlight: not-installed, verified, non-MCP-server rows,
- *  capped to 6, preserving input order. */
-export function featuredItems(items: HubItem[]): HubItem[] {
-  return items.filter((i) => !i.installed && i.verified && i.kind !== "mcp-server").slice(0, 6);
-}
-
 /** Maps a component's declared manifest tools onto the same `PluginToolEntry`
  *  shape `plugin_tools` returns, so `PluginToolsList` never needs to branch
  *  on which source it came from. Shared by `PluginDetailView`'s pre-install

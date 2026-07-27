@@ -3697,6 +3697,23 @@ impl Store {
         .await
     }
 
+    /// Clear the active flag on every release of `plugin_id` without revoking
+    /// anything — the uninstall shape: the versions stay in the ledger (and
+    /// reactivatable by a reinstall), there just is no active one anymore.
+    /// Idempotent; unknown ids and already-inactive plugins are a no-op `Ok`.
+    pub async fn deactivate_component_releases(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE component_plugin_releases SET active=0 \
+                 WHERE plugin_id=?1 AND active=1",
+                params![plugin_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Revoke `(plugin_id, version)`: records `reason`, clears `active` if
     /// this was the active version, and leaves other versions untouched.
     /// Idempotent — revoking an already-revoked version updates the
@@ -8620,6 +8637,41 @@ mod tests {
             releases[0].revocation_reason.as_deref(),
             Some("hash mismatch (re-checked)")
         );
+    }
+
+    #[tokio::test]
+    async fn component_release_deactivate_clears_active_without_revoking_and_is_idempotent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        store.deactivate_component_releases("github").await.unwrap();
+
+        assert!(store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .is_none());
+        let releases = store.list_component_releases("github").await.unwrap();
+        assert_eq!(releases.len(), 1);
+        assert!(
+            !releases[0].revoked,
+            "deactivation must not revoke — the version stays reactivatable"
+        );
+
+        // Idempotent: nothing active, and even an unknown id, is still Ok.
+        store.deactivate_component_releases("github").await.unwrap();
+        store
+            .deactivate_component_releases("never-installed")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

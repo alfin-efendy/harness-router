@@ -266,10 +266,18 @@ impl ComponentBundleInstaller {
         let version_root = plugin_root.join(&bundle.release.version);
         std::fs::create_dir_all(&plugin_root)?;
         if version_root.exists() {
-            bail!(
-                "component release destination already exists: {}",
-                version_root.display()
-            );
+            // A prior install of this exact version already claimed the
+            // destination — a half-committed earlier attempt, a reinstall
+            // after uninstall, or a corrupted-install repair. The staged
+            // replacement was verified moments ago, so replace the old
+            // directory wholesale; erroring here would wedge every future
+            // install of this version behind a directory nothing removes.
+            std::fs::remove_dir_all(&version_root).with_context(|| {
+                format!(
+                    "removing existing bundle directory {} before reinstall",
+                    version_root.display()
+                )
+            })?;
         }
         std::fs::rename(&bundle.staging_dir, &version_root)
             .with_context(|| format!("moving verified bundle into {}", version_root.display()))?;
@@ -674,6 +682,55 @@ component = "acme_connector.wasm"
         let bundles = load_active_bundles(root.path(), &store).await.unwrap();
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].release.version, "0.1.1");
+    }
+
+    #[tokio::test]
+    async fn reinstalling_the_same_version_replaces_the_existing_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+
+        let first_staging = tempfile::tempdir().unwrap();
+        write_valid_bundle_version(first_staging.path(), &signing_key(), KEY_ID, "0.1.0");
+        installer
+            .install_verified(verify_bundle(first_staging.path(), &trusted_keys()).unwrap())
+            .await
+            .unwrap();
+
+        // A leftover only the OLD directory holds — proves the reinstall
+        // replaced the directory wholesale rather than skipping the move.
+        let version_root = root.path().join("acme-connector/0.1.0");
+        fs::write(version_root.join("stale-marker"), b"old").unwrap();
+
+        // Reinstalling the SAME version (the UI's Install button clicked again
+        // after a half-committed first attempt, or a corrupted-install repair)
+        // must succeed and replace, never wedge on "destination already
+        // exists".
+        let second_staging = tempfile::tempdir().unwrap();
+        write_valid_bundle_version(second_staging.path(), &signing_key(), KEY_ID, "0.1.0");
+        installer
+            .install_verified(verify_bundle(second_staging.path(), &trusted_keys()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            !version_root.join("stale-marker").exists(),
+            "the old directory's contents must be gone after the reinstall"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("acme-connector/current")).unwrap(),
+            "0.1.0"
+        );
+        let active = store
+            .active_component_release("acme-connector")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+        let bundles = load_active_bundles(root.path(), &store).await.unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].release.version, "0.1.0");
     }
 
     #[tokio::test]

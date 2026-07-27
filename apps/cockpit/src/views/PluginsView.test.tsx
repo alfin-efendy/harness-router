@@ -26,12 +26,8 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   globalThis.ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver;
 }
 
-// `verified` defaults to `false` (mirrors `plugin-hub.test.ts`'s `mkPlugin`) —
-// `featuredItems` spotlights not-installed+verified rows regardless of the
-// active rail filter, so a `verified: true` default would make many
-// not-installed fixtures show up TWICE (once in the featured strip, once in
-// the row list) and break exact-text queries. Tests that need the "Verified"
-// badge opt in explicitly.
+// `verified` defaults to `false` (mirrors `plugin-hub.test.ts`'s `mkPlugin`);
+// tests that need the "Verified" badge opt in explicitly.
 function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}): PluginInfo {
   return {
     id,
@@ -446,6 +442,25 @@ test("a skill source backed by an installed plugin id renders once, as the plugi
 
   expect(await screen.findByText("Superpowers")).toBeTruthy();
   expect(screen.getAllByText("Superpowers")).toHaveLength(1);
+});
+
+test("a verified not-installed plugin renders exactly once — no featured strip duplicate", async () => {
+  // The horizontal "featured" spotlight strip is gone: a row that used to
+  // qualify for it (not-installed + verified + non-MCP-server) must appear
+  // only in the row list.
+  pluginsFixture = [{ ...githubPlugin, verified: true }];
+  await renderView();
+
+  expect(await screen.findByText("GitHub")).toBeTruthy();
+  expect(screen.getAllByText("GitHub")).toHaveLength(1);
+});
+
+test("the rail side menu is sticky so it stays visible while the row list scrolls", async () => {
+  await renderView();
+
+  const rail = screen.getByRole("complementary");
+  expect(rail.className).toContain("sticky");
+  expect(rail.className).toContain("self-start");
 });
 
 // ---------- Rail state filters ----------
