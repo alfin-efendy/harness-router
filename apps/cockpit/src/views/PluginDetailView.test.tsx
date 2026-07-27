@@ -1365,9 +1365,7 @@ test("the permission summary shows declared permissions pre-install, labeled as 
 
   expect(screen.queryByText(/Unknown until a release is fetched/)).toBeNull();
   expect(screen.getAllByText("api.xiaomimimo.com").length).toBeGreaterThan(0);
-  expect(
-    screen.getAllByText("As declared by the bundled manifest — verified against its signature at install.").length,
-  ).toBeGreaterThan(0);
+  expect(screen.getAllByText("As declared by the bundled manifest — verified against its signature at install.").length).toBeGreaterThan(0);
 });
 
 // Versions-tab (ComponentReleaseCard) fallback: declared permissions render
