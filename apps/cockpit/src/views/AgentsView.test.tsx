@@ -280,3 +280,8 @@ test("a rejected stats batch load never crashes the roster render and leaves row
   expect(screen.getByText("Reviews implementation quality and regressions.")).toBeTruthy();
   expect(screen.queryByText(/sessions ·/)).toBeNull();
 });
+
+test("no list row has an actions menu — Start chat/Duplicate/Delete live on the detail page", () => {
+  render(<AgentsView />);
+  expect(screen.queryByRole("button", { name: /^Actions for/ })).toBeNull();
+});

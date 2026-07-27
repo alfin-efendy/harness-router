@@ -638,7 +638,9 @@ test("agents: manage a non-default agent and start a chat session for it", async
   await expect(page.getByText("Sub Agent", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Open Fresh Agent" })).toBeVisible();
   await expect(page.getByText("Built-in", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Actions for Fresh Agent" })).toHaveCount(0);
+  // No list row has a "..." actions menu anymore — Start chat/Duplicate/
+  // Delete are reached through the detail header's menu only.
+  await expect(page.getByRole("button", { name: /^Actions for/ })).toHaveCount(0);
 
   // Fresh Agent detail: no editable identity/tabs, just the shared subagent
   // model editor (Task 8's model-only builtin branch).
@@ -674,7 +676,8 @@ test("agents: manage a non-default agent and start a chat session for it", async
   }
   await expect(readFileRow.getByRole("button", { name: "Allow", exact: true })).toHaveAttribute("aria-pressed", "true");
 
-  // Only the action menu drives "Start chat" — no separate start button.
+  // Only the DETAIL header's action menu drives "Start chat" — the list rows
+  // have no menu and there is no separate start button.
   await page.getByRole("button", { name: "Actions for Reviewer" }).click();
   await page.getByTestId("agent-actions-panel").getByRole("button", { name: "Start chat" }).click();
   await expect(page.getByRole("heading", { name: /What should we build/ })).toBeVisible();
