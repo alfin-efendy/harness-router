@@ -1308,6 +1308,34 @@ test("the permission summary shows 'Unknown until…' before any release is inst
   expect(screen.getByText(/Unknown until a release is fetched and its signature is verified/)).toBeTruthy();
 });
 
+// PR-1: a never-installed component with an embedded (declared) manifest
+// previews its real permissions, labeled as declared-not-yet-verified —
+// the "Unknown until…" placeholder is reserved for bundles with no
+// embedded manifest at all.
+test("the permission summary shows declared permissions pre-install, labeled as declared", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: null,
+    releases: [],
+    activeManifest: null,
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "Xiaomi MiMo free-tier chat provider.",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  expect(screen.queryByText(/Unknown until a release is fetched/)).toBeNull();
+  expect(screen.getAllByText("api.xiaomimimo.com").length).toBeGreaterThan(0);
+  expect(
+    screen.getAllByText("As declared by the bundled manifest — verified against its signature at install.").length,
+  ).toBeGreaterThan(0);
+});
+
 test("the permission summary renders the active release's publisher, lifecycle, domains, and OAuth profiles", async () => {
   mimoReleaseFixture = {
     pluginId: "mimo",
