@@ -24,6 +24,7 @@ function componentReleaseDetail(over: Partial<ComponentReleaseDetail> = {}): Com
     releases: [],
     activeVersion: null,
     activeManifest: null,
+    declaredManifest: null,
     ...over,
   };
 }

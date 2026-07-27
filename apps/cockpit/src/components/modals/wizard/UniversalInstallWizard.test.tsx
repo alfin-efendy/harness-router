@@ -80,7 +80,7 @@ function detailFixture(): PluginDetail {
 }
 
 function releaseFixture(): ComponentReleaseDetail {
-  return { pluginId: "notion", releases: [], activeVersion: null, activeManifest: null };
+  return { pluginId: "notion", releases: [], activeVersion: null, activeManifest: null, declaredManifest: null };
 }
 
 // Provider-shaped fixture with no permissions gate, no settings, and no
@@ -370,7 +370,7 @@ const toastSuccess = mock((_message: string) => {});
 // failed-install Retry test below) typechecks against an error variant too.
 const installComponentPlugin = mock(
   (_runnerId: string, id: string, _version: string | null): Promise<Result<ComponentReleaseDetail, CmdError>> =>
-    ok({ pluginId: id, releases: [], activeVersion: "1.0.0", activeManifest: null }),
+    ok({ pluginId: id, releases: [], activeVersion: "1.0.0", activeManifest: null, declaredManifest: null }),
 );
 const beginPluginOauth = mock((_runnerId: string, _pluginId: string) =>
   ok({ stateToken: "state-1", authorizeUrl: "https://notion.example/authorize", redirectUri: "http://127.0.0.1:8976/callback" }),
@@ -920,6 +920,7 @@ test("Connect step renders the device-flow OAuth profile connections when the ma
       ],
       tools: [],
     },
+    declaredManifest: null,
   };
   await renderWizard();
   const dialog = screen.getByRole("dialog", { name: "Install Notion" });
