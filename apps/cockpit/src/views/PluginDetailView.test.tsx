@@ -1007,7 +1007,8 @@ test("a component's declared manifest tools render as the pre-install Tools tab 
     pluginId: "atlassian",
     activeVersion: null,
     releases: [],
-    activeManifest: {
+    activeManifest: null,
+    declaredManifest: {
       publisher: "Ryuzi",
       description: "",
       lifecycle: "per-call",
@@ -1015,7 +1016,6 @@ test("a component's declared manifest tools render as the pre-install Tools tab 
       oauthProfiles: [],
       tools: [{ name: "jira_search", description: "Search Jira issues", writes: false }],
     },
-    declaredManifest: null,
   };
   render(<PluginDetailView id="atlassian" />);
   await screen.findByText("atlassian");
@@ -1025,6 +1025,40 @@ test("a component's declared manifest tools render as the pre-install Tools tab 
   expect(await screen.findByText("jira_search")).toBeTruthy();
   expect(screen.getByText("Search Jira issues")).toBeTruthy();
   expect(screen.getByText("Declared by the plugin — final list may differ after install.")).toBeTruthy();
+});
+
+test("active manifest tools take precedence over declared when both are present", async () => {
+  // Active (verified) manifest always wins over declared — this ensures
+  // we never regress to showing stale declared tools when an active version exists.
+  pluginToolsPendingIds.add("bitbucket");
+  componentReleaseFixtures.bitbucket = {
+    pluginId: "bitbucket",
+    activeVersion: "1.0.0",
+    releases: [],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.bitbucket.org"],
+      oauthProfiles: [],
+      tools: [{ name: "active_tool", description: "Active tool", writes: false }],
+    },
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.bitbucket.org"],
+      oauthProfiles: [],
+      tools: [{ name: "declared_tool", description: "Declared tool", writes: false }],
+    },
+  };
+  render(<PluginDetailView id="bitbucket" />);
+  await screen.findByText("bitbucket");
+
+  const toolsTabButton = await screen.findByRole("button", { name: /Tools \(1\)/ });
+  fireEvent.click(toolsTabButton);
+  expect(await screen.findByText("active_tool")).toBeTruthy();
+  expect(screen.queryByText("declared_tool")).toBeNull();
 });
 
 test("disables the enable switch for experimental plugins", async () => {

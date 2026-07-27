@@ -747,19 +747,19 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const hasHealthTab = isExtensionPlugin || idFindings.length > 0;
 
   // Tools & Skills tab — Task 10. `fallbackTools` is the pre-install case: a
-  // component-backed plugin's declared manifest tools (Task 2), mapped via
+  // component-backed plugin's active or declared manifest tools (Task 2), mapped via
   // the shared `declaredToolEntries` (`@/lib/plugin-hub`) to the same
   // `PluginToolEntry` shape `plugin_tools` returns — so `PluginToolsList`
   // never needs to branch on which source it came from, and the wizard's own
   // `OverviewStep` (`steps-component.tsx`) reuses the identical mapping
-  // rather than duplicating it. Once the store's `loadTools(id)` resolves
+  // (activeManifest ?? declaredManifest) rather than duplicating it. Once the store's `loadTools(id)` resolves
   // (even to an empty list), its cache wins over the fallback — `id in
   // toolsById` is the "has this id's fetch completed" gate (an empty array
   // is falsy under `??`, so a plain `toolsById[id] ?? fallbackTools` would
   // wrongly keep showing the fallback after a real fetch resolved to zero
   // entries).
   const toolsLoaded = id in toolsById;
-  const fallbackTools: PluginToolEntry[] = declaredToolEntries(releaseDetail?.activeManifest ?? null);
+  const fallbackTools: PluginToolEntry[] = declaredToolEntries(releaseDetail?.activeManifest ?? releaseDetail?.declaredManifest ?? null);
   const resolvedTools = toolsLoaded ? (toolsById[id] ?? []) : fallbackTools;
   const resolvedToolsLive = toolsLoaded ? (toolsLiveById[id] ?? false) : false;
   // A provider whose models only ever arrive via `plugin_tools` (`toolCount`
