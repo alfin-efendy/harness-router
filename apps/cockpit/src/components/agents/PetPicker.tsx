@@ -41,6 +41,7 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
   const [browseOpen, setBrowseOpen] = useState(false);
   const [manifest, setManifest] = useState<PetManifestEntryInfo[]>([]);
   const [manifestState, setManifestState] = useState<ManifestState>("idle");
+  const [manifestError, setManifestError] = useState<string | null>(null);
   const [downloadStates, setDownloadStates] = useState<Record<string, DownloadState>>({});
   const [downloadedSlugs, setDownloadedSlugs] = useState<Set<string>>(new Set());
 
@@ -54,15 +55,18 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
   const loadManifest = async () => {
     if (manifestState === "loading" || manifestState === "ready") return;
     setManifestState("loading");
+    setManifestError(null);
     try {
       const result = await commands.listPetManifest();
       if (result.status === "error") {
+        setManifestError(result.error.message);
         setManifestState("error");
         return;
       }
       setManifest(result.data);
       setManifestState("ready");
-    } catch {
+    } catch (error) {
+      setManifestError(error instanceof Error ? error.message : String(error));
       setManifestState("error");
     }
   };
@@ -149,11 +153,14 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
               <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Browse petdex.dev</span>
               {manifestState === "loading" && <p className="py-3 text-center text-[12px] text-muted-foreground">Loading petdex.dev…</p>}
               {manifestState === "error" && (
-                <div className="flex items-center justify-between rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
-                  Couldn't load petdex.dev.
-                  <Button variant="ghost" size="xs" onClick={() => void loadManifest()}>
-                    Retry
-                  </Button>
+                <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+                  <div className="flex items-center justify-between">
+                    Couldn't load petdex.dev.
+                    <Button variant="ghost" size="xs" onClick={() => void loadManifest()}>
+                      Retry
+                    </Button>
+                  </div>
+                  {manifestError && <p className="m-0 mt-1 break-words text-[11px] text-destructive/80">{manifestError}</p>}
                 </div>
               )}
               {manifestState === "ready" && (

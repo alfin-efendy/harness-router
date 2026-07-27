@@ -149,17 +149,30 @@ test("downloading a browsed entry makes it selectable, then reports its slug on 
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test("a manifest load failure shows a retry affordance", async () => {
-  listPetManifest.mockResolvedValueOnce({ status: "error", error: { message: "petdex.dev unreachable" } });
+test("a manifest load failure shows the backend detail and a retry affordance", async () => {
+  listPetManifest.mockResolvedValueOnce({ status: "error", error: { message: "pet manifest fetch failed: HTTP 502" } });
   render(<PetPicker open onClose={() => {}} onSelect={() => {}} currentPet={null} />);
   await awaitBundledGridReady();
   fireEvent.click(screen.getByRole("button", { name: "Browse petdex.dev" }));
 
   await screen.findByText("Couldn't load petdex.dev.");
+  expect(screen.getByText("pet manifest fetch failed: HTTP 502")).toBeTruthy();
+
   listPetManifest.mockResolvedValueOnce({ status: "ok", data: [manifestEntry()] });
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await screen.findByText("Paperclip");
   expect(listPetManifest).toHaveBeenCalledTimes(2);
+  expect(screen.queryByText("pet manifest fetch failed: HTTP 502")).toBeNull();
+});
+
+test("a thrown IPC error also surfaces its message", async () => {
+  listPetManifest.mockRejectedValueOnce(new Error("engine transport closed"));
+  render(<PetPicker open onClose={() => {}} onSelect={() => {}} currentPet={null} />);
+  await awaitBundledGridReady();
+  fireEvent.click(screen.getByRole("button", { name: "Browse petdex.dev" }));
+
+  await screen.findByText("Couldn't load petdex.dev.");
+  expect(screen.getByText("engine transport closed")).toBeTruthy();
 });
 
 test("caps visible browse results and hints at the remaining match count", async () => {
