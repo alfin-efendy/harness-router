@@ -446,6 +446,14 @@ fn provider_family(id: &str) -> String {
 }
 
 /// Pure kind → installed decision. Inputs are pre-computed by the caller.
+///
+/// `component_active` — an active `component_plugin_releases` row exists for
+/// this id, i.e. its WASM bundle IS installed on disk. It counts for the
+/// integration/gateway arms (an auth-less, still-disabled component like
+/// discord would otherwise read not-installed forever, re-offering Install
+/// for an already-installed bundle) but NOT for providers: provider
+/// installed-ness stays authoritative on the persisted installed set alone
+/// (mimo/opencode bundles are bootstrapped for everyone, set or no set).
 fn installed_flag(
     kind: &str,
     enabled: bool,
@@ -453,12 +461,13 @@ fn installed_flag(
     provider_installed: bool,
     gateway_settings_complete: bool,
     skill_pack_installed: bool,
+    component_active: bool,
 ) -> bool {
     match kind {
         "provider" => provider_installed,
-        "gateway" => gateway_settings_complete,
+        "gateway" => gateway_settings_complete || component_active,
         "skill-pack" => skill_pack_installed,
-        _ => configured || enabled,
+        _ => configured || enabled || component_active,
     }
 }
 
@@ -1299,6 +1308,7 @@ async fn compute_installed(
     enabled: bool,
     configured: bool,
     ctx: &InstalledCtx,
+    component_active: bool,
 ) -> anyhow::Result<bool> {
     let id = &plugin.manifest.id;
     // Provider installed-ness is authoritative on the persisted installed set
@@ -1346,6 +1356,7 @@ async fn compute_installed(
         provider_installed,
         gateway_settings_complete,
         skill_pack_installed,
+        component_active,
     ))
 }
 
@@ -1435,8 +1446,16 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             plugin.manifest.auth.as_ref(),
         )
         .await?;
-        let installed =
-            compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
+        let installed = compute_installed(
+            cp.store(),
+            &plugin,
+            kind,
+            enabled,
+            configured,
+            &ctx,
+            active_releases.contains_key(&plugin.manifest.id),
+        )
+        .await?;
         let record = installs.get(&plugin.manifest.id);
         let remote_row = remote.get(&plugin.manifest.id);
         let owns_slot = plugin
@@ -1573,7 +1592,19 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     let configured = plugin_auth_configured(cp.store(), id, m.auth.as_ref()).await?;
     let kind = derive_kind(&plugin).unwrap_or("integration");
     let ctx = installed_ctx(cp.store()).await?;
-    let installed = compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
+    // Fetched before `compute_installed` — an active release makes an
+    // integration/gateway row installed regardless of enable/configure state.
+    let active_release = cp.store().active_component_release(id).await?;
+    let installed = compute_installed(
+        cp.store(),
+        &plugin,
+        kind,
+        enabled,
+        configured,
+        &ctx,
+        active_release.is_some(),
+    )
+    .await?;
     // Single-plugin lookup is fine here — unlike `assemble_list`, there is
     // only ever one id to resolve for a detail view.
     let record = cp.store().get_plugin_install(id).await?;
@@ -1597,7 +1628,6 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
             .clone()
             .unwrap_or_else(|| format!("{id} failed to attach"))
     });
-    let active_release = cp.store().active_component_release(id).await?;
     let skill_count = (kind == "skill-pack")
         .then(|| {
             ctx.installed_skills
@@ -1982,6 +2012,12 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             for field in &plugin.manifest.settings {
                 cp.store().delete_setting_raw(&field.key).await?;
             }
+            // A component-backed gateway also sheds its installed bundle:
+            // installed-ness reads the active-release ledger, so leaving the
+            // release active would keep the row "installed" forever. No-op
+            // for native gateways (no release rows). Deactivated, NOT
+            // revoked — a reinstall stays possible.
+            cp.store().deactivate_component_releases(id).await?;
             crate::plugins::toggle_enabled(cp.plugins(), &settings, id, false).await
         }
         Some("skill-pack") => {
@@ -2011,6 +2047,12 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             if plugin.connector.is_some() && !plugin.manifest.experimental {
                 crate::plugins::toggle_enabled(cp.plugins(), &settings, id, false).await?;
             }
+            // Component-backed integrations (and the catalog stand-in a
+            // component gateway wears pre-restart) deactivate their installed
+            // bundle too — same rationale as the "gateway" arm above; the
+            // reconcile's `was_gateway_bundle` check runs BEFORE this for
+            // exactly that reason. No-op for rows without release ledger rows.
+            cp.store().deactivate_component_releases(id).await?;
             Ok(())
         }
     }
@@ -2901,50 +2943,31 @@ mod tests {
 
     #[test]
     fn installed_flag_per_kind() {
-        assert!(installed_flag(
-            "integration",
-            true,
-            false,
-            false,
-            false,
-            false
-        ));
-        assert!(installed_flag(
-            "integration",
-            false,
-            true,
-            false,
-            false,
-            false
-        ));
-        assert!(!installed_flag(
-            "integration",
-            false,
-            false,
-            true,
-            true,
-            true
-        ));
-        assert!(installed_flag("provider", false, false, true, false, false));
-        assert!(!installed_flag("provider", true, true, false, false, false));
-        assert!(installed_flag("gateway", false, false, false, true, false));
-        assert!(!installed_flag("gateway", true, false, false, false, false));
-        assert!(installed_flag(
-            "skill-pack",
-            false,
-            false,
-            false,
-            false,
-            true
-        ));
-        assert!(!installed_flag(
-            "skill-pack",
-            true,
-            true,
-            false,
-            false,
-            false
-        ));
+        // (kind, enabled, configured, provider_installed,
+        //  gateway_settings_complete, skill_pack_installed, component_active)
+        let f = |k, e, c, p, g, s, ca| installed_flag(k, e, c, p, g, s, ca);
+        assert!(f("integration", true, false, false, false, false, false));
+        assert!(f("integration", false, true, false, false, false, false));
+        assert!(!f("integration", false, false, true, true, true, false));
+        assert!(f("provider", false, false, true, false, false, false));
+        assert!(!f("provider", true, true, false, false, false, false));
+        assert!(f("gateway", false, false, false, true, false, false));
+        assert!(!f("gateway", true, false, false, false, false, false));
+        assert!(f("skill-pack", false, false, false, false, true, false));
+        assert!(!f("skill-pack", true, true, false, false, false, false));
+    }
+
+    #[test]
+    fn installed_flag_counts_an_active_component_release_for_integration_and_gateway() {
+        let f = |k| installed_flag(k, false, false, false, false, false, true);
+        // The discord shape: integration stand-in, auth none (never
+        // configured), disabled — the active bundle alone means installed.
+        assert!(f("integration"));
+        assert!(f("gateway"));
+        // Providers stay authoritative on the installed set; skill packs on
+        // the skills ledger — an active bundle row changes neither.
+        assert!(!f("provider"));
+        assert!(!f("skill-pack"));
     }
 
     // ---------- derive_plugin_status ----------
@@ -3010,7 +3033,7 @@ mod tests {
         };
 
         let installed_when_enabled =
-            compute_installed(&store, &plugin, "gateway", true, false, &ctx)
+            compute_installed(&store, &plugin, "gateway", true, false, &ctx, false)
                 .await
                 .unwrap();
         assert!(
@@ -3019,7 +3042,7 @@ mod tests {
         );
 
         let installed_when_disabled =
-            compute_installed(&store, &plugin, "gateway", false, false, &ctx)
+            compute_installed(&store, &plugin, "gateway", false, false, &ctx, false)
                 .await
                 .unwrap();
         assert!(
@@ -3043,7 +3066,7 @@ mod tests {
         // `mimo-free` is in DEFAULT_INSTALLED; no connection exists.
         let mimo_free = provider_only("mimo-free");
         assert!(
-            compute_installed(&store, &mimo_free, "provider", false, false, &ctx)
+            compute_installed(&store, &mimo_free, "provider", false, false, &ctx, false)
                 .await
                 .unwrap(),
             "a default-installed provider is installed with zero connections"
@@ -3052,7 +3075,7 @@ mod tests {
         // `xai` is not a default and has no connection.
         let xai = provider_only("xai");
         assert!(
-            !compute_installed(&store, &xai, "provider", false, false, &ctx)
+            !compute_installed(&store, &xai, "provider", false, false, &ctx, false)
                 .await
                 .unwrap(),
             "a non-installed, connectionless provider is not installed"
@@ -3095,7 +3118,7 @@ mod tests {
 
         let openai = provider_only("openai");
         assert!(
-            compute_installed(&store, &openai, "provider", false, false, &ctx)
+            compute_installed(&store, &openai, "provider", false, false, &ctx, false)
                 .await
                 .unwrap(),
             "a family in the installed set is installed"
@@ -3103,11 +3126,62 @@ mod tests {
 
         let xai = provider_only("xai");
         assert!(
-            !compute_installed(&store, &xai, "provider", false, false, &ctx)
+            !compute_installed(&store, &xai, "provider", false, false, &ctx, false)
                 .await
                 .unwrap(),
             "a family with a connection but absent from the set is NOT installed"
         );
+    }
+
+    // ---------- compute_installed: active component release ----------
+
+    /// Seeds an installed, active `component_plugin_releases` row for `id` —
+    /// the ledger state a successful `install_component_plugin` leaves behind.
+    async fn seed_active_component_release(cp: &ControlPlane, id: &str) {
+        cp.store()
+            .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
+                plugin_id: id.into(),
+                version: "0.1.0".into(),
+                source_url: format!("https://example.com/{id}.wasm"),
+                sha256: "aa".into(),
+                signing_key_id: "first-party".into(),
+                installed_at: 1,
+                active: false,
+                revoked: false,
+                revocation_reason: None,
+            })
+            .await
+            .unwrap();
+        cp.store()
+            .set_active_component_release(id, "0.1.0")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn component_integration_with_active_release_reports_installed_disabled() {
+        // The discord wedge: the install itself succeeded (active release in
+        // the ledger, bundle on disk) but the plugin was never enabled and has
+        // no auth to configure — so `configured || enabled` is false. The row
+        // must still read installed (status "disabled"), NOT "not-installed",
+        // which would keep offering Install for an already-installed bundle.
+        let cp = test_cp().await;
+        seed_active_component_release(&cp, "discord").await;
+
+        let list = assemble_list(&cp).await.unwrap();
+        let row = list
+            .iter()
+            .find(|p| p.id == "discord")
+            .expect("discord catalog row");
+        assert!(
+            row.installed,
+            "an active component release means the plugin IS installed"
+        );
+        assert_eq!(row.status, "disabled");
+
+        let detail = assemble_detail(&cp, "discord").await.unwrap();
+        assert!(detail.info.installed, "detail must agree with the list");
+        assert_eq!(detail.info.status, "disabled");
     }
 
     // ---------- plugin_info ----------
@@ -4235,6 +4309,50 @@ mod tests {
             .is_enabled(&settings, "acme-token")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn uninstall_component_integration_deactivates_the_active_release() {
+        // With installed-ness now derived from the active release ledger, an
+        // uninstall must deactivate the release or the row would keep reading
+        // "installed" forever (the reconcile's own comment already promises
+        // "uninstall may deactivate the bundle"). Uses the catalog's discord
+        // stand-in — `derive_kind` sees "integration" for it.
+        let cp = test_cp().await;
+        seed_active_component_release(&cp, "discord").await;
+
+        uninstall(&cp, "discord").await.unwrap();
+
+        assert!(
+            cp.store()
+                .active_component_release("discord")
+                .await
+                .unwrap()
+                .is_none(),
+            "uninstall must deactivate the component release"
+        );
+        // Deactivated, not revoked — a reinstall stays possible.
+        let releases = cp.store().list_component_releases("discord").await.unwrap();
+        assert!(releases.iter().all(|r| !r.revoked));
+    }
+
+    #[tokio::test]
+    async fn uninstall_gateway_deactivates_the_active_release() {
+        // Same contract through the "gateway" arm — the shape discord's host
+        // row takes once the engine has restarted with the bundle enabled.
+        let cp = test_cp_with(vec![gateway_only("discord")]).await;
+        seed_active_component_release(&cp, "discord").await;
+
+        uninstall(&cp, "discord").await.unwrap();
+
+        assert!(
+            cp.store()
+                .active_component_release("discord")
+                .await
+                .unwrap()
+                .is_none(),
+            "gateway uninstall must deactivate the component release"
+        );
     }
 
     #[tokio::test]

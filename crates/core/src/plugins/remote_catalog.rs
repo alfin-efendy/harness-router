@@ -791,9 +791,10 @@ pub async fn bootstrap_first_party_components(
     let mut satisfied = 0usize;
     let mut installed_this_pass = false;
     for id in FIRST_PARTY_BUNDLE_IDS {
-        // A prior partial boot may have installed this one already; count it as
-        // satisfied and never re-install (install_verified rejects a duplicate
-        // version directory).
+        // A prior partial boot may have installed this one already; count it
+        // as satisfied and never re-install (a reinstall would succeed —
+        // `install_verified` replaces the directory — but there is nothing
+        // for it to do here).
         if matches!(
             store.active_component_release(id).await,
             Ok(Some(rec)) if !rec.revoked
