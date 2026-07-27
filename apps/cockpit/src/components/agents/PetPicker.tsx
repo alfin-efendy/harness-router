@@ -19,17 +19,17 @@ function matches(query: string, ...values: (string | null | undefined)[]): boole
 export type PetPickerProps = {
   open: boolean;
   onClose: () => void;
-  /** Currently-selected pet slug, if any — highlighted in the bundled grid and required for the Clear action to appear. */
+  /** Currently-selected pet slug, if any — highlighted in the grids. */
   currentPet: string | null;
-  /** Fires with the chosen slug, or `null` when the user clears back to the color look. The picker closes itself right after. */
-  onSelect: (slug: string | null) => void;
+  /** Fires with the chosen slug; the picker closes itself right after. */
+  onSelect: (slug: string) => void;
 };
 
 /**
- * Grid of bundled pets + a lazily-expanded "Browse petdex.dev" search, used
- * everywhere an agent's pet avatar can be chosen (the editor modal's Pet
+ * Grid of bundled avatars + a lazily-expanded "Browse petdex.dev" search, used
+ * everywhere an agent's avatar can be chosen (the editor modal's avatar
  * field, the detail header's avatar button). Downloading a browsed entry
- * (`commands.downloadPet`) makes it locally available and selectable; a pet
+ * (`commands.downloadPet`) makes it locally available and selectable; an avatar
  * that's neither bundled nor downloaded on this machine simply can't be
  * picked here (no sync logic in this PR — see the brief).
  */
@@ -76,7 +76,7 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
     void loadManifest();
   };
 
-  const select = (slug: string | null) => {
+  const select = (slug: string) => {
     onSelect(slug);
     onClose();
   };
@@ -110,7 +110,7 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
 
   return (
     <Modal onClose={onClose} width={480}>
-      <ModalHeader title="Choose a pet" description="Pick a bundled pet, or browse petdex.dev for more." />
+      <ModalHeader title="Choose an avatar" description="Pick a bundled avatar, or browse petdex.dev for more." />
       <ModalBody className="flex flex-col gap-3">
         <div className="relative">
           <Search aria-hidden size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
@@ -118,8 +118,8 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
             className="pl-9"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search pets"
-            aria-label="Search pets"
+            placeholder="Search avatars"
+            aria-label="Search avatars"
           />
         </div>
 
@@ -139,7 +139,7 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
             </button>
           ))}
           {filteredBundled.length === 0 && (
-            <p className="col-span-4 py-2 text-center text-[12px] text-muted-foreground">No bundled pets match your search.</p>
+            <p className="col-span-4 py-2 text-center text-[12px] text-muted-foreground">No bundled avatars match your search.</p>
           )}
         </div>
 
@@ -223,11 +223,6 @@ export function PetPicker({ open, onClose, currentPet, onSelect }: PetPickerProp
         </div>
       </ModalBody>
       <ModalFooter>
-        {currentPet && (
-          <Button variant="outline" onClick={() => select(null)} className="mr-auto">
-            Clear (use color)
-          </Button>
-        )}
         <Button variant="outline" onClick={onClose}>
           Close
         </Button>

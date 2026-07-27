@@ -130,7 +130,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
           </Button>
           <button
             type="button"
-            aria-label={`Change ${summary.name}'s pet`}
+            aria-label={`Change ${summary.name}'s avatar`}
             onClick={() => setPetPickerOpen(true)}
             className="shrink-0 rounded-lg focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           >

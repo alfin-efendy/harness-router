@@ -648,14 +648,14 @@ test("agents: manage a non-default agent and start a chat session for it", async
   await expect(page.getByRole("heading", { name: "Fresh Agent" })).toBeVisible();
   await expect(page.getByTestId("agent-detail-tabs")).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "Agent model" })).toBeVisible();
-  // PR3 Task 8: the Fresh Agent's pet is hardcoded (FRESH_AGENT_PET =
+  // PR3 Task 8: the Fresh Agent's avatar is hardcoded (FRESH_AGENT_PET =
   // "sprout" in both agent_api.rs and lib/pet-sprite.ts, mirrored on
   // FRESH_AGENT.avatarPet in mock-ipc.ts) and rendered plain — the builtin
-  // detail branch has no "Change pet" button wrapping the avatar at all
+  // detail branch has no "Change avatar" button wrapping the avatar at all
   // (unlike a real agent's header below), since nothing about the Fresh
   // Agent's identity is editable.
   await expect(page.getByTestId("pet-sprite")).toBeVisible();
-  await expect(page.getByRole("button", { name: /Change .* pet/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Change .* avatar/ })).toHaveCount(0);
   // Scoped to "main": the app shell has its own unrelated "Back" control
   // elsewhere in the layout with the same accessible name.
   await page.getByRole("main").getByRole("button", { name: "Back" }).click();

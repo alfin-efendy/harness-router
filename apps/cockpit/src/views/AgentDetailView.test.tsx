@@ -406,7 +406,7 @@ test("the header avatar is a button that opens PetPicker; choosing a bundled pet
 
   try {
     render(<AgentDetailView agentId="reviewer" />);
-    fireEvent.click(screen.getByRole("button", { name: "Change Reviewer's pet" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change Reviewer's avatar" }));
 
     fireEvent.click(await screen.findByRole("button", { name: /Sprout/i }));
 
@@ -442,7 +442,7 @@ test("the built-in Fresh Agent header shows its pet but is not a clickable picke
     render(<AgentDetailView agentId="fresh" />);
 
     await waitFor(() => expect(screen.getByTestId("pet-sprite")).toBeTruthy());
-    expect(screen.queryByRole("button", { name: "Change Fresh Agent's pet" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Change Fresh Agent's avatar" })).toBeNull();
   } finally {
     globalThis.fetch = originalFetch;
   }
