@@ -130,9 +130,16 @@ export function firstPartyBadgeLabel(release: ComponentReleaseInfo): string {
 }
 
 /** The install/update permission-confirmation summary rows — `null` manifest
- *  (nothing installed yet, so nothing has been fetched+verified) renders a
- *  single honest placeholder rather than guessing at undeclared permissions. */
-export function permissionSummaryRows(manifest: ComponentManifestInfo | null): { label: string; value: string }[] {
+ *  (nothing installed AND no embedded manifest to preview) renders a single
+ *  honest placeholder rather than guessing at undeclared permissions.
+ *  `verified: false` marks a manifest read from the EMBEDDED catalog
+ *  (declared, not yet signature-checked on disk) — it appends a Source row
+ *  saying so; callers pass it when they fell back from `activeManifest` to
+ *  `declaredManifest`. */
+export function permissionSummaryRows(
+  manifest: ComponentManifestInfo | null,
+  opts?: { verified?: boolean },
+): { label: string; value: string }[] {
   if (!manifest) {
     return [
       {
@@ -150,6 +157,12 @@ export function permissionSummaryRows(manifest: ComponentManifestInfo | null): {
     rows.push({
       label: "OAuth",
       value: manifest.oauthProfiles.map((p) => `${p.id} (${p.scopes.length > 0 ? p.scopes.join(", ") : "no scopes declared"})`).join("; "),
+    });
+  }
+  if (opts?.verified === false) {
+    rows.push({
+      label: "Source",
+      value: "As declared by the bundled manifest — verified against its signature at install.",
     });
   }
   return rows;
@@ -348,7 +361,9 @@ function ComponentReleaseCard({
   onActivateVersion: (version: string) => void;
 }) {
   const hasActive = detail.activeVersion !== null;
-  const rows = permissionSummaryRows(detail.activeManifest);
+  const rows = permissionSummaryRows(detail.activeManifest ?? detail.declaredManifest, {
+    verified: detail.activeManifest !== null,
+  });
   // Newest-first for the release list (the store returns oldest-first).
   const releases = [...detail.releases].reverse();
 
@@ -732,19 +747,19 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const hasHealthTab = isExtensionPlugin || idFindings.length > 0;
 
   // Tools & Skills tab — Task 10. `fallbackTools` is the pre-install case: a
-  // component-backed plugin's declared manifest tools (Task 2), mapped via
+  // component-backed plugin's active or declared manifest tools (Task 2), mapped via
   // the shared `declaredToolEntries` (`@/lib/plugin-hub`) to the same
   // `PluginToolEntry` shape `plugin_tools` returns — so `PluginToolsList`
   // never needs to branch on which source it came from, and the wizard's own
   // `OverviewStep` (`steps-component.tsx`) reuses the identical mapping
-  // rather than duplicating it. Once the store's `loadTools(id)` resolves
+  // (activeManifest ?? declaredManifest) rather than duplicating it. Once the store's `loadTools(id)` resolves
   // (even to an empty list), its cache wins over the fallback — `id in
   // toolsById` is the "has this id's fetch completed" gate (an empty array
   // is falsy under `??`, so a plain `toolsById[id] ?? fallbackTools` would
   // wrongly keep showing the fallback after a real fetch resolved to zero
   // entries).
   const toolsLoaded = id in toolsById;
-  const fallbackTools: PluginToolEntry[] = declaredToolEntries(releaseDetail?.activeManifest ?? null);
+  const fallbackTools: PluginToolEntry[] = declaredToolEntries(releaseDetail?.activeManifest ?? releaseDetail?.declaredManifest ?? null);
   const resolvedTools = toolsLoaded ? (toolsById[id] ?? []) : fallbackTools;
   const resolvedToolsLive = toolsLoaded ? (toolsLiveById[id] ?? false) : false;
   // A provider whose models only ever arrive via `plugin_tools` (`toolCount`
@@ -1080,7 +1095,9 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
                 </CardHeader>
                 <div className="px-[18px] py-3.5">
                   <div className="flex flex-col gap-1.5">
-                    {permissionSummaryRows(releaseDetail?.activeManifest ?? null).map((r) => (
+                    {permissionSummaryRows(releaseDetail?.activeManifest ?? releaseDetail?.declaredManifest ?? null, {
+                      verified: (releaseDetail?.activeManifest ?? null) !== null,
+                    }).map((r) => (
                       <div key={r.label} className="flex gap-2 text-[12.5px]">
                         <span className="w-[75px] shrink-0 font-medium text-muted-foreground">{r.label}</span>
                         <span className="min-w-0 flex-1 break-words">{r.value}</span>

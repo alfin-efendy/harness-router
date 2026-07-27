@@ -257,7 +257,7 @@ const pluginTools = mock(async (_runnerId: string, id: string) => ({
 }));
 
 function emptyReleaseDetail(id: string) {
-  return { pluginId: id, releases: [] as unknown[], activeVersion: null as string | null, activeManifest: null };
+  return { pluginId: id, releases: [] as unknown[], activeVersion: null as string | null, activeManifest: null, declaredManifest: null };
 }
 const componentBootstrapStatus = mock(async () => ({ status: "ok" as const, data: componentBootstrapStatusFixture }));
 const pluginReleaseDetail = mock(async (_runnerId: string, id: string) => ({ status: "ok" as const, data: emptyReleaseDetail(id) }));

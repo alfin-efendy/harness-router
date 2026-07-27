@@ -1091,6 +1091,7 @@ const COMPONENT_RELEASES: Record<string, ComponentReleaseDetail> = {
         { name: "list_repos", description: "List repositories", writes: false },
       ],
     },
+    declaredManifest: null,
   },
 };
 
@@ -1622,7 +1623,9 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
           if (cmd === "plugin_release_detail") {
             const { id } = args as { id: string };
             const releases = fixtures.component_releases as Record<string, unknown>;
-            return Promise.resolve(releases[id] ?? { pluginId: id, releases: [], activeVersion: null, activeManifest: null });
+            return Promise.resolve(
+              releases[id] ?? { pluginId: id, releases: [], activeVersion: null, activeManifest: null, declaredManifest: null },
+            );
           }
           // Task 16: `plugin_detail` — pre-install support (Task 7) means this
           // resolves for a registered-but-not-yet-installed plugin too (the hub's
@@ -1680,6 +1683,7 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
                 oauthProfiles: [],
                 tools: [],
               },
+              declaredManifest: null,
             });
           }
           if (cmd === "list_model_routes") return Promise.resolve(modelRoutes);

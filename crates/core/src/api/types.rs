@@ -1324,10 +1324,12 @@ pub struct ComponentToolInfo {
 /// `profile_capability_context` already performs) rather than a new network
 /// fetch — safe because this data has already passed `verify_bundle`. `None`
 /// when nothing is currently active (including: never installed, or
-/// uninstalled) — there is no pipeline seam to preview an unverified
-/// manifest's fields before an install actually runs the signature check, so
-/// a plugin's very first install has no permission preview to show beyond
-/// the generic acknowledgement Cockpit renders in that case.
+/// uninstalled). First-party component bundles additionally surface their
+/// EMBEDDED manifest pre-install via
+/// `ComponentReleaseDetail::declared_manifest` (PR-1) — compiled into the
+/// binary, so it needs no fetch and no signature check; only bundles with no
+/// embedded manifest (e.g. third-party) still render Cockpit's generic
+/// "unknown until fetched" acknowledgement on first install.
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentManifestInfo {
@@ -1396,6 +1398,13 @@ pub struct ComponentReleaseDetail {
     pub active_version: Option<String>,
     /// Task 12 addition — see [`ComponentManifestInfo`]'s doc.
     pub active_manifest: Option<ComponentManifestInfo>,
+    /// PR-1 (pre-install metadata): the manifest `id`'s EMBEDDED first-party
+    /// bundle declares (`component_catalog::declared_bundle_manifest`) —
+    /// available before any release is fetched, because it is compiled into
+    /// the binary. `None` for non-component ids. UI reads
+    /// `activeManifest ?? declaredManifest` so the verified on-disk manifest
+    /// stays authoritative once a release is active.
+    pub declared_manifest: Option<ComponentManifestInfo>,
 }
 
 /// `component_bootstrap_status` RPC result (Task 11a): whether the first-party

@@ -80,7 +80,7 @@ function detailFixture(): PluginDetail {
 }
 
 function releaseFixture(): ComponentReleaseDetail {
-  return { pluginId: "notion", releases: [], activeVersion: null, activeManifest: null };
+  return { pluginId: "notion", releases: [], activeVersion: null, activeManifest: null, declaredManifest: null };
 }
 
 // Provider-shaped fixture with no permissions gate, no settings, and no
@@ -370,7 +370,7 @@ const toastSuccess = mock((_message: string) => {});
 // failed-install Retry test below) typechecks against an error variant too.
 const installComponentPlugin = mock(
   (_runnerId: string, id: string, _version: string | null): Promise<Result<ComponentReleaseDetail, CmdError>> =>
-    ok({ pluginId: id, releases: [], activeVersion: "1.0.0", activeManifest: null }),
+    ok({ pluginId: id, releases: [], activeVersion: "1.0.0", activeManifest: null, declaredManifest: null }),
 );
 const beginPluginOauth = mock((_runnerId: string, _pluginId: string) =>
   ok({ stateToken: "state-1", authorizeUrl: "https://notion.example/authorize", redirectUri: "http://127.0.0.1:8976/callback" }),
@@ -816,6 +816,69 @@ test("renders a shortened 4-step plan for a provider with no settings or permiss
 
 // ---------- Task 14: real per-step behavior ----------
 
+// PR-1: pre-install, the overview step lists the DECLARED tools from the
+// embedded manifest (activeManifest is null until a release is verified on
+// disk) instead of the empty-state card. Reuses the file's default
+// component-kind fixture as-is (detailData/renderWizard both default to
+// "notion" — detailFixture()'s componentBacked+kind "integration" is what
+// puts "permissions" in the plan) — only releaseData's declaredManifest is
+// populated here.
+test("overview step lists declared tools pre-install", async () => {
+  releaseData = {
+    pluginId: "notion",
+    releases: [],
+    activeVersion: null,
+    activeManifest: null,
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "GitHub connector.",
+      lifecycle: "per-session",
+      domains: ["api.github.com", "github.com"],
+      oauthProfiles: [],
+      tools: [
+        { name: "create_issue", description: "Create an issue", writes: true },
+        { name: "get_repo", description: "Read a repository", writes: false },
+      ],
+    },
+  };
+  await renderWizard();
+
+  expect(screen.queryByText("No tools declared.")).toBeNull();
+  expect(screen.getByText("create_issue")).toBeTruthy();
+  expect(screen.getByText("get_repo")).toBeTruthy();
+});
+
+// PR-1: the permissions step renders declared domains + the Source row
+// pre-install instead of the "Unknown until…" placeholder. Same default
+// "notion" component fixture, advanced one Continue click to reach
+// Permissions (mirrors "Continue advances to the next step..." above).
+test("permissions step shows declared permissions pre-install", async () => {
+  releaseData = {
+    pluginId: "notion",
+    releases: [],
+    activeVersion: null,
+    activeManifest: null,
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "GitHub connector.",
+      lifecycle: "per-session",
+      domains: ["api.github.com", "github.com"],
+      oauthProfiles: [],
+      tools: [
+        { name: "create_issue", description: "Create an issue", writes: true },
+        { name: "get_repo", description: "Read a repository", writes: false },
+      ],
+    },
+  };
+  await renderWizard();
+  const dialog = screen.getByRole("dialog", { name: "Install Notion" });
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+
+  expect(screen.queryByText(/Unknown until a release is fetched/)).toBeNull();
+  expect(screen.getByText(/api\.github\.com/)).toBeTruthy();
+  expect(screen.getByText("As declared by the bundled manifest — verified against its signature at install.")).toBeTruthy();
+});
+
 // The brief's TDD scenario: a component fixture with no settings field (so
 // the plan is 5 steps, ending Connect → Skip → Done directly) walking
 // Overview → Continue → Permissions (gated) → accept → Continue → install
@@ -920,6 +983,7 @@ test("Connect step renders the device-flow OAuth profile connections when the ma
       ],
       tools: [],
     },
+    declaredManifest: null,
   };
   await renderWizard();
   const dialog = screen.getByRole("dialog", { name: "Install Notion" });

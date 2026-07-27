@@ -2258,7 +2258,9 @@ async fn cancel_plugin_install(
 /// why this is read-only-disk, not a new network fetch, and why it is `None`
 /// for a never-installed plugin. Best-effort: any I/O error (most commonly,
 /// the bundle root not existing yet) degrades to `None` rather than failing
-/// the whole RPC, since this is read-only display data.
+/// the whole RPC, since this is read-only display data. PR-1: additionally
+/// carries the embedded first-party manifest as `declared_manifest` for
+/// component bundles — see `ComponentReleaseDetail`.
 async fn plugin_release_detail(
     cp: &ControlPlane,
     plugin_id: &str,
@@ -2290,6 +2292,19 @@ async fn plugin_release_detail(
         }
         None => None,
     };
+    let declared_manifest =
+        match crate::plugins::component_catalog::declared_bundle_manifest(plugin_id)
+            .map(ComponentManifestInfo::from)
+        {
+            Some(mut manifest) => {
+                // Same store enrichment the active manifest gets: a token or
+                // client-id override stored from a previous install survives
+                // uninstall, so the pre-install preview reflects it too.
+                enrich_oauth_profile_status(cp.store(), plugin_id, &mut manifest).await;
+                Some(manifest)
+            }
+            None => None,
+        };
     Ok(ComponentReleaseDetail {
         plugin_id: plugin_id.to_string(),
         releases: releases
@@ -2298,6 +2313,7 @@ async fn plugin_release_detail(
             .collect(),
         active_version,
         active_manifest,
+        declared_manifest,
     })
 }
 
@@ -4995,6 +5011,36 @@ mod tests {
         assert!(detail.releases.is_empty());
         assert!(detail.active_version.is_none());
         assert!(detail.active_manifest.is_none());
+    }
+
+    // PR-1 (pre-install metadata): a component-bundle id that has never been
+    // installed must still carry its embedded first-party manifest as
+    // `declared_manifest`, so the wizard's overview/permissions steps can
+    // render tools and permissions before anything is fetched. `active_*`
+    // stays None — "verified release on disk" semantics are untouched.
+    #[tokio::test]
+    async fn plugin_release_detail_carries_declared_manifest_pre_install() {
+        let cp = test_cp().await;
+        let res = plugin_release_detail(&cp, "github").await.unwrap();
+        assert!(res.active_version.is_none());
+        assert!(res.active_manifest.is_none());
+        let declared = res
+            .declared_manifest
+            .expect("github has an embedded first-party bundle manifest");
+        assert_eq!(declared.tools.len(), 12, "github declares exactly 12 tools");
+        assert!(!declared.domains.is_empty());
+        assert_eq!(declared.oauth_profiles.len(), 1);
+        // Store enrichment ran against an empty store: not connected.
+        assert!(!declared.oauth_profiles[0].connected);
+    }
+
+    // A non-component id (catalog provider, no embedded bundle) must not
+    // grow a declared manifest.
+    #[tokio::test]
+    async fn plugin_release_detail_declared_manifest_absent_for_non_component() {
+        let cp = test_cp().await;
+        let res = plugin_release_detail(&cp, "kiro").await.unwrap();
+        assert!(res.declared_manifest.is_none());
     }
 
     // The pure manifest -> `ComponentManifestInfo` conversion must carry the

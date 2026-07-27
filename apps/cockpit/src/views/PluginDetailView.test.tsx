@@ -623,12 +623,21 @@ type ReleaseDetailFixture = {
     // this file stays valid without adding `tools: []` to each one.
     tools?: { name: string; description: string; writes: boolean }[];
   } | null;
+  declaredManifest: {
+    publisher: string;
+    description: string;
+    lifecycle: string;
+    domains: string[];
+    oauthProfiles: { id: string; scopes: string[] }[];
+    tools?: { name: string; description: string; writes: boolean }[];
+  } | null;
 };
 const emptyReleaseDetail = (id: string): ReleaseDetailFixture => ({
   pluginId: id,
   releases: [],
   activeVersion: null,
   activeManifest: null,
+  declaredManifest: null,
 });
 function releaseInfo(over: Partial<ReleaseInfoFixture> = {}): ReleaseInfoFixture {
   return {
@@ -998,7 +1007,8 @@ test("a component's declared manifest tools render as the pre-install Tools tab 
     pluginId: "atlassian",
     activeVersion: null,
     releases: [],
-    activeManifest: {
+    activeManifest: null,
+    declaredManifest: {
       publisher: "Ryuzi",
       description: "",
       lifecycle: "per-call",
@@ -1015,6 +1025,40 @@ test("a component's declared manifest tools render as the pre-install Tools tab 
   expect(await screen.findByText("jira_search")).toBeTruthy();
   expect(screen.getByText("Search Jira issues")).toBeTruthy();
   expect(screen.getByText("Declared by the plugin — final list may differ after install.")).toBeTruthy();
+});
+
+test("active manifest tools take precedence over declared when both are present", async () => {
+  // Active (verified) manifest always wins over declared — this ensures
+  // we never regress to showing stale declared tools when an active version exists.
+  pluginToolsPendingIds.add("bitbucket");
+  componentReleaseFixtures.bitbucket = {
+    pluginId: "bitbucket",
+    activeVersion: "1.0.0",
+    releases: [],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.bitbucket.org"],
+      oauthProfiles: [],
+      tools: [{ name: "active_tool", description: "Active tool", writes: false }],
+    },
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.bitbucket.org"],
+      oauthProfiles: [],
+      tools: [{ name: "declared_tool", description: "Declared tool", writes: false }],
+    },
+  };
+  render(<PluginDetailView id="bitbucket" />);
+  await screen.findByText("bitbucket");
+
+  const toolsTabButton = await screen.findByRole("button", { name: /Tools \(1\)/ });
+  fireEvent.click(toolsTabButton);
+  expect(await screen.findByText("active_tool")).toBeTruthy();
+  expect(screen.queryByText("declared_tool")).toBeNull();
 });
 
 test("disables the enable switch for experimental plugins", async () => {
@@ -1298,6 +1342,60 @@ test("the permission summary shows 'Unknown until…' before any release is inst
   expect(screen.getByText(/Unknown until a release is fetched and its signature is verified/)).toBeTruthy();
 });
 
+// PR-1: a never-installed component with an embedded (declared) manifest
+// previews its real permissions, labeled as declared-not-yet-verified —
+// the "Unknown until…" placeholder is reserved for bundles with no
+// embedded manifest at all.
+test("the permission summary shows declared permissions pre-install, labeled as declared", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: null,
+    releases: [],
+    activeManifest: null,
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "Xiaomi MiMo free-tier chat provider.",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  expect(screen.queryByText(/Unknown until a release is fetched/)).toBeNull();
+  expect(screen.getAllByText("api.xiaomimimo.com").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("As declared by the bundled manifest — verified against its signature at install.").length).toBeGreaterThan(0);
+});
+
+// Versions-tab (ComponentReleaseCard) fallback: declared permissions render
+// for a never-installed component, even when there's no active release.
+test("the permission summary shows declared permissions in the Versions tab pre-install", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: null,
+    releases: [],
+    activeManifest: null,
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "Xiaomi MiMo free-tier chat provider.",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
+  const panel = within(screen.getByTestId("tab-panel-versions"));
+
+  expect(panel.queryByText(/Unknown until a release is fetched/)).toBeNull();
+  expect(panel.getByText("Ryuzi")).toBeTruthy();
+  expect(panel.getByText("api.xiaomimimo.com")).toBeTruthy();
+  expect(panel.getByText("As declared by the bundled manifest — verified against its signature at install.")).toBeTruthy();
+});
+
 test("the permission summary renders the active release's publisher, lifecycle, domains, and OAuth profiles", async () => {
   mimoReleaseFixture = {
     pluginId: "mimo",
@@ -1310,6 +1408,7 @@ test("the permission summary renders the active release's publisher, lifecycle, 
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [{ id: "github", scopes: ["repo", "read:user"] }],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1342,6 +1441,7 @@ test("Update to latest is DISABLED until the permission-acceptance switch is tog
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1376,6 +1476,7 @@ test("exactly one release shows the Active badge among several (one-active-versi
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1399,6 +1500,7 @@ test("rolling back to a prior good version dispatches rollbackComponentPlugin wi
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1417,6 +1519,7 @@ test("a revoked release offers no Roll back action, and the active release offer
       releaseInfo({ version: "0.2.0", active: true }),
     ],
     activeManifest: null,
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1433,6 +1536,7 @@ test("a third-party (non-first-party) release is labeled distinctly from a first
     activeVersion: "0.2.0",
     releases: [releaseInfo({ version: "0.2.0", active: true, firstParty: false, signingKeyId: "some-other-key" })],
     activeManifest: null,
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1462,6 +1566,7 @@ test("atlassian's detail page shows only its own atlassian-cloud profile, never 
       domains: ["api.atlassian.com", "auth.atlassian.com"],
       oauthProfiles: [{ id: "atlassian-cloud", scopes: ["read:jira-work", "write:jira-work"] }],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="atlassian" />);
   await screen.findByText("atlassian");
@@ -1482,6 +1587,7 @@ test("bitbucket's detail page shows only its own bitbucket-cloud profile, never 
       domains: ["api.bitbucket.org", "bitbucket.org"],
       oauthProfiles: [{ id: "bitbucket-cloud", scopes: ["account", "repository"] }],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="bitbucket" />);
   await screen.findByText("bitbucket");
@@ -1502,6 +1608,7 @@ test("rendering both in sequence never leaks one's profile into the other's page
       domains: ["api.atlassian.com"],
       oauthProfiles: [{ id: "atlassian-cloud", scopes: [] }],
     },
+    declaredManifest: null,
   };
   componentReleaseFixtures.bitbucket = {
     pluginId: "bitbucket",
@@ -1514,6 +1621,7 @@ test("rendering both in sequence never leaks one's profile into the other's page
       domains: ["api.bitbucket.org"],
       oauthProfiles: [{ id: "bitbucket-cloud", scopes: [] }],
     },
+    declaredManifest: null,
   };
 
   const first = render(<PluginDetailView id="atlassian" />);
