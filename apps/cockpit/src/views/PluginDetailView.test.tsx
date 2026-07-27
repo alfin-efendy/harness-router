@@ -623,12 +623,21 @@ type ReleaseDetailFixture = {
     // this file stays valid without adding `tools: []` to each one.
     tools?: { name: string; description: string; writes: boolean }[];
   } | null;
+  declaredManifest: {
+    publisher: string;
+    description: string;
+    lifecycle: string;
+    domains: string[];
+    oauthProfiles: { id: string; scopes: string[] }[];
+    tools?: { name: string; description: string; writes: boolean }[];
+  } | null;
 };
 const emptyReleaseDetail = (id: string): ReleaseDetailFixture => ({
   pluginId: id,
   releases: [],
   activeVersion: null,
   activeManifest: null,
+  declaredManifest: null,
 });
 function releaseInfo(over: Partial<ReleaseInfoFixture> = {}): ReleaseInfoFixture {
   return {
@@ -1006,6 +1015,7 @@ test("a component's declared manifest tools render as the pre-install Tools tab 
       oauthProfiles: [],
       tools: [{ name: "jira_search", description: "Search Jira issues", writes: false }],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="atlassian" />);
   await screen.findByText("atlassian");
@@ -1310,6 +1320,7 @@ test("the permission summary renders the active release's publisher, lifecycle, 
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [{ id: "github", scopes: ["repo", "read:user"] }],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1342,6 +1353,7 @@ test("Update to latest is DISABLED until the permission-acceptance switch is tog
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1376,6 +1388,7 @@ test("exactly one release shows the Active badge among several (one-active-versi
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1399,6 +1412,7 @@ test("rolling back to a prior good version dispatches rollbackComponentPlugin wi
       domains: ["api.xiaomimimo.com"],
       oauthProfiles: [],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1417,6 +1431,7 @@ test("a revoked release offers no Roll back action, and the active release offer
       releaseInfo({ version: "0.2.0", active: true }),
     ],
     activeManifest: null,
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1433,6 +1448,7 @@ test("a third-party (non-first-party) release is labeled distinctly from a first
     activeVersion: "0.2.0",
     releases: [releaseInfo({ version: "0.2.0", active: true, firstParty: false, signingKeyId: "some-other-key" })],
     activeManifest: null,
+    declaredManifest: null,
   };
   render(<PluginDetailView id="mimo" />);
   await screen.findByText("mimo");
@@ -1462,6 +1478,7 @@ test("atlassian's detail page shows only its own atlassian-cloud profile, never 
       domains: ["api.atlassian.com", "auth.atlassian.com"],
       oauthProfiles: [{ id: "atlassian-cloud", scopes: ["read:jira-work", "write:jira-work"] }],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="atlassian" />);
   await screen.findByText("atlassian");
@@ -1482,6 +1499,7 @@ test("bitbucket's detail page shows only its own bitbucket-cloud profile, never 
       domains: ["api.bitbucket.org", "bitbucket.org"],
       oauthProfiles: [{ id: "bitbucket-cloud", scopes: ["account", "repository"] }],
     },
+    declaredManifest: null,
   };
   render(<PluginDetailView id="bitbucket" />);
   await screen.findByText("bitbucket");
@@ -1502,6 +1520,7 @@ test("rendering both in sequence never leaks one's profile into the other's page
       domains: ["api.atlassian.com"],
       oauthProfiles: [{ id: "atlassian-cloud", scopes: [] }],
     },
+    declaredManifest: null,
   };
   componentReleaseFixtures.bitbucket = {
     pluginId: "bitbucket",
@@ -1514,6 +1533,7 @@ test("rendering both in sequence never leaks one's profile into the other's page
       domains: ["api.bitbucket.org"],
       oauthProfiles: [{ id: "bitbucket-cloud", scopes: [] }],
     },
+    declaredManifest: null,
   };
 
   const first = render(<PluginDetailView id="atlassian" />);
