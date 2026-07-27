@@ -1336,6 +1336,34 @@ test("the permission summary shows declared permissions pre-install, labeled as 
   ).toBeGreaterThan(0);
 });
 
+// Versions-tab (ComponentReleaseCard) fallback: declared permissions render
+// for a never-installed component, even when there's no active release.
+test("the permission summary shows declared permissions in the Versions tab pre-install", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: null,
+    releases: [],
+    activeManifest: null,
+    declaredManifest: {
+      publisher: "Ryuzi",
+      description: "Xiaomi MiMo free-tier chat provider.",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  fireEvent.click(screen.getByRole("button", { name: "Versions" }));
+  const panel = within(screen.getByTestId("tab-panel-versions"));
+
+  expect(panel.queryByText(/Unknown until a release is fetched/)).toBeNull();
+  expect(panel.getByText("Ryuzi")).toBeTruthy();
+  expect(panel.getByText("api.xiaomimimo.com")).toBeTruthy();
+  expect(panel.getByText("As declared by the bundled manifest — verified against its signature at install.")).toBeTruthy();
+});
+
 test("the permission summary renders the active release's publisher, lifecycle, domains, and OAuth profiles", async () => {
   mimoReleaseFixture = {
     pluginId: "mimo",
