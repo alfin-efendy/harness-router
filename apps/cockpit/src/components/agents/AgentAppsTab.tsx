@@ -18,6 +18,14 @@ function providerOf(id: string): string {
   return dot === -1 ? id : id.slice(0, dot);
 }
 
+// Plugin kinds that are configuration noise for an agent: model providers
+// and the built-in runtime ("Ryuzi") expose no agent-facing tools. Hidden
+// from the flat Plugins section UNLESS the profile already has the id
+// enabled — a previously-toggled row must stay visible so it can be turned
+// off (nothing is ever silently locked on). Profile validation still sees
+// the full catalog, so no agent flips to Invalid because of this filter.
+const HIDDEN_PLUGIN_KINDS = new Set(["provider", "runtime"]);
+
 type ToolRowProps = {
   tool: CatalogEntryInfo;
   on: boolean;
@@ -94,7 +102,7 @@ export function AgentAppsTab({ detail }: { detail: AgentDetailInfo }) {
   const knownToolIds = new Set(catalog.pluginTools.map((entry) => entry.id));
   for (const id of detail.pluginTools) {
     if (knownToolIds.has(id)) continue;
-    addTool({ id, label: id, description: "", available: false, commandScoped: false, pack: null });
+    addTool({ id, label: id, description: "", available: false, commandScoped: false, pack: null, kind: null });
   }
 
   const appById = new Map(catalog.apps.map((app) => [app.id, app]));
@@ -106,7 +114,8 @@ export function AgentAppsTab({ detail }: { detail: AgentDetailInfo }) {
   const appIdSet = new Set(appIds);
   const flatTools = Array.from(toolsByProvider.entries())
     .filter(([provider]) => !appIdSet.has(provider))
-    .flatMap(([, entries]) => entries);
+    .flatMap(([, entries]) => entries)
+    .filter((entry) => !HIDDEN_PLUGIN_KINDS.has(entry.kind ?? "") || detail.pluginTools.includes(entry.id));
 
   const setAppEnabled = (id: string, on: boolean) => {
     // Read the store directly rather than closing over the `saving` prop —

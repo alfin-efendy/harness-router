@@ -102,6 +102,8 @@ const { AgentsView } = await import("./AgentsView");
 const { useAgents } = await import("@/store-agents");
 const { useNav } = await import("@/store-nav");
 
+const originalFetch = globalThis.fetch;
+
 function seedAgents() {
   useAgents.setState({
     registry: registry(),
@@ -124,10 +126,18 @@ beforeEach(() => {
   updateSubagentModel.mockClear();
   getAgentStatsBatch.mockClear();
   getAgentStatsBatch.mockImplementation(async () => ({ status: "ok" as const, data: {} }));
+  // The editor modal fetches the bundled-pet roster for its avatar prefill;
+  // an EMPTY roster keeps the prefill inert so the strict create-payload
+  // assertion below (avatarPet: null) stays deterministic.
+  __resetBundledPetsCacheForTests();
+  globalThis.fetch = mock(() => Promise.resolve({ ok: true, json: () => Promise.resolve([]) } as Response)) as unknown as typeof fetch;
   seedAgents();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  globalThis.fetch = originalFetch;
+});
 
 test("management flow creates through the generated command store and opens detail", async () => {
   useAgents.setState({ registry: { ...registry(), agents: [ryuzi] } });
@@ -279,4 +289,9 @@ test("a rejected stats batch load never crashes the roster render and leaves row
   await waitFor(() => expect(getAgentStatsBatch).toHaveBeenCalled());
   expect(screen.getByText("Reviews implementation quality and regressions.")).toBeTruthy();
   expect(screen.queryByText(/sessions ·/)).toBeNull();
+});
+
+test("no list row has an actions menu — Start chat/Duplicate/Delete live on the detail page", () => {
+  render(<AgentsView />);
+  expect(screen.queryByRole("button", { name: /^Actions for/ })).toBeNull();
 });

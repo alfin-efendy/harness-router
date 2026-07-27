@@ -41,7 +41,7 @@ export function AgentMentionMenu({
         <MenuPanelSection>Agents</MenuPanelSection>
         {agents.map((agent, index) => (
           <MenuPanelItem key={agent.id} selected={index === activeIndex} onClick={() => onPick(agent)} className="font-medium">
-            <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: agent.avatarColor }} />
+            <span className="size-2.5 shrink-0 rounded-full bg-muted-foreground/40" />
             <span className="min-w-0 flex-1 truncate">{agent.name}</span>
           </MenuPanelItem>
         ))}

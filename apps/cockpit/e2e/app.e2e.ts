@@ -638,7 +638,9 @@ test("agents: manage a non-default agent and start a chat session for it", async
   await expect(page.getByText("Sub Agent", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Open Fresh Agent" })).toBeVisible();
   await expect(page.getByText("Built-in", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Actions for Fresh Agent" })).toHaveCount(0);
+  // No list row has a "..." actions menu anymore — Start chat/Duplicate/
+  // Delete are reached through the detail header's menu only.
+  await expect(page.getByRole("button", { name: /^Actions for/ })).toHaveCount(0);
 
   // Fresh Agent detail: no editable identity/tabs, just the shared subagent
   // model editor (Task 8's model-only builtin branch).
@@ -646,14 +648,14 @@ test("agents: manage a non-default agent and start a chat session for it", async
   await expect(page.getByRole("heading", { name: "Fresh Agent" })).toBeVisible();
   await expect(page.getByTestId("agent-detail-tabs")).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "Agent model" })).toBeVisible();
-  // PR3 Task 8: the Fresh Agent's pet is hardcoded (FRESH_AGENT_PET =
+  // PR3 Task 8: the Fresh Agent's avatar is hardcoded (FRESH_AGENT_PET =
   // "sprout" in both agent_api.rs and lib/pet-sprite.ts, mirrored on
   // FRESH_AGENT.avatarPet in mock-ipc.ts) and rendered plain — the builtin
-  // detail branch has no "Change pet" button wrapping the avatar at all
+  // detail branch has no "Change avatar" button wrapping the avatar at all
   // (unlike a real agent's header below), since nothing about the Fresh
   // Agent's identity is editable.
   await expect(page.getByTestId("pet-sprite")).toBeVisible();
-  await expect(page.getByRole("button", { name: /Change .* pet/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Change .* avatar/ })).toHaveCount(0);
   // Scoped to "main": the app shell has its own unrelated "Back" control
   // elsewhere in the layout with the same accessible name.
   await page.getByRole("main").getByRole("button", { name: "Back" }).click();
@@ -674,7 +676,17 @@ test("agents: manage a non-default agent and start a chat session for it", async
   }
   await expect(readFileRow.getByRole("button", { name: "Allow", exact: true })).toHaveAttribute("aria-pressed", "true");
 
-  // Only the action menu drives "Start chat" — no separate start button.
+  // Apps & MCP: the fixture's provider ("Anthropic") and runtime ("Ryuzi")
+  // plugin entries are filtered out of the tab — with no MCP apps either,
+  // only the empty state remains.
+  await tabs.getByRole("button", { name: "Apps & MCP", exact: true }).click();
+  await expect(page.getByText("No apps available.")).toBeVisible();
+  await expect(page.getByTestId("plugins-section")).toHaveCount(0);
+  await expect(page.getByText("Anthropic", { exact: true })).toHaveCount(0);
+  await tabs.getByRole("button", { name: "Permissions", exact: true }).click();
+
+  // Only the DETAIL header's action menu drives "Start chat" — the list rows
+  // have no menu and there is no separate start button.
   await page.getByRole("button", { name: "Actions for Reviewer" }).click();
   await page.getByTestId("agent-actions-panel").getByRole("button", { name: "Start chat" }).click();
   await expect(page.getByRole("heading", { name: /What should we build/ })).toBeVisible();
@@ -721,7 +733,7 @@ test("agents: roster rows render pet avatars and lazy-loaded stats", async ({ pa
   await page.goto("/");
   await page.getByText("Agents", { exact: true }).first().click();
 
-  // Ryuzi (RYUZI_AGENT.avatarPet = "tennis-ball", a real bundled slug)
+  // Ryuzi (RYUZI_AGENT.avatarPet = "cloudlet", a real bundled slug)
   // renders a PetSprite in its row, not the plain color tile.
   const ryuziRow = page.getByRole("button", { name: "Open Ryuzi" });
   await expect(ryuziRow.getByTestId("pet-sprite")).toBeVisible();

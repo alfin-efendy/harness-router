@@ -1737,6 +1737,10 @@ pub struct CatalogEntryInfo {
     /// a standalone (not pack-installed) skill — the frontend groups `None`
     /// entries under a synthetic "Standalone" heading.
     pub pack: Option<String>,
+    /// Plugin-tool entries only: the plugin's coarse kind — see
+    /// [`crate::agents::catalog::CatalogEntry::kind`]. `None` for skills,
+    /// native tools, and apps.
+    pub kind: Option<String>,
 }
 
 impl From<crate::agents::catalog::CatalogEntry> for CatalogEntryInfo {
@@ -1748,6 +1752,7 @@ impl From<crate::agents::catalog::CatalogEntry> for CatalogEntryInfo {
             available: entry.available,
             command_scoped: entry.command_scoped,
             pack: entry.pack,
+            kind: entry.kind,
         }
     }
 }

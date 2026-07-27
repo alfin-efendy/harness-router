@@ -1,16 +1,16 @@
 import { Bot } from "lucide-react";
 import { useBundledPetSlugs } from "@/lib/bundled-pets";
-import type { PetPose } from "@/lib/pet-sprite";
+import { NEUTRAL_AVATAR_COLOR, type PetPose } from "@/lib/pet-sprite";
 import { PetSprite } from "./PetSprite";
-
-const FALLBACK_COLOR = "#6b7280";
 
 // Same "only pay for the bundled-pet lookup when there's a pet" split as
 // AgentAvatar's PetTile — see that file's comment for the transient
 // bundled-ness caveat, which applies here too.
 function PetGlyph({ pet, pose, size, animate }: { pet: string; pose?: PetPose; size: number; animate?: boolean }) {
   const bundledSlugs = useBundledPetSlugs();
-  return <PetSprite slug={pet} bundled={bundledSlugs.has(pet)} size={size} pose={pose} animate={animate} fallbackColor={FALLBACK_COLOR} />;
+  return (
+    <PetSprite slug={pet} bundled={bundledSlugs.has(pet)} size={size} pose={pose} animate={animate} fallbackColor={NEUTRAL_AVATAR_COLOR} />
+  );
 }
 
 export type AgentGlyphProps = {

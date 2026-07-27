@@ -290,6 +290,33 @@ pub fn install_providers(regs: &mut Registries) {
     }
 }
 
+/// Coarse plugin classification shared by the plugins list
+/// (`api::plugins_api::derive_kind`) and the agent configuration catalog
+/// (`agents::catalog::build_live_catalog`). Priority order matters: a
+/// provider manifest wins over runtime meta (ollama is both), and a
+/// skill-pack source wins over connector shape.
+pub fn plugin_kind(plugin: &CorePlugin) -> &'static str {
+    if plugin.manifest.provider.is_some() {
+        return "provider";
+    }
+    if plugin.harness.is_some() {
+        return "runtime";
+    }
+    if matches!(plugin.source, PluginSource::SkillPack(_)) {
+        return "skill-pack";
+    }
+    if plugin.gateway.is_some()
+        || plugin
+            .manifest
+            .categories
+            .iter()
+            .any(|category| category == "chat-gateway")
+    {
+        return "gateway";
+    }
+    "integration"
+}
+
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) plus the first-party component catalog
 /// ([`component_catalog::component_catalog_plugins`]) — to `regs`.
@@ -1534,5 +1561,25 @@ mod install_builtins_tests {
             "install_builtins silently dropped a colliding id instead of staying disjoint \
              from the native builtin"
         );
+    }
+
+    #[test]
+    fn plugin_kind_classifies_providers_runtime_and_components() {
+        let provider = providers::provider_plugins()
+            .into_iter()
+            .next()
+            .expect("at least one provider plugin");
+        assert_eq!(plugin_kind(&provider), "provider");
+        assert_eq!(
+            plugin_kind(&crate::harness::native::native_plugin()),
+            "runtime"
+        );
+        for component in component_catalog::component_catalog_plugins() {
+            assert!(
+                matches!(plugin_kind(&component), "integration" | "gateway"),
+                "unexpected kind for {}",
+                component.manifest.id
+            );
+        }
     }
 }

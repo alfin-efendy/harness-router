@@ -5,6 +5,7 @@ import { useStore } from "@/store";
 import { buildTranscript, closeDanglingFence, formatTurnDuration, liveTurnStartMs, type Row, type RowAttachment } from "@/lib/transcript";
 import { useNow } from "@/hooks/useNow";
 import { mediaKindForContentType } from "@/lib/attachments";
+import { NEUTRAL_AVATAR_COLOR } from "@/lib/pet-sprite";
 import { distanceFromBottom, isStuck, pinningInterrupted, showScrollFab } from "@/lib/scroll";
 import { Markdown } from "./Markdown";
 import { ThoughtBlock } from "./ThoughtBlock";
@@ -160,7 +161,6 @@ export function Transcript({
   runnerId,
   sessionPk,
   rows,
-  agentColor,
   running,
   ownerRunId,
   children,
@@ -169,7 +169,6 @@ export function Transcript({
   runnerId: string;
   sessionPk: string;
   rows: Row[];
-  agentColor: string;
   running: boolean;
   ownerRunId: string | null;
   children?: ReactNode;
@@ -312,7 +311,7 @@ export function Transcript({
                   return null;
               }
             })}
-            {running && <WorkingPulse color={agentColor} startedAt={liveStart} />}
+            {running && <WorkingPulse color={NEUTRAL_AVATAR_COLOR} startedAt={liveStart} />}
             {approvals.map((approval, index) => (
               <div key={`${approval.runnerId}:${approval.runId}:${approval.requestId}`} className="px-4 pb-2">
                 <ApprovalCard approval={approval} hotkey={index === approvals.length - 1} />

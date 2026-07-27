@@ -76,23 +76,16 @@ test("search filters the bundled grid", async () => {
   render(<PetPicker open onClose={() => {}} onSelect={() => {}} currentPet={null} />);
   await awaitBundledGridReady();
 
-  fireEvent.change(screen.getByRole("textbox", { name: "Search pets" }), { target: { value: "box" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Search avatars" }), { target: { value: "box" } });
 
   expect(screen.getByText("Boxcat")).toBeTruthy();
   expect(screen.queryByText("Sprout")).toBeNull();
 });
 
-test("Clear (use color) only appears with a current pet, and reports null", async () => {
-  const onSelect = mock(() => {});
-  const onClose = mock(() => {});
-  const { rerender } = render(<PetPicker open onClose={onClose} onSelect={onSelect} currentPet={null} />);
+test("no clear affordance exists even with a current avatar — avatars can be changed, not removed", async () => {
+  render(<PetPicker open onClose={() => {}} onSelect={() => {}} currentPet="sprout" />);
   await awaitBundledGridReady();
-  expect(screen.queryByRole("button", { name: "Clear (use color)" })).toBeNull();
-
-  rerender(<PetPicker open onClose={onClose} onSelect={onSelect} currentPet="sprout" />);
-  fireEvent.click(screen.getByRole("button", { name: "Clear (use color)" }));
-  expect(onSelect).toHaveBeenCalledWith(null);
-  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("button", { name: /Clear/ })).toBeNull();
 });
 
 test("Browse petdex.dev is lazy: listPetManifest only fires once expanded", async () => {
@@ -122,7 +115,7 @@ test("search also filters browsed entries, excluding slugs already offered in th
   await waitFor(() => expect(screen.getAllByText("Paperclip")).toHaveLength(1));
   expect(screen.getAllByText("Sprout")).toHaveLength(1); // only the bundled-grid tile
 
-  fireEvent.change(screen.getByRole("textbox", { name: "Search pets" }), { target: { value: "paper" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Search avatars" }), { target: { value: "paper" } });
   expect(screen.getByText("Paperclip")).toBeTruthy();
   expect(screen.queryByText("Sprout")).toBeNull();
 });
@@ -149,17 +142,30 @@ test("downloading a browsed entry makes it selectable, then reports its slug on 
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test("a manifest load failure shows a retry affordance", async () => {
-  listPetManifest.mockResolvedValueOnce({ status: "error", error: { message: "petdex.dev unreachable" } });
+test("a manifest load failure shows the backend detail and a retry affordance", async () => {
+  listPetManifest.mockResolvedValueOnce({ status: "error", error: { message: "pet manifest fetch failed: HTTP 502" } });
   render(<PetPicker open onClose={() => {}} onSelect={() => {}} currentPet={null} />);
   await awaitBundledGridReady();
   fireEvent.click(screen.getByRole("button", { name: "Browse petdex.dev" }));
 
   await screen.findByText("Couldn't load petdex.dev.");
+  expect(screen.getByText("pet manifest fetch failed: HTTP 502")).toBeTruthy();
+
   listPetManifest.mockResolvedValueOnce({ status: "ok", data: [manifestEntry()] });
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await screen.findByText("Paperclip");
   expect(listPetManifest).toHaveBeenCalledTimes(2);
+  expect(screen.queryByText("pet manifest fetch failed: HTTP 502")).toBeNull();
+});
+
+test("a thrown IPC error also surfaces its message", async () => {
+  listPetManifest.mockRejectedValueOnce(new Error("engine transport closed"));
+  render(<PetPicker open onClose={() => {}} onSelect={() => {}} currentPet={null} />);
+  await awaitBundledGridReady();
+  fireEvent.click(screen.getByRole("button", { name: "Browse petdex.dev" }));
+
+  await screen.findByText("Couldn't load petdex.dev.");
+  expect(screen.getByText("engine transport closed")).toBeTruthy();
 });
 
 test("caps visible browse results and hints at the remaining match count", async () => {

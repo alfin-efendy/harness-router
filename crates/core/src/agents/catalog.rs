@@ -30,6 +30,12 @@ pub struct CatalogEntry {
     /// this skill was installed as part of a multi-skill pack. `None` for
     /// every non-skill entry and for a standalone-installed skill.
     pub pack: Option<String>,
+    /// Plugin-tool entries only: the plugin's coarse kind
+    /// ([`crate::plugins::plugin_kind`] — "provider" | "runtime" |
+    /// "skill-pack" | "gateway" | "integration"), letting the frontend hide
+    /// provider/runtime rows from the Apps & MCP tab without touching
+    /// profile validation. `None` for skills, native tools, and apps.
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -136,6 +142,7 @@ pub async fn build_live_catalog(
             available: true,
             command_scoped: native_tool_is_command_scoped(id),
             pack: None,
+            kind: None,
         })
         .collect::<Vec<_>>();
 
@@ -157,6 +164,7 @@ pub async fn build_live_catalog(
             available: true,
             command_scoped: false,
             pack: None,
+            kind: Some(crate::plugins::plugin_kind(&plugin).to_string()),
         });
     }
 
@@ -170,6 +178,7 @@ pub async fn build_live_catalog(
             available: true,
             command_scoped: false,
             pack: None,
+            kind: None,
         })
         .collect::<Vec<_>>();
 
@@ -197,6 +206,7 @@ fn skill_catalog_entry(skill: crate::skills_install::InstalledSkillInfo) -> Cata
         available: true,
         command_scoped: false,
         pack,
+        kind: None,
     }
 }
 
@@ -298,6 +308,7 @@ pub fn native(id: &str, label: &str) -> CatalogEntry {
         available: true,
         command_scoped: false,
         pack: None,
+        kind: None,
     }
 }
 

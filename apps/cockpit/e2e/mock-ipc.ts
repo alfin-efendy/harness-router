@@ -325,18 +325,18 @@ export const PROVIDER_FAMILY_ROUTE_SELECTIONS = [
  * history journeys: Ryuzi (the executable default) and Reviewer (a second
  * executable agent used as a delegation target and, in the history journey,
  * a session owner deliberately absent from a narrower registry override). */
-// avatarPet fixtures (Task 8): Ryuzi carries a bundled pet slug so pet-aware
-// surfaces (roster row, detail header, PetSprite) have a real case to render;
-// Reviewer stays pet-less (`null`) so the plain-color-tile fallback (still
-// the majority case in real rosters) is exercised too. "tennis-ball" is a
-// real bundled slug (`public/pets/tennis-ball/`), distinct from the Fresh
-// Agent's own bundled pet below so the two never collide in assertions.
+// avatarPet fixtures: Ryuzi carries "cloudlet" — mirroring the backend's
+// DEFAULT_RYUZI_PET seed/backfill (crates/core/src/agents/bootstrap.rs) —
+// so pet-aware surfaces (roster row, detail header, PetSprite) render the
+// same avatar a real install shows. Reviewer stays pet-less (`null`) so the
+// neutral fallback tile is exercised too. "cloudlet" is a real bundled slug
+// (`public/pets/cloudlet/`), distinct from the Fresh Agent's own pet below.
 export const RYUZI_AGENT = {
   id: "ryuzi",
   name: "Ryuzi",
   description: "General-purpose coding agent",
   avatarColor: "violet",
-  avatarPet: "tennis-ball",
+  avatarPet: "cloudlet",
   model: { kind: "concrete", name: "fixture/model-alpha", effort: "high" },
   builtin: false,
   skillCount: 1,
@@ -562,6 +562,7 @@ export const AGENT_CONFIGURATION_CATALOG = {
       available: true,
       commandScoped: false,
       pack: null,
+      kind: null,
     },
     {
       id: "code-review",
@@ -570,14 +571,45 @@ export const AGENT_CONFIGURATION_CATALOG = {
       available: true,
       commandScoped: false,
       pack: null,
+      kind: null,
     },
   ],
   nativeTools: [
-    { id: "read_file", label: "Read file", description: "Read files from disk", available: true, commandScoped: false, pack: null },
-    { id: "grep", label: "Grep", description: "Search file contents", available: true, commandScoped: false, pack: null },
-    { id: "bash", label: "Bash", description: "Run shell commands", available: true, commandScoped: true, pack: null },
+    {
+      id: "read_file",
+      label: "Read file",
+      description: "Read files from disk",
+      available: true,
+      commandScoped: false,
+      pack: null,
+      kind: null,
+    },
+    { id: "grep", label: "Grep", description: "Search file contents", available: true, commandScoped: false, pack: null, kind: null },
+    { id: "bash", label: "Bash", description: "Run shell commands", available: true, commandScoped: true, pack: null, kind: null },
   ],
-  pluginTools: [],
+  // Hidden kinds only (provider/runtime): the Apps & MCP tab must not list
+  // these, and nothing in the fixtures enables them — so the whole flat
+  // Plugins section stays absent and the tab shows its empty state.
+  pluginTools: [
+    {
+      id: "native",
+      label: "Ryuzi",
+      description: "Built-in agent runtime",
+      available: true,
+      commandScoped: false,
+      pack: null,
+      kind: "runtime",
+    },
+    {
+      id: "anthropic",
+      label: "Anthropic",
+      description: "Model provider",
+      available: true,
+      commandScoped: false,
+      pack: null,
+      kind: "provider",
+    },
+  ],
   apps: [],
 } satisfies AgentConfigurationCatalogInfo;
 

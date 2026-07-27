@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { __resetBundledPetsCacheForTests } from "@/lib/bundled-pets";
+import { NEUTRAL_AVATAR_COLOR } from "@/lib/pet-sprite";
 
 // AgentAvatar's pet branch reaches PetSprite (which calls
 // `commands.getPetSprite` for non-bundled slugs) — narrow mock per the
@@ -27,16 +28,16 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-test("a null pet renders the plain color tile and never touches the bundled-pet fetch", () => {
+test("a null pet renders the neutral Bot fallback tile and never touches the bundled-pet fetch", () => {
   const fetchSpy = mock(() => Promise.resolve(jsonResponse([])));
   globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
-  render(<AgentAvatar pet={null} colorHex="#8B5CF6" size={36} />);
+  render(<AgentAvatar pet={null} size={36} />);
 
   const tile = screen.getByTestId("agent-avatar-color-tile");
-  expect(tile.style.backgroundColor).toBe("#8B5CF6");
   expect(tile.style.width).toBe("36px");
   expect(tile.style.height).toBe("36px");
+  expect(tile.querySelector("svg")).toBeTruthy(); // the Bot icon
   expect(screen.queryByTestId("pet-sprite")).toBeNull();
   expect(screen.queryByTestId("pet-sprite-fallback")).toBeNull();
   expect(fetchSpy).not.toHaveBeenCalled();
@@ -47,7 +48,7 @@ test("a bundled pet settles on PetSprite's bundled asset URL once /pets/index.js
     Promise.resolve(jsonResponse([{ slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." }])),
   ) as unknown as typeof fetch;
 
-  render(<AgentAvatar pet="sprout" colorHex="#8B5CF6" size={32} />);
+  render(<AgentAvatar pet="sprout" size={32} />);
 
   // Bundled-ness resolves asynchronously (the same /pets/index.json fetch),
   // so the very first render before it resolves may briefly treat the pet
@@ -65,19 +66,19 @@ test("a downloaded (non-bundled) pet resolves through commands.getPetSprite", as
   // the same bun test run, so reusing that slug here would let this test's
   // resolution satisfy that file's `getPetSprite` call-count assertion for
   // free (or vice versa, depending on run order).
-  render(<AgentAvatar pet="agent-avatar-fixture-pet" colorHex="#F43F5E" size={32} />);
+  render(<AgentAvatar pet="agent-avatar-fixture-pet" size={32} />);
 
   const sprite = await screen.findByTestId("pet-sprite");
   expect(sprite.style.backgroundImage).toContain("data:image/webp;base64,QUJD");
   expect(getPetSprite).toHaveBeenCalledWith("agent-avatar-fixture-pet");
 });
 
-test("a pet that resolves to nothing (neither bundled nor downloaded) falls back to the color tile", async () => {
+test("a pet that resolves to nothing falls back to the neutral sprite tile", async () => {
   globalThis.fetch = mock(() => Promise.resolve(jsonResponse([]))) as unknown as typeof fetch;
   getPetSprite.mockImplementation(async () => ({ status: "ok" as const, data: null }));
 
-  render(<AgentAvatar pet="avatar-unresolvable-fixture-pet" colorHex="#F43F5E" size={32} />);
+  render(<AgentAvatar pet="avatar-unresolvable-fixture-pet" size={32} />);
 
   await screen.findByTestId("pet-sprite-fallback");
-  expect(screen.getByTestId("pet-sprite-fallback").style.backgroundColor).toBe("#F43F5E");
+  expect(screen.getByTestId("pet-sprite-fallback").style.backgroundColor).toBe(NEUTRAL_AVATAR_COLOR);
 });

@@ -2191,7 +2191,13 @@ export type CatalogEntryInfo = { id: string; label: string; description: string;
  * a standalone (not pack-installed) skill — the frontend groups `None`
  * entries under a synthetic "Standalone" heading.
  */
-pack: string | null }
+pack: string | null;
+/**
+ * Plugin-tool entries only: the plugin's coarse kind — see
+ * [`crate::agents::catalog::CatalogEntry::kind`]. `None` for skills,
+ * native tools, and apps.
+ */
+kind: string | null }
 /**
  * `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
  * `catalog_feed_state` row plus counts from the cached

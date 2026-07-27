@@ -2,21 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Plus } from "lucide-react";
 import { Badge, Button, SettingsCard, cn } from "@ryuzi/ui";
 import type { AgentModelInfo, AgentSummaryInfo } from "@/bindings";
-import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
 import { AgentAvatar } from "@/components/agents/AgentAvatar";
 import { AgentEditorModal } from "@/components/agents/AgentEditorModal";
 import { statsRowFragment } from "@/lib/agent-stats";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
-
-const AVATAR_COLORS: Record<string, string> = {
-  violet: "#8B5CF6",
-  blue: "#3B82F6",
-  cyan: "#06B6D4",
-  emerald: "#10B981",
-  amber: "#F59E0B",
-  rose: "#F43F5E",
-};
 
 function modelValue(model: AgentModelInfo): string {
   return model.kind === "route" ? model.route : model.name;
@@ -33,8 +23,9 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
   // never included in that batch, so it never has a fragment to show.
   const stats = useAgents((s) => (agent.builtin ? undefined : s.statsByAgent[agent.id]));
   // Built-in rows (the synthetic Fresh Agent) are non-editable: dashed frame,
-  // "Built-in" badge, no validation surface, and no actions menu. They still
-  // open a detail page like every other row.
+  // "Built-in" badge, no validation surface. No row carries an actions menu —
+  // Start chat/Duplicate/Delete live on the detail header (AgentActionsMenu
+  // in AgentDetailView). Every row opens a detail page on click.
   return (
     <SettingsCard className={cn("flex h-[92px] items-stretch", agent.builtin && "border-dashed")}>
       <Button
@@ -44,7 +35,7 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
         onClick={() => nav.navigate({ kind: "agentDetail", agentId: agent.id })}
         className="h-full min-w-0 flex-1 justify-start gap-3 rounded-none px-[18px] text-left font-normal hover:bg-accent/50"
       >
-        <AgentAvatar pet={agent.avatarPet} colorHex={AVATAR_COLORS[agent.avatarColor] ?? agent.avatarColor} size={36} />
+        <AgentAvatar pet={agent.avatarPet} size={36} />
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
             <span className="truncate text-[13.5px] font-semibold text-foreground">{agent.name}</span>
@@ -68,11 +59,6 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
         </span>
         <ChevronRight aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
       </Button>
-      {!agent.builtin && (
-        <span className="flex w-12 shrink-0 items-center justify-center border-l border-border">
-          <AgentActionsMenu agent={agent} />
-        </span>
-      )}
     </SettingsCard>
   );
 }

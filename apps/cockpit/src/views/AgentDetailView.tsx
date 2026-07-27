@@ -6,6 +6,7 @@ import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
 import { AgentAppsTab } from "@/components/agents/AgentAppsTab";
 import { AgentAvatar } from "@/components/agents/AgentAvatar";
 import { mutationFromDetail } from "@/components/agents/agentMutation";
+import { IdentityField } from "@/components/agents/IdentityField";
 import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
@@ -31,14 +32,6 @@ const TABS = [
   { id: "advanced", label: "Advanced" },
 ] as const;
 type Tab = (typeof TABS)[number]["id"];
-const COLORS: Record<string, string> = {
-  violet: "#8B5CF6",
-  blue: "#3B82F6",
-  cyan: "#06B6D4",
-  emerald: "#10B981",
-  amber: "#F59E0B",
-  rose: "#F43F5E",
-};
 
 function metric(value: number, singular: string, plural: string) {
   return `${value} ${value === 1 ? singular : plural}`;
@@ -98,7 +91,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             <Button variant="ghost" size="icon-sm" aria-label="Back" title="Back" onClick={nav.goBack} className="-ml-1 shrink-0">
               <ArrowLeft aria-hidden size={15} />
             </Button>
-            <AgentAvatar pet={summary.avatarPet} colorHex={COLORS[summary.avatarColor] ?? summary.avatarColor} size={32} />
+            <AgentAvatar pet={summary.avatarPet} size={32} />
             <div className="min-w-0 flex-1">
               <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
               <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
@@ -137,15 +130,28 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
           </Button>
           <button
             type="button"
-            aria-label={`Change ${summary.name}'s pet`}
+            aria-label={`Change ${summary.name}'s avatar`}
             onClick={() => setPetPickerOpen(true)}
             className="shrink-0 rounded-lg focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           >
-            <AgentAvatar pet={summary.avatarPet} colorHex={COLORS[summary.avatarColor] ?? summary.avatarColor} size={32} />
+            <AgentAvatar pet={summary.avatarPet} size={32} />
           </button>
           <div className="min-w-0 flex-1">
-            <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
-            <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
+            {/* Heading semantics live here (visually hidden): the editable
+                IdentityField inputs below cannot be headings themselves. */}
+            <h2 className="sr-only">{summary.name}</h2>
+            <IdentityField
+              value={summary.name}
+              ariaLabel="Agent name"
+              className="text-lg font-semibold"
+              commit={(name) => void useAgents.getState().update(summary.id, { ...mutationFromDetail(detail), name })}
+            />
+            <IdentityField
+              value={summary.description}
+              ariaLabel="Agent description"
+              className="text-[11px] text-muted-foreground"
+              commit={(description) => void useAgents.getState().update(summary.id, { ...mutationFromDetail(detail), description })}
+            />
           </div>
           {summary.isDefault ? <Badge variant="secondary">Default</Badge> : null}
           <Badge variant={summary.executable ? "outline" : "destructive"}>

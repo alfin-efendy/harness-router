@@ -416,6 +416,33 @@ impl AgentRegistry {
             .expect("committed updated agent"))
     }
 
+    /// One-time bootstrap backfill for the seeded built-in `ryuzi` profile:
+    /// sets its avatar pet to `slug` when none is configured. A no-op when
+    /// the id is absent (UUID-seeded installs) or a pet is already set.
+    /// Only the avatar changes — the profile is otherwise committed as-is,
+    /// and `AgentAvatar::pet` is free-form (no catalog validation on write).
+    pub async fn backfill_ryuzi_pet(&self, slug: &str) -> Result<(), AgentRegistryError> {
+        let _guard = self.mutations.lock().await;
+        let state = self.state.read().await.clone();
+        let needs_backfill = state
+            .agents
+            .get("ryuzi")
+            .is_some_and(|agent| agent.profile.avatar.pet.is_none());
+        if !needs_backfill {
+            return Ok(());
+        }
+        let mut profiles = typed_profiles(&state);
+        profiles.get_mut("ryuzi").expect("checked above").avatar.pet = Some(slug.to_owned());
+        self.commit_candidate(
+            state.index.clone(),
+            profiles,
+            state.subagents.clone(),
+            Vec::new(),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn duplicate(&self, agent_id: &str) -> Result<AgentSnapshot, AgentRegistryError> {
         let _guard = self.mutations.lock().await;
         let state = self.state.read().await.clone();
@@ -2155,5 +2182,79 @@ mod tests {
         assert_eq!(updated.profile.name, "Ryuzi Updated");
         assert_ne!(registry.snapshot().await, before);
         assert_eq!(registry.config_root, fixture.config_root());
+    }
+
+    #[tokio::test]
+    async fn backfill_ryuzi_pet_sets_a_missing_pet_and_persists_it() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        registry.backfill_ryuzi_pet("cloudlet").await.unwrap();
+        let snapshot = registry.snapshot().await;
+        assert_eq!(
+            snapshot.agents[0].profile.avatar.pet.as_deref(),
+            Some("cloudlet")
+        );
+        // Committed to disk, not just in-memory: a fresh load sees it too.
+        let reloaded = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.snapshot().await.agents[0]
+                .profile
+                .avatar
+                .pet
+                .as_deref(),
+            Some("cloudlet")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_ryuzi_pet_never_overwrites_and_ignores_foreign_ids() {
+        // An already-set pet stays untouched.
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(
+            profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high")).replace(
+                "avatar: { color: violet }",
+                "avatar: { color: violet, pet: boxcat }",
+            ),
+        );
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        registry.backfill_ryuzi_pet("cloudlet").await.unwrap();
+        assert_eq!(
+            registry.snapshot().await.agents[0]
+                .profile
+                .avatar
+                .pet
+                .as_deref(),
+            Some("boxcat")
+        );
+
+        // No `ryuzi` id at all (UUID-seeded install) → clean no-op.
+        let other = RegistryFixture::new().await;
+        other.write_index(&["agent-123"], "agent-123");
+        other.write_profile(
+            "agent-123",
+            profile_yaml(
+                "agent-123",
+                "Ryuzi",
+                "anthropic/claude-opus-4-8",
+                Some("high"),
+            ),
+        );
+        let registry = AgentRegistry::load(other.config_root(), other.store.clone())
+            .await
+            .unwrap();
+        registry.backfill_ryuzi_pet("cloudlet").await.unwrap();
+        assert_eq!(registry.snapshot().await.agents[0].profile.avatar.pet, None);
     }
 }
