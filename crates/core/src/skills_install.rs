@@ -66,6 +66,21 @@ pub struct InstalledSkillInfo {
     pub skill_count: usize,
 }
 
+/// One agent-catalog row per installed skill (PR-2 fix D). `pack` carries the
+/// owning pack's display name for plugin-installed packs, `None` for
+/// standalone skills — the frontend groups by it. `skill_name` is the SKILL.md
+/// frontmatter name, i.e. the exact string the runtime's by-name matching
+/// (`skill_guidance`, `global_skill_listed`) compares against — unlike
+/// [`InstalledSkillInfo`]'s `id`/pack-level grouping (still used by the hub
+/// RPC, `list_installed_skills`), which collapses a whole pack to one row
+/// keyed by an id nothing at runtime matches by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSkillCatalogRow {
+    pub skill_name: String,
+    pub label: String,
+    pub pack: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SkillInstallProvenance {
     source: String,
@@ -232,6 +247,32 @@ pub fn skills_root() -> Result<PathBuf> {
 pub fn list_installed_skills() -> Result<Vec<InstalledSkillInfo>> {
     let roots = InstallRoots::for_user()?;
     list_installed_skills_in(&roots)
+}
+
+/// One agent-catalog row per installed skill (PR-2 fix D) — feeds
+/// `crate::agents::catalog::build_live_catalog`'s skills source. Unlike
+/// `list_installed_skills` (kept as-is for the hub RPC), a multi-skill pack
+/// contributes one row per member skill instead of collapsing to a single
+/// pack-level row.
+pub fn list_installed_skill_catalog_rows() -> Result<Vec<InstalledSkillCatalogRow>> {
+    let roots = InstallRoots::for_user()?;
+    list_installed_skill_catalog_rows_in(&roots)
+}
+
+/// PR-2 fix E compat shim: profiles written before per-skill binding stored
+/// the PACK id in `skills` (the only id the old collapsed catalog row
+/// offered). Expand any bound element that equals an installed pack id to
+/// that pack's member skill names; anything else (an already-per-skill
+/// binding, or a stale id naming neither) passes through untouched. Those
+/// legacy pack-id bindings matched nothing at runtime before (the runtime
+/// only ever compares by skill name), so expansion only ever adds what the
+/// user visibly toggled on — it can't newly grant something they didn't
+/// already ask for.
+pub fn expand_skill_bindings(bound: &[String]) -> Vec<String> {
+    match InstallRoots::for_user() {
+        Ok(roots) => expand_skill_bindings_in(&roots, bound),
+        Err(_) => bound.to_vec(),
+    }
 }
 
 /// One installed pack's full detail (including its individual
@@ -1279,6 +1320,37 @@ fn list_installed_skills_in(roots: &InstallRoots) -> Result<Vec<InstalledSkillIn
     Ok(infos)
 }
 
+fn list_installed_skill_catalog_rows_in(
+    roots: &InstallRoots,
+) -> Result<Vec<InstalledSkillCatalogRow>> {
+    let mut rows = Vec::new();
+    for pack in collect_installed_packs(roots)? {
+        let pack_label = pack.plugin_id.is_some().then(|| pack.name.clone());
+        for skill in &pack.skills {
+            rows.push(InstalledSkillCatalogRow {
+                skill_name: skill.name.clone(),
+                label: skill.name.clone(),
+                pack: pack_label.clone(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.pack.cmp(&b.pack).then(a.skill_name.cmp(&b.skill_name)));
+    Ok(rows)
+}
+
+fn expand_skill_bindings_in(roots: &InstallRoots, bound: &[String]) -> Vec<String> {
+    let packs = collect_installed_packs(roots).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for id in bound {
+        match packs.iter().find(|p| &p.id == id) {
+            Some(pack) => out.extend(pack.skills.iter().map(|s| s.name.clone())),
+            None => out.push(id.clone()),
+        }
+    }
+    out.dedup();
+    out
+}
+
 fn remove_installed_skill_in(roots: &InstallRoots, id: &str) -> Result<()> {
     read_installed_pack(roots, id)?;
     remove_all_artifacts_for_identity(roots, id)
@@ -2259,6 +2331,40 @@ mod tests {
         let dir = roots.skills_root.join(id);
         write_skill(&dir, name, "Installed skill", body);
         write_provenance(&dir.join(PROVENANCE_FILE), &provenance).unwrap();
+    }
+
+    /// Fixture for the per-skill catalog tests: a 2-skill plugin pack whose
+    /// plugin id is "superpack" and display name is "Superpack", with member
+    /// skills "alpha" and "beta". Materializes both the skills-root
+    /// provenance (`write_installed_skill`, same as a real
+    /// `install_plugin_pack` output) AND a real `ryuzi-plugin.toml` under
+    /// `plugins_root` so `plugin_display_name` resolves "Superpack" the same
+    /// way it would for a genuine install — a bare provenance stamp with no
+    /// manifest would fall back to the plugin id itself (see
+    /// `collect_installed_packs`'s `pack_name` resolution).
+    fn install_fixture_pack_superpack(roots: &InstallRoots) {
+        std::fs::create_dir_all(roots.plugins_root.join("superpack")).unwrap();
+        std::fs::write(
+            roots
+                .plugins_root
+                .join("superpack")
+                .join("ryuzi-plugin.toml"),
+            "contract = 1\nid = \"superpack\"\nname = \"Superpack\"\n",
+        )
+        .unwrap();
+        let provenance = SkillInstallProvenance {
+            source: "https://example.test/superpack".to_string(),
+            plugin_id: Some("superpack".to_string()),
+            installed_at: "2026-01-01T00:00:00.000Z".to_string(),
+        };
+        write_installed_skill(
+            roots,
+            "superpack--alpha",
+            "alpha",
+            "Alpha body.",
+            provenance.clone(),
+        );
+        write_installed_skill(roots, "superpack--beta", "beta", "Beta body.", provenance);
     }
 
     #[test]
@@ -4767,5 +4873,71 @@ events = ["tool.before"]
         // Don't leak this test's fixture into other parallel tests' view of
         // the (process-global) staging map.
         staging_map().lock().unwrap().remove(&keep_token);
+    }
+
+    // PR-2 fix D: a multi-skill pack yields one catalog row PER SKILL (keyed
+    // by SKILL.md frontmatter name), grouped under the pack's display name —
+    // not one collapsed row named after the pack.
+    #[test]
+    fn catalog_rows_list_each_skill_of_a_pack() {
+        let config = tempfile::tempdir().unwrap();
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        roots.ensure_exists().unwrap();
+        install_fixture_pack_superpack(&roots);
+
+        let rows = list_installed_skill_catalog_rows_in(&roots).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.skill_name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(rows.iter().all(|r| r.pack.as_deref() == Some("Superpack")));
+        assert!(
+            !names.contains(&"superpack"),
+            "the pack id itself is not a row"
+        );
+    }
+
+    // Regression guard for the standalone-skill half of PR-2 fix D (not one
+    // of the brief's two directive tests, added to replace the coverage lost
+    // by deleting `catalog.rs`'s `standalone_installed_skill_carries_no_pack_name`,
+    // which unit-tested the now-deleted `skill_catalog_entry` helper): a
+    // standalone (non-pack) installed skill still gets its own catalog row,
+    // with `pack: None`.
+    #[test]
+    fn catalog_rows_standalone_skill_carries_no_pack_name() {
+        let config = tempfile::tempdir().unwrap();
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        roots.ensure_exists().unwrap();
+        write_installed_skill(
+            &roots,
+            "requesting-code-review",
+            "requesting-code-review",
+            "Body.",
+            SkillInstallProvenance {
+                source: "https://example.test/requesting-code-review".to_string(),
+                plugin_id: None,
+                installed_at: "2026-01-01T00:00:00.000Z".to_string(),
+            },
+        );
+
+        let rows = list_installed_skill_catalog_rows_in(&roots).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].skill_name, "requesting-code-review");
+        assert_eq!(rows[0].pack, None);
+    }
+
+    // PR-2 fix E shim: a legacy binding that stored the PACK id expands to
+    // its member skill names; unknown ids pass through untouched.
+    #[test]
+    fn expand_skill_bindings_expands_pack_ids() {
+        let config = tempfile::tempdir().unwrap();
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        roots.ensure_exists().unwrap();
+        install_fixture_pack_superpack(&roots);
+
+        let out = expand_skill_bindings_in(&roots, &["superpack".into(), "gamma".into()]);
+        assert!(out.contains(&"alpha".to_string()));
+        assert!(out.contains(&"beta".to_string()));
+        assert!(out.contains(&"gamma".to_string()));
+        assert!(!out.contains(&"superpack".to_string()));
     }
 }

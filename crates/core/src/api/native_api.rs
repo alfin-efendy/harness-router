@@ -213,12 +213,15 @@ async fn slash_catalog_entries(
 }
 
 /// The durable primary agent's bound skill names (`profile.skills`), mirroring
-/// the harness adapter's `allowed_skills` mapping. `None` = no binding.
+/// the harness adapter's `allowed_skills` mapping (including the PR-2 fix E
+/// pack-id expansion shim — see `crate::skills_install::expand_skill_bindings`).
+/// `None` = no binding.
 async fn agent_allowed_skills(state: &ApiState, agent_id: Option<&str>) -> Option<Vec<String>> {
     let agent_id = agent_id?;
     let registry = state.agents.snapshot().await;
     let agent = registry.agents.iter().find(|a| a.profile.id == agent_id)?;
-    (!agent.profile.skills.is_empty()).then(|| agent.profile.skills.clone())
+    (!agent.profile.skills.is_empty())
+        .then(|| crate::skills_install::expand_skill_bindings(&agent.profile.skills))
 }
 
 fn slash_entry_info(entry: crate::harness::native::slash_catalog::SlashEntry) -> SlashEntryInfo {

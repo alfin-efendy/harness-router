@@ -144,7 +144,13 @@ fn adapt_primary_profile(
             can_delegate: false,
             builtin: false,
         },
-        allowed_skills: (!profile.skills.is_empty()).then(|| profile.skills.clone()),
+        // PR-2 fix E shim: a profile written before per-skill binding may
+        // still store a pack id here — expand it to that pack's member
+        // skill names (the exact strings the runtime matches skills by), so
+        // a legacy binding isn't silently inert. See
+        // `crate::skills_install::expand_skill_bindings`.
+        allowed_skills: (!profile.skills.is_empty())
+            .then(|| crate::skills_install::expand_skill_bindings(&profile.skills)),
     })
 }
 
