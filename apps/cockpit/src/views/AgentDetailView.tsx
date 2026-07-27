@@ -6,6 +6,7 @@ import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
 import { AgentAppsTab } from "@/components/agents/AgentAppsTab";
 import { AgentAvatar } from "@/components/agents/AgentAvatar";
 import { mutationFromDetail } from "@/components/agents/agentMutation";
+import { IdentityField } from "@/components/agents/IdentityField";
 import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
@@ -136,8 +137,18 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             <AgentAvatar pet={summary.avatarPet} size={32} />
           </button>
           <div className="min-w-0 flex-1">
-            <h2 className="m-0 truncate text-lg font-semibold">{summary.name}</h2>
-            <p className="m-0 truncate text-[11px] text-muted-foreground">{summary.description}</p>
+            <IdentityField
+              value={summary.name}
+              ariaLabel="Agent name"
+              className="text-lg font-semibold"
+              commit={(name) => void useAgents.getState().update(summary.id, { ...mutationFromDetail(detail), name })}
+            />
+            <IdentityField
+              value={summary.description}
+              ariaLabel="Agent description"
+              className="text-[11px] text-muted-foreground"
+              commit={(description) => void useAgents.getState().update(summary.id, { ...mutationFromDetail(detail), description })}
+            />
           </div>
           {summary.isDefault ? <Badge variant="secondary">Default</Badge> : null}
           <Badge variant={summary.executable ? "outline" : "destructive"}>

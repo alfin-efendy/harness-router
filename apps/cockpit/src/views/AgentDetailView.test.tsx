@@ -254,7 +254,7 @@ afterEach(cleanup);
 
 test("management flow inspects, duplicates, starts chat with, and deletes through the generated command store", async () => {
   const { unmount } = render(<AgentDetailView agentId="reviewer" />);
-  expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
+  expect((screen.getByRole("textbox", { name: "Agent name" }) as HTMLInputElement).value).toBe("Reviewer");
 
   fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer" }));
   fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
@@ -312,7 +312,7 @@ test("Advanced delete uses the same success-only detail navigation", async () =>
 test("detail has Back, identity, actions, seven tabs, and loaded overview stat cards", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
-  expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
+  expect((screen.getByRole("textbox", { name: "Agent name" }) as HTMLInputElement).value).toBe("Reviewer");
   expect(screen.getByRole("button", { name: "Actions for Reviewer" })).toBeTruthy();
   const tabs = screen.getByTestId("agent-detail-tabs");
   expect(
@@ -712,4 +712,61 @@ test("reselecting the Fresh Agent's current model or effort fires no updateSubag
   await waitFor(() => expect(updateSubagentModel).toHaveBeenCalledTimes(1));
   expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, { kind: "concrete", name: opusInfo.requestValue, effort: "max" });
   expect(updateAgent).not.toHaveBeenCalled();
+});
+
+test("header name edit commits the trimmed value on blur with the rest of the mutation preserved", async () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  const name = screen.getByRole("textbox", { name: "Agent name" });
+  fireEvent.focus(name);
+  fireEvent.change(name, { target: { value: "  Reviewer II  " } });
+  fireEvent.blur(name);
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "reviewer",
+      expect.objectContaining({
+        name: "Reviewer II",
+        description: "Reviews implementation quality.",
+        skills: ["requesting-code-review"],
+      }),
+    ),
+  );
+});
+
+test("Escape and empty-name edits revert without saving; a genuine description edit fires exactly one update", async () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  const name = screen.getByRole("textbox", { name: "Agent name" }) as HTMLInputElement;
+
+  fireEvent.focus(name);
+  fireEvent.change(name, { target: { value: "Nope" } });
+  fireEvent.keyDown(name, { key: "Escape" });
+  fireEvent.blur(name);
+
+  fireEvent.focus(name);
+  fireEvent.change(name, { target: { value: "   " } });
+  fireEvent.blur(name);
+  expect(name.value).toBe("Reviewer");
+
+  // Count-hardened idiom (see the Model tab tests above): the two reverts
+  // are proven save-free only by the call count staying at exactly 1 after
+  // one genuine edit lands.
+  const description = screen.getByRole("textbox", { name: "Agent description" });
+  fireEvent.focus(description);
+  fireEvent.change(description, { target: { value: "Sharper reviews." } });
+  fireEvent.blur(description);
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
+  expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", expect.objectContaining({ description: "Sharper reviews." }));
+});
+
+test("re-committing an unchanged name is a no-op", async () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  const name = screen.getByRole("textbox", { name: "Agent name" });
+  fireEvent.focus(name);
+  fireEvent.blur(name);
+
+  const description = screen.getByRole("textbox", { name: "Agent description" });
+  fireEvent.focus(description);
+  fireEvent.change(description, { target: { value: "Changed." } });
+  fireEvent.blur(description);
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
 });
