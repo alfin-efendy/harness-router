@@ -47,15 +47,14 @@ fn pet_manifest_cache() -> &'static Mutex<Option<Vec<PetManifestEntryInfo>>> {
     PET_MANIFEST_CACHE.get_or_init(|| Mutex::new(None))
 }
 
+/// Only the `pets` array is parsed. The endpoint's other top-level fields
+/// (`generatedAt`, `total`) are deliberately NOT declared: `generatedAt`
+/// already drifted from a number to an ISO string once (2026-07), and a
+/// declared-but-unused field with the wrong type fails the WHOLE manifest.
+/// serde ignores unknown keys by default, which is exactly the tolerance
+/// we want for fields we never read.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct PetManifestResponse {
-    #[serde(default)]
-    #[allow(dead_code)] // parsed for shape-fidelity, not currently surfaced
-    generated_at: i64,
-    #[serde(default)]
-    #[allow(dead_code)]
-    total: u32,
     #[serde(default)]
     pets: Vec<PetManifestEntryInfo>,
 }
@@ -374,10 +373,15 @@ mod tests {
     // --- manifest wire-shape parsing (no network) -----------------------------
 
     #[test]
-    fn manifest_response_parses_camel_case_and_ignores_unknown_per_pet_fields() {
+    fn manifest_response_parses_the_live_wire_shape_and_ignores_unknown_fields() {
+        // Mirrors the REAL petdex.dev wire as of 2026-07-27: `generatedAt`
+        // is an ISO-8601 STRING (it was once a number — the type drift that
+        // broke parsing), `total` is present, and per-pet entries carry
+        // extra `petJsonUrl`/`zipUrl` keys. None of the unused top-level
+        // fields may be parsed at all — that is the regression under test.
         let raw = serde_json::json!({
-            "generatedAt": 1_700_000_000_i64,
-            "total": 1,
+            "generatedAt": "2026-07-27T02:09:49.667Z",
+            "total": 4193,
             "pets": [{
                 "slug": "sprout",
                 "displayName": "Sprout",
@@ -389,7 +393,6 @@ mod tests {
             }]
         });
         let parsed: PetManifestResponse = serde_json::from_value(raw).unwrap();
-        assert_eq!(parsed.total, 1);
         assert_eq!(parsed.pets.len(), 1);
         let entry = &parsed.pets[0];
         assert_eq!(entry.slug, "sprout");
