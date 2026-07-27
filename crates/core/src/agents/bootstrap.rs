@@ -138,6 +138,11 @@ pub async fn initialize_agent_persistence(
     })
 }
 
+/// Bundled pet slug seeded — and backfilled on older installs — as the
+/// built-in Ryuzi agent's avatar. Must remain a real
+/// `apps/cockpit/public/pets/<slug>` bundle.
+pub const DEFAULT_RYUZI_PET: &str = "cloudlet";
+
 /// The built-in Ryuzi profile template: every built-in native tool is
 /// explicitly `Allow`, matching the old runtime's unrestricted native
 /// harness behavior for the built-in agent.
@@ -149,7 +154,7 @@ pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
         description: "General-purpose coding and operations agent.".into(),
         avatar: AgentAvatar {
             color: "blue".into(),
-            pet: None,
+            pet: Some(DEFAULT_RYUZI_PET.into()),
         },
         model: AgentModel::Route {
             route: "free".into(),
@@ -427,6 +432,12 @@ async fn load_existing(
     } else {
         append_default_ryuzi(&config_root, &store, &snapshot).await?
     };
+    // One-time backfill: installs seeded before pets became the avatar have
+    // a `ryuzi` profile with `pet: None` — give it the default. Fail-soft:
+    // a validation or I/O failure here must never block startup.
+    if let Err(error) = registry.backfill_ryuzi_pet(DEFAULT_RYUZI_PET).await {
+        tracing::warn!("ryuzi avatar backfill failed: {error}");
+    }
     ensure_knowledge_bundles(&config_root, &registry).await?;
     store
         .set_setting_raw(AGENT_PERSISTENCE_MARKER, AGENT_PERSISTENCE_SCHEMA)
@@ -1192,6 +1203,13 @@ mod tests {
                 crate::agents::types::NativeToolDecision::Allow
             );
         }
+    }
+
+    #[test]
+    fn default_ryuzi_profile_seeds_the_default_pet() {
+        let profile = default_ryuzi_profile("ryuzi".into());
+        assert_eq!(profile.avatar.pet.as_deref(), Some(DEFAULT_RYUZI_PET));
+        assert_eq!(profile.avatar.color, "blue");
     }
 
     #[tokio::test]

@@ -724,7 +724,7 @@ test("agents: roster rows render pet avatars and lazy-loaded stats", async ({ pa
   await page.goto("/");
   await page.getByText("Agents", { exact: true }).first().click();
 
-  // Ryuzi (RYUZI_AGENT.avatarPet = "tennis-ball", a real bundled slug)
+  // Ryuzi (RYUZI_AGENT.avatarPet = "cloudlet", a real bundled slug)
   // renders a PetSprite in its row, not the plain color tile.
   const ryuziRow = page.getByRole("button", { name: "Open Ryuzi" });
   await expect(ryuziRow.getByTestId("pet-sprite")).toBeVisible();

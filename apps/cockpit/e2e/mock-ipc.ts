@@ -325,18 +325,18 @@ export const PROVIDER_FAMILY_ROUTE_SELECTIONS = [
  * history journeys: Ryuzi (the executable default) and Reviewer (a second
  * executable agent used as a delegation target and, in the history journey,
  * a session owner deliberately absent from a narrower registry override). */
-// avatarPet fixtures (Task 8): Ryuzi carries a bundled pet slug so pet-aware
-// surfaces (roster row, detail header, PetSprite) have a real case to render;
-// Reviewer stays pet-less (`null`) so the plain-color-tile fallback (still
-// the majority case in real rosters) is exercised too. "tennis-ball" is a
-// real bundled slug (`public/pets/tennis-ball/`), distinct from the Fresh
-// Agent's own bundled pet below so the two never collide in assertions.
+// avatarPet fixtures: Ryuzi carries "cloudlet" — mirroring the backend's
+// DEFAULT_RYUZI_PET seed/backfill (crates/core/src/agents/bootstrap.rs) —
+// so pet-aware surfaces (roster row, detail header, PetSprite) render the
+// same avatar a real install shows. Reviewer stays pet-less (`null`) so the
+// neutral fallback tile is exercised too. "cloudlet" is a real bundled slug
+// (`public/pets/cloudlet/`), distinct from the Fresh Agent's own pet below.
 export const RYUZI_AGENT = {
   id: "ryuzi",
   name: "Ryuzi",
   description: "General-purpose coding agent",
   avatarColor: "violet",
-  avatarPet: "tennis-ball",
+  avatarPet: "cloudlet",
   model: { kind: "concrete", name: "fixture/model-alpha", effort: "high" },
   builtin: false,
   skillCount: 1,
