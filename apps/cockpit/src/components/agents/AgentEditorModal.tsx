@@ -1,24 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { Button, Combobox, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, Textarea } from "@ryuzi/ui";
+import { Button, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, Textarea } from "@ryuzi/ui";
 import type { AgentMutationInfo, AgentRegistryInfo } from "@/bindings";
+import { useBundledPets } from "@/lib/bundled-pets";
+import { FRESH_AGENT_PET } from "@/lib/pet-sprite";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 import { AgentAvatar } from "./AgentAvatar";
 import { PetPicker } from "./PetPicker";
 
-const COLOR_OPTIONS = [
-  { value: "violet", label: "Violet" },
-  { value: "blue", label: "Blue" },
-  { value: "cyan", label: "Cyan" },
-  { value: "emerald", label: "Emerald" },
-  { value: "amber", label: "Amber" },
-  { value: "rose", label: "Rose" },
-];
-
 function initialMutation(registry: AgentRegistryInfo): AgentMutationInfo {
   return {
     name: "",
     description: "",
+    // Inert back-compat value — the backend requires a string here but the
+    // UI no longer renders avatar colors anywhere (pets ARE the avatar).
     avatarColor: "violet",
     avatarPet: null,
     model: registry.subagentModel,
@@ -42,6 +37,22 @@ export function AgentEditorModal({ open, onClose }: { open: boolean; onClose: ()
   useEffect(() => {
     if (open && registry) setDraft(initialMutation(registry));
   }, [open, registry]);
+
+  const bundledPets = useBundledPets();
+  // Prefill a random bundled avatar (never sprout — the Fresh Agent's
+  // reserved identity) once the roster lands, only while the draft still
+  // has none. Re-runs after each open-reset; it never fights a user pick,
+  // since a chosen avatar can only be changed, not cleared.
+  useEffect(() => {
+    if (!open) return;
+    const candidates = bundledPets.filter((pet) => pet.slug !== FRESH_AGENT_PET);
+    if (candidates.length === 0) return;
+    setDraft((current) =>
+      current && current.avatarPet === null
+        ? { ...current, avatarPet: candidates[Math.floor(Math.random() * candidates.length)].slug }
+        : current,
+    );
+  }, [open, bundledPets]);
 
   if (!open || !draft) return null;
   const valid = draft.name.trim().length > 0 && draft.description.trim().length > 0;
@@ -79,24 +90,16 @@ export function AgentEditorModal({ open, onClose }: { open: boolean; onClose: ()
             rows={3}
           />
         </FormField>
-        <FormField label="Avatar color" hint="The fallback look when no pet is set.">
-          <Combobox
-            aria-label="Avatar color"
-            options={COLOR_OPTIONS}
-            value={draft.avatarColor}
-            onValueChange={(avatarColor) => setDraft((current) => (current ? { ...current, avatarColor } : current))}
-          />
-        </FormField>
-        <FormField label="Pet" hint="Optional animated avatar. Clear it to fall back to the color tile.">
+        <FormField label="Avatar" hint="Every agent gets one — pick a different look any time.">
           <button
             type="button"
-            aria-label={draft.avatarPet ? "Change pet" : "Choose a pet"}
+            aria-label={draft.avatarPet ? "Change avatar" : "Choose an avatar"}
             onClick={() => setPetPickerOpen(true)}
             className="flex items-center gap-2.5 rounded-md border border-border px-3 py-2 text-left hover:bg-accent"
           >
             <AgentAvatar pet={draft.avatarPet} size={28} />
             <span aria-hidden className="text-[12.5px] font-medium">
-              {draft.avatarPet ? "Change pet" : "Choose a pet"}
+              {draft.avatarPet ? "Change avatar" : "Choose an avatar"}
             </span>
           </button>
         </FormField>

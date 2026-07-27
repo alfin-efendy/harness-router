@@ -63,7 +63,12 @@ beforeEach(() => {
     saving: false,
   });
   globalThis.fetch = mock(() =>
-    Promise.resolve(jsonResponse([{ slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." }])),
+    Promise.resolve(
+      jsonResponse([
+        { slug: "sprout", displayName: "Sprout", submittedBy: "Chen W." },
+        { slug: "boxcat", displayName: "Boxcat", submittedBy: "railly" },
+      ]),
+    ),
   ) as unknown as typeof fetch;
 });
 
@@ -72,23 +77,36 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-test("associates accessible names with every create field", () => {
+test("associates accessible names with every create field — and there is no avatar color field", async () => {
   render(<AgentEditorModal open onClose={() => {}} />);
 
   expect(screen.getByRole("textbox", { name: "Name" })).toBeTruthy();
   expect(screen.getByRole("textbox", { name: "Description" })).toBeTruthy();
-  expect(screen.getByRole("combobox", { name: "Avatar color" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Choose a pet" })).toBeTruthy();
+  expect(screen.queryByRole("combobox", { name: "Avatar color" })).toBeNull();
+  // The random prefill lands once the bundled roster resolves — the button
+  // then reads "Change avatar", never "Choose an avatar".
+  expect(await screen.findByRole("button", { name: "Change avatar" })).toBeTruthy();
 });
 
-test("choosing a bundled pet previews it and is included in the create payload", async () => {
+test("prefills a random non-sprout bundled avatar and includes it in the create payload", async () => {
   render(<AgentEditorModal open onClose={() => {}} />);
+  // With a [sprout, boxcat] roster and sprout reserved for the Fresh Agent,
+  // boxcat is the only candidate — the "random" pick is deterministic here.
+  await screen.findByRole("button", { name: "Change avatar" });
 
-  fireEvent.click(screen.getByRole("button", { name: "Choose a pet" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Reviewer" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Description" }), { target: { value: "Reviews changes" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+  await waitFor(() => expect(createAgent).toHaveBeenCalledTimes(1));
+  expect(createAgent.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ avatarPet: "boxcat", avatarColor: "violet" }));
+});
+
+test("an explicit pick through the picker overrides the prefill", async () => {
+  render(<AgentEditorModal open onClose={() => {}} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Change avatar" }));
   await screen.findByText("Sprout");
   fireEvent.click(screen.getByRole("button", { name: /Sprout/i }));
-
-  expect(await screen.findByRole("button", { name: "Change pet" })).toBeTruthy();
 
   fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Reviewer" } });
   fireEvent.change(screen.getByRole("textbox", { name: "Description" }), { target: { value: "Reviews changes" } });
