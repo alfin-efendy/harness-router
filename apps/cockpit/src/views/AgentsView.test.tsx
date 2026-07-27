@@ -130,9 +130,7 @@ beforeEach(() => {
   // an EMPTY roster keeps the prefill inert so the strict create-payload
   // assertion below (avatarPet: null) stays deterministic.
   __resetBundledPetsCacheForTests();
-  globalThis.fetch = mock(() =>
-    Promise.resolve({ ok: true, json: () => Promise.resolve([]) } as Response),
-  ) as unknown as typeof fetch;
+  globalThis.fetch = mock(() => Promise.resolve({ ok: true, json: () => Promise.resolve([]) } as Response)) as unknown as typeof fetch;
   seedAgents();
 });
 

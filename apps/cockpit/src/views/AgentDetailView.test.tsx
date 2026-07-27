@@ -38,7 +38,9 @@ const agentConfigurationCatalog: AgentConfigurationCatalogInfo = {
     { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false, pack: null, kind: null },
     { id: "bash", label: "Bash", description: "Run commands", available: true, commandScoped: true, pack: null, kind: null },
   ],
-  pluginTools: [{ id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false, pack: null, kind: null }],
+  pluginTools: [
+    { id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false, pack: null, kind: null },
+  ],
   apps: [{ id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false, pack: null, kind: null }],
 };
 

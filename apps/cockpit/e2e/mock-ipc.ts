@@ -575,7 +575,15 @@ export const AGENT_CONFIGURATION_CATALOG = {
     },
   ],
   nativeTools: [
-    { id: "read_file", label: "Read file", description: "Read files from disk", available: true, commandScoped: false, pack: null, kind: null },
+    {
+      id: "read_file",
+      label: "Read file",
+      description: "Read files from disk",
+      available: true,
+      commandScoped: false,
+      pack: null,
+      kind: null,
+    },
     { id: "grep", label: "Grep", description: "Search file contents", available: true, commandScoped: false, pack: null, kind: null },
     { id: "bash", label: "Bash", description: "Run shell commands", available: true, commandScoped: true, pack: null, kind: null },
   ],
@@ -583,8 +591,24 @@ export const AGENT_CONFIGURATION_CATALOG = {
   // these, and nothing in the fixtures enables them — so the whole flat
   // Plugins section stays absent and the tab shows its empty state.
   pluginTools: [
-    { id: "native", label: "Ryuzi", description: "Built-in agent runtime", available: true, commandScoped: false, pack: null, kind: "runtime" },
-    { id: "anthropic", label: "Anthropic", description: "Model provider", available: true, commandScoped: false, pack: null, kind: "provider" },
+    {
+      id: "native",
+      label: "Ryuzi",
+      description: "Built-in agent runtime",
+      available: true,
+      commandScoped: false,
+      pack: null,
+      kind: "runtime",
+    },
+    {
+      id: "anthropic",
+      label: "Anthropic",
+      description: "Model provider",
+      available: true,
+      commandScoped: false,
+      pack: null,
+      kind: "provider",
+    },
   ],
   apps: [],
 } satisfies AgentConfigurationCatalogInfo;
