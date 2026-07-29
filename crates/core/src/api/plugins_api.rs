@@ -2198,6 +2198,12 @@ async fn begin_plugin_install(
         .plugins()
         .get(&plugin_id)
         .ok_or_else(|| ApiError::not_found(format!("unknown plugin: {plugin_id}")))?;
+    if plugin.source == PluginSource::Component {
+        return Err(ApiError::bad_request(
+            "component plugins connect via their oauth profiles, not the declarative install flow"
+                .to_string(),
+        ));
+    }
     let auth = plugin.manifest.auth.clone();
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -5018,6 +5024,22 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         assert!(!flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s2")));
+    }
+
+    #[tokio::test]
+    async fn begin_plugin_install_rejects_component_source() {
+        let cp = test_cp().await;
+        let result = begin_plugin_install(&cp, "github".to_string()).await;
+        match result {
+            Err(err) => {
+                assert!(
+                    err.message.contains("oauth profiles"),
+                    "error message must mention oauth profiles, got: {}",
+                    err.message
+                );
+            }
+            Ok(_) => panic!("expected begin_plugin_install to reject component plugin github"),
+        }
     }
 
     #[tokio::test]
