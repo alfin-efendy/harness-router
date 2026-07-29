@@ -1049,6 +1049,14 @@ fn auth_configured(setting_value: Option<&str>, env_is_set: bool) -> bool {
 /// `PluginAuthInfo.configured` for the list payload without building the whole
 /// auth DTO: oauth → a token is stored and reconnect isn't required; otherwise
 /// the `auth.setting`-row / `auth.env` check. No `[auth]` → false.
+///
+/// PR-3: for a component id whose declared bundle manifest carries `[[oauth]]`
+/// profiles (github/atlassian/bitbucket), oauth-configured means EVERY
+/// declared profile has a live stored token — a single-profile bundle behaves
+/// like the classic single-token check, but a multi-profile one is only
+/// "configured" once every profile is connected. Non-component oauth (and any
+/// component with no declared profiles) falls through to the classic
+/// single-token check unchanged.
 async fn plugin_auth_configured(
     store: &Store,
     plugin_id: &str,
@@ -1058,6 +1066,21 @@ async fn plugin_auth_configured(
         return Ok(false);
     };
     if auth.kind == AuthKind::Oauth {
+        if let Some(bundle) = crate::plugins::component_catalog::declared_bundle_manifest(plugin_id)
+        {
+            if !bundle.oauth.is_empty() {
+                for profile in &bundle.oauth {
+                    let live = store
+                        .get_plugin_oauth_profile_token(plugin_id, &profile.id)
+                        .await?
+                        .is_some_and(|t| !t.reconnect_required);
+                    if !live {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+        }
         let token = store.get_plugin_oauth_token(plugin_id).await?;
         return Ok(token.is_some_and(|token| !token.reconnect_required));
     }
@@ -3455,11 +3478,35 @@ mod tests {
     // `PluginInfoContext.active_version`). Once the active release is
     // reactivated to match the catalog version, the same plugin must fall
     // back to `ok`.
+    //
+    // PR-3: the bridge now derives `authKind: "oauth"` for github (it
+    // declares `[[oauth]] id = "github"`), so an unconnected github would
+    // read `needs-setup` and mask the update-available/ok assertions this
+    // test is actually about — seed a live token for its one declared
+    // profile so `configured` stays true throughout, isolating the
+    // update-available logic from the (separately covered) auth-configured
+    // gate.
     #[tokio::test]
     async fn assemble_list_marks_update_available_from_component_release_ledger() {
         let cp = test_cp().await;
         let settings = SettingsStore::new(cp.store().clone());
         settings.set("plugin.github.enabled", "true").await.unwrap();
+        cp.store()
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
 
         cp.store()
             .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
@@ -3602,6 +3649,42 @@ mod tests {
     fn auth_configured_false_when_neither_setting_nor_env_present() {
         assert!(!auth_configured(None, false));
         assert!(!auth_configured(Some(""), false));
+    }
+
+    // PR-3: a component with declared oauth profiles is configured only when
+    // every profile has a live stored token.
+    #[tokio::test]
+    async fn component_oauth_configured_requires_profile_tokens() {
+        let cp = test_cp().await;
+        let auth = Some(AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        });
+        assert!(!plugin_auth_configured(cp.store(), "github", auth.as_ref())
+            .await
+            .unwrap());
+        // Store a token for github's single declared profile ("github",
+        // matching plugins/github/ryuzi-plugin.toml's `[[oauth]] id =
+        // "github"`) → configured.
+        cp.store()
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(plugin_auth_configured(cp.store(), "github", auth.as_ref())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

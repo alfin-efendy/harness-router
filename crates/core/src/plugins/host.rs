@@ -82,7 +82,11 @@ pub fn plugin_fields_all() -> Vec<(String, SettingField)> {
 /// - each `manifest.settings[]` field, verbatim
 /// - `manifest.auth.setting`, if present, as a synthetic secret `String`
 ///   field (the manifest's `[auth]` block only names the key; it has no
-///   label/help of its own)
+///   label/help of its own) — UNLESS `manifest.settings[]` already declared
+///   that key (PR-3: a bridged component's derived `AuthKind::Token` setting
+///   IS one of its own `settings[]` fields, e.g. `plugin.discord.token`, with
+///   a real label/help/kind the manifest author wrote; the label-less
+///   synthetic field must never clobber it)
 /// - `plugin.<id>.enabled`, always, as a `Bool` field — this is what makes
 ///   `validate_setting("plugin.<id>.enabled", ...)` accept every installed
 ///   plugin, not just connector-capable ones (harmless for the others: they
@@ -96,22 +100,24 @@ fn register_plugin_fields(manifest: &PluginManifest) {
     }
     if let Some(auth) = &manifest.auth {
         if let Some(key) = &auth.setting {
-            fields.insert(
-                key.clone(),
-                (
-                    manifest.id.clone(),
-                    SettingField {
-                        key: key.clone(),
-                        label: format!("{} auth", manifest.name),
-                        help: String::new(),
-                        secret: true,
-                        required: false,
-                        kind: FieldKind::String,
-                        options: Vec::new(),
-                        default: None,
-                    },
-                ),
-            );
+            if !fields.contains_key(key) {
+                fields.insert(
+                    key.clone(),
+                    (
+                        manifest.id.clone(),
+                        SettingField {
+                            key: key.clone(),
+                            label: format!("{} auth", manifest.name),
+                            help: String::new(),
+                            secret: true,
+                            required: false,
+                            kind: FieldKind::String,
+                            options: Vec::new(),
+                            default: None,
+                        },
+                    ),
+                );
+            }
         }
     }
     let enabled_key = format!("plugin.{}.enabled", manifest.id);
