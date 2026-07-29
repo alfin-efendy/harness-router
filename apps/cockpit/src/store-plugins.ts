@@ -107,13 +107,7 @@ type PluginsState = {
    *  route's Rust side in production, exposed here mainly for symmetry and
    *  direct testing. Both toast on error. */
   beginProfilePkce: (pluginId: string, profileId: string) => Promise<PluginProfilePkceStart | null>;
-  completeProfilePkce: (
-    pluginId: string,
-    profileId: string,
-    redirectUri: string,
-    code: string,
-    verifier: string,
-  ) => Promise<boolean>;
+  completeProfilePkce: (pluginId: string, profileId: string, redirectUri: string, code: string, verifier: string) => Promise<boolean>;
   /** Manually retries the first-party bootstrap (which otherwise only runs
    *  automatically at daemon start): attempts `installComponentPlugin` for
    *  every known first-party id, then reloads the bootstrap status and the
