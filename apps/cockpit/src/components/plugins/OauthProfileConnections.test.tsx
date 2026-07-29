@@ -47,6 +47,7 @@ function profile(over: Partial<ComponentOauthProfileInfo> = {}): ComponentOauthP
     tokenUrl: "https://github.com/login/oauth/access_token",
     deviceAuthorizationUrl: "https://github.com/login/device/code",
     connected: false,
+    authorizeUrl: null,
     clientIdConfigured: true,
     ...over,
   };

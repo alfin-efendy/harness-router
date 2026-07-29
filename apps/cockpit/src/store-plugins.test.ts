@@ -634,6 +634,59 @@ test("rollbackComponentPlugin toasts the error and returns null", async () => {
   rollbackSpy.mockRestore();
 });
 
+test("beginProfilePkce forwards to the command and returns the start payload", async () => {
+  reset();
+  const start = { authorizeUrl: "https://auth.example/x", state: "s1", verifier: "v1" };
+  const spy = spyOn(commands, "pluginProfileBeginPkce").mockResolvedValue({ status: "ok", data: start });
+
+  const result = await usePlugins.getState().beginProfilePkce("atlassian", "atlassian-cloud");
+
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "atlassian", "atlassian-cloud");
+  expect(result).toEqual(start);
+  spy.mockRestore();
+});
+
+test("beginProfilePkce toasts and returns null on error", async () => {
+  reset();
+  const spy = spyOn(commands, "pluginProfileBeginPkce").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+
+  const result = await usePlugins.getState().beginProfilePkce("atlassian", "atlassian-cloud");
+
+  expect(result).toBeNull();
+  spy.mockRestore();
+});
+
+test("completeProfilePkce forwards to the command and returns true on success", async () => {
+  reset();
+  const spy = spyOn(commands, "pluginProfileCompletePkce").mockResolvedValue({ status: "ok", data: null });
+
+  const result = await usePlugins
+    .getState()
+    .completeProfilePkce("atlassian", "atlassian-cloud", "http://127.0.0.1:8976/cb", "code-1", "verifier-1");
+
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "atlassian", "atlassian-cloud", "http://127.0.0.1:8976/cb", "code-1", "verifier-1");
+  expect(result).toBe(true);
+  spy.mockRestore();
+});
+
+test("completeProfilePkce toasts and returns false on error", async () => {
+  reset();
+  const spy = spyOn(commands, "pluginProfileCompletePkce").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+
+  const result = await usePlugins
+    .getState()
+    .completeProfilePkce("atlassian", "atlassian-cloud", "http://127.0.0.1:8976/cb", "code-1", "verifier-1");
+
+  expect(result).toBe(false);
+  spy.mockRestore();
+});
+
 test("retryComponentBootstrap installs every known first-party id, then reloads status and componentPlugins", async () => {
   reset();
   seedComponentPlugins();

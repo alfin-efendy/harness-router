@@ -978,6 +978,7 @@ test("Connect step renders the device-flow OAuth profile connections when the ma
           tokenUrl: "https://notion.example/token",
           deviceAuthorizationUrl: "https://notion.example/device",
           connected: false,
+          authorizeUrl: null,
           clientIdConfigured: true,
         },
       ],
