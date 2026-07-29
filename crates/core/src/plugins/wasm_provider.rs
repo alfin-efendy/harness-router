@@ -304,7 +304,10 @@ pub fn unregister_wasm_providers_for_plugin(plugin_id: &str) {
 /// Every failure mode is warn-and-skip (missing root, discovery error,
 /// unavailable runtime, per-bundle compile failure, enablement-lookup error),
 /// so a broken provider plugin never blocks daemon startup, and a clean install
-/// (nothing enabled that exports a provider) registers nothing. `root` is a
+/// (nothing enabled AND configured that exports a provider) registers
+/// nothing — an enabled-but-unconfigured bundle (missing a required secret
+/// setting) is skipped the same as a disabled one, not attached and left to
+/// fail `start()`. `root` is a
 /// parameter (rather than always
 /// [`crate::plugins::bundle::installed_bundle_root`]) purely so tests can point
 /// discovery at a hermetic install root; production passes the real per-user
@@ -345,6 +348,25 @@ pub(crate) async fn discover_provider_components(
             Ok(false) => continue,
             Err(error) => {
                 tracing::warn!(plugin = %id, "wasm provider: enablement check failed: {error}");
+                continue;
+            }
+        }
+        // Enabled is not the same as configured (see `lifecycle.rs`'s
+        // session-tools attach for the full rationale) — an enabled bundle
+        // whose derived auth still needs a setting is needs-setup, not
+        // broken; attaching it would restart-loop `start()`'s `InvalidConfig`
+        // forever.
+        match crate::plugins::host::component_required_settings_configured(settings, &id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    plugin = %id,
+                    "wasm provider: skipping {id}: required settings not configured (needs-setup)"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(plugin = %id, "wasm provider: configured-settings check failed: {error}");
                 continue;
             }
         }

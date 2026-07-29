@@ -397,6 +397,39 @@ pub async fn component_plugin_enabled(settings: &SettingsStore, id: &str) -> any
     }
 }
 
+/// Whether `id`'s installed component has every setting its derived auth
+/// requires (the `component_catalog::derive_bundle_auth` contract: an
+/// embedded manifest secret+required field, e.g. discord's bot token). `true`
+/// when the embedded bundle manifest declares no such field —
+/// there is nothing to configure, so an enabled component is free to attach —
+/// or when every declared secret+required field has a stored non-empty value.
+///
+/// This is deliberately SEPARATE from [`component_plugin_enabled`]: enabled
+/// answers "did the user turn this on" (default yes, opt-out), while this
+/// answers "can it actually start" (needs-setup is a real, honest state, not
+/// a supervisor-restart-loop failure). Callers gate an attach path on BOTH —
+/// an enabled-but-unconfigured component must skip attaching, not fail
+/// `start()` and get retried forever.
+pub async fn component_required_settings_configured(
+    settings: &SettingsStore,
+    id: &str,
+) -> anyhow::Result<bool> {
+    let Some(bundle) = crate::plugins::component_catalog::declared_bundle_manifest(id) else {
+        return Ok(true);
+    };
+    for field in bundle.settings.iter().filter(|f| f.secret && f.required) {
+        let key = format!("plugin.{id}.{}", field.key);
+        let configured = settings
+            .get(&key)
+            .await?
+            .is_some_and(|value| !value.is_empty());
+        if !configured {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// The extension registries, plus the plugin host recording every
 /// installed [`CorePlugin`]. `harness` is a single slot: the native
 /// runtime is the only harness — production leaves the default, tests
@@ -1023,6 +1056,61 @@ mod tests {
                 .await
                 .unwrap(),
             "an explicit true setting must enable"
+        );
+    }
+
+    // ---------- component_required_settings_configured ----------
+
+    // Final-review fix: enabled ("should this run") and configured ("can it
+    // actually start") are separate axes. `discord` is the one embedded
+    // catalog manifest (`component_catalog::declared_bundle_manifest`) with a
+    // `secret + required` settings field (its bot token), so it is the id
+    // that exercises the real gate; a synthetic id with no embedded manifest
+    // must report configured unconditionally (nothing to configure).
+    #[tokio::test]
+    async fn component_required_settings_configured_gates_on_the_embedded_secret_field() {
+        let (store, settings, _tmp) = open_settings().await;
+
+        // No embedded manifest at all (e.g. a generic test/gateway bundle) —
+        // nothing declared, so nothing blocks attaching.
+        assert!(
+            component_required_settings_configured(&settings, "acme-no-manifest")
+                .await
+                .unwrap(),
+            "an id with no embedded manifest has nothing to configure"
+        );
+
+        // `discord` declares its bot token as `secret = true, required = true`
+        // — with no stored value, it must report NOT configured.
+        assert!(
+            !component_required_settings_configured(&settings, "discord")
+                .await
+                .unwrap(),
+            "discord's required bot-token setting has no stored value yet"
+        );
+
+        // Storing the required setting flips it to configured.
+        store
+            .set_setting_raw("plugin.discord.token", "test-bot-token")
+            .await
+            .unwrap();
+        assert!(
+            component_required_settings_configured(&settings, "discord")
+                .await
+                .unwrap(),
+            "once the required setting is stored, the component is configured"
+        );
+
+        // An empty stored value is the same as unset — still not configured.
+        store
+            .set_setting_raw("plugin.discord.token", "")
+            .await
+            .unwrap();
+        assert!(
+            !component_required_settings_configured(&settings, "discord")
+                .await
+                .unwrap(),
+            "an empty stored value must not count as configured"
         );
     }
 

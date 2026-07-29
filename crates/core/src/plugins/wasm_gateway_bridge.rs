@@ -2963,6 +2963,73 @@ mod gateway_impl_tests {
         assert_eq!(gateways[0].id(), "acme-gateway");
     }
 
+    /// Final-review fix: enabled is not the same as configured. `discord` is
+    /// the one embedded catalog manifest
+    /// (`component_catalog::declared_bundle_manifest`) with a `secret +
+    /// required` settings field (its bot token) — installing this throwaway
+    /// fixture component under the literal id `"discord"` is what exercises
+    /// `component_required_settings_configured` here, since that check reads
+    /// the EMBEDDED manifest by id, not whatever this on-disk fixture's own
+    /// bare `ryuzi-plugin.toml` declares. Before this fix an
+    /// enabled-but-unconfigured bundle attached anyway, failed `start()` with
+    /// `InvalidConfig`, and the supervisor restart-looped it forever — the
+    /// true state is needs-setup, so `build_wasm_gateways` must construct
+    /// nothing for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_path_skips_an_enabled_bundle_whose_required_setting_is_not_configured() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+
+        install_active_gateway_bundle(root.path(), &store, "discord", true).await;
+
+        let gateways = build_wasm_gateways(
+            Arc::clone(&store),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert!(
+            gateways.is_empty(),
+            "an enabled discord bundle with no stored bot token must not attach: {:?}",
+            gateways.iter().map(|g| g.id()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The positive counterpart of the test above: once the required setting
+    /// IS stored, the same enabled `discord`-id bundle attaches normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_path_attaches_once_the_required_setting_is_configured() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+
+        install_active_gateway_bundle(root.path(), &store, "discord", true).await;
+        store
+            .set_setting_raw("plugin.discord.token", "test-bot-token")
+            .await
+            .unwrap();
+
+        let gateways = build_wasm_gateways(
+            Arc::clone(&store),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(
+            gateways.len(),
+            1,
+            "once the required setting is stored, the bundle must attach"
+        );
+        assert_eq!(gateways[0].id(), "discord");
+    }
+
     // -------------------------------------------------------------
     // Task 6: teardown — no leaked background tasks (Arc-cycle regression)
     // -------------------------------------------------------------
