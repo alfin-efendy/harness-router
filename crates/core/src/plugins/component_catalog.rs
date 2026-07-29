@@ -25,7 +25,7 @@
 //!   against whichever row won.
 
 use ryuzi_plugin_sdk::bundle::{DeclaredTool, PluginBundleManifest};
-use ryuzi_plugin_sdk::{PluginManifest, CONTRACT_VERSION};
+use ryuzi_plugin_sdk::{AuthKind, AuthSpec, PluginManifest, CONTRACT_VERSION};
 
 use super::host::{CorePlugin, PluginSource};
 
@@ -98,12 +98,48 @@ pub const COMPONENT_BACKED_PROVIDER_IDS: &[&str] = &[
     "qwen",
 ];
 
+/// Derive the coarse auth contract a bundle implies (PR-3): declared OAuth
+/// profiles → oauth; else a secret+required setting (e.g. discord's bot
+/// token) → token, pointing `setting` at its fully-qualified key; else none.
+/// Presentation/status metadata ONLY — component connect flows run through
+/// the profile RPCs, never the classic declarative OAuth engine.
+fn derive_bundle_auth(id: &str, bundle: &PluginBundleManifest) -> Option<AuthSpec> {
+    if !bundle.oauth.is_empty() {
+        return Some(AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        });
+    }
+    bundle
+        .settings
+        .iter()
+        .find(|f| f.secret && f.required)
+        .map(|f| AuthSpec {
+            kind: AuthKind::Token,
+            setting: Some(format!("plugin.{id}.{}", f.key)),
+            ..Default::default()
+        })
+}
+
 /// Map a bundle manifest onto the declarative [`PluginManifest`] shape the
-/// plugin list speaks. Fields the bundle format has no concept of (`auth`,
-/// `mcp`, `settings`, `skills`, `provider`) stay empty on purpose: a
-/// component's behavior is contributed by the running component, never by
-/// this manifest.
+/// plugin list speaks. `mcp`/`skills`/`provider` stay empty — the bundle
+/// format has no concept of them, and a component's behavior is contributed
+/// by the running component, never by this manifest. `auth`/`settings` ARE
+/// bridged (PR-3, [`derive_bundle_auth`]): the bundle's declared OAuth
+/// profiles / settings drive the wizard connect step, needs-setup status,
+/// and the setup checklist for component plugins, with every bare bundle
+/// settings key namespaced `plugin.<id>.<key>` to match the settings store.
 fn manifest_from_bundle(bundle: PluginBundleManifest) -> PluginManifest {
+    let auth = derive_bundle_auth(&bundle.id, &bundle);
+    let settings = bundle
+        .settings
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            f.key = format!("plugin.{}.{}", bundle.id, f.key);
+            f
+        })
+        .collect();
     PluginManifest {
         contract: CONTRACT_VERSION,
         id: bundle.id,
@@ -121,8 +157,8 @@ fn manifest_from_bundle(bundle: PluginBundleManifest) -> PluginManifest {
         slot: None,
         verified: true,
         experimental: false,
-        auth: None,
-        settings: vec![],
+        auth,
+        settings,
         mcp: vec![],
         extensions: vec![],
         skills: vec![],
@@ -194,6 +230,76 @@ pub fn component_catalog_plugins() -> Vec<CorePlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryuzi_plugin_sdk::{FieldKind, SettingField};
+
+    // PR-3: the bridge derives an auth kind so needs-setup/connect surfaces
+    // light up. github/atlassian/bitbucket declare [[oauth]] → oauth;
+    // discord declares a secret+required token setting (Task 10) → token —
+    // until Task 10 lands, discord derives None here, so this test uses a
+    // synthetic bundle for the token case.
+    #[test]
+    fn bridge_derives_auth_from_bundle() {
+        let github = manifest_from_bundle(declared_bundle_manifest("github").unwrap());
+        assert_eq!(github.auth.as_ref().map(|a| a.kind), Some(AuthKind::Oauth));
+
+        let mut synthetic = declared_bundle_manifest("github").unwrap();
+        synthetic.id = "synth".into();
+        synthetic.oauth.clear();
+        synthetic.settings = vec![SettingField {
+            key: "token".into(),
+            label: "Token".into(),
+            help: String::new(),
+            secret: true,
+            required: true,
+            kind: FieldKind::String,
+            options: vec![],
+            default: None,
+        }];
+        let m = manifest_from_bundle(synthetic);
+        assert_eq!(m.auth.as_ref().map(|a| a.kind), Some(AuthKind::Token));
+        assert_eq!(
+            m.auth.as_ref().and_then(|a| a.setting.as_deref()),
+            Some("plugin.synth.token")
+        );
+        assert_eq!(
+            m.settings[0].key, "plugin.synth.token",
+            "bridge prefixes bare keys"
+        );
+    }
+
+    // Task 10: discord now declares its settings for real, so the bridge
+    // derives AuthKind::Token from the embedded manifest itself (no more
+    // synthetic-bundle workaround, see `bridge_derives_auth_from_bundle`
+    // above).
+    #[test]
+    fn discord_bundle_declares_token_settings_and_derives_token_auth() {
+        let m = manifest_from_bundle(declared_bundle_manifest("discord").unwrap());
+        assert_eq!(m.auth.as_ref().map(|a| a.kind), Some(AuthKind::Token));
+        assert_eq!(
+            m.auth.as_ref().and_then(|a| a.setting.as_deref()),
+            Some("plugin.discord.token")
+        );
+        let keys: Vec<&str> = m.settings.iter().map(|f| f.key.as_str()).collect();
+        assert!(keys.contains(&"plugin.discord.token"));
+        assert!(keys.contains(&"plugin.discord.app_id"));
+        assert!(keys.contains(&"plugin.discord.guild_id"));
+    }
+
+    // Task 10: atlassian's [[oauth]] profile now carries the PKCE extras +
+    // client-id-setting the host-side 3LO wiring needs.
+    #[test]
+    fn atlassian_profile_carries_pkce_extras_and_client_id_setting() {
+        let bundle = declared_bundle_manifest("atlassian").unwrap();
+        let p = &bundle.oauth[0];
+        assert_eq!(
+            p.client_id_setting.as_deref(),
+            Some("plugin.atlassian.oauth_client_id")
+        );
+        assert_eq!(
+            p.extra_authorize_params.get("audience").map(String::as_str),
+            Some("api.atlassian.com")
+        );
+    }
 
     #[test]
     fn every_embedded_manifest_parses_and_matches_its_declared_id() {

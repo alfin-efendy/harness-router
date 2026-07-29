@@ -6,7 +6,7 @@ use crate::harness::native::tools::ToolRegistry;
 use crate::mcp;
 use crate::plugins::PluginHost;
 use crate::settings::SettingsStore;
-use crate::skills_install::list_installed_skills;
+use crate::skills_install::list_installed_skill_catalog_rows;
 use crate::store::Store;
 
 /// Native tool ids whose permission rules can carry a `command_prefix`
@@ -146,9 +146,17 @@ pub async fn build_live_catalog(
         })
         .collect::<Vec<_>>();
 
-    let skills = list_installed_skills()?
+    let skills = list_installed_skill_catalog_rows()?
         .into_iter()
-        .map(skill_catalog_entry)
+        .map(|row| CatalogEntry {
+            id: row.skill_name,
+            label: row.label,
+            description: String::new(),
+            available: true,
+            command_scoped: false,
+            pack: row.pack,
+            kind: None,
+        })
         .collect::<Vec<_>>();
 
     let settings = SettingsStore::new(std::sync::Arc::new(store.clone()));
@@ -190,26 +198,6 @@ pub async fn build_live_catalog(
     })
 }
 
-/// Builds one skills-catalog entry from an installed skill (pack). `pack`
-/// carries the owning [`crate::skills_install::InstalledSkillPack`]'s
-/// display name — which is exactly this `InstalledSkillInfo`'s own `name`,
-/// since `list_installed_skills` already flattens one row per installed
-/// pack — whenever the pack is plugin-backed (`plugin_id.is_some()`); a
-/// standalone (not pack-installed) skill carries `None`, which the frontend
-/// renders under a synthetic "Standalone" heading.
-fn skill_catalog_entry(skill: crate::skills_install::InstalledSkillInfo) -> CatalogEntry {
-    let pack = skill.plugin_id.is_some().then(|| skill.name.clone());
-    CatalogEntry {
-        id: skill.id,
-        label: skill.name,
-        description: String::new(),
-        available: true,
-        command_scoped: false,
-        pack,
-        kind: None,
-    }
-}
-
 pub fn runtime_profile_executable(
     profile: &AgentProfile,
     structural_executable: bool,
@@ -229,7 +217,12 @@ fn validate_references(
 ) -> Vec<AgentValidationIssue> {
     let mut issues = Vec::new();
 
-    for id in skills {
+    // Expand through the PR-2 fix E shim first: a profile written before
+    // per-skill binding may still store a pack id in `skills` (see
+    // `expand_skill_bindings`'s doc comment) — validate the skill names it
+    // expands to, not the pack id itself.
+    let expanded_skills = crate::skills_install::expand_skill_bindings(skills);
+    for id in &expanded_skills {
         if !catalog.contains_skill(id) {
             issues.push(AgentValidationIssue {
                 field: "skills".to_string(),
@@ -457,42 +450,19 @@ mod tests {
         );
     }
 
-    fn installed_skill_info(
-        id: &str,
-        name: &str,
-        plugin_id: Option<&str>,
-    ) -> crate::skills_install::InstalledSkillInfo {
-        crate::skills_install::InstalledSkillInfo {
-            id: id.to_string(),
-            name: name.to_string(),
-            source: "https://example.test/repo".to_string(),
-            plugin_id: plugin_id.map(str::to_string),
-            installed_at: "2026-01-01T00:00:00Z".to_string(),
-            skill_count: 1,
-        }
-    }
-
-    #[test]
-    fn standalone_installed_skill_carries_no_pack_name() {
-        let entry = skill_catalog_entry(installed_skill_info(
-            "requesting-code-review",
-            "requesting-code-review",
-            None,
-        ));
-
-        assert_eq!(entry.id, "requesting-code-review");
-        assert_eq!(entry.pack, None);
-    }
-
-    #[test]
-    fn plugin_backed_installed_skill_carries_its_owning_pack_name() {
-        let entry = skill_catalog_entry(installed_skill_info(
-            "superpowers",
-            "Superpowers",
-            Some("superpowers"),
-        ));
-
-        assert_eq!(entry.id, "superpowers");
-        assert_eq!(entry.pack, Some("Superpowers".to_string()));
-    }
+    // `standalone_installed_skill_carries_no_pack_name` and
+    // `plugin_backed_installed_skill_carries_its_owning_pack_name` (plus
+    // their shared `installed_skill_info` fixture) were removed here: they
+    // unit-tested the now-deleted `skill_catalog_entry(InstalledSkillInfo)`
+    // helper, which — via `InstalledSkillInfo` — always produced exactly one
+    // `CatalogEntry` per pack regardless of `skill_count`. That collapse is
+    // the bug this task removes; the pack-attribution behavior they checked
+    // (standalone -> `pack: None`, plugin-backed -> `pack: Some(<display
+    // name>)`) is now exercised directly against
+    // `list_installed_skill_catalog_rows_in` in `skills_install.rs`'s test
+    // module (`catalog_rows_list_each_skill_of_a_pack` and
+    // `catalog_rows_standalone_skill_carries_no_pack_name`), since that's
+    // where the pack-vs-standalone branching now actually lives —
+    // `build_live_catalog`'s row-to-`CatalogEntry` mapping left in this file
+    // is a plain field copy with no branching left to unit-test.
 }

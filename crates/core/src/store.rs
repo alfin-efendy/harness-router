@@ -47,8 +47,22 @@ CREATE INDEX agent_runs_primary_agent_idx ON agent_runs(primary_agent_id, starte
 CREATE INDEX sessions_primary_agent_idx ON sessions(primary_agent_id);
 ";
 
+/// v2 -> v3: caches a profile's declared `client-secret-setting` NAME (never
+/// the secret itself) alongside the token endpoint + client id already stored
+/// at connect time, so `oauth::ProfileOauth::refresh_profile_token` — which
+/// has only a `(plugin_id, profile_id)`, not the manifest — can resolve the
+/// confidential-client secret for the refresh grant. Without this, Atlassian
+/// and Bitbucket (both REQUIRE `client_secret` on refresh) forced a reconnect
+/// roughly every hour for every PKCE-connected profile.
+const OAUTH_CLIENT_SECRET_SETTING_MIGRATION_SQL: &str =
+    "ALTER TABLE plugin_oauth_profile_clients ADD COLUMN client_secret_setting TEXT;";
+
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(BASELINE_SQL), M::up(AGENT_STATS_MIGRATION_SQL)])
+    Migrations::new(vec![
+        M::up(BASELINE_SQL),
+        M::up(AGENT_STATS_MIGRATION_SQL),
+        M::up(OAUTH_CLIENT_SECRET_SETTING_MIGRATION_SQL),
+    ])
 }
 
 pub struct Store {
@@ -418,6 +432,14 @@ pub struct PluginOauthClient {
 /// the profile-keyed counterpart of [`PluginOauthClient`] for bundles that
 /// declare more than one `[[oauth]]` profile (Task 8 slice 2a). Same
 /// column-merge upsert semantics as `upsert_plugin_oauth_client`.
+///
+/// `client_secret_setting` is the profile's declared `client-secret-setting`
+/// name (manifest, not the secret itself) cached here at connect time
+/// (`complete_pkce`/`poll_device_flow`) so a later `refresh_profile_token`
+/// can resolve the confidential-client secret from this row alone — it has
+/// only a `profile_id`, not the manifest, and every OAuth-capable provider
+/// this bundle format supports (Atlassian, Bitbucket, ...) REQUIRES the
+/// secret on the refresh grant, not just the initial exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginOauthProfileClient {
     pub plugin_id: String,
@@ -425,6 +447,7 @@ pub struct PluginOauthProfileClient {
     pub authorize_url: Option<String>,
     pub token_url: Option<String>,
     pub client_id: Option<String>,
+    pub client_secret_setting: Option<String>,
 }
 
 /// One row of `plugin_installs`: the authoritative record of an installed
@@ -592,9 +615,10 @@ impl Store {
         // upgraded: the squash removed the intermediate migrations, so
         // `to_latest` would otherwise fail with an opaque "database too far
         // ahead". Detect it up front and return an actionable error instead.
-        // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage.)
+        // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage, 3 =
+        // + plugin_oauth_profile_clients.client_secret_setting.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 2;
+        const LATEST_VERSION: i64 = 3;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -3328,12 +3352,14 @@ impl Store {
         self.with_conn(move |c| {
             c.execute(
                 "INSERT INTO plugin_oauth_profile_clients(\
-                     plugin_id, profile_id, authorize_url, token_url, client_id, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     plugin_id, profile_id, authorize_url, token_url, client_id, \
+                     client_secret_setting, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(plugin_id, profile_id) DO UPDATE SET \
                    authorize_url=COALESCE(excluded.authorize_url, plugin_oauth_profile_clients.authorize_url), \
                    token_url=COALESCE(excluded.token_url, plugin_oauth_profile_clients.token_url), \
                    client_id=COALESCE(excluded.client_id, plugin_oauth_profile_clients.client_id), \
+                   client_secret_setting=COALESCE(excluded.client_secret_setting, plugin_oauth_profile_clients.client_secret_setting), \
                    updated_at=excluded.updated_at",
                 params![
                     client.plugin_id,
@@ -3341,6 +3367,7 @@ impl Store {
                     client.authorize_url,
                     client.token_url,
                     client.client_id,
+                    client.client_secret_setting,
                     updated_at
                 ],
             )
@@ -3358,7 +3385,8 @@ impl Store {
         let profile_id = profile_id.to_string();
         self.with_conn(move |c| {
             c.query_row(
-                "SELECT plugin_id, profile_id, authorize_url, token_url, client_id \
+                "SELECT plugin_id, profile_id, authorize_url, token_url, client_id, \
+                        client_secret_setting \
                  FROM plugin_oauth_profile_clients WHERE plugin_id=?1 AND profile_id=?2",
                 params![plugin_id, profile_id],
                 |r| {
@@ -3368,6 +3396,7 @@ impl Store {
                         authorize_url: r.get(2)?,
                         token_url: r.get(3)?,
                         client_id: r.get(4)?,
+                        client_secret_setting: r.get(5)?,
                     })
                 },
             )
@@ -8056,6 +8085,7 @@ mod tests {
                 authorize_url: Some("https://acme.test/authorize".into()),
                 token_url: Some("https://acme.test/token".into()),
                 client_id: None,
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -8066,6 +8096,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-123".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -9641,9 +9672,10 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 2 database (v1 squashed baseline + v2
-    // agent_tool_usage/pets-stats migration) whose schema + seeded rows
-    // exactly match the golden fixture.
+    // produce a `user_version` 3 database (v1 squashed baseline + v2
+    // agent_tool_usage/pets-stats migration + v3
+    // plugin_oauth_profile_clients.client_secret_setting) whose schema +
+    // seeded rows exactly match the golden fixture.
     //
     // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
     // version, messages_fts_data blocks), which are artifacts of the bundled
@@ -9656,8 +9688,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 2,
-            "squashed baseline + agent_stats migration DB must be user_version 2"
+            user_version, 3,
+            "squashed baseline + agent_stats + oauth-client-secret-setting migrations must be user_version 3"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

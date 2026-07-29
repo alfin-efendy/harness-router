@@ -8,6 +8,7 @@ import {
   type DoctorFinding,
   type PluginInfo,
   type PluginProfileDeviceFlowStart,
+  type PluginProfilePkceStart,
   type PluginToolEntry,
 } from "./bindings";
 
@@ -99,6 +100,14 @@ type PluginsState = {
     expiresAt: number,
   ) => Promise<string | null>;
   disconnectProfile: (pluginId: string, profileId: string) => Promise<boolean>;
+  /** Component OAuth profile PKCE connect. Thin RPC wrappers, same shape as
+   *  the device-flow trio above: `beginProfilePkce` returns the daemon's
+   *  authorize URL/state/verifier (or `null` on error), the caller opens the
+   *  browser; `completeProfilePkce` is invoked by the loopback callback
+   *  route's Rust side in production, exposed here mainly for symmetry and
+   *  direct testing. Both toast on error. */
+  beginProfilePkce: (pluginId: string, profileId: string) => Promise<PluginProfilePkceStart | null>;
+  completeProfilePkce: (pluginId: string, profileId: string, redirectUri: string, code: string, verifier: string) => Promise<boolean>;
   /** Manually retries the first-party bootstrap (which otherwise only runs
    *  automatically at daemon start): attempts `installComponentPlugin` for
    *  every known first-party id, then reloads the bootstrap status and the
@@ -342,6 +351,24 @@ export const usePlugins = create<PluginsState>((set, get) => ({
       return false;
     }
     toast.success("Disconnected");
+    return true;
+  },
+
+  beginProfilePkce: async (pluginId, profileId) => {
+    const res = await commands.pluginProfileBeginPkce("local", pluginId, profileId);
+    if (res.status === "error") {
+      toast.error(`Couldn't start the connection: ${res.error.message}`);
+      return null;
+    }
+    return res.data;
+  },
+
+  completeProfilePkce: async (pluginId, profileId, redirectUri, code, verifier) => {
+    const res = await commands.pluginProfileCompletePkce("local", pluginId, profileId, redirectUri, code, verifier);
+    if (res.status === "error") {
+      toast.error(`Couldn't complete the connection: ${res.error.message}`);
+      return false;
+    }
     return true;
   },
 

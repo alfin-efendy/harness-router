@@ -24,11 +24,32 @@ const disconnect = mock(async () => ({ status: "ok" as const, data: null }));
 const openUrl = mock(async (_u: string) => {});
 const toastSuccess = mock((_m: string) => {});
 
+const beginPkce = mock(async (_r: string | null, _p: string, _profileId: string) => ({
+  status: "ok" as const,
+  data: { authorizeUrl: "https://auth.atlassian.com/authorize?state=abc", state: "abc", verifier: "verifier-xyz" },
+}));
+// The PKCE poll loop reads `pluginReleaseDetail` directly (the loopback
+// callback server completes the token exchange out-of-band) — default fixture
+// reports the profile as still not connected, so tests that don't care about
+// the eventual poll outcome never need to override this.
+const pluginReleaseDetail = mock(async (_r: string | null, id: string) => ({
+  status: "ok" as const,
+  data: {
+    pluginId: id,
+    releases: [],
+    activeVersion: null,
+    activeManifest: null,
+    declaredManifest: null,
+  },
+}));
+
 mock.module("@/bindings", () => ({
   commands: {
     pluginProfileBeginDeviceFlow: beginDeviceFlow,
     pluginProfilePollDeviceFlow: pollDeviceFlow,
     pluginProfileDisconnect: disconnect,
+    pluginProfileBeginPkce: beginPkce,
+    pluginReleaseDetail,
   },
 }));
 mock.module("sonner", () => ({
@@ -47,6 +68,7 @@ function profile(over: Partial<ComponentOauthProfileInfo> = {}): ComponentOauthP
     tokenUrl: "https://github.com/login/oauth/access_token",
     deviceAuthorizationUrl: "https://github.com/login/device/code",
     connected: false,
+    authorizeUrl: null,
     clientIdConfigured: true,
     ...over,
   };
@@ -59,6 +81,8 @@ beforeEach(() => {
   disconnect.mockClear();
   openUrl.mockClear();
   toastSuccess.mockClear();
+  beginPkce.mockClear();
+  pluginReleaseDetail.mockClear();
 });
 afterEach(cleanup);
 
@@ -135,4 +159,38 @@ test("a transient poll error is tolerated: the flow keeps polling and still conn
   await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Connected github"), { timeout: 4000 });
   await waitFor(() => expect(onChanged).toHaveBeenCalled());
   expect(pollDeviceFlow.mock.calls.length).toBeGreaterThanOrEqual(2);
+});
+
+// ---------- PKCE connect flow (Task 9) ----------
+
+function pkceProfile(over: Partial<ComponentOauthProfileInfo> = {}): ComponentOauthProfileInfo {
+  return {
+    id: "atlassian-cloud",
+    scopes: [],
+    tokenUrl: "https://auth.atlassian.com/oauth/token",
+    deviceAuthorizationUrl: null,
+    connected: false,
+    authorizeUrl: "https://auth.atlassian.com/authorize",
+    clientIdConfigured: true,
+    ...over,
+  };
+}
+
+test("a PKCE-capable profile with a client id shows Connect and launches the browser flow", async () => {
+  render(<OauthProfileConnections pluginId="atlassian" profiles={[pkceProfile()]} onChanged={() => {}} />);
+
+  const btn = screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement;
+  expect(btn.disabled).toBe(false);
+  fireEvent.click(btn);
+
+  await waitFor(() => expect(beginPkce).toHaveBeenCalledWith("local", "atlassian", "atlassian-cloud"));
+  await waitFor(() => expect(openUrl).toHaveBeenCalledWith("https://auth.atlassian.com/authorize?state=abc"));
+  expect(await screen.findByText(/Waiting for you to finish signing in in the browser/)).toBeTruthy();
+});
+
+test("a PKCE profile without a client id shows a disabled Connect with the settings hint", () => {
+  render(<OauthProfileConnections pluginId="atlassian" profiles={[pkceProfile({ clientIdConfigured: false })]} onChanged={() => {}} />);
+
+  expect((screen.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText("Enter the OAuth client id in Settings first.")).toBeTruthy();
 });

@@ -677,6 +677,25 @@ pub(crate) async fn discover_gateway_components(
                 continue;
             }
         }
+        // Enabled is not the same as configured (see `lifecycle.rs`'s
+        // session-tools attach for the full rationale) — an enabled bundle
+        // whose derived auth still needs a setting is needs-setup, not
+        // broken; attaching it would restart-loop `start()`'s `InvalidConfig`
+        // forever.
+        match crate::plugins::host::component_required_settings_configured(settings, &id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    plugin = %id,
+                    "wasm gateway: skipping {id}: required settings not configured (needs-setup)"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(plugin = %id, "wasm gateway: configured-settings check failed: {error}");
+                continue;
+            }
+        }
         // Single source of truth for the installed-bundle capability policy
         // (incl. the first-party-only `allow_self_auth` gate) — see
         // `HostPolicy::for_installed_bundle`.
@@ -795,6 +814,7 @@ mod tests {
                 oauth: vec![],
                 provider_ids: vec![],
                 tools: vec![],
+                settings: vec![],
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),

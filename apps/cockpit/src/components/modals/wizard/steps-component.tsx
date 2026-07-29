@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { Button, FormField, Input, Switch } from "@ryuzi/ui";
 import { commands, events, type PluginDetail } from "@/bindings";
 import { StatusDot } from "@/components/common/bits";
-import { isDeviceFlowConnectable, OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
+import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { declaredToolEntries } from "@/lib/plugin-hub";
 import { LOCAL_RUNNER } from "@/lib/session-key";
@@ -332,16 +332,20 @@ export function TokenConnect({ ctx, auth }: { ctx: WizardCtx; auth: NonNullable<
 }
 
 /** Dispatches on how this plugin connects (spec §5): a component's declared
- *  device-flow OAuth profiles first (reuses `OauthProfileConnections`
- *  wholesale — same card the Settings tab renders); else the top-level auth
- *  spec's own kind (oauth browser flow, or a token/api-key field); else a
- *  plain "nothing to do" message (e.g. a provider with no auth spec at all —
- *  today's launch points never route a provider through this wizard, but the
- *  plan always includes a connect step for `kind === "provider"`, so this
- *  stays crash-free for it regardless). */
+ *  OAuth profiles first (reuses `OauthProfileConnections` wholesale — same
+ *  card the Settings tab renders). Task 9: the card renders for ANY declared
+ *  profile, not just device-flow-connectable ones — a PKCE-only profile with
+ *  no client id configured yet (e.g. atlassian pre-registration) still needs
+ *  its own row (disabled Connect + a settings hint) instead of falling
+ *  through to the generic "nothing to do" message below. Else the top-level
+ *  auth spec's own kind (oauth browser flow, or a token/api-key field); else
+ *  a plain "nothing to do" message (e.g. a provider with no auth spec at all
+ *  — today's launch points never route a provider through this wizard, but
+ *  the plan always includes a connect step for `kind === "provider"`, so
+ *  this stays crash-free for it regardless). */
 export function ConnectStep({ ctx, onNext }: { ctx: WizardCtx; onNext: () => void }) {
   const profiles = ctx.releaseDetail?.activeManifest?.oauthProfiles ?? [];
-  if (profiles.some(isDeviceFlowConnectable)) {
+  if (profiles.length > 0) {
     return <OauthProfileConnections pluginId={ctx.pluginId} profiles={profiles} onChanged={() => void ctx.refresh()} />;
   }
 

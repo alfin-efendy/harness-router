@@ -82,17 +82,32 @@ fn tool_filter_for_profile(
             allowed.push(plugin.clone());
             continue;
         }
-        let (provider, tool) = plugin.split_once('.').unwrap_or((plugin, ""));
-        allowed.extend(
-            available
-                .iter()
-                .filter(|name| {
-                    *name == &format!("mcp__{provider}__{tool}")
-                        || *name == &format!("ext__{provider}__{tool}")
-                        || *name == &format!("wasm__{provider}__{tool}")
-                })
-                .cloned(),
-        );
+        match plugin.split_once('.') {
+            // Namespaced `<plugin>.<tool>`: exact single-tool grant (unchanged).
+            Some((provider, tool)) => allowed.extend(
+                available
+                    .iter()
+                    .filter(|name| {
+                        *name == &format!("mcp__{provider}__{tool}")
+                            || *name == &format!("ext__{provider}__{tool}")
+                            || *name == &format!("wasm__{provider}__{tool}")
+                    })
+                    .cloned(),
+            ),
+            // Bare plugin id: every tool the plugin contributes, mirroring the
+            // app arm below. The old code fed ("<id>", "") through the exact
+            // arm and matched `wasm__<id>__` — i.e. nothing.
+            None => allowed.extend(
+                available
+                    .iter()
+                    .filter(|name| {
+                        name.starts_with(&format!("mcp__{plugin}__"))
+                            || name.starts_with(&format!("ext__{plugin}__"))
+                            || name.starts_with(&format!("wasm__{plugin}__"))
+                    })
+                    .cloned(),
+            ),
+        }
     }
     for app in &profile.tools.apps {
         allowed.extend(
@@ -129,7 +144,13 @@ fn adapt_primary_profile(
             can_delegate: false,
             builtin: false,
         },
-        allowed_skills: (!profile.skills.is_empty()).then(|| profile.skills.clone()),
+        // PR-2 fix E shim: a profile written before per-skill binding may
+        // still store a pack id here — expand it to that pack's member
+        // skill names (the exact strings the runtime matches skills by), so
+        // a legacy binding isn't silently inert. See
+        // `crate::skills_install::expand_skill_bindings`.
+        allowed_skills: (!profile.skills.is_empty())
+            .then(|| crate::skills_install::expand_skill_bindings(&profile.skills)),
     })
 }
 
@@ -1399,6 +1420,47 @@ mod tests {
             tool_filter_for_profile(&profile, &available),
             agents::ToolFilter::Only(vec!["mcp__github__search".into(), "read".into()])
         );
+    }
+
+    // PR-2 fix F: a bare plugin id in tools.plugins used to demand an exact
+    // match on `wasm__<id>__` (empty tool segment) and therefore granted
+    // NOTHING. It must grant every tool the plugin contributes, mirroring the
+    // app arm's prefix match. The namespaced form stays exact.
+    #[test]
+    fn bare_plugin_id_grants_all_of_that_plugins_tools() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
+        profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
+        profile.tools.plugins = vec!["github".into()];
+        let available = vec![
+            "wasm__github__create_issue".to_string(),
+            "wasm__github__get_repo".to_string(),
+            "wasm__discord__send".to_string(),
+            "read_file".to_string(),
+        ];
+        let agents::ToolFilter::Only(allowed) = tool_filter_for_profile(&profile, &available)
+        else {
+            panic!("expected Only");
+        };
+        assert!(allowed.contains(&"wasm__github__create_issue".to_string()));
+        assert!(allowed.contains(&"wasm__github__get_repo".to_string()));
+        assert!(!allowed.contains(&"wasm__discord__send".to_string()));
+    }
+
+    #[test]
+    fn namespaced_plugin_binding_stays_exact() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
+        profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
+        profile.tools.plugins = vec!["github.create_issue".into()];
+        let available = vec![
+            "wasm__github__create_issue".to_string(),
+            "wasm__github__get_repo".to_string(),
+        ];
+        let agents::ToolFilter::Only(allowed) = tool_filter_for_profile(&profile, &available)
+        else {
+            panic!("expected Only");
+        };
+        assert!(allowed.contains(&"wasm__github__create_issue".to_string()));
+        assert!(!allowed.contains(&"wasm__github__get_repo".to_string()));
     }
 
     #[test]

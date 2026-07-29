@@ -18,6 +18,10 @@ use tokio::sync::oneshot;
 
 const CALLBACK_HTML: &str = "<!doctype html><html><body>You can close this tab.</body></html>";
 
+/// Served when a profile OAuth callback fails validation (missing code, missing
+/// state, or state mismatch). The user must return to Cockpit and retry.
+const CALLBACK_FAILED_HTML: &str = "<!doctype html><html><body>Connection failed — return to Ryuzi Cockpit and try again.</body></html>";
+
 /// Served for any path OTHER than the registered callback path — e.g. a
 /// second plugin's vendor redirecting onto the first plugin's live server.
 /// Friendlier than axum's bare 404: tells the user how to recover.
@@ -60,6 +64,30 @@ async fn handle_fallback() -> Html<&'static str> {
     Html(FALLBACK_HTML)
 }
 
+/// Profile-specific callback handler that validates `code` and `state` before
+/// responding. Serves CALLBACK_FAILED_HTML if validation fails (missing code,
+/// missing state, or state mismatch); serves CALLBACK_HTML on success. The
+/// CallbackResult is sent through the channel regardless so the await logic
+/// doesn't hang — it's the HTML response that differentiates validation
+/// outcomes.
+async fn handle_profile_callback(
+    State((slot, expected_state)): State<(CallbackSlot, String)>,
+    Query(q): Query<CallbackQuery>,
+) -> Html<&'static str> {
+    let validation_ok = q.code.is_some() && q.state.as_deref() == Some(&expected_state);
+    if let Some(tx) = slot.lock().unwrap().take() {
+        let _ = tx.send(CallbackResult {
+            code: q.code,
+            state: q.state,
+        });
+    }
+    if validation_ok {
+        Html(CALLBACK_HTML)
+    } else {
+        Html(CALLBACK_FAILED_HTML)
+    }
+}
+
 /// Bind 127.0.0.1:{port}. Bind failures are mapped to an actionable message
 /// naming the port — a fixed loopback port is only ever taken by another
 /// sign-in flow already running.
@@ -96,6 +124,39 @@ pub fn spawn_callback_server(
         .route(path, get(handle_callback))
         .fallback(handle_fallback)
         .with_state(slot);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    (handle, result_rx, shutdown_tx)
+}
+
+/// Profile-specific variant that validates `state` before responding to the
+/// callback. Like [`spawn_callback_server`], but the HTTP response reflects
+/// validation outcome: [`CALLBACK_HTML`] on success, [`CALLBACK_FAILED_HTML`]
+/// if code, state, or state match fails. The [`CallbackResult`] is sent through
+/// the channel regardless — the HTML response is what differentiates outcomes,
+/// and the awaiting code can continue its background work.
+pub fn spawn_profile_callback_server(
+    listener: TcpListener,
+    path: &str,
+    expected_state: String,
+) -> (
+    tokio::task::JoinHandle<()>,
+    oneshot::Receiver<CallbackResult>,
+    oneshot::Sender<()>,
+) {
+    let (result_tx, result_rx) = oneshot::channel::<CallbackResult>();
+    let slot: CallbackSlot = Arc::new(Mutex::new(Some(result_tx)));
+    let app = Router::new()
+        .route(path, get(handle_profile_callback))
+        .fallback(handle_fallback)
+        .with_state((slot, expected_state));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {

@@ -1572,6 +1572,39 @@ async pluginProfileDisconnect(runnerId: string | null, pluginId: string, profile
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Begins a component OAuth profile's PKCE connect flow. Mirrors
+ * `begin_plugin_install`'s local-loopback shape (bind-retry the fixed wizard
+ * port, spawn a one-shot callback server, await it in the background) but
+ * simpler: there is no DCR/manual-paste fallback for a profile connect, so a
+ * still-taken port surfaces as a command error rather than degrading to
+ * `callback_mode: "manual"`. The daemon owns the PKCE flow state (verifier
+ * is round-tripped back to Cockpit, same as `plugin_profile_begin_device_flow`
+ * round-trips its device code); Cockpit only binds the port, awaits the
+ * redirect, validates `state` locally, and hands the code + verifier back
+ * via `plugin_profile_complete_pkce`.
+ */
+async pluginProfileBeginPkce(runnerId: string | null, pluginId: string, profileId: string) : Promise<Result<PluginProfilePkceStart, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_profile_begin_pkce", { runnerId, pluginId, profileId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Exposed for symmetry with [`plugin_profile_begin_pkce`] (and for direct
+ * testing) — the loopback callback task above is the only production
+ * caller.
+ */
+async pluginProfileCompletePkce(runnerId: string | null, pluginId: string, profileId: string, redirectUri: string, code: string, verifier: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_profile_complete_pkce", { runnerId, pluginId, profileId, redirectUri, code, verifier }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pluginModels(runnerId: string | null, id: string) : Promise<Result<string[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("plugin_models", { runnerId, id }) };
@@ -2307,6 +2340,12 @@ deviceAuthorizationUrl: string | null;
  */
 connected: boolean;
 /**
+ * The profile's authorize endpoint (`authorize_url`), which `begin_pkce`
+ * builds the browser-facing authorize URL against. `None` when the
+ * manifest omits it (e.g. a device-flow-only profile).
+ */
+authorizeUrl: string | null;
+/**
  * A client id resolves for this profile (manifest baked-in, a stored
  * per-install override, or a settings value) — Connect is gated on this.
  * The pure [`From`] sets it from the manifest's baked `client-id` only;
@@ -2873,6 +2912,13 @@ export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: st
  * to the user once and must never be written to durable telemetry.
  */
 export type PluginProfileDeviceFlowStart = { deviceCode: string; userCode: string; verificationUri: string; verificationUriComplete: string | null; intervalSecs: number; expiresAt: number }
+/**
+ * `plugin_profile_begin_pkce` RPC result. Mirror of
+ * `crate::plugins::capabilities::oauth::PkceStart`. `verifier` is returned to
+ * the caller (Cockpit) so it can complete the token exchange; it must never
+ * be persisted to durable telemetry (see that type's doc).
+ */
+export type PluginProfilePkceStart = { authorizeUrl: string; state: string; verifier: string }
 /**
  * One entry `plugin_tools` lists for a plugin: an agent-facing tool, an
  * installed skill, or a provider's model — `kind` discriminates which.

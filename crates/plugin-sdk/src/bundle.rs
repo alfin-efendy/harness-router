@@ -9,7 +9,7 @@
 //! I/O. `PluginBundleManifest` and `PluginRelease` are data + validation
 //! only, mirroring `crate::manifest::PluginManifest`'s discipline.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +65,13 @@ pub struct PluginBundleManifest {
     /// keeps working.
     #[serde(default)]
     pub tools: Vec<DeclaredTool>,
+    /// Host-rendered configuration fields (PR-3). Keys are BARE (`token`,
+    /// not `plugin.<id>.token`) — the host maps them to the fully-qualified
+    /// `plugin.<id>.<key>` settings namespace when it bridges the bundle
+    /// into the plugin list, and the component reads them back by bare key
+    /// through `ryuzi:settings/settings`. Optional and empty by default.
+    #[serde(default)]
+    pub settings: Vec<crate::manifest::SettingField>,
 }
 
 /// How the host instances a bundle's component: one shared instance for
@@ -124,6 +131,13 @@ pub struct OAuthProfile {
     pub client_secret_setting: Option<String>,
     pub resource: Option<String>,
     pub dynamic_registration: bool,
+    /// Extra query parameters the provider's authorize URL requires beyond
+    /// the standard PKCE set (e.g. Atlassian's mandatory
+    /// `audience=api.atlassian.com`). Mirrors the declarative
+    /// `AuthSpec.extra_authorize_params`. Forwarded verbatim by the host's
+    /// `begin_pkce`.
+    #[serde(default)]
+    pub extra_authorize_params: BTreeMap<String, String>,
 }
 
 /// A tool the component exposes to agents, declared statically so Cockpit can
@@ -193,6 +207,12 @@ pub enum BundleError {
     EmptyToolName,
     #[error("duplicate tool name: {0}")]
     DuplicateTool(String),
+    #[error("settings key must not be empty")]
+    EmptySettingKey,
+    #[error("duplicate settings key: {0}")]
+    DuplicateSettingKey(String),
+    #[error("settings key must not start with \"plugin.\": {0}")]
+    SettingKeyPrefixForbidden(String),
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -316,6 +336,19 @@ impl PluginBundleManifest {
             }
             if !seen_tool_names.insert(tool.name.as_str()) {
                 return Err(BundleError::DuplicateTool(tool.name.clone()));
+            }
+        }
+
+        let mut seen_setting_keys: HashSet<&str> = HashSet::new();
+        for setting in &self.settings {
+            if setting.key.is_empty() {
+                return Err(BundleError::EmptySettingKey);
+            }
+            if setting.key.starts_with("plugin.") {
+                return Err(BundleError::SettingKeyPrefixForbidden(setting.key.clone()));
+            }
+            if !seen_setting_keys.insert(setting.key.as_str()) {
+                return Err(BundleError::DuplicateSettingKey(setting.key.clone()));
             }
         }
 
@@ -1034,5 +1067,73 @@ description = "Nameless tool"
         let err = PluginBundleManifest::from_toml(toml_str)
             .expect_err("empty tool name should fail validation");
         assert!(matches!(err, BundleError::EmptyToolName));
+    }
+
+    #[test]
+    fn bundle_manifest_parses_settings_and_extra_authorize_params() {
+        let toml = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "acme.wasm"
+
+[[settings]]
+key = "token"
+label = "Bot token"
+secret = true
+required = true
+
+[[oauth]]
+id = "acme-cloud"
+authorize-url = "https://auth.acme.test/authorize"
+token-url = "https://auth.acme.test/token"
+
+[oauth.extra-authorize-params]
+audience = "api.acme.test"
+prompt = "consent"
+"#;
+        let m: PluginBundleManifest = toml::from_str(toml).unwrap();
+        assert_eq!(m.settings.len(), 1);
+        assert_eq!(m.settings[0].key, "token");
+        assert!(m.settings[0].secret && m.settings[0].required);
+        assert_eq!(
+            m.oauth[0]
+                .extra_authorize_params
+                .get("audience")
+                .map(String::as_str),
+            Some("api.acme.test")
+        );
+        assert_eq!(
+            m.oauth[0]
+                .extra_authorize_params
+                .get("prompt")
+                .map(String::as_str),
+            Some("consent")
+        );
+    }
+
+    #[test]
+    fn bundle_settings_keys_must_be_bare() {
+        // validate() rejects a fully-qualified key — bundle settings are bare;
+        // the host prefixes `plugin.<id>.` when bridging to the plugin list.
+        let toml = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "acme.wasm"
+
+[[settings]]
+key = "plugin.acme.token"
+label = "Bot token"
+"#;
+        let err = PluginBundleManifest::from_toml(toml)
+            .expect_err("settings key starting with plugin. should fail validation");
+        assert!(
+            matches!(err, BundleError::SettingKeyPrefixForbidden(key) if key == "plugin.acme.token")
+        );
     }
 }

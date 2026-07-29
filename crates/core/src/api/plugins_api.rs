@@ -79,6 +79,7 @@ pub(crate) const HANDLES: &[&str] = &[
     // Thin, profile-aware wrappers over the Phase-3 OAuth profile engine
     // (`plugins::capabilities::oauth`) — Task 11a.
     "plugin_profile_begin_pkce",
+    "plugin_profile_complete_pkce",
     "plugin_profile_disconnect",
     "plugin_profile_begin_device_flow",
     "plugin_profile_poll_device_flow",
@@ -183,6 +184,14 @@ struct ProfileBeginPkceP {
 struct ProfileIdP {
     plugin_id: String,
     profile_id: String,
+}
+#[derive(Deserialize)]
+struct ProfileCompletePkceP {
+    plugin_id: String,
+    profile_id: String,
+    redirect_uri: String,
+    code: String,
+    verifier: String,
 }
 #[derive(Deserialize)]
 struct ProfileDeviceFlowP {
@@ -307,6 +316,18 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "plugin_profile_begin_pkce" => {
             let a: ProfileBeginPkceP = params(p)?;
             ok(plugin_profile_begin_pkce(cp, &a.plugin_id, &a.profile_id, &a.redirect_uri).await?)
+        }
+        "plugin_profile_complete_pkce" => {
+            let a: ProfileCompletePkceP = params(p)?;
+            ok(plugin_profile_complete_pkce(
+                cp,
+                &a.plugin_id,
+                &a.profile_id,
+                &a.redirect_uri,
+                &a.code,
+                &a.verifier,
+            )
+            .await?)
         }
         "plugin_profile_disconnect" => {
             let a: ProfileIdP = params(p)?;
@@ -1049,6 +1070,14 @@ fn auth_configured(setting_value: Option<&str>, env_is_set: bool) -> bool {
 /// `PluginAuthInfo.configured` for the list payload without building the whole
 /// auth DTO: oauth → a token is stored and reconnect isn't required; otherwise
 /// the `auth.setting`-row / `auth.env` check. No `[auth]` → false.
+///
+/// PR-3: for a component id whose declared bundle manifest carries `[[oauth]]`
+/// profiles (github/atlassian/bitbucket), oauth-configured means EVERY
+/// declared profile has a live stored token — a single-profile bundle behaves
+/// like the classic single-token check, but a multi-profile one is only
+/// "configured" once every profile is connected. Non-component oauth (and any
+/// component with no declared profiles) falls through to the classic
+/// single-token check unchanged.
 async fn plugin_auth_configured(
     store: &Store,
     plugin_id: &str,
@@ -1058,6 +1087,21 @@ async fn plugin_auth_configured(
         return Ok(false);
     };
     if auth.kind == AuthKind::Oauth {
+        if let Some(bundle) = crate::plugins::component_catalog::declared_bundle_manifest(plugin_id)
+        {
+            if !bundle.oauth.is_empty() {
+                for profile in &bundle.oauth {
+                    let live = store
+                        .get_plugin_oauth_profile_token(plugin_id, &profile.id)
+                        .await?
+                        .is_some_and(|t| !t.reconnect_required);
+                    if !live {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+        }
         let token = store.get_plugin_oauth_token(plugin_id).await?;
         return Ok(token.is_some_and(|token| !token.reconnect_required));
     }
@@ -2175,6 +2219,12 @@ async fn begin_plugin_install(
         .plugins()
         .get(&plugin_id)
         .ok_or_else(|| ApiError::not_found(format!("unknown plugin: {plugin_id}")))?;
+    if plugin.source == PluginSource::Component {
+        return Err(ApiError::bad_request(
+            "component plugins connect via their oauth profiles, not the declarative install flow"
+                .to_string(),
+        ));
+    }
     let auth = plugin.manifest.auth.clone();
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -2343,6 +2393,28 @@ async fn enrich_oauth_profile_status(
                 .flatten()
                 .and_then(|c| c.client_id)
                 .is_some_and(|id| !id.is_empty());
+        }
+        if !profile.client_id_configured {
+            // A client-id-setting with a stored non-empty value also counts
+            // (PR-3: user-supplied client id until first-party ids are baked).
+            let setting_key = crate::plugins::component_catalog::declared_bundle_manifest(
+                plugin_id,
+            )
+            .and_then(|bundle| {
+                bundle
+                    .oauth
+                    .into_iter()
+                    .find(|p| p.id == profile.id)
+                    .and_then(|p| p.client_id_setting)
+            });
+            if let Some(key) = setting_key {
+                profile.client_id_configured = store
+                    .get_setting_raw(&key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|v| !v.is_empty());
+            }
         }
     }
 }
@@ -2630,6 +2702,29 @@ async fn plugin_profile_begin_pkce(
         .await
         .map_err(oauth_err)?;
     Ok(start.into())
+}
+
+/// Completes a PKCE authorization-code exchange begun by
+/// `plugin_profile_begin_pkce`. Cockpit's loopback callback is the only
+/// caller of this RPC. On success the new token is live immediately, so this
+/// emits `CoreEvent::PluginsChanged` (mirroring `install_component_plugin`)
+/// so Cockpit refreshes the profile's connected status.
+async fn plugin_profile_complete_pkce(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    profile_id: &str,
+    redirect_uri: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<(), ApiError> {
+    let (ctx, manifest) = profile_capability_context(cp, plugin_id).await?;
+    let profile = find_oauth_profile(&manifest, profile_id)?;
+    crate::plugins::capabilities::oauth::ProfileOauth::new(&ctx)
+        .complete_pkce(&profile, redirect_uri, code, verifier)
+        .await
+        .map_err(oauth_err)?;
+    cp.emit(CoreEvent::PluginsChanged);
+    Ok(())
 }
 
 async fn plugin_profile_disconnect(
@@ -3159,14 +3254,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_integration_with_active_release_reports_installed_disabled() {
-        // The discord wedge: the install itself succeeded (active release in
-        // the ledger, bundle on disk) but the plugin was never enabled and has
-        // no auth to configure — so `configured || enabled` is false. The row
-        // must still read installed (status "disabled"), NOT "not-installed",
-        // which would keep offering Install for an already-installed bundle.
+    async fn component_integration_with_active_release_and_no_setting_reports_installed_enabled() {
+        // PR-2 fix A (Task 1): the install itself succeeded (active release
+        // in the ledger, bundle on disk) and `plugin.discord.enabled` was
+        // never written. `PluginHost::is_enabled` now treats an installed
+        // component with no explicit setting as enabled, so the row reads
+        // installed AND enabled.
+        //
+        // Before this fix, `is_enabled` defaulted an unset component to
+        // `false`, and this same scenario asserted `status == "disabled"` —
+        // that was the "install succeeded but the final enable write didn't"
+        // wedge this task closes.
+        //
+        // Since Task 10, discord's bundle DOES declare a secret+required
+        // `token` setting, from which the bridge derives `AuthKind::Token` —
+        // so this scenario also needs the token configured to isolate the
+        // enabled-by-default behavior under test from the (separately
+        // covered, see `component_needs_setup_when_declared_auth_setting_is_unconfigured`)
+        // needs-setup gate.
         let cp = test_cp().await;
         seed_active_component_release(&cp, "discord").await;
+        cp.store()
+            .set_setting_raw("plugin.discord.token", "test-token")
+            .await
+            .unwrap();
 
         let list = assemble_list(&cp).await.unwrap();
         let row = list
@@ -3177,11 +3288,37 @@ mod tests {
             row.installed,
             "an active component release means the plugin IS installed"
         );
-        assert_eq!(row.status, "disabled");
+        assert!(
+            row.enabled,
+            "an active release with no plugin.<id>.enabled setting now defaults to enabled"
+        );
+        assert_eq!(row.status, "ok");
 
         let detail = assemble_detail(&cp, "discord").await.unwrap();
         assert!(detail.info.installed, "detail must agree with the list");
-        assert_eq!(detail.info.status, "disabled");
+        assert!(detail.info.enabled, "detail must agree with the list");
+        assert_eq!(detail.info.status, "ok");
+    }
+
+    // Task 10: discord's bundle now declares a secret+required `token`
+    // setting, from which the bridge derives `AuthKind::Token` — an active,
+    // enabled install with NO token configured must report "needs-setup",
+    // the mirror image of the "ok" case above (which seeds the token).
+    #[tokio::test]
+    async fn component_needs_setup_when_declared_auth_setting_is_unconfigured() {
+        let cp = test_cp().await;
+        seed_active_component_release(&cp, "discord").await;
+
+        let list = assemble_list(&cp).await.unwrap();
+        let row = list
+            .iter()
+            .find(|p| p.id == "discord")
+            .expect("discord catalog row");
+        assert!(row.enabled, "an active release defaults to enabled");
+        assert_eq!(
+            row.status, "needs-setup",
+            "discord's derived token auth has no configured value, so this must be needs-setup"
+        );
     }
 
     // ---------- plugin_info ----------
@@ -3442,11 +3579,35 @@ mod tests {
     // `PluginInfoContext.active_version`). Once the active release is
     // reactivated to match the catalog version, the same plugin must fall
     // back to `ok`.
+    //
+    // PR-3: the bridge now derives `authKind: "oauth"` for github (it
+    // declares `[[oauth]] id = "github"`), so an unconnected github would
+    // read `needs-setup` and mask the update-available/ok assertions this
+    // test is actually about — seed a live token for its one declared
+    // profile so `configured` stays true throughout, isolating the
+    // update-available logic from the (separately covered) auth-configured
+    // gate.
     #[tokio::test]
     async fn assemble_list_marks_update_available_from_component_release_ledger() {
         let cp = test_cp().await;
         let settings = SettingsStore::new(cp.store().clone());
         settings.set("plugin.github.enabled", "true").await.unwrap();
+        cp.store()
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
 
         cp.store()
             .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
@@ -3589,6 +3750,42 @@ mod tests {
     fn auth_configured_false_when_neither_setting_nor_env_present() {
         assert!(!auth_configured(None, false));
         assert!(!auth_configured(Some(""), false));
+    }
+
+    // PR-3: a component with declared oauth profiles is configured only when
+    // every profile has a live stored token.
+    #[tokio::test]
+    async fn component_oauth_configured_requires_profile_tokens() {
+        let cp = test_cp().await;
+        let auth = Some(AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        });
+        assert!(!plugin_auth_configured(cp.store(), "github", auth.as_ref())
+            .await
+            .unwrap());
+        // Store a token for github's single declared profile ("github",
+        // matching plugins/github/ryuzi-plugin.toml's `[[oauth]] id =
+        // "github"`) → configured.
+        cp.store()
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "github",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(plugin_auth_configured(cp.store(), "github", auth.as_ref())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -4925,6 +5122,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_plugin_install_rejects_component_source() {
+        let cp = test_cp().await;
+        let result = begin_plugin_install(&cp, "github".to_string()).await;
+        match result {
+            Err(err) => {
+                assert!(
+                    err.message.contains("oauth profiles"),
+                    "error message must mention oauth profiles, got: {}",
+                    err.message
+                );
+            }
+            Ok(_) => panic!("expected begin_plugin_install to reject component plugin github"),
+        }
+    }
+
+    #[tokio::test]
     async fn list_plugins_dispatches_as_array() {
         let s = state().await;
         let out = dispatch(&s, "list_plugins", json!({})).await.unwrap();
@@ -5141,6 +5354,7 @@ writes = true
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("stored-id".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -5151,6 +5365,7 @@ writes = true
             token_url: None,
             device_authorization_url: None,
             connected: false,
+            authorize_url: None,
             client_id_configured: baked,
         };
         let mut manifest = ComponentManifestInfo {
@@ -5179,6 +5394,77 @@ writes = true
         assert!(
             !unset.client_id_configured,
             "no manifest baked-in and no stored client => not configured"
+        );
+    }
+
+    // The `client_id_setting` fallback (PR-3) only applies to profiles the
+    // installed bundle's declared manifest actually names one for. The
+    // embedded `github` bundle bakes a first-party client id instead (no
+    // `client-id-setting`), so this profile must stay unconfigured rather
+    // than the new lookup panicking or false-positiving on a plugin id that
+    // resolves via `component_catalog::declared_bundle_manifest`.
+    #[tokio::test]
+    async fn enrich_client_id_setting_fallback_leaves_unconfigured_when_none_declared() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![ComponentOauthProfileInfo {
+                id: "github".into(),
+                scopes: vec![],
+                token_url: None,
+                device_authorization_url: None,
+                connected: false,
+                authorize_url: None,
+                client_id_configured: false,
+            }],
+            tools: vec![],
+        };
+        enrich_oauth_profile_status(store, "github", &mut manifest).await;
+        assert!(
+            !manifest.oauth_profiles[0].client_id_configured,
+            "github's declared profile has no client_id_setting, so this must stay false"
+        );
+    }
+
+    // T7-deferred positive case, now landed by Task 10: atlassian's embedded
+    // bundle declares `client-id-setting = "plugin.atlassian.oauth_client_id"`
+    // (see `component_catalog`'s `atlassian_profile_carries_pkce_extras_and_client_id_setting`).
+    // A non-empty stored value at that key must flip `client_id_configured`
+    // through `plugin_release_detail`/`enrich_oauth_profile_status`'s
+    // `declared_bundle_manifest` fallback — the mirror image of
+    // `enrich_client_id_setting_fallback_leaves_unconfigured_when_none_declared`.
+    #[tokio::test]
+    async fn enrich_client_id_setting_fallback_flips_configured_when_value_is_stored() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .set_setting_raw("plugin.atlassian.oauth_client_id", "abc123")
+            .await
+            .unwrap();
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![ComponentOauthProfileInfo {
+                id: "atlassian-cloud".into(),
+                scopes: vec![],
+                token_url: None,
+                device_authorization_url: None,
+                connected: false,
+                authorize_url: None,
+                client_id_configured: false,
+            }],
+            tools: vec![],
+        };
+        enrich_oauth_profile_status(store, "atlassian", &mut manifest).await;
+        assert!(
+            manifest.oauth_profiles[0].client_id_configured,
+            "atlassian's declared client-id-setting with a stored value must flip client_id_configured"
         );
     }
 
@@ -5213,6 +5499,7 @@ writes = true
                 token_url: None,
                 device_authorization_url: None,
                 connected: false,
+                authorize_url: None,
                 client_id_configured: true,
             }],
             tools: vec![],

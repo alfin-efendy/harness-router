@@ -555,6 +555,7 @@ mod tests {
                 oauth: vec![],
                 provider_ids: vec![],
                 tools: vec![],
+                settings: vec![],
             },
             release: PluginRelease {
                 id: plugin_id.to_string(),

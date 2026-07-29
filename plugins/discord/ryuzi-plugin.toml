@@ -23,10 +23,29 @@ description = "Discord gateway: connects the Discord gateway (wss) over the host
 [permissions]
 network = ["gateway.discord.gg", "*.discord.gg", "discord.com", "*.discord.com", "*.discordapp.com"]
 
-# The bundle manifest schema (crates/plugin-sdk/src/bundle.rs) has no `settings`
-# section — like github/mimo, the component reads its host settings at runtime by
-# key through `ryuzi:settings/settings`, and Cockpit renders the fields. The keys
-# this component reads (declared here as documentation only, NOT a parsed field):
-#   - `plugin.discord.token`   bot token, injected into IDENTIFY + `Authorization: Bot` (secret).
-#   - `plugin.discord.app_id`  application id, for slash-command registration.
-#   - `plugin.discord.guild_id` guild the slash commands are registered in.
+# Host-rendered configuration fields (PR-3, Task 10). Bare keys — the host
+# namespaces them to `plugin.discord.<key>` when it bridges this bundle into
+# the plugin list, and this component reads them back by bare key through
+# `ryuzi:settings/settings` (see `src/guest.rs`'s `KEY_TOKEN`/`KEY_APP_ID`/
+# `KEY_GUILD_ID`). `token` being secret+required is also what
+# `component_catalog::derive_bundle_auth` reads to derive this bundle's
+# `AuthKind::Token` (setting `plugin.discord.token`) for the needs-setup /
+# connect surfaces.
+[[settings]]
+key = "token"
+label = "Bot token"
+help = "The bot token from your Discord application's Bot page (discord.com/developers/applications)."
+secret = true
+required = true
+
+[[settings]]
+key = "app_id"
+label = "Application id"
+help = "Your Discord application's id, for slash-command registration."
+required = true
+
+[[settings]]
+key = "guild_id"
+label = "Guild id"
+help = "The Discord server (guild) id the slash commands are registered in."
+required = false

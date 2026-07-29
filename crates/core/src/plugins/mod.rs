@@ -1175,18 +1175,31 @@ mod toggle_enabled_tests {
             .unwrap());
     }
 
-    // A component bundle is manifest-only, but it must NOT read as always-on:
-    // its off-disk tools gate on `plugin.<id>.enabled` (`component_plugin_enabled`),
-    // so `is_enabled` must mirror that gate (default off) and `toggle_enabled`
-    // must be able to flip it — the whole point of making the plugin usable.
+    // A component bundle is manifest-only, but it must NOT read as always-on
+    // like a non-component builtin does. `is_enabled` delegates to
+    // `component_plugin_enabled`'s tri-state gate: an explicit
+    // `plugin.<id>.enabled` setting always wins in either direction; with NO
+    // setting, enabled defaults to "is it actually installed"
+    // (`Store::active_component_release`) rather than a blanket on/off. This
+    // test's `component_only` row is never installed (no active release
+    // seeded), so it exercises the "not installed, no explicit setting" leg
+    // of that default — an installed component defaults to enabled instead
+    // (see `component_plugin_enabled_defaults_to_active_release_state` in
+    // `host.rs`) — and confirms `toggle_enabled`'s explicit setting still
+    // overrides it either way. Separately, whether an enabled *and* installed
+    // component can actually ATTACH also depends on
+    // `component_required_settings_configured` (needs-setup is a third,
+    // independent axis, covered by that function's own tests) — out of scope
+    // here.
     #[tokio::test]
-    async fn component_is_disabled_by_default_and_toggle_flips_its_gate() {
+    async fn component_with_no_active_release_defaults_off_and_toggle_flips_its_gate() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
         host.add(component_only("github"));
 
-        // Default: a component is OFF (unlike a manifest-only builtin, which is
-        // always on) — so its WASM tools don't load until explicitly enabled.
+        // Default with no explicit setting and no installed (active-release)
+        // bundle: OFF — so its WASM tools don't load until explicitly
+        // enabled or actually installed.
         assert!(!host.is_enabled(&settings, "github").await.unwrap());
 
         // Enable flips the exact key `component_plugin_enabled` reads.

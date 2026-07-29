@@ -1687,6 +1687,7 @@ mod gateway_impl_tests {
                 oauth: vec![],
                 provider_ids: vec![],
                 tools: vec![],
+                settings: vec![],
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),
@@ -2885,10 +2886,17 @@ mod gateway_impl_tests {
         let settings = SettingsStore::new(store.clone());
         let root = tempfile::tempdir().unwrap();
 
-        // One ENABLED and one DISABLED (never enabled -> default false) generic,
-        // NON-Discord long-lived gateway bundle, both installed + active.
+        // One ENABLED and one DISABLED (PR-2 fix: active bundles default to
+        // enabled, so we must explicitly disable to test the disabled path)
+        // generic, NON-Discord long-lived gateway bundle, both installed + active.
         install_active_gateway_bundle(root.path(), &store, "acme-gateway", true).await;
         install_active_gateway_bundle(root.path(), &store, "beta-gateway", false).await;
+
+        // Explicitly disable the beta-gateway bundle.
+        store
+            .set_setting_raw("plugin.beta-gateway.enabled", "false")
+            .await
+            .unwrap();
 
         let gateways = build_wasm_gateways(
             Arc::clone(&store),
@@ -2919,6 +2927,107 @@ mod gateway_impl_tests {
             .start()
             .await
             .expect("the daemon start path starts the constructed gateway");
+    }
+
+    /// PR-2 fix A: an installed+ACTIVE gateway bundle without an explicit
+    /// `plugin.<id>.enabled` setting is ENABLED by default (the positive
+    /// counterpart of the test above). This kills the "install succeeded but
+    /// the final enable write didn't" wedge — agents may bind the bundle
+    /// without a separate enable write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_path_enables_active_gateway_bundle_without_explicit_setting() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+
+        // Install an active bundle but do NOT write `plugin.<id>.enabled`.
+        // The `enabled` parameter is false, so the fixture doesn't auto-write
+        // the setting — this tests the positive path where a fresh install
+        // counts as enabled without an explicit enable write.
+        install_active_gateway_bundle(root.path(), &store, "acme-gateway", false).await;
+
+        let gateways = build_wasm_gateways(
+            Arc::clone(&store),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(
+            gateways.len(),
+            1,
+            "an active release without explicit enable must be constructed + registered"
+        );
+        assert_eq!(gateways[0].id(), "acme-gateway");
+    }
+
+    /// Final-review fix: enabled is not the same as configured. `discord` is
+    /// the one embedded catalog manifest
+    /// (`component_catalog::declared_bundle_manifest`) with a `secret +
+    /// required` settings field (its bot token) — installing this throwaway
+    /// fixture component under the literal id `"discord"` is what exercises
+    /// `component_required_settings_configured` here, since that check reads
+    /// the EMBEDDED manifest by id, not whatever this on-disk fixture's own
+    /// bare `ryuzi-plugin.toml` declares. Before this fix an
+    /// enabled-but-unconfigured bundle attached anyway, failed `start()` with
+    /// `InvalidConfig`, and the supervisor restart-looped it forever — the
+    /// true state is needs-setup, so `build_wasm_gateways` must construct
+    /// nothing for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_path_skips_an_enabled_bundle_whose_required_setting_is_not_configured() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+
+        install_active_gateway_bundle(root.path(), &store, "discord", true).await;
+
+        let gateways = build_wasm_gateways(
+            Arc::clone(&store),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert!(
+            gateways.is_empty(),
+            "an enabled discord bundle with no stored bot token must not attach: {:?}",
+            gateways.iter().map(|g| g.id()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The positive counterpart of the test above: once the required setting
+    /// IS stored, the same enabled `discord`-id bundle attaches normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_path_attaches_once_the_required_setting_is_configured() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+
+        install_active_gateway_bundle(root.path(), &store, "discord", true).await;
+        store
+            .set_setting_raw("plugin.discord.token", "test-bot-token")
+            .await
+            .unwrap();
+
+        let gateways = build_wasm_gateways(
+            Arc::clone(&store),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(
+            gateways.len(),
+            1,
+            "once the required setting is stored, the bundle must attach"
+        );
+        assert_eq!(gateways[0].id(), "discord");
     }
 
     // -------------------------------------------------------------

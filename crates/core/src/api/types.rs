@@ -1295,6 +1295,10 @@ pub struct ComponentOauthProfileInfo {
     /// connected. Enriched from the store in `plugin_release_detail`; the pure
     /// manifest [`From`] conversion leaves it `false`.
     pub connected: bool,
+    /// The profile's authorize endpoint (`authorize_url`), which `begin_pkce`
+    /// builds the browser-facing authorize URL against. `None` when the
+    /// manifest omits it (e.g. a device-flow-only profile).
+    pub authorize_url: Option<String>,
     /// A client id resolves for this profile (manifest baked-in, a stored
     /// per-install override, or a settings value) — Connect is gated on this.
     /// The pure [`From`] sets it from the manifest's baked `client-id` only;
@@ -1371,6 +1375,7 @@ impl From<ryuzi_plugin_sdk::PluginBundleManifest> for ComponentManifestInfo {
                     token_url: p.token_url,
                     device_authorization_url: p.device_authorization_url,
                     connected: false,
+                    authorize_url: p.authorize_url,
                     client_id_configured: p.client_id.is_some(),
                 })
                 .collect(),

@@ -1752,21 +1752,24 @@ impl ControlPlane {
 
     /// Discover every active WASM component bundle
     /// ([`crate::plugins::bundle::load_active_bundles`]), keep only the ENABLED
-    /// ones ([`crate::plugins::host::component_plugin_enabled`], the same
-    /// `plugin.<id>.enabled` convention connector/extension plugins use), and
-    /// build one shared [`WasmActivation`] per enabled bundle. Returns a
-    /// [`WasmTools`] provider (its connector tools) and a
+    /// ([`crate::plugins::host::component_plugin_enabled`], the same
+    /// `plugin.<id>.enabled` convention connector/extension plugins use) AND
+    /// CONFIGURED (`component_required_settings_configured` — every setting
+    /// its derived auth requires, e.g. discord's bot token, is actually
+    /// stored) ones, and build one shared [`WasmActivation`] per attached
+    /// bundle. Returns a [`WasmTools`] provider (its connector tools) and a
     /// [`WasmHookDispatcher`] (its `ryuzi:hooks/hooks` export) over the same
     /// activations, to thread into the session next to the extension seams.
     ///
     /// Every failure mode is warn-and-skip: a missing bundle root, a discovery
     /// error, an unavailable component runtime, a per-bundle compile failure,
-    /// or an enablement-lookup error each drop just the affected bundle (or the
-    /// whole set) rather than blocking the session from starting — a broken
-    /// component plugin must never brick a session. `(None, None)` when nothing
-    /// enabled is installed, so the common case constructs no component runtime
-    /// at all. Declarative connectors are untouched (this migration phase keeps
-    /// both paths live).
+    /// an enablement-lookup error, or a needs-setup skip each drop just the
+    /// affected bundle (or the whole set) rather than blocking the session
+    /// from starting — a broken OR not-yet-configured component plugin must
+    /// never brick a session, and a needs-setup one must never restart-loop
+    /// either. `(None, None)` when nothing enabled+configured is installed,
+    /// so the common case constructs no component runtime at all. Declarative
+    /// connectors are untouched (this migration phase keeps both paths live).
     async fn build_wasm_session_providers(
         &self,
         settings: &SettingsStore,
@@ -1807,6 +1810,26 @@ impl ControlPlane {
                 Ok(false) => continue,
                 Err(error) => {
                     tracing::warn!(plugin = %id, "wasm: enablement check failed: {error}");
+                    continue;
+                }
+            }
+            // Enabled is not the same as configured: an enabled component
+            // whose derived auth needs a setting it doesn't have yet (e.g.
+            // discord's bot token) is a needs-setup plugin, not a broken one —
+            // attaching it would fail `start()` with `InvalidConfig` and have
+            // the supervisor restart-loop it forever. Skip quietly.
+            match crate::plugins::host::component_required_settings_configured(settings, &id).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        plugin = %id,
+                        "wasm: skipping {id}: required settings not configured (needs-setup)"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(plugin = %id, "wasm: configured-settings check failed: {error}");
                     continue;
                 }
             }

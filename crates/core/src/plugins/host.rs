@@ -82,7 +82,11 @@ pub fn plugin_fields_all() -> Vec<(String, SettingField)> {
 /// - each `manifest.settings[]` field, verbatim
 /// - `manifest.auth.setting`, if present, as a synthetic secret `String`
 ///   field (the manifest's `[auth]` block only names the key; it has no
-///   label/help of its own)
+///   label/help of its own) — UNLESS `manifest.settings[]` already declared
+///   that key (PR-3: a bridged component's derived `AuthKind::Token` setting
+///   IS one of its own `settings[]` fields, e.g. `plugin.discord.token`, with
+///   a real label/help/kind the manifest author wrote; the label-less
+///   synthetic field must never clobber it)
 /// - `plugin.<id>.enabled`, always, as a `Bool` field — this is what makes
 ///   `validate_setting("plugin.<id>.enabled", ...)` accept every installed
 ///   plugin, not just connector-capable ones (harmless for the others: they
@@ -96,22 +100,24 @@ fn register_plugin_fields(manifest: &PluginManifest) {
     }
     if let Some(auth) = &manifest.auth {
         if let Some(key) = &auth.setting {
-            fields.insert(
-                key.clone(),
-                (
-                    manifest.id.clone(),
-                    SettingField {
-                        key: key.clone(),
-                        label: format!("{} auth", manifest.name),
-                        help: String::new(),
-                        secret: true,
-                        required: false,
-                        kind: FieldKind::String,
-                        options: Vec::new(),
-                        default: None,
-                    },
-                ),
-            );
+            if !fields.contains_key(key) {
+                fields.insert(
+                    key.clone(),
+                    (
+                        manifest.id.clone(),
+                        SettingField {
+                            key: key.clone(),
+                            label: format!("{} auth", manifest.name),
+                            help: String::new(),
+                            secret: true,
+                            required: false,
+                            kind: FieldKind::String,
+                            options: Vec::new(),
+                            default: None,
+                        },
+                    ),
+                );
+            }
         }
     }
     let enabled_key = format!("plugin.{}.enabled", manifest.id);
@@ -313,8 +319,11 @@ impl PluginHost {
     /// - harness-capable → always `true` (the native runtime cannot be
     ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
-    /// - component bundle → the setting `plugin.<id>.enabled == "true"`
-    ///   (defaults to `false`), matching `component_plugin_enabled`
+    /// - component bundle → explicit `plugin.<id>.enabled` wins in either
+    ///   direction (`"false"` disables, `"true"` enables); with no setting,
+    ///   enabled iff an active release exists on disk
+    ///   (`Store::active_component_release`) — a successful install counts as
+    ///   enabled without a separate enable write
     /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector/extension capability)
     ///   → always `true`
@@ -329,15 +338,11 @@ impl PluginHost {
             return Ok(true);
         }
         if plugin.source == PluginSource::Component {
-            // A first-party WASM component bundle is registered manifest-only
-            // (its connector/gateway/provider capability runs off-disk), but
-            // ALL of those gate on `plugin.<id>.enabled` via
-            // `component_plugin_enabled`. Report that same gate so the UI
-            // reflects the real switch instead of the manifest-only
-            // "always on" default below — and so `toggle_enabled` has a switch
-            // to flip.
-            let key = format!("plugin.{id}.enabled");
-            return Ok(settings.get(&key).await?.as_deref() == Some("true"));
+            // PR-2 fix A — one rule, one implementation: the catalog gate and
+            // the runtime-attach gate must never disagree (a wedged install
+            // would be bindable but never attach), so this delegates to the
+            // same function the daemon-build path uses.
+            return component_plugin_enabled(settings, id).await;
         }
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());
@@ -363,9 +368,11 @@ impl PluginHost {
     }
 }
 
-/// Whether an installed WASM component bundle (Task 9+) is enabled, per the
-/// same `plugin.<id>.enabled == "true"` convention (default `false`)
-/// [`PluginHost::is_enabled`] applies to connector/extension plugins.
+/// Whether an installed WASM component bundle (Task 9+) is enabled. Mirrors
+/// [`PluginHost::is_enabled`]'s logic for Component bundles: an installed
+/// (active-release-on-disk) component is enabled unless the user explicitly
+/// disabled it (explicit `plugin.<id>.enabled == "false"`). Explicit settings
+/// always win, in either direction.
 ///
 /// Component bundles are discovered off-disk
 /// ([`crate::plugins::bundle::load_active_bundles`]) rather than registered as
@@ -376,7 +383,51 @@ impl PluginHost {
 /// component.
 pub async fn component_plugin_enabled(settings: &SettingsStore, id: &str) -> anyhow::Result<bool> {
     let key = format!("plugin.{id}.enabled");
-    Ok(settings.get(&key).await?.as_deref() == Some("true"))
+    match settings.get(&key).await?.as_deref() {
+        Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        _ => {
+            let active = settings
+                .store()
+                .active_component_release(id)
+                .await?
+                .is_some();
+            Ok(active)
+        }
+    }
+}
+
+/// Whether `id`'s installed component has every setting its derived auth
+/// requires (the `component_catalog::derive_bundle_auth` contract: an
+/// embedded manifest secret+required field, e.g. discord's bot token). `true`
+/// when the embedded bundle manifest declares no such field —
+/// there is nothing to configure, so an enabled component is free to attach —
+/// or when every declared secret+required field has a stored non-empty value.
+///
+/// This is deliberately SEPARATE from [`component_plugin_enabled`]: enabled
+/// answers "did the user turn this on" (default yes, opt-out), while this
+/// answers "can it actually start" (needs-setup is a real, honest state, not
+/// a supervisor-restart-loop failure). Callers gate an attach path on BOTH —
+/// an enabled-but-unconfigured component must skip attaching, not fail
+/// `start()` and get retried forever.
+pub async fn component_required_settings_configured(
+    settings: &SettingsStore,
+    id: &str,
+) -> anyhow::Result<bool> {
+    let Some(bundle) = crate::plugins::component_catalog::declared_bundle_manifest(id) else {
+        return Ok(true);
+    };
+    for field in bundle.settings.iter().filter(|f| f.secret && f.required) {
+        let key = format!("plugin.{id}.{}", field.key);
+        let configured = settings
+            .get(&key)
+            .await?
+            .is_some_and(|value| !value.is_empty());
+        if !configured {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The extension registries, plus the plugin host recording every
@@ -622,11 +673,47 @@ mod tests {
         }
     }
 
+    fn component_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            provider: None,
+            source: PluginSource::Component,
+        }
+    }
+
     async fn open_settings() -> (Arc<Store>, SettingsStore, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
         let settings = SettingsStore::new(store.clone());
         (store, settings, tmp)
+    }
+
+    /// Seeds an installed, active `component_plugin_releases` row for `id` —
+    /// the ledger state a successful component-bundle install leaves behind.
+    /// Mirrors `plugins_api.rs`'s `seed_active_component_release` test helper.
+    async fn seed_active_component_release(store: &Store, id: &str) {
+        store
+            .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
+                plugin_id: id.into(),
+                version: "0.1.0".into(),
+                source_url: format!("https://example.com/{id}.wasm"),
+                sha256: "aa".into(),
+                signing_key_id: "first-party".into(),
+                installed_at: 1,
+                active: false,
+                revoked: false,
+                revocation_reason: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_active_component_release(id, "0.1.0")
+            .await
+            .unwrap();
     }
 
     // ---------- PluginHost::add/get/list ----------
@@ -875,9 +962,213 @@ mod tests {
         assert!(host.is_enabled(&settings, "acme-ext").await.unwrap());
     }
 
+    // PR-2 fix A: a component bundle with an ACTIVE release on disk counts as
+    // enabled even when `plugin.<id>.enabled` was never written — the install
+    // succeeded, so agents may bind it. Explicit "false" still disables.
+    #[tokio::test]
+    async fn component_with_active_release_defaults_enabled() {
+        let (store, settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(component_only("acme-component"));
+
+        // No active release and no `plugin.<id>.enabled` setting → disabled.
+        assert!(
+            !host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "no active release and no setting must default to disabled"
+        );
+
+        // An active release with no setting written → enabled by default:
+        // the install succeeded, so agents may bind it without an explicit
+        // enable write.
+        seed_active_component_release(&store, "acme-component").await;
+        assert!(
+            host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "an active release on disk must default to enabled"
+        );
+
+        // Explicit "false" still disables, even with an active release.
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "false")
+            .await
+            .unwrap();
+        assert!(
+            !host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "an explicit false setting must win over an active release"
+        );
+
+        // Explicit "true" enables (unchanged from before this fix).
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "true")
+            .await
+            .unwrap();
+        assert!(
+            host.is_enabled(&settings, "acme-component").await.unwrap(),
+            "an explicit true setting must enable"
+        );
+    }
+
+    // ---------- component_plugin_enabled ----------
+
+    // Mirrors component_with_active_release_defaults_enabled but tests the
+    // standalone function rather than the PluginHost::is_enabled path.
+    #[tokio::test]
+    async fn component_plugin_enabled_defaults_to_active_release_state() {
+        let (store, settings, _tmp) = open_settings().await;
+
+        // No active release and no `plugin.<id>.enabled` setting → disabled.
+        assert!(
+            !component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
+            "no active release and no setting must default to disabled"
+        );
+
+        // An active release with no setting written → enabled by default:
+        // the install succeeded, so runtime may bind it without an explicit
+        // enable write.
+        seed_active_component_release(&store, "acme-component").await;
+        assert!(
+            component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
+            "an active release on disk must default to enabled"
+        );
+
+        // Explicit "false" still disables, even with an active release.
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "false")
+            .await
+            .unwrap();
+        assert!(
+            !component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
+            "an explicit false setting must win over an active release"
+        );
+
+        // Explicit "true" enables (unchanged from before this fix).
+        store
+            .set_setting_raw("plugin.acme-component.enabled", "true")
+            .await
+            .unwrap();
+        assert!(
+            component_plugin_enabled(&settings, "acme-component")
+                .await
+                .unwrap(),
+            "an explicit true setting must enable"
+        );
+    }
+
+    // ---------- component_required_settings_configured ----------
+
+    // Final-review fix: enabled ("should this run") and configured ("can it
+    // actually start") are separate axes. `discord` is the one embedded
+    // catalog manifest (`component_catalog::declared_bundle_manifest`) with a
+    // `secret + required` settings field (its bot token), so it is the id
+    // that exercises the real gate; a synthetic id with no embedded manifest
+    // must report configured unconditionally (nothing to configure).
+    #[tokio::test]
+    async fn component_required_settings_configured_gates_on_the_embedded_secret_field() {
+        let (store, settings, _tmp) = open_settings().await;
+
+        // No embedded manifest at all (e.g. a generic test/gateway bundle) —
+        // nothing declared, so nothing blocks attaching.
+        assert!(
+            component_required_settings_configured(&settings, "acme-no-manifest")
+                .await
+                .unwrap(),
+            "an id with no embedded manifest has nothing to configure"
+        );
+
+        // `discord` declares its bot token as `secret = true, required = true`
+        // — with no stored value, it must report NOT configured.
+        assert!(
+            !component_required_settings_configured(&settings, "discord")
+                .await
+                .unwrap(),
+            "discord's required bot-token setting has no stored value yet"
+        );
+
+        // Storing the required setting flips it to configured.
+        store
+            .set_setting_raw("plugin.discord.token", "test-bot-token")
+            .await
+            .unwrap();
+        assert!(
+            component_required_settings_configured(&settings, "discord")
+                .await
+                .unwrap(),
+            "once the required setting is stored, the component is configured"
+        );
+
+        // An empty stored value is the same as unset — still not configured.
+        store
+            .set_setting_raw("plugin.discord.token", "")
+            .await
+            .unwrap();
+        assert!(
+            !component_required_settings_configured(&settings, "discord")
+                .await
+                .unwrap(),
+            "an empty stored value must not count as configured"
+        );
+    }
+
     #[test]
     fn capabilities_reports_extension_when_the_axis_is_present() {
         let plugin = extension_only("acme-ext");
         assert_eq!(plugin.capabilities(), vec!["extension"]);
+    }
+
+    // Task 10's first real collision: a bundle-bridged manifest (discord) now
+    // declares `auth.setting` pointing at one of its OWN `settings[]` keys
+    // (the derived token auth setting IS the declared field). The doc-stated
+    // guard at `register_plugin_fields` must keep the declared field's real
+    // label/required — never let the label-less auth-synthetic clobber it.
+    #[test]
+    fn register_plugin_fields_keeps_declared_field_when_auth_setting_collides() {
+        use ryuzi_plugin_sdk::{AuthKind, AuthSpec};
+
+        let id = "acme-collision-guard";
+        let key = format!("plugin.{id}.token");
+        let plugin = CorePlugin {
+            manifest: PluginManifest {
+                auth: Some(AuthSpec {
+                    kind: AuthKind::Token,
+                    setting: Some(key.clone()),
+                    ..Default::default()
+                }),
+                settings: vec![SettingField {
+                    key: key.clone(),
+                    label: "Bot token".to_string(),
+                    help: "declared by the manifest author, not synthesized".to_string(),
+                    secret: true,
+                    required: true,
+                    kind: FieldKind::String,
+                    options: Vec::new(),
+                    default: None,
+                }],
+                ..manifest(id)
+            },
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            provider: None,
+            source: PluginSource::Builtin,
+        };
+
+        let mut host = PluginHost::new();
+        assert!(host.add(plugin));
+
+        let field = plugin_field(&key).expect("the declared field must be registered");
+        assert_eq!(
+            field.label, "Bot token",
+            "the declared settings[] field's label must win over the label-less auth synthetic"
+        );
+        assert!(
+            field.required,
+            "the declared field's required flag must survive, not the synthetic's always-false"
+        );
     }
 }

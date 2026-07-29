@@ -47,8 +47,9 @@ pub use ryuzi_core::api::types::{
     CatalogStatus, ComponentBootstrapStatus, ComponentManifestInfo, ComponentOauthProfileInfo,
     ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, ExtensionStatusEntry,
     PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo, PluginInstallBeginResult,
-    PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, PluginToolEntry,
-    PluginToolsResult, SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
+    PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, PluginProfilePkceStart,
+    PluginToolEntry, PluginToolsResult, SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto,
+    UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -265,6 +266,245 @@ pub async fn plugin_profile_disconnect(
         .rpc(
             "plugin_profile_disconnect",
             serde_json::json!({ "plugin_id": plugin_id, "profile_id": profile_id }),
+        )
+        .await
+}
+
+/// A profile's PKCE connect path, distinct per `(plugin_id, profile_id)` so
+/// multiple components' profile connects never collide on the same fixed
+/// port — unlike the install wizard's single `{plugin_id}` path, a plugin can
+/// declare several `[[oauth]]` profiles.
+fn plugin_profile_callback_path(plugin_id: &str, profile_id: &str) -> String {
+    format!("/plugin-oauth/{plugin_id}/profile/{profile_id}/callback")
+}
+
+/// Namespaced (`profile:` prefix) so a profile flow's cancel entry can never
+/// collide with — or be swept up by — the install wizard's
+/// `cancel_pending_local_flows(plugin_id, None)`, which only matches keys
+/// starting with `{plugin_id}:`.
+fn plugin_profile_flow_key(plugin_id: &str, profile_id: &str, state_token: &str) -> String {
+    format!("profile:{plugin_id}:{profile_id}:{state_token}")
+}
+
+/// Shut down a live local callback server for this `(plugin_id, profile_id)`
+/// pair, if any — the profile-scoped analogue of `cancel_pending_local_flows`,
+/// sharing the same cancel map (see [`plugin_profile_flow_key`]'s doc for why
+/// the two never collide). Fired on a same-profile re-begin (Retry).
+fn cancel_pending_profile_flow(plugin_id: &str, profile_id: &str) {
+    let prefix = format!("profile:{plugin_id}:{profile_id}:");
+    let mut cancels = plugin_install_cancels()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let keys: Vec<String> = cancels
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(tx) = cancels.remove(&key) {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Begins a component OAuth profile's PKCE connect flow. Mirrors
+/// `begin_plugin_install`'s local-loopback shape (bind-retry the fixed wizard
+/// port, spawn a one-shot callback server, await it in the background) but
+/// simpler: there is no DCR/manual-paste fallback for a profile connect, so a
+/// still-taken port surfaces as a command error rather than degrading to
+/// `callback_mode: "manual"`. The daemon owns the PKCE flow state (verifier
+/// is round-tripped back to Cockpit, same as `plugin_profile_begin_device_flow`
+/// round-trips its device code); Cockpit only binds the port, awaits the
+/// redirect, validates `state` locally, and hands the code + verifier back
+/// via `plugin_profile_complete_pkce`.
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_profile_begin_pkce(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    plugin_id: String,
+    profile_id: String,
+) -> R<PluginProfilePkceStart> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{PLUGIN_OAUTH_CALLBACK_PORT}{}",
+        plugin_profile_callback_path(&plugin_id, &profile_id)
+    );
+    let start: PluginProfilePkceStart = client
+        .rpc(
+            "plugin_profile_begin_pkce",
+            serde_json::json!({
+                "plugin_id": plugin_id,
+                "profile_id": profile_id,
+                "redirect_uri": redirect_uri,
+            }),
+        )
+        .await?;
+
+    // A same-profile re-begin (Retry) must shut down the previous flow's
+    // local callback server before we try to bind the fixed port again — the
+    // daemon already dropped its own stale flow state in the RPC above.
+    cancel_pending_profile_flow(&plugin_id, &profile_id);
+
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let flow_key = plugin_profile_flow_key(&plugin_id, &profile_id, &start.state);
+    plugin_install_cancels()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(flow_key.clone(), cancel_tx);
+
+    // Same bind-retry as `begin_plugin_install`: the just-canceled previous
+    // flow's axum server shuts down asynchronously, so the port can still be
+    // held for a moment.
+    let mut bound = oauth_loopback::bind_fixed(PLUGIN_OAUTH_CALLBACK_PORT).await;
+    for _ in 0..2 {
+        if bound.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        bound = oauth_loopback::bind_fixed(PLUGIN_OAUTH_CALLBACK_PORT).await;
+    }
+    let listener = match bound {
+        Ok(listener) => listener,
+        Err(err) => {
+            plugin_install_cancels()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&flow_key);
+            return Err(err.into());
+        }
+    };
+
+    let (server, result_rx, shutdown_tx) = oauth_loopback::spawn_profile_callback_server(
+        listener,
+        &plugin_profile_callback_path(&plugin_id, &profile_id),
+        start.state.clone(),
+    );
+    let engine_client = client.clone();
+    let task_plugin_id = plugin_id.clone();
+    let task_profile_id = profile_id.clone();
+    let task_redirect_uri = redirect_uri.clone();
+    let verifier = start.verifier.clone();
+    let state_token = start.state.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = tokio::select! {
+            res = oauth_loopback::await_callback(
+                server,
+                result_rx,
+                shutdown_tx,
+                std::time::Duration::from_secs(5 * 60),
+            ) => Some(res),
+            // Cancellation (view closed / re-begin): dropping the
+            // await_callback future drops shutdown_tx, which shuts the axum
+            // server down gracefully.
+            _ = cancel_rx => None,
+        };
+        plugin_install_cancels()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&flow_key);
+        // Canceled, or the callback capture itself failed (timeout / listener
+        // closed): exit silently, same as the install wizard's cancel path.
+        // A genuine capture failure has no local UI listener to report to —
+        // the profile just stays disconnected, same as any other abandoned
+        // flow.
+        if let Some(Ok(callback)) = outcome {
+            complete_local_profile_callback(
+                &engine_client,
+                &task_plugin_id,
+                &task_profile_id,
+                &task_redirect_uri,
+                &verifier,
+                &state_token,
+                callback,
+            )
+            .await;
+        }
+    });
+
+    Ok(start)
+}
+
+/// Validate a captured loopback callback's `state` LOCALLY for a profile PKCE
+/// flow (mirrors `complete_local_callback`'s validation), then hand the code +
+/// verifier to the daemon's `plugin_profile_complete_pkce` for token exchange.
+/// On success the daemon emits `CoreEvent::PluginsChanged`, which is how the
+/// profile's `connected` flag reaches Cockpit — there is no dedicated
+/// event/toast for this background completion (unlike
+/// `PluginOauthCompletedMsg` for the install wizard), so failures are only
+/// logged; the profile simply stays disconnected and the user can retry.
+async fn complete_local_profile_callback(
+    engine: &EngineClient,
+    plugin_id: &str,
+    profile_id: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    state_token: &str,
+    callback: oauth_loopback::CallbackResult,
+) {
+    let Some(code) = callback.code else {
+        eprintln!(
+            "[ryuzi] profile OAuth callback for {plugin_id}/{profile_id} did not include a `code` parameter"
+        );
+        return;
+    };
+    let Some(state) = callback.state else {
+        eprintln!(
+            "[ryuzi] profile OAuth callback for {plugin_id}/{profile_id} did not include a `state` parameter"
+        );
+        return;
+    };
+    if state != state_token {
+        eprintln!(
+            "[ryuzi] profile OAuth state mismatch for {plugin_id}/{profile_id} — discarding the callback"
+        );
+        return;
+    }
+    if let Err(err) = engine
+        .rpc::<()>(
+            "plugin_profile_complete_pkce",
+            serde_json::json!({
+                "plugin_id": plugin_id,
+                "profile_id": profile_id,
+                "redirect_uri": redirect_uri,
+                "code": code.trim(),
+                "verifier": verifier,
+            }),
+        )
+        .await
+    {
+        eprintln!(
+            "[ryuzi] profile OAuth completion failed for {plugin_id}/{profile_id}: {}",
+            err.message
+        );
+    }
+}
+
+/// Exposed for symmetry with [`plugin_profile_begin_pkce`] (and for direct
+/// testing) — the loopback callback task above is the only production
+/// caller.
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_profile_complete_pkce(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    plugin_id: String,
+    profile_id: String,
+    redirect_uri: String,
+    code: String,
+    verifier: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "plugin_profile_complete_pkce",
+            serde_json::json!({
+                "plugin_id": plugin_id,
+                "profile_id": profile_id,
+                "redirect_uri": redirect_uri,
+                "code": code,
+                "verifier": verifier,
+            }),
         )
         .await
 }

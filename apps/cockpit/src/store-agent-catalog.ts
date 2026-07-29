@@ -7,6 +7,7 @@ type AgentConfigurationCatalogState = {
   loading: boolean;
   error: string | null;
   load: () => Promise<void>;
+  reload: () => Promise<void>;
 };
 
 function errorMessage(error: unknown): string {
@@ -36,6 +37,13 @@ export const useAgentConfigurationCatalog = create<AgentConfigurationCatalogStat
         }
       })();
       return inFlight;
+    },
+    reload: () => {
+      // pluginsChanged invalidation (PR-2 fix C): drop the cache AND any
+      // in-flight fetch's claim so a fresh request actually goes out.
+      inFlight = null;
+      set({ catalog: null });
+      return get().load();
     },
   };
 });

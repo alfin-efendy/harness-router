@@ -616,7 +616,7 @@ type ReleaseDetailFixture = {
     description: string;
     lifecycle: string;
     domains: string[];
-    oauthProfiles: { id: string; scopes: string[] }[];
+    oauthProfiles: OauthProfileFixture[];
     // Task 10: the pre-install Tools tab fallback source
     // (`ComponentManifestInfo.tools`) — optional here (rather than mirroring
     // the real DTO's required field) so every pre-Task-10 fixture literal in
@@ -628,9 +628,24 @@ type ReleaseDetailFixture = {
     description: string;
     lifecycle: string;
     domains: string[];
-    oauthProfiles: { id: string; scopes: string[] }[];
+    oauthProfiles: OauthProfileFixture[];
     tools?: { name: string; description: string; writes: boolean }[];
   } | null;
+};
+// Task 9: every field beyond `id`/`scopes` is optional so every pre-Task-9
+// fixture literal in this file (which only ever set those two) stays valid —
+// only the new PKCE-connections test below needs the full
+// `ComponentOauthProfileInfo` shape (`OauthProfileConnections` reads
+// `tokenUrl`/`deviceAuthorizationUrl`/`authorizeUrl`/`clientIdConfigured`/
+// `connected` to decide what to render).
+type OauthProfileFixture = {
+  id: string;
+  scopes: string[];
+  tokenUrl?: string | null;
+  deviceAuthorizationUrl?: string | null;
+  connected?: boolean;
+  authorizeUrl?: string | null;
+  clientIdConfigured?: boolean;
 };
 const emptyReleaseDetail = (id: string): ReleaseDetailFixture => ({
   pluginId: id,
@@ -1631,6 +1646,52 @@ test("rendering both in sequence never leaks one's profile into the other's page
   render(<PluginDetailView id="bitbucket" />);
   await screen.findByText(/bitbucket-cloud/);
   expect(screen.queryByText(/atlassian-cloud/)).toBeNull();
+});
+
+// Task 9: a PKCE-only profile (no device-authorization endpoint) must still
+// surface a Settings/auth tab and its own connections-card row — before this
+// task, `hasComponentOauth` only checked the device-flow pair, so a
+// PKCE-only component like atlassian had literally no way to reach its own
+// Connect action once installed.
+test("a PKCE-only profile still gets a settings tab with a disabled Connect + settings hint before a client id is configured", async () => {
+  const atlassianDetail = componentDetail("atlassian");
+  pluginDetail.mockImplementationOnce((_runnerId: string, _id: string) =>
+    ok({ ...atlassianDetail, info: { ...atlassianDetail.info, installed: true } }),
+  );
+  componentReleaseFixtures.atlassian = {
+    pluginId: "atlassian",
+    activeVersion: "0.1.0",
+    releases: [releaseInfo({ pluginId: "atlassian", version: "0.1.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.atlassian.com"],
+      oauthProfiles: [
+        {
+          id: "atlassian-cloud",
+          scopes: ["read:jira-work"],
+          tokenUrl: "https://auth.atlassian.com/oauth/token",
+          deviceAuthorizationUrl: null,
+          connected: false,
+          authorizeUrl: "https://auth.atlassian.com/authorize",
+          clientIdConfigured: false,
+        },
+      ],
+    },
+    declaredManifest: null,
+  };
+
+  render(<PluginDetailView id="atlassian" />);
+  await screen.findByText("atlassian");
+
+  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  const panel = within(screen.getByTestId("tab-panel-settings"));
+
+  expect(panel.getByText("Connections (OAuth)")).toBeTruthy();
+  expect(panel.getByText("atlassian-cloud")).toBeTruthy();
+  expect((panel.getByRole("button", { name: "Connect" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(panel.getByText("Enter the OAuth client id in Settings first.")).toBeTruthy();
 });
 
 // ---------- Tabbed scaffold: hero actions + deep-link consumption — Task 9 ----------
