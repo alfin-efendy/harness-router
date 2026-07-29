@@ -720,10 +720,12 @@ pub(crate) async fn build_test_transport_with_grants(
                     client_id_setting: None,
                     client_secret_setting: None,
                     dynamic_registration: false,
+                    extra_authorize_params: Default::default(),
                 })
                 .collect(),
             provider_ids: grants.provider_ids.clone(),
             tools: vec![],
+            settings: vec![],
         },
         release: PluginRelease {
             id: provider_id.to_string(),

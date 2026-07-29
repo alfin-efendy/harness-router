@@ -674,6 +674,7 @@ mod tests {
             client_secret_setting: None,
             resource: None,
             dynamic_registration: false,
+            extra_authorize_params: Default::default(),
         }
     }
 

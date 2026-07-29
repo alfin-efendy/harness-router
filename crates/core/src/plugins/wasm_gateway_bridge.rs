@@ -1687,6 +1687,7 @@ mod gateway_impl_tests {
                 oauth: vec![],
                 provider_ids: vec![],
                 tools: vec![],
+                settings: vec![],
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),
