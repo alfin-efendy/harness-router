@@ -79,6 +79,7 @@ pub(crate) const HANDLES: &[&str] = &[
     // Thin, profile-aware wrappers over the Phase-3 OAuth profile engine
     // (`plugins::capabilities::oauth`) — Task 11a.
     "plugin_profile_begin_pkce",
+    "plugin_profile_complete_pkce",
     "plugin_profile_disconnect",
     "plugin_profile_begin_device_flow",
     "plugin_profile_poll_device_flow",
@@ -183,6 +184,14 @@ struct ProfileBeginPkceP {
 struct ProfileIdP {
     plugin_id: String,
     profile_id: String,
+}
+#[derive(Deserialize)]
+struct ProfileCompletePkceP {
+    plugin_id: String,
+    profile_id: String,
+    redirect_uri: String,
+    code: String,
+    verifier: String,
 }
 #[derive(Deserialize)]
 struct ProfileDeviceFlowP {
@@ -307,6 +316,18 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "plugin_profile_begin_pkce" => {
             let a: ProfileBeginPkceP = params(p)?;
             ok(plugin_profile_begin_pkce(cp, &a.plugin_id, &a.profile_id, &a.redirect_uri).await?)
+        }
+        "plugin_profile_complete_pkce" => {
+            let a: ProfileCompletePkceP = params(p)?;
+            ok(plugin_profile_complete_pkce(
+                cp,
+                &a.plugin_id,
+                &a.profile_id,
+                &a.redirect_uri,
+                &a.code,
+                &a.verifier,
+            )
+            .await?)
         }
         "plugin_profile_disconnect" => {
             let a: ProfileIdP = params(p)?;
@@ -2373,6 +2394,28 @@ async fn enrich_oauth_profile_status(
                 .and_then(|c| c.client_id)
                 .is_some_and(|id| !id.is_empty());
         }
+        if !profile.client_id_configured {
+            // A client-id-setting with a stored non-empty value also counts
+            // (PR-3: user-supplied client id until first-party ids are baked).
+            let setting_key = crate::plugins::component_catalog::declared_bundle_manifest(
+                plugin_id,
+            )
+            .and_then(|bundle| {
+                bundle
+                    .oauth
+                    .into_iter()
+                    .find(|p| p.id == profile.id)
+                    .and_then(|p| p.client_id_setting)
+            });
+            if let Some(key) = setting_key {
+                profile.client_id_configured = store
+                    .get_setting_raw(&key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|v| !v.is_empty());
+            }
+        }
     }
 }
 
@@ -2659,6 +2702,29 @@ async fn plugin_profile_begin_pkce(
         .await
         .map_err(oauth_err)?;
     Ok(start.into())
+}
+
+/// Completes a PKCE authorization-code exchange begun by
+/// `plugin_profile_begin_pkce`. Cockpit's loopback callback is the only
+/// caller of this RPC. On success the new token is live immediately, so this
+/// emits `CoreEvent::PluginsChanged` (mirroring `install_component_plugin`)
+/// so Cockpit refreshes the profile's connected status.
+async fn plugin_profile_complete_pkce(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    profile_id: &str,
+    redirect_uri: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<(), ApiError> {
+    let (ctx, manifest) = profile_capability_context(cp, plugin_id).await?;
+    let profile = find_oauth_profile(&manifest, profile_id)?;
+    crate::plugins::capabilities::oauth::ProfileOauth::new(&ctx)
+        .complete_pkce(&profile, redirect_uri, code, verifier)
+        .await
+        .map_err(oauth_err)?;
+    cp.emit(CoreEvent::PluginsChanged);
+    Ok(())
 }
 
 async fn plugin_profile_disconnect(
@@ -5269,6 +5335,7 @@ writes = true
             token_url: None,
             device_authorization_url: None,
             connected: false,
+            authorize_url: None,
             client_id_configured: baked,
         };
         let mut manifest = ComponentManifestInfo {
@@ -5297,6 +5364,39 @@ writes = true
         assert!(
             !unset.client_id_configured,
             "no manifest baked-in and no stored client => not configured"
+        );
+    }
+
+    // The `client_id_setting` fallback (PR-3) only applies to profiles the
+    // installed bundle's declared manifest actually names one for. The
+    // embedded `github` bundle bakes a first-party client id instead (no
+    // `client-id-setting`), so this profile must stay unconfigured rather
+    // than the new lookup panicking or false-positiving on a plugin id that
+    // resolves via `component_catalog::declared_bundle_manifest`.
+    #[tokio::test]
+    async fn enrich_client_id_setting_fallback_leaves_unconfigured_when_none_declared() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![ComponentOauthProfileInfo {
+                id: "github".into(),
+                scopes: vec![],
+                token_url: None,
+                device_authorization_url: None,
+                connected: false,
+                authorize_url: None,
+                client_id_configured: false,
+            }],
+            tools: vec![],
+        };
+        enrich_oauth_profile_status(store, "github", &mut manifest).await;
+        assert!(
+            !manifest.oauth_profiles[0].client_id_configured,
+            "github's declared profile has no client_id_setting, so this must stay false"
         );
     }
 
@@ -5331,6 +5431,7 @@ writes = true
                 token_url: None,
                 device_authorization_url: None,
                 connected: false,
+                authorize_url: None,
                 client_id_configured: true,
             }],
             tools: vec![],

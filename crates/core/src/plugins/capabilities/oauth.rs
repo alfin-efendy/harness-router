@@ -192,11 +192,125 @@ impl<'a> ProfileOauth<'a> {
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
 
+        // Provider-mandated extras (e.g. Atlassian's audience=) — declared in
+        // the signed manifest, forwarded verbatim (PR-3).
+        for (key, value) in &profile.extra_authorize_params {
+            url.query_pairs_mut().append_pair(key, value);
+        }
+
         Ok(PkceStart {
             authorize_url: url.to_string(),
             state,
             verifier,
         })
+    }
+
+    /// Exchanges a PKCE authorization code for tokens and persists them for
+    /// `profile` (PR-3). The Cockpit loopback callback is the only caller —
+    /// the guest-facing WIT deliberately exposes neither begin nor complete.
+    /// Sends `client_secret` when the profile names a configured
+    /// `client_secret_setting` (confidential-client fallback); pure public
+    /// PKCE otherwise.
+    pub async fn complete_pkce(
+        &self,
+        profile: &OAuthProfile,
+        redirect_uri: &str,
+        code: &str,
+        verifier: &str,
+    ) -> Result<(), OauthErr> {
+        self.ensure_declared_profile(&profile.id)?;
+        let token_url = profile
+            .token_url
+            .as_deref()
+            .ok_or_else(|| OauthErr::InvalidRequest("profile has no token_url".to_string()))?;
+        let client_id = self.resolve_client_id(profile).await?;
+        let client_secret = match &profile.client_secret_setting {
+            Some(setting) => self
+                .ctx
+                .settings
+                .get(setting)
+                .await
+                .ok()
+                .flatten()
+                .filter(|v| !v.is_empty()),
+            None => None,
+        };
+
+        let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id.as_str()),
+            ("code_verifier", verifier),
+        ];
+        if let Some(secret) = client_secret.as_deref() {
+            form.push(("client_secret", secret));
+        }
+
+        let response = bounded_http_client()?
+            .post(token_url)
+            .header("Accept", "application/json")
+            .form(&form)
+            .send()
+            .await
+            .map_err(|error| OauthErr::Failed(describe_reqwest_error(&error)))?;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| OauthErr::Failed(error.to_string()))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| OauthErr::Failed(error.to_string()))?;
+        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+            return Err(OauthErr::Failed(format!("token exchange failed: {err}")));
+        }
+        let access_token = json
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OauthErr::Failed("token response missing `access_token`".into()))?
+            .to_string();
+        let refresh_token = json
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let token_type = json
+            .get("token_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Bearer")
+            .to_string();
+        let expires_at = json
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .map(|secs| now_ms() + (secs as i64) * 1000);
+
+        // Persist the client row first so a later refresh has an endpoint +
+        // client id to work with (mirror the device-flow begin path's
+        // upsert — same struct, same fields).
+        self.ctx
+            .store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: self.ctx.plugin_id.clone(),
+                profile_id: profile.id.clone(),
+                authorize_url: profile.authorize_url.clone(),
+                token_url: Some(token_url.to_string()),
+                client_id: Some(client_id.clone()),
+            })
+            .await
+            .map_err(|error| OauthErr::Failed(error.to_string()))?;
+        let token = crate::plugins::oauth::PluginOauthToken {
+            plugin_id: self.ctx.plugin_id.clone(),
+            access_token,
+            refresh_token,
+            token_type,
+            expires_at,
+            scopes: profile.scopes.clone(),
+            reconnect_required: false,
+        };
+        self.ctx
+            .store
+            .upsert_plugin_oauth_profile_token(&self.ctx.plugin_id, &profile.id, &token)
+            .await
+            .map_err(|error| OauthErr::Failed(error.to_string()))?;
+        Ok(())
     }
 
     /// Issues one HTTP request against `url` authenticated with the stored
@@ -763,6 +877,137 @@ mod tests {
             .begin_pkce(&profile, "https://cockpit.local/callback")
             .await;
         assert!(matches!(result, Err(OauthErr::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn begin_pkce_forwards_extra_authorize_params() {
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "atlassian".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("client-abc".into()),
+            })
+            .await
+            .unwrap();
+        let ctx = ctx_for(store, "atlassian");
+        let oauth = ProfileOauth::new(&ctx);
+        let mut profile = test_profile("default");
+        profile.extra_authorize_params = std::collections::BTreeMap::from([(
+            "audience".to_string(),
+            "api.acme.test".to_string(),
+        )]);
+
+        let start = oauth
+            .begin_pkce(&profile, "https://cockpit.local/callback")
+            .await
+            .unwrap();
+
+        assert!(start.authorize_url.contains("audience=api.acme.test"));
+        // The standard PKCE params still ride alongside the extras.
+        assert!(start.authorize_url.contains("code_challenge_method=S256"));
+        assert!(start.authorize_url.contains("client_id=client-abc"));
+    }
+
+    #[tokio::test]
+    async fn complete_pkce_exchanges_and_persists() {
+        use axum::routing::post;
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                r#"{"access_token":"at","refresh_token":"rt","token_type":"Bearer","expires_in":3600}"#
+            }),
+        );
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("client-abc".into()),
+            })
+            .await
+            .unwrap();
+        let ctx = ctx_for(store.clone(), "github");
+        let oauth = ProfileOauth::new(&ctx);
+        let mut profile = test_profile("default");
+        profile.token_url = Some(format!("http://127.0.0.1:{port}/token"));
+
+        oauth
+            .complete_pkce(
+                &profile,
+                "https://cockpit.local/callback",
+                "auth-code",
+                "verifier-xyz",
+            )
+            .await
+            .unwrap();
+
+        let token = store
+            .get_plugin_oauth_profile_token("github", "default")
+            .await
+            .unwrap()
+            .expect("token should be persisted on success");
+        assert_eq!(token.access_token, "at");
+        assert_eq!(token.refresh_token.as_deref(), Some("rt"));
+
+        let client = store
+            .get_plugin_oauth_profile_client("github", "default")
+            .await
+            .unwrap()
+            .expect("client row should be persisted so refresh can work later");
+        assert_eq!(
+            client.token_url.as_deref(),
+            Some(profile.token_url.as_deref().unwrap())
+        );
+        assert_eq!(client.client_id.as_deref(), Some("client-abc"));
+    }
+
+    #[tokio::test]
+    async fn complete_pkce_provider_error_persists_nothing() {
+        use axum::routing::post;
+        let app = Router::new().route("/token", post(|| async { r#"{"error":"invalid_grant"}"# }));
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "github".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("client-abc".into()),
+            })
+            .await
+            .unwrap();
+        let ctx = ctx_for(store.clone(), "github");
+        let oauth = ProfileOauth::new(&ctx);
+        let mut profile = test_profile("default");
+        profile.token_url = Some(format!("http://127.0.0.1:{port}/token"));
+
+        let result = oauth
+            .complete_pkce(
+                &profile,
+                "https://cockpit.local/callback",
+                "auth-code",
+                "verifier-xyz",
+            )
+            .await;
+        assert!(matches!(result, Err(OauthErr::Failed(_))));
+
+        let token = store
+            .get_plugin_oauth_profile_token("github", "default")
+            .await
+            .unwrap();
+        assert!(
+            token.is_none(),
+            "a provider error must persist no token for this profile"
+        );
     }
 
     // The `gh` CLI model: with no user-set setting and no stored per-install
