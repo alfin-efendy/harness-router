@@ -10,8 +10,9 @@ import {
   SettingsCardRow as CardRow,
   SettingsCardTitle as CardTitle,
 } from "@ryuzi/ui";
-import type { ComponentOauthProfileInfo } from "@/bindings";
+import { commands, type ComponentOauthProfileInfo } from "@/bindings";
 import { Pill } from "@/components/common/bits";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { usePlugins } from "@/store-plugins";
 
 /** A profile can be connected via the device grant only when it declares BOTH
@@ -21,16 +22,51 @@ export function isDeviceFlowConnectable(p: ComponentOauthProfileInfo): boolean {
   return !!p.deviceAuthorizationUrl && !!p.tokenUrl;
 }
 
+/** PKCE-connectable: authorize + token endpoints declared AND a client id
+ *  resolves (baked, stored, or via the profile's client-id setting — the
+ *  backend folds all three into `clientIdConfigured`). */
+export function isPkceConnectable(p: ComponentOauthProfileInfo): boolean {
+  return !!p.authorizeUrl && !!p.tokenUrl && p.clientIdConfigured;
+}
+
+export function isProfileConnectable(p: ComponentOauthProfileInfo): boolean {
+  return isDeviceFlowConnectable(p) || isPkceConnectable(p);
+}
+
+/** Has SOME connect method declared (regardless of whether a client id is
+ *  configured yet) — this, not `isProfileConnectable`, decides which
+ *  profiles get a row in the card. A PKCE-capable profile with no client id
+ *  still gets a row (disabled Connect + a hint to configure one in
+ *  Settings) rather than being hidden entirely — that's the whole point of
+ *  showing the pre-registration UX instead of "Nothing more to connect
+ *  here." */
+function hasConnectMethod(p: ComponentOauthProfileInfo): boolean {
+  return isDeviceFlowConnectable(p) || (!!p.authorizeUrl && !!p.tokenUrl);
+}
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** Transient state of an in-progress device-flow connection for one profile. */
+/** How long the PKCE poll loop waits between `pluginReleaseDetail` checks,
+ *  and the overall deadline before it gives up — the loopback callback
+ *  server completes the token exchange out-of-band, so this is purely
+ *  "has the daemon recorded a token yet", not a provider-imposed interval. */
+const PKCE_POLL_INTERVAL_MS = 2000;
+const PKCE_POLL_TIMEOUT_MS = 5 * 60_000;
+
+/** Transient state of an in-progress connection for one profile — shared by
+ *  both the device-grant and PKCE flows (`kind` picks which sub-render
+ *  applies; the device flow is the only one that ever populates
+ *  `userCode`). */
 type Flow = {
   profileId: string;
   userCode: string;
-  /** `verification_uri_complete` when the provider offers it (pre-fills the
-   *  code), else the plain `verification_uri`. */
+  /** Device flow: `verification_uri_complete` when the provider offers it
+   *  (pre-fills the code), else the plain `verification_uri`. PKCE: the
+   *  authorize URL already opened automatically — kept here mainly so a
+   *  future "reopen" affordance has it on hand. */
   openUrl: string;
   status: "polling" | "expired" | "denied" | "error";
+  kind: "device" | "pkce";
 };
 
 /** Give up a device-flow poll after this many CONSECUTIVE transport errors —
@@ -57,6 +93,7 @@ export function OauthProfileConnections({
   const beginProfileDeviceFlow = usePlugins((s) => s.beginProfileDeviceFlow);
   const pollProfileDeviceFlow = usePlugins((s) => s.pollProfileDeviceFlow);
   const disconnectProfile = usePlugins((s) => s.disconnectProfile);
+  const beginProfilePkce = usePlugins((s) => s.beginProfilePkce);
 
   const [flow, setFlow] = useState<Flow | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -79,6 +116,7 @@ export function OauthProfileConnections({
         userCode: start.userCode,
         openUrl: start.verificationUriComplete ?? start.verificationUri,
         status: "polling",
+        kind: "device",
       });
 
       let intervalMs = Math.max(1, start.intervalSecs) * 1000;
@@ -123,6 +161,46 @@ export function OauthProfileConnections({
     [pluginId, beginProfileDeviceFlow, pollProfileDeviceFlow, onChanged],
   );
 
+  /** PKCE connect: begin (spawns the loopback callback server daemon-side and
+   *  returns the authorize URL), open the browser, then poll
+   *  `pluginReleaseDetail` until the callback route has completed the token
+   *  exchange and the profile reports `connected` — unlike the device flow,
+   *  there is nothing to exchange from this side, so the loop is a plain
+   *  "has it happened yet" check rather than a provider-driven poll. */
+  const connectPkce = useCallback(
+    async (profileId: string) => {
+      cancelledRef.current = false;
+      setBusy(profileId);
+      const start = await beginProfilePkce(pluginId, profileId);
+      setBusy(null);
+      if (!start) return; // store already toasted
+
+      setFlow({ profileId, userCode: "", openUrl: start.authorizeUrl, status: "polling", kind: "pkce" });
+      void openUrl(start.authorizeUrl);
+
+      const deadline = Date.now() + PKCE_POLL_TIMEOUT_MS;
+      while (!cancelledRef.current && Date.now() < deadline) {
+        await sleep(PKCE_POLL_INTERVAL_MS);
+        if (cancelledRef.current) return;
+        const detail = await commands.pluginReleaseDetail(LOCAL_RUNNER, pluginId);
+        if (cancelledRef.current) return;
+        if (detail.status === "ok") {
+          const p = (detail.data.activeManifest ?? detail.data.declaredManifest)?.oauthProfiles.find((x) => x.id === profileId);
+          if (p?.connected) {
+            toast.success(`Connected ${profileId}`);
+            setFlow(null);
+            onChanged();
+            return;
+          }
+        }
+      }
+      if (!cancelledRef.current) {
+        setFlow((f) => (f && f.profileId === profileId ? { ...f, status: "expired" } : f));
+      }
+    },
+    [pluginId, beginProfilePkce, onChanged],
+  );
+
   const cancel = useCallback(() => {
     cancelledRef.current = true;
     setFlow(null);
@@ -138,18 +216,20 @@ export function OauthProfileConnections({
     [pluginId, disconnectProfile, onChanged],
   );
 
-  const connectable = profiles.filter(isDeviceFlowConnectable);
-  if (connectable.length === 0) return null;
+  const rows = profiles.filter(hasConnectMethod);
+  if (rows.length === 0) return null;
 
   return (
     <Card className="mb-3">
       <CardHeader>
         <CardTitle>Connections (OAuth)</CardTitle>
-        <CardHint>Sign in with the device grant — no configuration needed.</CardHint>
+        <CardHint>Connect this plugin's account to use its tools.</CardHint>
       </CardHeader>
 
-      {connectable.map((profile) => {
+      {rows.map((profile) => {
         const flowing = flow?.profileId === profile.id;
+        const deviceFlow = isDeviceFlowConnectable(profile);
+        const onConnectClick = deviceFlow ? () => void connect(profile) : () => void connectPkce(profile.id);
         return (
           <div key={profile.id} className="border-b border-border last:border-b-0">
             <CardRow>
@@ -168,8 +248,8 @@ export function OauthProfileConnections({
                 <Button
                   size="sm"
                   disabled={!profile.clientIdConfigured || busy === profile.id || flowing}
-                  title={profile.clientIdConfigured ? undefined : "This plugin ships no OAuth client id"}
-                  onClick={() => void connect(profile)}
+                  title={profile.clientIdConfigured || !deviceFlow ? undefined : "This plugin ships no OAuth client id"}
+                  onClick={onConnectClick}
                 >
                   {busy === profile.id ? "Starting…" : "Connect"}
                 </Button>
@@ -178,11 +258,13 @@ export function OauthProfileConnections({
 
             {!profile.clientIdConfigured && !profile.connected && (
               <div className="px-[18px] pb-3 text-[11.5px] text-muted-foreground">
-                No OAuth client id is configured for this profile, so it can't be connected.
+                {deviceFlow
+                  ? "No OAuth client id is configured for this profile, so it can't be connected."
+                  : "Enter the OAuth client id in Settings first."}
               </div>
             )}
 
-            {flowing && flow && (
+            {flowing && flow && flow.kind === "device" && (
               <div className="flex flex-col gap-3 px-[18px] pb-4">
                 {flow.status === "polling" && (
                   <>
@@ -245,6 +327,30 @@ export function OauthProfileConnections({
                       Couldn't reach the sign-in service. Check your connection and try again.
                     </span>
                     <Button size="sm" onClick={() => void connect(profile)}>
+                      Try again
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={cancel}>
+                      Dismiss
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {flowing && flow && flow.kind === "pkce" && (
+              <div className="flex flex-col gap-3 px-[18px] pb-4">
+                {flow.status === "polling" && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-[12.5px] text-muted-foreground">Waiting for you to finish signing in in the browser…</span>
+                    <Button variant="ghost" size="sm" onClick={cancel}>
+                      Cancel
+                    </Button>
+                  </div>
+                )}
+                {flow.status === "expired" && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-[12.5px] text-muted-foreground">The sign-in link expired before you finished.</span>
+                    <Button size="sm" onClick={() => void connectPkce(profile.id)}>
                       Try again
                     </Button>
                     <Button variant="ghost" size="sm" onClick={cancel}>

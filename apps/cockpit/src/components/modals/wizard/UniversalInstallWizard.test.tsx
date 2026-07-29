@@ -1001,6 +1001,46 @@ test("Connect step renders the device-flow OAuth profile connections when the ma
   expect(beginPluginOauth).not.toHaveBeenCalled();
 });
 
+test("Connect step renders the connections card for a PKCE-only profile even before a client id is configured, instead of the generic fallback", async () => {
+  releaseData = {
+    pluginId: "notion",
+    releases: [],
+    activeVersion: "1.0.0",
+    activeManifest: {
+      publisher: "Notion",
+      description: "",
+      lifecycle: "singleton",
+      domains: [],
+      oauthProfiles: [
+        {
+          id: "workspace",
+          scopes: ["read"],
+          tokenUrl: "https://notion.example/token",
+          deviceAuthorizationUrl: null,
+          connected: false,
+          authorizeUrl: "https://notion.example/authorize",
+          clientIdConfigured: false,
+        },
+      ],
+      tools: [],
+    },
+    declaredManifest: null,
+  };
+  await renderWizard();
+  const dialog = screen.getByRole("dialog", { name: "Install Notion" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  fireEvent.click(within(dialog).getByRole("switch", { name: "Accept permissions" }));
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  await act(async () => {});
+  await act(async () => {});
+
+  expect(within(dialog).getByText("Step 4 of 6 — Connect")).toBeTruthy();
+  expect(within(dialog).getByText("Connections (OAuth)")).toBeTruthy();
+  expect(within(dialog).queryByText("Nothing more to connect here.")).toBeNull();
+  expect(within(dialog).getByText("Enter the OAuth client id in Settings first.")).toBeTruthy();
+});
+
 // Finding 1 — TokenConnect (non-oauth `detail.auth.setting`) was previously
 // untested here even though it's production-reachable: the checklist connect
 // action now routes every plugin, component-backed or not, through this

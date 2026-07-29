@@ -737,11 +737,16 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   // ---------- Tabbed scaffold — Task 9 ----------
   const hasVersionsTab =
     releaseDetail !== null && (info.componentBacked || releaseDetail.releases.length > 0 || releaseDetail.activeVersion !== null);
-  // A component's device-flow-connectable OAuth profiles (`OauthProfileConnections`)
-  // also live on the Settings tab — without this, a component-backed plugin
-  // with no generic `detail.auth`/`settings`/`mcp` (e.g. atlassian/bitbucket)
-  // would have no way to reach its own Connect action.
-  const hasComponentOauth = (releaseDetail?.activeManifest?.oauthProfiles ?? []).some((p) => p.deviceAuthorizationUrl && p.tokenUrl);
+  // A component's declared OAuth profiles (`OauthProfileConnections`) also
+  // live on the Settings tab — without this, a component-backed plugin with
+  // no generic `detail.auth`/`settings`/`mcp` (e.g. atlassian/bitbucket)
+  // would have no way to reach its own Connect action. Task 9: broadened
+  // from "device-flow-connectable only" to ANY declared profile (falling
+  // back from `activeManifest` to `declaredManifest` too) — a PKCE-only
+  // profile with no client id configured yet still needs its own row
+  // (disabled Connect + a settings hint), not just device-grant ones.
+  const componentOauthProfiles = (releaseDetail?.activeManifest ?? releaseDetail?.declaredManifest)?.oauthProfiles ?? [];
+  const hasComponentOauth = componentOauthProfiles.length > 0;
   const hasAuthTab = (!!detail.auth && detail.auth.kind !== "none") || hasComponentOauth;
   const hasSettingsTab = detail.settings.length > 0 || detail.mcp.length > 0;
   const hasHealthTab = isExtensionPlugin || idFindings.length > 0;
@@ -1287,17 +1292,15 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
               </Card>
             )}
 
-            {/* Device-grant OAuth connect for a component's declared profiles —
-                renders itself null unless the active manifest declares a
-                device-flow-connectable profile. Refreshes the release detail
-                on connect/disconnect so the status badge reflects the new
-                token. */}
-            {releaseDetail?.activeManifest && (
-              <OauthProfileConnections
-                pluginId={id}
-                profiles={releaseDetail.activeManifest.oauthProfiles}
-                onChanged={() => void loadRelease()}
-              />
+            {/* OAuth connect (device grant or PKCE) for a component's
+                declared profiles — renders itself null unless at least one
+                profile has a connect method. Falls back from `activeManifest`
+                to `declaredManifest` (Task 9) so a never-installed component
+                still shows its connect row from the wizard's pre-install
+                fallback path. Refreshes the release detail on connect/
+                disconnect so the status badge reflects the new token. */}
+            {componentOauthProfiles.length > 0 && (
+              <OauthProfileConnections pluginId={id} profiles={componentOauthProfiles} onChanged={() => void loadRelease()} />
             )}
           </div>
         )}
