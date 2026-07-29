@@ -375,9 +375,10 @@ pub async fn plugin_profile_begin_pkce(
         }
     };
 
-    let (server, result_rx, shutdown_tx) = oauth_loopback::spawn_callback_server(
+    let (server, result_rx, shutdown_tx) = oauth_loopback::spawn_profile_callback_server(
         listener,
         &plugin_profile_callback_path(&plugin_id, &profile_id),
+        start.state.clone(),
     );
     let engine_client = client.clone();
     let task_plugin_id = plugin_id.clone();
