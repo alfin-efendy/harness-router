@@ -528,6 +528,7 @@ async fn seed_github_client(store: &Store) {
             authorize_url: None,
             token_url: None,
             client_id: Some("gh-client-123".to_string()),
+            client_secret_setting: None,
         })
         .await
         .unwrap();

@@ -5354,6 +5354,7 @@ writes = true
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("stored-id".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();

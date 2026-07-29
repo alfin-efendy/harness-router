@@ -293,6 +293,7 @@ impl<'a> ProfileOauth<'a> {
                 authorize_url: profile.authorize_url.clone(),
                 token_url: Some(token_url.to_string()),
                 client_id: Some(client_id.clone()),
+                client_secret_setting: profile.client_secret_setting.clone(),
             })
             .await
             .map_err(|error| OauthErr::Failed(error.to_string()))?;
@@ -382,9 +383,13 @@ impl<'a> ProfileOauth<'a> {
 
     /// Exchanges the stored refresh token for a fresh access token via the OAuth
     /// 2.0 `refresh_token` grant, persists it, and returns it. The token
-    /// endpoint + client id come from the `(plugin_id, profile_id)`
-    /// `plugin_oauth_profile_clients` row, which the device-flow connect
-    /// persisted — so this needs neither the manifest nor a widened `ctx`.
+    /// endpoint + client id (+ confidential-client secret setting NAME) come
+    /// from the `(plugin_id, profile_id)` `plugin_oauth_profile_clients` row,
+    /// cached there at connect time (`complete_pkce`/`poll_device_flow`) — so
+    /// this needs neither the manifest nor a widened `ctx`: it has only a
+    /// `profile_id`, not an `&OAuthProfile`, because the WASM host adapter
+    /// that drives it (`ryuzi:oauth`'s `authorized-request`) never has the
+    /// manifest in hand either.
     ///
     /// A definitive provider rejection (a JSON `error`, i.e. the refresh token
     /// is dead) marks the stored token `reconnect_required` so the UI surfaces
@@ -392,8 +397,13 @@ impl<'a> ProfileOauth<'a> {
     /// transient transport error returns [`OauthErr::Failed`] WITHOUT flagging
     /// reconnect — the caller keeps the still-valid current token.
     ///
-    /// Refresh needs no `client_secret`: it is only reachable for a profile
-    /// connected via the public device-flow client, which has none.
+    /// Sends `client_secret` when the stored client row names a configured
+    /// `client_secret_setting`, resolved via `self.ctx.settings` exactly like
+    /// [`Self::complete_pkce`] resolves it for the initial exchange — pure
+    /// public-client PKCE / device-flow profiles omit it. Atlassian and
+    /// Bitbucket both REQUIRE `client_secret` on refresh (not just on the
+    /// initial exchange), so omitting it here forced a reconnect roughly every
+    /// hour for every confidential-client profile.
     async fn refresh_profile_token(
         &self,
         profile_id: &str,
@@ -418,12 +428,26 @@ impl<'a> ProfileOauth<'a> {
         let client_id = client
             .client_id
             .ok_or_else(|| OauthErr::InvalidRequest("no stored client id".to_string()))?;
+        let client_secret = match &client.client_secret_setting {
+            Some(setting) => self
+                .ctx
+                .settings
+                .get(setting)
+                .await
+                .ok()
+                .flatten()
+                .filter(|v| !v.is_empty()),
+            None => None,
+        };
 
-        let form = [
+        let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", client_id.as_str()),
         ];
+        if let Some(secret) = client_secret.as_deref() {
+            form.push(("client_secret", secret));
+        }
         let response = bounded_http_client()?
             .post(&token_url)
             // Same reason as the device-flow endpoints: without this GitHub (and
@@ -703,6 +727,7 @@ impl<'a> ProfileOauth<'a> {
                 authorize_url: profile.authorize_url.clone(),
                 token_url: Some(token_url.to_string()),
                 client_id: Some(client_id.clone()),
+                client_secret_setting: profile.client_secret_setting.clone(),
             })
             .await;
 
@@ -813,6 +838,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -846,6 +872,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -889,6 +916,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -930,6 +958,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -982,6 +1011,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1041,6 +1071,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("stored-override".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1338,6 +1369,7 @@ mod tests {
                 authorize_url: None,
                 token_url: Some(format!("http://127.0.0.1:{port}/token")),
                 client_id: Some("cid".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1399,6 +1431,7 @@ mod tests {
                 authorize_url: None,
                 token_url: Some(format!("http://127.0.0.1:{port}/token")),
                 client_id: Some("cid".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1419,6 +1452,111 @@ mod tests {
             stored.reconnect_required,
             "a dead refresh token must flag reconnect_required"
         );
+    }
+
+    // Both Atlassian and Bitbucket REQUIRE `client_secret` on the refresh
+    // grant, not just the initial exchange — a confidential-client profile
+    // whose refresh omits it gets rejected by the provider, forcing a
+    // reconnect roughly every hour. The stub token endpoint below enforces
+    // that requirement itself (rejects a refresh missing `client_secret`,
+    // accepts one with it), so this proves `refresh_profile_token` actually
+    // sends the secret rather than merely resolving it and dropping it.
+    #[tokio::test]
+    async fn authorized_request_refresh_sends_client_secret_for_a_confidential_client_profile() {
+        use axum::routing::post;
+        use axum::{Form, Json};
+        use std::collections::HashMap;
+
+        let app = Router::new()
+            .route(
+                "/token",
+                post(|Form(form): Form<HashMap<String, String>>| async move {
+                    if form.get("client_secret").map(String::as_str) != Some("shh-secret") {
+                        return Json(serde_json::json!({"error": "invalid_client"}));
+                    }
+                    Json(serde_json::json!({
+                        "access_token": "new-access",
+                        "refresh_token": "rt-new",
+                        "token_type": "bearer",
+                        "expires_in": 3600
+                    }))
+                }),
+            )
+            .route(
+                "/api",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                }),
+            );
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        let ctx = ctx_for(store.clone(), "atlassian");
+        // Bypass `SettingsStore::set`'s schema validation (it only accepts a
+        // `plugin.*` key for a plugin the process-wide `plugin_field`
+        // registry knows about, which this unit test has no reason to spin
+        // up) — the raw row is all `refresh_profile_token`'s `ctx.settings.get`
+        // ever reads at runtime anyway.
+        store
+            .set_setting_raw("atlassian_client_secret", "shh-secret")
+            .await
+            .unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "atlassian",
+                "default",
+                &PluginOauthToken {
+                    plugin_id: "atlassian".into(),
+                    access_token: "old-access".into(),
+                    refresh_token: Some("rt-old".into()),
+                    token_type: "Bearer".into(),
+                    expires_at: Some(crate::paths::now_ms() - 1_000), // just elapsed
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_client(&crate::store::PluginOauthProfileClient {
+                plugin_id: "atlassian".into(),
+                profile_id: "default".into(),
+                authorize_url: None,
+                token_url: Some(format!("http://127.0.0.1:{port}/token")),
+                client_id: Some("cid".into()),
+                client_secret_setting: Some("atlassian_client_secret".into()),
+            })
+            .await
+            .unwrap();
+
+        let oauth = ProfileOauth::new(&ctx);
+        let response = oauth
+            .authorized_request(
+                "default",
+                "GET",
+                &format!("http://127.0.0.1:{port}/api"),
+                vec![],
+                None,
+            )
+            .await
+            .expect(
+                "the stub token endpoint only accepts a refresh WITH client_secret, so success \
+                 here proves it was sent",
+            );
+        assert_eq!(response.body, b"Bearer new-access");
+
+        let stored = store
+            .get_plugin_oauth_profile_token("atlassian", "default")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_token, "new-access");
+        assert!(!stored.reconnect_required);
     }
 
     #[tokio::test]
@@ -1523,6 +1661,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1573,6 +1712,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1629,6 +1769,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1671,6 +1812,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1732,6 +1874,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1790,6 +1933,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1837,6 +1981,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();
@@ -1886,6 +2031,7 @@ mod tests {
                 authorize_url: None,
                 token_url: None,
                 client_id: Some("client-abc".into()),
+                client_secret_setting: None,
             })
             .await
             .unwrap();

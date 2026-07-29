@@ -58,7 +58,7 @@ CREATE TABLE plugin_attach_status (plugin_id TEXT PRIMARY KEY NOT NULL,last_atta
 CREATE TABLE plugin_catalog_cache (id TEXT PRIMARY KEY NOT NULL,manifest_toml TEXT NOT NULL,version TEXT NOT NULL,sequence INTEGER NOT NULL,blocked INTEGER NOT NULL DEFAULT 0,blocked_reason TEXT,fetched_at INTEGER NOT NULL);
 CREATE TABLE plugin_installs (plugin_id TEXT PRIMARY KEY NOT NULL,kind TEXT NOT NULL,source_spec TEXT NOT NULL,resolved_commit TEXT,fingerprint TEXT NOT NULL,installed_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,pin_reason TEXT,trust_tier TEXT NOT NULL,trust_ack_at INTEGER,trust_ack_summary TEXT);
 CREATE TABLE "plugin_oauth_clients" (plugin_id TEXT PRIMARY KEY NOT NULL,authorize_url TEXT,token_url TEXT,client_id TEXT,updated_at INTEGER NOT NULL);
-CREATE TABLE plugin_oauth_profile_clients (plugin_id TEXT NOT NULL,profile_id TEXT NOT NULL,authorize_url TEXT,token_url TEXT,client_id TEXT,updated_at INTEGER NOT NULL,PRIMARY KEY (plugin_id, profile_id));
+CREATE TABLE plugin_oauth_profile_clients (plugin_id TEXT NOT NULL,profile_id TEXT NOT NULL,authorize_url TEXT,token_url TEXT,client_id TEXT,updated_at INTEGER NOT NULL, client_secret_setting TEXT,PRIMARY KEY (plugin_id, profile_id));
 CREATE TABLE plugin_oauth_profile_tokens (plugin_id TEXT NOT NULL,profile_id TEXT NOT NULL,token_json TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY (plugin_id, profile_id));
 CREATE TABLE plugin_oauth_tokens (plugin_id TEXT PRIMARY KEY NOT NULL,token_json TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE project_bindings (gateway TEXT NOT NULL,workspace_id TEXT NOT NULL,project_id TEXT NOT NULL,PRIMARY KEY (gateway, workspace_id));
