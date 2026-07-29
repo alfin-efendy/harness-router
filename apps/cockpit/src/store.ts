@@ -19,6 +19,7 @@ import { basename } from "./lib/paths";
 import { delegationRunKey, useDelegation } from "./store-delegation";
 import { useNative } from "./store-native";
 import { usePlugins } from "./store-plugins";
+import { useAgentConfigurationCatalog } from "./store-agent-catalog";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
@@ -665,7 +666,12 @@ export const useStore = create<State>((set, get) => ({
       // Spec B2: the daemon emits pluginsChanged on every plugin mutation —
       // refetch the plugin list + restart flag reactively instead of relying
       // on each mutating action to remember to reload.
-      if (event.kind === "pluginsChanged") void usePlugins.getState().load();
+      if (event.kind === "pluginsChanged") {
+        void usePlugins.getState().load();
+        // Agent binding tabs read a separately-cached catalog — refresh it too
+        // so a fresh install shows up without an app reload (PR-2 fix C).
+        void useAgentConfigurationCatalog.getState().reload();
+      }
     });
   },
 }));
