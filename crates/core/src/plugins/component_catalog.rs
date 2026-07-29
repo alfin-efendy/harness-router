@@ -267,6 +267,40 @@ mod tests {
         );
     }
 
+    // Task 10: discord now declares its settings for real, so the bridge
+    // derives AuthKind::Token from the embedded manifest itself (no more
+    // synthetic-bundle workaround, see `bridge_derives_auth_from_bundle`
+    // above).
+    #[test]
+    fn discord_bundle_declares_token_settings_and_derives_token_auth() {
+        let m = manifest_from_bundle(declared_bundle_manifest("discord").unwrap());
+        assert_eq!(m.auth.as_ref().map(|a| a.kind), Some(AuthKind::Token));
+        assert_eq!(
+            m.auth.as_ref().and_then(|a| a.setting.as_deref()),
+            Some("plugin.discord.token")
+        );
+        let keys: Vec<&str> = m.settings.iter().map(|f| f.key.as_str()).collect();
+        assert!(keys.contains(&"plugin.discord.token"));
+        assert!(keys.contains(&"plugin.discord.app_id"));
+        assert!(keys.contains(&"plugin.discord.guild_id"));
+    }
+
+    // Task 10: atlassian's [[oauth]] profile now carries the PKCE extras +
+    // client-id-setting the host-side 3LO wiring needs.
+    #[test]
+    fn atlassian_profile_carries_pkce_extras_and_client_id_setting() {
+        let bundle = declared_bundle_manifest("atlassian").unwrap();
+        let p = &bundle.oauth[0];
+        assert_eq!(
+            p.client_id_setting.as_deref(),
+            Some("plugin.atlassian.oauth_client_id")
+        );
+        assert_eq!(
+            p.extra_authorize_params.get("audience").map(String::as_str),
+            Some("api.atlassian.com")
+        );
+    }
+
     #[test]
     fn every_embedded_manifest_parses_and_matches_its_declared_id() {
         for (id, toml_src) in COMPONENT_BUNDLE_MANIFESTS {

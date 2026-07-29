@@ -1031,4 +1031,56 @@ mod tests {
         let plugin = extension_only("acme-ext");
         assert_eq!(plugin.capabilities(), vec!["extension"]);
     }
+
+    // Task 10's first real collision: a bundle-bridged manifest (discord) now
+    // declares `auth.setting` pointing at one of its OWN `settings[]` keys
+    // (the derived token auth setting IS the declared field). The doc-stated
+    // guard at `register_plugin_fields` must keep the declared field's real
+    // label/required — never let the label-less auth-synthetic clobber it.
+    #[test]
+    fn register_plugin_fields_keeps_declared_field_when_auth_setting_collides() {
+        use ryuzi_plugin_sdk::{AuthKind, AuthSpec};
+
+        let id = "acme-collision-guard";
+        let key = format!("plugin.{id}.token");
+        let plugin = CorePlugin {
+            manifest: PluginManifest {
+                auth: Some(AuthSpec {
+                    kind: AuthKind::Token,
+                    setting: Some(key.clone()),
+                    ..Default::default()
+                }),
+                settings: vec![SettingField {
+                    key: key.clone(),
+                    label: "Bot token".to_string(),
+                    help: "declared by the manifest author, not synthesized".to_string(),
+                    secret: true,
+                    required: true,
+                    kind: FieldKind::String,
+                    options: Vec::new(),
+                    default: None,
+                }],
+                ..manifest(id)
+            },
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            provider: None,
+            source: PluginSource::Builtin,
+        };
+
+        let mut host = PluginHost::new();
+        assert!(host.add(plugin));
+
+        let field = plugin_field(&key).expect("the declared field must be registered");
+        assert_eq!(
+            field.label, "Bot token",
+            "the declared settings[] field's label must win over the label-less auth synthetic"
+        );
+        assert!(
+            field.required,
+            "the declared field's required flag must survive, not the synthetic's always-false"
+        );
+    }
 }

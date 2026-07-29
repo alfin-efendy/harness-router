@@ -3259,17 +3259,25 @@ mod tests {
         // in the ledger, bundle on disk) and `plugin.discord.enabled` was
         // never written. `PluginHost::is_enabled` now treats an installed
         // component with no explicit setting as enabled, so the row reads
-        // installed AND enabled. Discord's bundle manifest carries no `auth`
-        // block (component auth is read at runtime by key, not declared —
-        // see `plugins/discord/ryuzi-plugin.toml`), so `auth_kind` is "none"
-        // and status falls through to "ok" rather than "needs-setup".
+        // installed AND enabled.
         //
         // Before this fix, `is_enabled` defaulted an unset component to
         // `false`, and this same scenario asserted `status == "disabled"` —
         // that was the "install succeeded but the final enable write didn't"
         // wedge this task closes.
+        //
+        // Since Task 10, discord's bundle DOES declare a secret+required
+        // `token` setting, from which the bridge derives `AuthKind::Token` —
+        // so this scenario also needs the token configured to isolate the
+        // enabled-by-default behavior under test from the (separately
+        // covered, see `component_needs_setup_when_declared_auth_setting_is_unconfigured`)
+        // needs-setup gate.
         let cp = test_cp().await;
         seed_active_component_release(&cp, "discord").await;
+        cp.store()
+            .set_setting_raw("plugin.discord.token", "test-token")
+            .await
+            .unwrap();
 
         let list = assemble_list(&cp).await.unwrap();
         let row = list
@@ -3290,6 +3298,27 @@ mod tests {
         assert!(detail.info.installed, "detail must agree with the list");
         assert!(detail.info.enabled, "detail must agree with the list");
         assert_eq!(detail.info.status, "ok");
+    }
+
+    // Task 10: discord's bundle now declares a secret+required `token`
+    // setting, from which the bridge derives `AuthKind::Token` — an active,
+    // enabled install with NO token configured must report "needs-setup",
+    // the mirror image of the "ok" case above (which seeds the token).
+    #[tokio::test]
+    async fn component_needs_setup_when_declared_auth_setting_is_unconfigured() {
+        let cp = test_cp().await;
+        seed_active_component_release(&cp, "discord").await;
+
+        let list = assemble_list(&cp).await.unwrap();
+        let row = list
+            .iter()
+            .find(|p| p.id == "discord")
+            .expect("discord catalog row");
+        assert!(row.enabled, "an active release defaults to enabled");
+        assert_eq!(
+            row.status, "needs-setup",
+            "discord's derived token auth has no configured value, so this must be needs-setup"
+        );
     }
 
     // ---------- plugin_info ----------
@@ -5397,6 +5426,44 @@ writes = true
         assert!(
             !manifest.oauth_profiles[0].client_id_configured,
             "github's declared profile has no client_id_setting, so this must stay false"
+        );
+    }
+
+    // T7-deferred positive case, now landed by Task 10: atlassian's embedded
+    // bundle declares `client-id-setting = "plugin.atlassian.oauth_client_id"`
+    // (see `component_catalog`'s `atlassian_profile_carries_pkce_extras_and_client_id_setting`).
+    // A non-empty stored value at that key must flip `client_id_configured`
+    // through `plugin_release_detail`/`enrich_oauth_profile_status`'s
+    // `declared_bundle_manifest` fallback — the mirror image of
+    // `enrich_client_id_setting_fallback_leaves_unconfigured_when_none_declared`.
+    #[tokio::test]
+    async fn enrich_client_id_setting_fallback_flips_configured_when_value_is_stored() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .set_setting_raw("plugin.atlassian.oauth_client_id", "abc123")
+            .await
+            .unwrap();
+        let mut manifest = ComponentManifestInfo {
+            publisher: "Ryuzi".into(),
+            description: String::new(),
+            lifecycle: "per-call".into(),
+            domains: vec![],
+            oauth_profiles: vec![ComponentOauthProfileInfo {
+                id: "atlassian-cloud".into(),
+                scopes: vec![],
+                token_url: None,
+                device_authorization_url: None,
+                connected: false,
+                authorize_url: None,
+                client_id_configured: false,
+            }],
+            tools: vec![],
+        };
+        enrich_oauth_profile_status(store, "atlassian", &mut manifest).await;
+        assert!(
+            manifest.oauth_profiles[0].client_id_configured,
+            "atlassian's declared client-id-setting with a stored value must flip client_id_configured"
         );
     }
 

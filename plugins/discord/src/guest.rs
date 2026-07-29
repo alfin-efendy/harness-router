@@ -40,10 +40,11 @@ use ryuzi::http::http;
 use ryuzi::settings::settings;
 use ryuzi::websocket::websocket as ws;
 
-/// Host setting keys (namespaced to `discord` by the host).
-const KEY_TOKEN: &str = "plugin.discord.token";
-const KEY_APP_ID: &str = "plugin.discord.app_id";
-const KEY_GUILD_ID: &str = "plugin.discord.guild_id";
+/// Host setting keys — BARE names; the host's `ryuzi:settings` capability
+/// scopes them to `plugin.discord.<key>` and rejects fully-qualified keys.
+const KEY_TOKEN: &str = "token";
+const KEY_APP_ID: &str = "app_id";
+const KEY_GUILD_ID: &str = "guild_id";
 
 /// The live gateway connection: the websocket handle, the pure protocol state,
 /// a monotonic clock base for the heartbeat schedule, the inbound events

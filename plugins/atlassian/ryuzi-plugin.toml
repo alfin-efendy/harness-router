@@ -40,17 +40,43 @@ scopes = [
   "offline_access",
 ]
 # Atlassian OAuth apps do not support RFC 7591 Dynamic Client Registration;
-# the client id is provisioned out-of-band (developer.atlassian.com console)
-# and supplied host-side at connect time.
+# the client id/secret are provisioned out-of-band (developer.atlassian.com
+# console) and supplied per-install through the settings named below (Task
+# 10) — read back host-side by `resolve_client_id`/the token exchange, never
+# by the component itself.
 dynamic-registration = false
+client-id-setting = "plugin.atlassian.oauth_client_id"
+client-secret-setting = "plugin.atlassian.oauth_client_secret"
+
 # Atlassian's authorize URL REQUIRES an `audience=api.atlassian.com` query
-# parameter (undocumented by any other OAuthProfile field name — the closest
-# schema field is `resource`, which host-side `ProfileOauth::begin_pkce` does
-# not yet forward as a query parameter; see crates/core/src/plugins/capabilities/oauth.rs).
-# Recorded here for the host-side 3LO wiring this profile needs before a real
-# "Connect Atlassian" flow works end-to-end:
-#   https://auth.atlassian.com/authorize?audience=api.atlassian.com&...
-resource = "api.atlassian.com"
+# parameter (undocumented by any other OAuthProfile field name); `prompt =
+# "consent"` additionally forces the account/site picker on every connect
+# rather than silently reusing a stale prior grant. Both are forwarded
+# verbatim by the host's `begin_pkce` (see
+# crates/core/src/plugins/capabilities/oauth.rs) — this replaces the earlier
+# `resource`-field workaround, which `begin_pkce` never actually forwarded as
+# a query parameter; `resource` is dropped from this manifest as dead weight
+# now that `extra-authorize-params` covers the real requirement.
+[oauth.extra-authorize-params]
+audience = "api.atlassian.com"
+prompt = "consent"
+
+# Host-rendered configuration fields (PR-3, Task 10). Bare keys — the host
+# namespaces them to `plugin.atlassian.<key>` when it bridges this bundle
+# into the plugin list; `client-id-setting`/`client-secret-setting` above
+# reference the namespaced form directly.
+[[settings]]
+key = "oauth_client_id"
+label = "OAuth client id"
+help = "From your Atlassian OAuth 2.0 (3LO) app at developer.atlassian.com/console/myapps/"
+required = false
+
+[[settings]]
+key = "oauth_client_secret"
+label = "OAuth client secret"
+help = "From your Atlassian OAuth 2.0 (3LO) app at developer.atlassian.com/console/myapps/"
+secret = true
+required = false
 
 # The tools this component exposes to agents (name/description copied verbatim
 # from `plugins/atlassian/src/logic.rs::tool_definitions`). `writes = true`

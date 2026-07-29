@@ -55,18 +55,23 @@ impl<'a> ScopedSettings<'a> {
         Ok(effective)
     }
 
-    /// Returns `(effective key, value, secret)`. A secret field's value is
-    /// never returned to the guest — it comes back as an empty string with
-    /// `secret = true`, so the component can observe *that* a secret is
-    /// configured without ever reading it.
+    /// Returns `(effective key, value, secret)`. A component may read back
+    /// the REAL value of its own declared secret fields (PR-3) — the
+    /// credential exists FOR this component (declared in its own signed
+    /// manifest), and it needs it to build provider payloads itself (e.g.
+    /// discord's gateway IDENTIFY, which the component — not the host —
+    /// assembles). `effective_key`'s own-plugin+declared scoping already
+    /// makes another plugin's secrets structurally unreachable (see the
+    /// module doc), and reachability of THIS plugin's own secret is further
+    /// bounded by the manifest's signed network allowlist: whatever the
+    /// component does with the value, it can only ever send it to the hosts
+    /// its manifest declared. `secret` still comes back `true` so a UI keeps
+    /// masking the field.
     pub async fn get(&self, key: &str) -> Result<(String, String, bool), SettingsErr> {
         let effective = self.effective_key(key)?;
         let secret = crate::settings::is_secret(&effective);
         match self.ctx.settings.get(&effective).await {
-            Ok(Some(value)) => {
-                let value = if secret { String::new() } else { value };
-                Ok((effective, value, secret))
-            }
+            Ok(Some(value)) => Ok((effective, value, secret)),
             Ok(None) => Err(SettingsErr::NotFound),
             Err(_) => Err(SettingsErr::Unavailable),
         }
@@ -181,8 +186,13 @@ mod tests {
         }
     }
 
+    // PR-3: a component may read back its OWN declared secret's real value —
+    // it needs the credential to build provider payloads (e.g. discord's
+    // gateway IDENTIFY). Scoping + declaration checks are unchanged. This
+    // replaces the old `secret_field_round_trip_never_returns_the_raw_value`,
+    // which asserted the opposite (blanking) policy this task removes.
     #[tokio::test]
-    async fn secret_field_round_trip_never_returns_the_raw_value() {
+    async fn own_declared_secret_reads_back_real_value() {
         let id = "task7-github";
         register_test_plugin(id);
         let (store, _tmp) = open_test_store().await;
@@ -192,8 +202,11 @@ mod tests {
         settings.set("token", "s3cr3t").await.unwrap();
         let (effective, value, secret) = settings.get("token").await.unwrap();
         assert_eq!(effective, format!("plugin.{id}.token"));
-        assert!(secret);
-        assert_eq!(value, "", "a secret field must never surface its raw value");
+        assert!(secret, "secret still reports true so a UI keeps masking");
+        assert_eq!(
+            value, "s3cr3t",
+            "a component may read back its own declared secret's real value"
+        );
     }
 
     #[tokio::test]

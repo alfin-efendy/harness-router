@@ -47,9 +47,29 @@ token-url = "https://bitbucket.org/site/oauth2/access_token"
 scopes = ["account", "repository", "pullrequest:write", "issue:write"]
 # Bitbucket Cloud OAuth consumers are registered manually per-workspace
 # (workspace settings -> OAuth consumers -> Add consumer); there is no RFC
-# 7591 Dynamic Client Registration endpoint. The client id is provisioned
-# out-of-band and supplied host-side at connect time.
+# 7591 Dynamic Client Registration endpoint. The client id/secret are
+# provisioned out-of-band and supplied per-install through the settings named
+# below (Task 10) — read back host-side, never by the component itself.
 dynamic-registration = false
+client-id-setting = "plugin.bitbucket.oauth_client_id"
+client-secret-setting = "plugin.bitbucket.oauth_client_secret"
+
+# Host-rendered configuration fields (PR-3, Task 10). Bare keys — the host
+# namespaces them to `plugin.bitbucket.<key>` when it bridges this bundle
+# into the plugin list; `client-id-setting`/`client-secret-setting` above
+# reference the namespaced form directly.
+[[settings]]
+key = "oauth_client_id"
+label = "OAuth client id"
+help = "From your Bitbucket Cloud OAuth consumer (workspace settings -> OAuth consumers)."
+required = false
+
+[[settings]]
+key = "oauth_client_secret"
+label = "OAuth client secret"
+help = "From your Bitbucket Cloud OAuth consumer (workspace settings -> OAuth consumers)."
+secret = true
+required = false
 
 # The tools this component exposes to agents (name/description copied verbatim
 # from `plugins/bitbucket/src/logic.rs::tool_definitions`). `writes = true`
