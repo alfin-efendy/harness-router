@@ -99,6 +99,7 @@ impl LlmStream for ScriptedResponsesLlm {
                 connection_id: "scripted".into(),
                 connection_label: "Scripted".into(),
                 reason: RouteSelectionReason::Initial,
+                tools_unavailable_note: None,
             },
             events: rx,
         })

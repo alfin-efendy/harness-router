@@ -31,6 +31,16 @@ pub struct ToolTransportRequirements {
 }
 
 impl ToolTransportRequirements {
+    /// Whether the request needs ANY tool wire feature. A request with no
+    /// tools at all never needs the degrade-instead-of-empty fallback in
+    /// `llm_router::client::filter_tool_compatible`.
+    pub fn any(self) -> bool {
+        self.function_tools
+            || self.custom_freeform_tools
+            || self.strict_function_schema
+            || self.tool_output_schema
+    }
+
     pub fn satisfied_by(self, capabilities: TransportToolCapabilities) -> bool {
         (!self.function_tools || capabilities.supports_function_tools)
             && (!self.custom_freeform_tools || capabilities.supports_custom_freeform_tools)

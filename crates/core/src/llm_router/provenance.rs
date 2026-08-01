@@ -32,6 +32,15 @@ pub struct RouteSelection {
     pub connection_id: String,
     pub connection_label: String,
     pub reason: RouteSelectionReason,
+    /// Set when this turn's request carried tools but the accepted target
+    /// cannot execute them (a toolless WASM provider divert — see
+    /// `llm_router::client::target_tool_capabilities`), and no tool-capable
+    /// alternative was available so the router degraded instead of
+    /// hard-failing. `None` when tools were fully honored or none were
+    /// requested. Carries the ready-to-display warning text; surfaced to the
+    /// user via `Store::observe_session_route`'s system/notice message,
+    /// independent of whether the resolved model/account itself changed.
+    pub tools_unavailable_note: Option<String>,
 }
 
 pub type AnthropicEvent = (String, Value);
@@ -195,6 +204,7 @@ mod tests {
             connection_id: "connection-a".into(),
             connection_label: "Personal Codex".into(),
             reason: RouteSelectionReason::Initial,
+            tools_unavailable_note: None,
         }
     }
 

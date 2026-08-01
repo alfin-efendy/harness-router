@@ -1467,12 +1467,31 @@ impl Store {
                             connection_id: r.get(5)?,
                             connection_label: String::new(),
                             reason: crate::llm_router::provenance::RouteSelectionReason::Initial,
+                            // `session_route_state` only persists route
+                            // identity (for change-detection), not the
+                            // per-turn tools warning — irrelevant to
+                            // reconstructing the PREVIOUS selection.
+                            tools_unavailable_note: None,
                         })
                     },
                 )
                 .optional()?;
             let created_at = now_ms();
-            let notice = crate::llm_router::provenance::notice_text(previous.as_ref(), &selection)
+            // The route-switch line is deduplicated against the PREVIOUS
+            // selection (silent on first observation / unchanged route). The
+            // tools-unavailable warning is NOT part of route identity — it
+            // must surface every turn it applies, even across otherwise
+            // identical selections — so it is appended independently rather
+            // than folded into `notice_text`'s change-detection.
+            let switch_notice =
+                crate::llm_router::provenance::notice_text(previous.as_ref(), &selection);
+            let combined_notice = match (switch_notice, selection.tools_unavailable_note.clone()) {
+                (Some(switch), Some(note)) => Some(format!("{switch}\n{note}")),
+                (Some(switch), None) => Some(switch),
+                (None, Some(note)) => Some(note),
+                (None, None) => None,
+            };
+            let notice = combined_notice
                 .map(|copy| -> rusqlite::Result<Message> {
                     let payload = serde_json::json!({ "text": copy });
                     let payload_json = serde_json::to_string(&payload).map_err(to_sql_json_error)?;
@@ -5405,6 +5424,7 @@ mod tests {
             connection_id: "connection-a".into(),
             connection_label: "Personal Codex".into(),
             reason: RouteSelectionReason::Initial,
+            tools_unavailable_note: None,
         }
     }
 
@@ -5520,6 +5540,58 @@ mod tests {
                 Some("high".into()),
                 "connection-a".into(),
             )
+        );
+    }
+
+    /// Unlike the route-switch line, the tools-unavailable warning is NOT
+    /// route identity: it must surface every turn it applies, even on the
+    /// very first observation (where the switch line stays silent) and even
+    /// across otherwise-identical selections (where the switch line would
+    /// dedupe). This is what lets the router warn the user on EVERY degraded
+    /// turn, not just the first one.
+    #[tokio::test]
+    async fn session_route_state_tools_unavailable_note_surfaces_every_turn_even_when_route_is_unchanged(
+    ) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        let mut degraded = route_selection();
+        degraded.tools_unavailable_note = Some(
+            "This model can't use tools — 1 bound tool(s) were not available for this turn.".into(),
+        );
+
+        let first = store
+            .observe_session_route("s1", &degraded)
+            .await
+            .unwrap()
+            .expect("the tools warning must surface even on the first observation");
+        assert_eq!(
+            first.payload,
+            serde_json::json!({"text": degraded.tools_unavailable_note.clone().unwrap()})
+        );
+
+        // Same route identity as before (no switch), but the note is still
+        // set — a second, undeduplicated notice must still appear.
+        let second = store
+            .observe_session_route("s1", &degraded)
+            .await
+            .unwrap()
+            .expect("an unchanged route must not suppress the tools warning");
+        assert_eq!(second.seq, first.seq + 1);
+        assert_eq!(
+            store.list_messages("s1").await.unwrap().len(),
+            2,
+            "both degraded turns must leave a notice behind"
+        );
+
+        // Once tools become available again (note cleared), a THIRD,
+        // unchanged-route observation goes back to silent.
+        let mut recovered = route_selection();
+        recovered.tools_unavailable_note = None;
+        assert_eq!(
+            store.observe_session_route("s1", &recovered).await.unwrap(),
+            None
         );
     }
 

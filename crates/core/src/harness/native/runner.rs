@@ -4733,6 +4733,7 @@ pub(crate) mod testutil {
             connection_id: "ignored".into(),
             connection_label: "Ignored".into(),
             reason: RouteSelectionReason::Initial,
+            tools_unavailable_note: None,
         }
     }
 
