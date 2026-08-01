@@ -464,13 +464,18 @@ fn filter_tool_compatible(
 /// `filter_tool_compatible`: it must (a) actually be diverted to the flat
 /// text WASM ABI (`target_is_toolless_wasm`), and (b) have been tool-capable
 /// per its DESCRIPTOR — i.e. what `target_tool_capabilities` would have
-/// returned before the runtime WASM override collapsed it to toolless. (b)
-/// excludes a target that was already incompatible for a non-toolless
-/// reason (e.g. a `ConnectionOverride` base URL that can't honor a strict
-/// schema): re-admitting it would forward `strict`/`output_schema`/a custom
-/// tool to a wire endpoint that cannot honor them (see
-/// `translate::mod` request construction), which is exactly the
-/// upstream-400 bug this fallback must not reintroduce.
+/// returned before the runtime WASM override collapsed it to toolless.
+///
+/// (b) is a BASE-PARITY guard, not a wire-safety one: a target passing (a)
+/// is diverted to the component and never reaches an HTTP endpoint, so
+/// nothing could be forwarded to a wire that cannot honor it. What (b)
+/// buys is that this fallback only ever re-admits targets the pre-override
+/// (descriptor-derived) filter would itself have kept — so the degrade is a
+/// strict narrowing that answers exactly the requests routing answered
+/// before this seam existed, and never resurrects one that was already
+/// hard-filtered for a non-toolless reason (strict schema, custom/freeform
+/// tools, output schema — see `ToolTransportRequirements`). Dropping (b)
+/// would widen the fallback back into that bug; keep it.
 fn is_toolless_wasm_fallback_candidate(
     target: &RouteTarget,
     requirements: capabilities::ToolTransportRequirements,
