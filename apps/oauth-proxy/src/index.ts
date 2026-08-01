@@ -99,7 +99,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   const providerKey = tokenMatch[1] ?? "";
-  const provider = PROVIDERS[providerKey];
+  // `Object.hasOwn` (not `providerKey in PROVIDERS` / plain index access) so prototype-chain
+  // keys like `__proto__`, `constructor`, `toString` correctly 404 instead of resolving to an
+  // inherited value and falling through to the 503 "unconfigured" branch below.
+  const provider = Object.hasOwn(PROVIDERS, providerKey) ? PROVIDERS[providerKey] : undefined;
   if (!provider) {
     return jsonResponse(404, { error: "unknown_provider" });
   }
@@ -147,7 +150,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (grantType === "authorization_code") {
     const code = incoming.get("code");
     const redirectUri = incoming.get("redirect_uri");
-    if (!code || !redirectUri) {
+    // Cockpit always sends PKCE. A missing code_verifier means the caller isn't our client
+    // (or is trying to downgrade off PKCE) — reject before the redirect_uri check even runs,
+    // and well before any upstream call.
+    const codeVerifier = incoming.get("code_verifier");
+    if (!code || !redirectUri || !codeVerifier) {
       return jsonResponse(400, { error: "missing_parameters" });
     }
     if (!REDIRECT_URI_RE.test(redirectUri)) {
@@ -155,10 +162,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     outgoing.set("code", code);
     outgoing.set("redirect_uri", redirectUri);
-    const codeVerifier = incoming.get("code_verifier");
-    if (codeVerifier) {
-      outgoing.set("code_verifier", codeVerifier);
-    }
+    outgoing.set("code_verifier", codeVerifier);
   } else {
     const refreshToken = incoming.get("refresh_token");
     if (!refreshToken) {

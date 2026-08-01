@@ -13,12 +13,15 @@ for tokens is relayed through here.
 
 ## Deploy runbook
 
-Run these from the repo root unless noted otherwise.
+Run these from `apps/oauth-proxy/` unless noted otherwise — that's where `wrangler.toml`
+lives, and `wrangler login` / `wrangler deploy` / `wrangler secret put` all expect to be run
+from there.
 
-1. Install dependencies:
+1. From the repo root, move into the Worker directory and install dependencies:
 
    ```sh
-   cd apps/oauth-proxy && bun install
+   cd apps/oauth-proxy
+   bun install
    ```
 
 2. Authenticate Wrangler with your Cloudflare account:

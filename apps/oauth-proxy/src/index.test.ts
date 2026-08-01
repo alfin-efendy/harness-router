@@ -80,6 +80,7 @@ describe("POST /token/:provider", () => {
       postToken("bitbucket", {
         grant_type: "authorization_code",
         code: "auth-code-456",
+        code_verifier: "verifier-456",
         redirect_uri: "http://127.0.0.1:8976/plugin-oauth/bitbucket/profile/default/callback",
       }),
       ENV,
@@ -102,6 +103,7 @@ describe("POST /token/:provider", () => {
       postToken("atlassian", {
         grant_type: "authorization_code",
         code: "auth-code-789",
+        code_verifier: "verifier-789",
         redirect_uri: VALID_REDIRECT_URI,
         client_id: "attacker-client-id",
         client_secret: "attacker-secret",
@@ -121,6 +123,7 @@ describe("POST /token/:provider", () => {
       postToken("atlassian", {
         grant_type: "authorization_code",
         code: "auth-code-abc",
+        code_verifier: "verifier-abc-2",
         redirect_uri: VALID_REDIRECT_URI,
         scope: "admin",
         audience: "evil",
@@ -140,6 +143,7 @@ describe("POST /token/:provider", () => {
       postToken("atlassian", {
         grant_type: "authorization_code",
         code: "auth-code-xyz",
+        code_verifier: "verifier-xyz",
         redirect_uri: "https://evil.example.com/callback",
       }),
       ENV,
@@ -216,6 +220,16 @@ describe("POST /token/:provider", () => {
     expect(res.status).toBe(415);
   });
 
+  it("8e. prototype-chain provider key (__proto__) -> 404, not 503; upstream never called", async () => {
+    // PROVIDERS[key] with a plain index access resolves __proto__/constructor/toString to an
+    // inherited Object.prototype value, which is truthy and would fall through to the 503
+    // "provider_unconfigured" branch instead of correctly 404ing as an unknown provider.
+    const fetchMock = stubFetch(async () => new Response("{}", { status: 200 }));
+    const res = await handleRequest(postToken("__proto__", { grant_type: "refresh_token", refresh_token: "x" }), ENV);
+    expect(res.status).toBe(404);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("9. upstream error response is passed through unchanged, and the code is never logged", async () => {
     const logSpy = spyOn(console, "log");
     stubFetch(async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }));
@@ -224,6 +238,7 @@ describe("POST /token/:provider", () => {
       postToken("atlassian", {
         grant_type: "authorization_code",
         code: "super-secret-code-value",
+        code_verifier: "verifier-super-secret",
         redirect_uri: VALID_REDIRECT_URI,
       }),
       ENV,
@@ -299,5 +314,124 @@ describe("rate limiting (guard on absence)", () => {
 
     expect(res.status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("redirect_uri gate (table-driven near-misses)", () => {
+  // Each of these is a plausible bypass shape for the loopback-callback allowlist: userinfo
+  // smuggling, trailing/traversal path tricks, encoded/real newline suffixes, off-by-one host
+  // and port, and a scheme/case mismatch. Every one must be rejected with 400 *before* the
+  // upstream token endpoint is ever called — a false accept here would leak the client secret
+  // exchange to an attacker-controlled redirect target.
+  const HOSTILE_REDIRECT_URIS: Array<[string, string]> = [
+    [
+      "userinfo smuggling (@evil.com after the loopback authority)",
+      "http://127.0.0.1:8976@evil.com/plugin-oauth/atlassian/profile/atlassian-cloud/callback",
+    ],
+    ["trailing slash", "http://127.0.0.1:8976/plugin-oauth/atlassian/profile/atlassian-cloud/callback/"],
+    ["encoded newline suffix (%0A)", "http://127.0.0.1:8976/plugin-oauth/atlassian/profile/atlassian-cloud/callback%0A"],
+    ["real newline suffix", "http://127.0.0.1:8976/plugin-oauth/atlassian/profile/atlassian-cloud/callback\n"],
+    ["wrong port (8977)", "http://127.0.0.1:8977/plugin-oauth/atlassian/profile/atlassian-cloud/callback"],
+    ["confusable host (127.0.0.10)", "http://127.0.0.10:8976/plugin-oauth/atlassian/profile/atlassian-cloud/callback"],
+    ["uppercase scheme (HTTP://)", "HTTP://127.0.0.1:8976/plugin-oauth/atlassian/profile/atlassian-cloud/callback"],
+    ["empty plugin segment", "http://127.0.0.1:8976/plugin-oauth//profile/atlassian-cloud/callback"],
+    ["path traversal segment (..)", "http://127.0.0.1:8976/plugin-oauth/../atlassian/profile/atlassian-cloud/callback"],
+    ["https scheme instead of http", "https://127.0.0.1:8976/plugin-oauth/atlassian/profile/atlassian-cloud/callback"],
+  ];
+
+  for (const [label, redirectUri] of HOSTILE_REDIRECT_URIS) {
+    it(`rejects with 400, upstream never called: ${label}`, async () => {
+      const fetchMock = stubFetch(async () => new Response("{}", { status: 200 }));
+
+      const res = await handleRequest(
+        postToken("atlassian", {
+          grant_type: "authorization_code",
+          code: "auth-code-near-miss",
+          code_verifier: "verifier-near-miss",
+          redirect_uri: redirectUri,
+        }),
+        ENV,
+      );
+
+      expect(res.status).toBe(400);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  }
+
+  it("positive control: the exact valid loopback shape passes the gate (proves the table isn't just rejecting everything)", async () => {
+    const fetchMock = stubFetch(async () => new Response(JSON.stringify({ access_token: "tok" }), { status: 200 }));
+
+    const res = await handleRequest(
+      postToken("atlassian", {
+        grant_type: "authorization_code",
+        code: "auth-code-positive-control",
+        code_verifier: "verifier-positive-control",
+        redirect_uri: "http://127.0.0.1:8976/plugin-oauth/atlassian/profile/atlassian-cloud/callback",
+      }),
+      ENV,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("code_verifier requirement on authorization_code grants", () => {
+  it("missing code_verifier -> 400, upstream never called (Cockpit always sends PKCE)", async () => {
+    const fetchMock = stubFetch(async () => new Response("{}", { status: 200 }));
+
+    const res = await handleRequest(
+      postToken("atlassian", {
+        grant_type: "authorization_code",
+        code: "auth-code-no-verifier",
+        redirect_uri: VALID_REDIRECT_URI,
+      }),
+      ENV,
+    );
+
+    expect(res.status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("empty code_verifier -> 400, upstream never called", async () => {
+    const fetchMock = stubFetch(async () => new Response("{}", { status: 200 }));
+
+    const res = await handleRequest(
+      postToken("atlassian", {
+        grant_type: "authorization_code",
+        code: "auth-code-empty-verifier",
+        code_verifier: "",
+        redirect_uri: VALID_REDIRECT_URI,
+      }),
+      ENV,
+    );
+
+    expect(res.status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("upstream response header filtering", () => {
+  it("strips Set-Cookie and x-ratelimit-* from the upstream response, keeps only content-type + cache-control", async () => {
+    const fetchMock = stubFetch(
+      async () =>
+        new Response(JSON.stringify({ access_token: "tok" }), {
+          status: 200,
+          headers: {
+            "set-cookie": "session=evil-upstream-cookie; HttpOnly",
+            "x-ratelimit-remaining": "3",
+            "x-ratelimit-reset": "60",
+          },
+        }),
+    );
+
+    const res = await handleRequest(postToken("atlassian", { grant_type: "refresh_token", refresh_token: "refresh-header-test" }), ENV);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(res.headers.get("x-ratelimit-remaining")).toBeNull();
+    expect(res.headers.get("x-ratelimit-reset")).toBeNull();
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 });
