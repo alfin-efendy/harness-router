@@ -31,5 +31,8 @@
   // apps/cockpit and packages/ui are DOM/React workspaces with their own tsconfig
   // (DOM lib + `@/` path alias). They are type-checked separately by the `typecheck`
   // script; excluded here so this Bun-side config (no DOM lib) does not false-fail them.
-  "exclude": ["apps/cockpit", "packages/ui", "**/node_modules", "**/dist"]
+  // apps/oauth-proxy is a Cloudflare Worker with its own tsconfig (Workers runtime globals
+  // via @cloudflare/workers-types, which collide with this config's `bun` types); excluded
+  // for the same reason — `bunx tsc --noEmit` from apps/oauth-proxy checks it instead.
+  "exclude": ["apps/cockpit", "packages/ui", "apps/oauth-proxy", "**/node_modules", "**/dist"]
 }
