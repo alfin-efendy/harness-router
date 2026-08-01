@@ -46,11 +46,16 @@ network = ["api.atlassian.com", "auth.atlassian.com"]
 #   - `client-id` below is the first-party app's PUBLIC client id (safe to
 #     publish — it already appears in plaintext in every authorize URL) so
 #     Connect works with zero user configuration out of the box.
-#   - `client-id-setting`/`client-secret-setting` below are UNCHANGED: a
-#     user/enterprise-supplied Atlassian OAuth app still overrides the
-#     first-party one (`resolve_client_id` prefers setting → stored →
-#     baked), and a request using an override client id bypasses the relay's
-#     baked secret assumption on the token call as before.
+#   - `client-id-setting`/`client-secret-setting` below are kept, but note
+#     the LIMITATION routing through the relay introduces: `resolve_client_id`
+#     still prefers a user-set client id when the host builds the authorize
+#     URL, yet the token exchange now posts to the relay, which ALWAYS
+#     substitutes the first-party client id and secret. A code minted for a
+#     user-supplied client would therefore be redeemed under the wrong
+#     client and rejected. Overriding the client id is consequently NOT
+#     supported while `token-url` points at the relay. Supporting it needs
+#     the host to post directly to `auth.atlassian.com/oauth/token` when
+#     both override settings carry values — tracked as a follow-up.
 [[oauth]]
 id = "atlassian-cloud"
 authorize-url = "https://auth.atlassian.com/authorize"
