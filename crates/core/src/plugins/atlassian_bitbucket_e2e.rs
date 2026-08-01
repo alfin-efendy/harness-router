@@ -316,8 +316,8 @@ async fn atlassian_and_bitbucket_releases_sign_install_and_load_through_the_gene
             .unwrap()
             .unwrap()
             .version,
-        // Bumped to 0.2.0 when atlassian's token exchange moved to the OAuth
-        // relay; bitbucket below is still on its original 0.1.0.
+        // Both bundles moved to 0.2.0 when their token exchange was routed
+        // through the OAuth relay.
         "0.2.0"
     );
     assert_eq!(
@@ -327,7 +327,7 @@ async fn atlassian_and_bitbucket_releases_sign_install_and_load_through_the_gene
             .unwrap()
             .unwrap()
             .version,
-        "0.1.0"
+        "0.2.0"
     );
 
     let bundles = load_active_bundles(root.path(), &store).await.unwrap();
@@ -507,7 +507,7 @@ async fn installed_atlassian_enumerates_jira_and_confluence_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn installed_bitbucket_enumerates_its_0_1_0_connector_tools() {
+async fn installed_bitbucket_enumerates_its_declared_connector_tools() {
     let (store, _tmp, root) = install_atlassian_and_bitbucket().await;
     let bundle = load_active_bundles(root.path(), &store)
         .await

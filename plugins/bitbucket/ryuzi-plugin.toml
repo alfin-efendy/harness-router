@@ -1,6 +1,6 @@
 id = "bitbucket"
 name = "Bitbucket"
-version = "0.1.0"
+version = "0.2.0"
 wit-api = ">=0.1.0, <0.2.0"
 lifecycle = "per-call"
 component = "bitbucket.wasm"
@@ -32,10 +32,32 @@ network = ["api.bitbucket.org", "bitbucket.org"]
 # Cloud's OAuth consumer is a separate app registration
 # (workspace settings -> OAuth consumers -> Add consumer) from Atlassian's
 # Jira/Confluence 3LO app; the two grants share no token.
+#
+# authorize vs token are split across two hosts on purpose, mirroring the
+# atlassian bundle:
+#   - `authorize-url` stays pointed directly at bitbucket.org — user consent
+#     is a browser redirect, carries no secret, and has no reason to be
+#     relayed.
+#   - `token-url` is routed through the Ryuzi OAuth relay (a small Cloudflare
+#     Worker) instead of bitbucket.org's own token endpoint. Bitbucket Cloud
+#     authenticates the code exchange with HTTP Basic `key:secret` — a
+#     CONFIDENTIAL-client grant — and this is a public repo, so the secret
+#     cannot be baked into a shipped manifest. The relay holds it server-side
+#     (a Worker secret, never checked in) and forwards the exchange.
+#   - `client-id` below is the first-party OAuth client's PUBLIC key (it
+#     already appears in plaintext in every authorize URL) so Connect works
+#     with zero user configuration.
+#   - `client-id-setting`/`client-secret-setting` below are kept, but carry
+#     the same LIMITATION as atlassian's: the relay always substitutes the
+#     first-party client id and secret on the token call, so a code minted
+#     for a user-supplied client would be redeemed under the wrong client and
+#     rejected. Overriding the client id is NOT supported while `token-url`
+#     points at the relay — same follow-up as atlassian.
 [[oauth]]
 id = "bitbucket-cloud"
 authorize-url = "https://bitbucket.org/site/oauth2/authorize"
-token-url = "https://bitbucket.org/site/oauth2/access_token"
+token-url = "https://ryuzi-oauth-relay.alfin1993.workers.dev/token/bitbucket"
+client-id = "yg5R40U6Z62cJzzHLVOWygbgLE3aNPuL"
 # Scopes verified against developer.atlassian.com/cloud/bitbucket/bitbucket-cloud-rest-api-scopes/
 # (July 2026): `account` (GET /2.0/user, the auth_status tool); `repository`
 # (read access to repos, repo_list/repo_get) — listed explicitly even though
