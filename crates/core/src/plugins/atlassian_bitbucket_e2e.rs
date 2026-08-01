@@ -143,12 +143,22 @@ fn build_artifacts(
     key_id: &str,
 ) -> ComponentArtifacts {
     let manifest_toml = std::fs::read(manifest_path).unwrap();
+    // The release descriptor's version must match the manifest's own — the
+    // installer rejects a mismatch ("bundle version mismatch"). Read it from
+    // the real manifest rather than hardcoding, so bumping a shipped bundle
+    // never breaks these tests. `wit-api` stays literal: the manifest declares
+    // a RANGE (`>=0.1.0, <0.2.0`), a release declares the concrete version.
+    let declared_version = PluginBundleManifest::from_toml(
+        std::str::from_utf8(&manifest_toml).expect("manifest is utf-8"),
+    )
+    .expect("real bundle manifest must parse")
+    .version;
     let wasm = std::fs::read(wasm_path).unwrap();
     let sha = format!("{:x}", Sha256::digest(&wasm));
     let component_url = format!("{base}/{plugin_id}.wasm");
     let release_json = serde_json::to_vec(&json!({
         "id": plugin_id,
-        "version": "0.1.0",
+        "version": declared_version,
         "wit-api": "0.1.0",
         "component_url": component_url,
         "component_sha256": sha,
@@ -306,7 +316,9 @@ async fn atlassian_and_bitbucket_releases_sign_install_and_load_through_the_gene
             .unwrap()
             .unwrap()
             .version,
-        "0.1.0"
+        // Bumped to 0.2.0 when atlassian's token exchange moved to the OAuth
+        // relay; bitbucket below is still on its original 0.1.0.
+        "0.2.0"
     );
     assert_eq!(
         store
