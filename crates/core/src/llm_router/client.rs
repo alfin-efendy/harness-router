@@ -189,12 +189,47 @@ pub async fn route_tool_capabilities(
         )
         .await?,
     );
-    TransportToolCapabilities::intersection(
-        targets
-            .into_iter()
-            .map(|annotated| target_tool_capabilities(&annotated.target)),
-    )
-    .map_err(anyhow::Error::from)
+
+    // Deliberately differs from `filter_tool_compatible`: this function has
+    // no request body, so it peeks at capabilities for every target the
+    // route COULD land on to feed native-tools-V2 planning
+    // (`CapabilityResolver::resolve`) up front, before a turn even starts.
+    // `target_tool_capabilities` reports a toolless-WASM target as carrying
+    // NO tool support at all; intersecting that in unconditionally would let
+    // a single WASM target in a mixed candidate set zero out
+    // `supports_function_tools` for the WHOLE route and hard-fail planning
+    // (`"transport and runtime share no tool interaction mode"`) even when a
+    // perfectly good HTTP target sits right next to it — and even for a
+    // pure chat turn with zero tools. So: if any candidate is NOT
+    // toolless-WASM, intersect over only those (a toolless-WASM candidate
+    // would be dropped by `filter_tool_compatible` on an actual tools-
+    // bearing route anyway, so it must not veto the intersection here). Only
+    // when EVERY candidate is toolless WASM do we fall back to the
+    // DESCRIPTOR-derived capabilities (pre-runtime-override, same value
+    // `target_tool_capabilities` returned before this fix) so planning
+    // reports what the route COULD support instead of a hard zero — the
+    // routing filter plus `RouteSelection.tools_unavailable_note` already
+    // handle the truth for the actual toolless turn.
+    let (wasm_targets, non_wasm_targets): (Vec<_>, Vec<_>) = targets
+        .into_iter()
+        .partition(|annotated| target_is_toolless_wasm(&annotated.target));
+    if !non_wasm_targets.is_empty() {
+        TransportToolCapabilities::intersection(
+            non_wasm_targets
+                .iter()
+                .map(|annotated| target_tool_capabilities(&annotated.target)),
+        )
+        .map_err(anyhow::Error::from)
+    } else {
+        TransportToolCapabilities::intersection(wasm_targets.iter().map(|annotated| {
+            annotated
+                .target
+                .desc
+                .tool_transport
+                .capabilities_for_endpoint(connections::endpoint_source(&annotated.target.conn))
+        }))
+        .map_err(anyhow::Error::from)
+    }
 }
 
 async fn route_models_for_body_matching(
@@ -393,10 +428,17 @@ async fn route_models_for_body_matching_with_cache(
 /// Prefer tool-capable targets; degrade with a visible warning only when
 /// there is no alternative. A tool-bearing request first drops every target
 /// this turn cannot serve tools through. If that empties an otherwise
-/// non-empty candidate list, it falls BACK to the unfiltered list instead of
-/// hard-failing — the free tier still answers, and the target that ends up
-/// accepted records the drop in `RouteSelection.tools_unavailable_note`
-/// (`selection_for_accepted_target`) so the user sees a warning.
+/// non-empty candidate list, it does NOT fall back to the whole unfiltered
+/// list — only to the subset of dropped targets whose SOLE incompatibility
+/// is the toolless WASM divert (see `is_toolless_wasm_fallback_candidate`).
+/// A target dropped for a genuine transport shortfall (e.g. a
+/// `ConnectionOverride` endpoint that can't honor `strict`/custom/output
+/// schema) is a HARD requirement failure and must stay filtered out — see
+/// the doc comment on `ToolTransportRequirements`. If no target qualifies
+/// for the toolless-WASM fallback either, this returns empty exactly like a
+/// plain hard filter. The target that ends up accepted records the drop in
+/// `RouteSelection.tools_unavailable_note` (`selection_for_accepted_target`)
+/// so the user sees a warning.
 fn filter_tool_compatible(
     targets: Vec<AnnotatedRouteTarget>,
     requirements: capabilities::ToolTransportRequirements,
@@ -409,22 +451,58 @@ fn filter_tool_compatible(
         .filter(|target| requirements.satisfied_by(target_tool_capabilities(&target.target)))
         .cloned()
         .collect();
-    if compatible.is_empty() && !targets.is_empty() {
-        return targets;
+    if !compatible.is_empty() {
+        return compatible;
     }
-    compatible
+    targets
+        .into_iter()
+        .filter(|target| is_toolless_wasm_fallback_candidate(&target.target, requirements))
+        .collect()
+}
+
+/// Whether `target` qualifies for the toolless-WASM degrade fallback in
+/// `filter_tool_compatible`: it must (a) actually be diverted to the flat
+/// text WASM ABI (`target_is_toolless_wasm`), and (b) have been tool-capable
+/// per its DESCRIPTOR — i.e. what `target_tool_capabilities` would have
+/// returned before the runtime WASM override collapsed it to toolless. (b)
+/// excludes a target that was already incompatible for a non-toolless
+/// reason (e.g. a `ConnectionOverride` base URL that can't honor a strict
+/// schema): re-admitting it would forward `strict`/`output_schema`/a custom
+/// tool to a wire endpoint that cannot honor them (see
+/// `translate::mod` request construction), which is exactly the
+/// upstream-400 bug this fallback must not reintroduce.
+fn is_toolless_wasm_fallback_candidate(
+    target: &RouteTarget,
+    requirements: capabilities::ToolTransportRequirements,
+) -> bool {
+    target_is_toolless_wasm(target)
+        && requirements.satisfied_by(
+            target
+                .desc
+                .tool_transport
+                .capabilities_for_endpoint(connections::endpoint_source(&target.conn)),
+        )
+}
+
+/// Whether `target` is diverted to the flat-text toolless WASM component —
+/// the SAME predicate as the divert at the `wasm_provider(&target.conn.
+/// provider)` choke point below (search this file). Shared by
+/// `target_tool_capabilities` (runtime capability lookup),
+/// `is_toolless_wasm_fallback_candidate` (degrade eligibility), and
+/// `selection_for_accepted_target` (the user-visible warning) so the three
+/// can never drift apart on what counts as "toolless".
+fn target_is_toolless_wasm(target: &RouteTarget) -> bool {
+    crate::plugins::wasm_provider::wasm_provider(&target.conn.provider).is_some()
 }
 
 /// Runtime-aware tool capability for a resolved target. A connection backed
 /// by an installed WASM provider bundle diverts to the in-process component
-/// — the SAME predicate as the divert at the `wasm_provider(&target.conn.
-/// provider)` choke point below (search this file) — and that ABI is flat
-/// text with no tools in or out, BY CONSTRUCTION, for every WASM-diverted
-/// provider (not just mimo/opencode). Runtime reality wins over the
-/// descriptor's HTTP-wire declaration, which only describes what the wire
-/// format WOULD support if spoken directly.
+/// and that ABI is flat text with no tools in or out, BY CONSTRUCTION, for
+/// every WASM-diverted provider (not just mimo/opencode). Runtime reality
+/// wins over the descriptor's HTTP-wire declaration, which only describes
+/// what the wire format WOULD support if spoken directly.
 fn target_tool_capabilities(target: &RouteTarget) -> TransportToolCapabilities {
-    if crate::plugins::wasm_provider::wasm_provider(&target.conn.provider).is_some() {
+    if target_is_toolless_wasm(target) {
         return TransportToolCapabilities::toolless(
             target.desc.tool_transport.capabilities().wire_protocol,
         );
@@ -1206,14 +1284,22 @@ pub(crate) fn target_effort(
 
 /// `tool_requirements`/`tools_count` describe the ORIGINAL request (before
 /// any degrade fallback in `filter_tool_compatible`) — used here to detect
-/// whether the target actually being accepted can serve them, independent of
-/// how it survived filtering. This is intentionally recomputed from the
+/// whether the accepted target is the toolless-WASM degrade case, independent
+/// of how it survived filtering. This is intentionally recomputed from the
 /// accepted target rather than threaded as a flag through
 /// `filter_tool_compatible`'s return value: it is the single source of
-/// truth for "does THIS accepted target support what THIS request needs",
+/// truth for "did THIS accepted target degrade because it's toolless-WASM",
 /// and stays correct even across route continuation / failover, where a
 /// later-accepted target may differ from whatever the initial filter pass
 /// examined.
+///
+/// The note is keyed off `target_is_toolless_wasm`, NOT a generic
+/// `!tool_requirements.satisfied_by(..)` check: after the fallback was
+/// narrowed to the toolless-WASM case only (see `filter_tool_compatible`),
+/// a generic "requirements unsatisfied" test would be misleading wording —
+/// "can't use tools" — for a target that failed for some OTHER capability
+/// shortfall (which can no longer reach acceptance via a degrade anyway,
+/// since that case now stays hard-filtered).
 fn selection_for_accepted_target(
     target: &RouteTarget,
     requested_model: &str,
@@ -1242,9 +1328,8 @@ fn selection_for_accepted_target(
         .get(&surface)
         .map(|capability| capability.model_display_name.clone())
         .unwrap_or_else(|| target.upstream_model.clone());
-    let tools_unavailable_note = (tool_requirements.any()
-        && !tool_requirements.satisfied_by(target_tool_capabilities(target)))
-    .then(|| {
+    let tools_unavailable_note = (tool_requirements.any() && target_is_toolless_wasm(target))
+        .then(|| {
         format!(
             "This model can't use tools — {tools_count} bound tool(s) were not available for this turn."
         )
@@ -3802,6 +3887,255 @@ mod tests {
         registry::unregister_custom_descriptor(PROVIDER_ID);
     }
 
+    /// Review fix wave, Critical 1 (regression guard): a target excluded for
+    /// a NON-toolless reason — here, a `ConnectionOverride` base URL that
+    /// collapses to `function_only` and can't honor `strict` — must NOT be
+    /// re-admitted by the degrade fallback, even when it is the sole
+    /// candidate. Re-admitting it would forward `strict`/output-schema/a
+    /// custom tool to a wire endpoint that can't honor them, guaranteeing an
+    /// upstream 400 — the exact bug the narrowed fallback closes.
+    #[test]
+    fn filter_tool_compatible_does_not_readmit_a_non_toolless_incompatible_only_candidate() {
+        let override_target = AnnotatedRouteTarget {
+            target: RouteTarget {
+                conn: mk_conn(
+                    "override-conn",
+                    "openai",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("key".into()),
+                        base_url_override: Some("https://compatible.example/v1".into()),
+                        ..Default::default()
+                    },
+                ),
+                desc: registry::descriptor("openai").unwrap(),
+                upstream_model: "opaque-override".into(),
+                route_target_key: None,
+            },
+            reason: RouteSelectionReason::Initial,
+        };
+
+        let requirements = capabilities::ToolTransportRequirements {
+            strict_function_schema: true,
+            ..Default::default()
+        };
+        let filtered = filter_tool_compatible(vec![override_target], requirements);
+
+        assert!(
+            filtered.is_empty(),
+            "a non-toolless capability shortfall on the sole candidate must stay \
+             hard-filtered, not be re-admitted as if it were a toolless-WASM degrade"
+        );
+    }
+
+    /// Review fix wave, Critical 1 + Important 4: a toolless-WASM target IS
+    /// re-admitted by the degrade fallback when it is the only candidate and
+    /// the request carries plain (non-strict, non-custom, no output-schema)
+    /// function tools — its descriptor would have satisfied the request
+    /// before the runtime override collapsed it — and the accepted-target
+    /// warning note fires for it.
+    #[test]
+    fn filter_tool_compatible_readmits_a_toolless_wasm_only_candidate_for_plain_function_tools() {
+        const PROVIDER_ID: &str = "wasm-filter-readmit-fixture";
+        register_wasm_descriptor(PROVIDER_ID);
+        crate::plugins::wasm_provider::register_wasm_provider(Arc::new(FakeWasmProvider::new(
+            PROVIDER_ID,
+        )));
+
+        let wasm_target = AnnotatedRouteTarget {
+            target: RouteTarget {
+                conn: mk_conn(
+                    "wasm-conn",
+                    PROVIDER_ID,
+                    "api_key",
+                    ConnectionData::default(),
+                ),
+                desc: registry::descriptor(PROVIDER_ID).unwrap(),
+                upstream_model: "fixture-model".into(),
+                route_target_key: None,
+            },
+            reason: RouteSelectionReason::Initial,
+        };
+
+        let requirements = capabilities::ToolTransportRequirements {
+            function_tools: true,
+            ..Default::default()
+        };
+        let filtered = filter_tool_compatible(vec![wasm_target], requirements);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "the sole toolless-WASM candidate must degrade, not hard-fail, for plain \
+             function tools its descriptor would have supported"
+        );
+
+        let requested = format!("{PROVIDER_ID}/fixture-model");
+        let selection = selection_for_accepted_target(
+            &filtered[0].target,
+            &requested,
+            &empty_policy(&requested),
+            RouteSelectionReason::Initial,
+            requirements,
+            1,
+        );
+        assert!(
+            selection.tools_unavailable_note.is_some(),
+            "the degrade must be flagged so the user sees a warning"
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
+    }
+
+    /// Review fix wave, Critical 2: a mixed route (toolless-WASM + HTTP)
+    /// must not have the WASM candidate veto the intersection —
+    /// `route_tool_capabilities` still reports function-tool support so
+    /// native-tools-V2 planning doesn't hard-fail a route that has a
+    /// perfectly good HTTP alternative sitting right next to the WASM one.
+    #[tokio::test]
+    async fn route_tool_capabilities_mixed_wasm_and_http_route_reports_function_tool_support() {
+        const PROVIDER_ID: &str = "wasm-route-caps-mixed-fixture";
+        register_wasm_descriptor(PROVIDER_ID);
+        crate::plugins::wasm_provider::register_wasm_provider(Arc::new(FakeWasmProvider::new(
+            PROVIDER_ID,
+        )));
+        let ctx = test_ctx().await;
+
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "wasm-conn",
+                PROVIDER_ID,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("unused".into()),
+                    models_override: Some(vec!["fixture-model".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "http-conn",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    models_override: Some(vec!["gpt-mix".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "mixed-wasm-http".into(),
+                name: "mixed-wasm-http".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: PROVIDER_ID.into(),
+                        model: "fixture-model".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "gpt-mix".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let capabilities = route_tool_capabilities(&ctx.store, "mixed-wasm-http")
+            .await
+            .unwrap();
+
+        assert!(
+            capabilities.supports_function_tools,
+            "a toolless-WASM candidate must not veto function-tool support when an \
+             HTTP candidate is also in the route"
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
+    }
+
+    /// Review fix wave, Critical 2: when EVERY candidate in a route is
+    /// toolless-WASM, `route_tool_capabilities` must report the
+    /// DESCRIPTOR-derived capability (what native-tools-V2 planning should
+    /// assume the route could support) instead of a runtime-zeroed one —
+    /// otherwise planning hard-fails every turn on a free-route session,
+    /// including pure chat with zero tools. The routing filter plus the
+    /// user-visible notice already handle the truth for the actual turn.
+    #[tokio::test]
+    async fn route_tool_capabilities_all_wasm_route_reports_descriptor_derived_capabilities() {
+        const PROVIDER_ID: &str = "wasm-route-caps-allwasm-fixture";
+        register_wasm_descriptor(PROVIDER_ID);
+        crate::plugins::wasm_provider::register_wasm_provider(Arc::new(FakeWasmProvider::new(
+            PROVIDER_ID,
+        )));
+        let ctx = test_ctx().await;
+
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "wasm-conn",
+                PROVIDER_ID,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("unused".into()),
+                    models_override: Some(vec!["fixture-model".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "all-wasm".into(),
+                name: "all-wasm".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![routes::ModelRouteTarget {
+                    provider: PROVIDER_ID.into(),
+                    model: "fixture-model".into(),
+                    effort: None,
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let capabilities = route_tool_capabilities(&ctx.store, "all-wasm")
+            .await
+            .unwrap();
+
+        assert!(
+            capabilities.supports_function_tools,
+            "an all-WASM route must report the descriptor-derived capability, not a \
+             runtime-zeroed one, so native-tools-V2 planning doesn't hard-fail"
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
+    }
+
     /// Test 3 (brief item): degrade path. When the ONLY available target is
     /// a toolless WASM provider and the request carries tools, the router
     /// must NOT hard-fail — it degrades to the unfiltered (WASM) target and
@@ -5890,7 +6224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_tools_degrade_instead_of_rejecting_an_openai_base_url_override() {
+    async fn strict_tools_reject_an_openai_base_url_override() {
         let ctx = test_ctx().await;
         connections::add_connection(
             &ctx.store,
@@ -5921,10 +6255,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        // This override is the ONLY candidate and can't serve a strict
-        // schema — no alternative exists, so the router degrades (keeps the
-        // target) instead of hard-failing the turn.
-        assert_eq!(targets.len(), 1);
+        assert!(targets.is_empty());
     }
 
     #[tokio::test]
@@ -6068,7 +6399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_free_route_intersects_transport_facts_and_degrades_strict_requests() {
+    async fn dynamic_free_route_intersects_and_filters_declared_transport_facts() {
         let ctx = test_ctx().await;
         for (id, provider, model) in [
             ("mimo-free-account", "mimo-free", "mimo-auto"),
@@ -6128,16 +6459,11 @@ mod tests {
             "strict": true,
             "parameters": {"type": "object"}
         }}]});
-        // Neither free target supports strict schemas and there is no
-        // tool-capable alternative — the router must degrade to the
-        // unfiltered free targets (so the free tier still answers) rather
-        // than hard-failing the turn with an empty target list.
         assert!(
-            !route_models_for_body(&ctx.store, "free", Some(&strict_request))
+            route_models_for_body(&ctx.store, "free", Some(&strict_request))
                 .await
                 .unwrap()
-                .is_empty(),
-            "no target satisfies strict schemas, but degrading beats a hard failure"
+                .is_empty()
         );
     }
 
@@ -6285,8 +6611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_queue_degrades_instead_of_rejecting_strict_custom_and_output_for_an_override_endpoint(
-    ) {
+    async fn continuation_queue_rejects_strict_custom_and_output_for_an_override_endpoint() {
         let ctx = test_ctx().await;
         for (id, provider, model, base_url_override) in [
             ("initial", "anthropic", "start", None),
@@ -6366,11 +6691,7 @@ mod tests {
             )
             .await
             .unwrap();
-            // The override endpoint is the only continuation candidate and
-            // satisfies none of these requirements — no alternative exists,
-            // so continuation degrades (keeps the sole target) instead of
-            // rejecting it outright.
-            assert_eq!(targets.len(), 1, "requirements: {requirements:?}");
+            assert!(targets.is_empty(), "requirements: {requirements:?}");
         }
     }
 
