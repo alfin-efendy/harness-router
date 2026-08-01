@@ -77,6 +77,24 @@ impl TransportToolCapabilities {
         }
     }
 
+    /// A transport that carries no tool wire capability at all. `wire_protocol`
+    /// still reflects the underlying HTTP wire format for provenance — only
+    /// the tool-ish flags collapse to false — because the caller (a
+    /// connection diverted to a toolless WASM provider component, see
+    /// `llm_router::client::target_tool_capabilities`) genuinely cannot
+    /// accept or emit tool calls regardless of what its descriptor declares.
+    pub const fn toolless(wire_protocol: WireProtocol) -> Self {
+        Self {
+            wire_protocol,
+            supports_function_tools: false,
+            supports_custom_freeform_tools: false,
+            supports_parallel_tool_calls: false,
+            supports_strict_function_schema: false,
+            supports_tool_output_schema: false,
+            schema_budget_tokens: 0,
+        }
+    }
+
     pub fn intersection(
         capabilities: impl IntoIterator<Item = Self>,
     ) -> Result<Self, CapabilityResolutionError> {
