@@ -37,6 +37,7 @@ jobs:
             ts:
               - "packages/**"
               - "apps/cockpit/src/**"
+              - "apps/oauth-proxy/src/**"
               - "apps/**/tsconfig*.json"
               - "scripts/**"
               - "tsconfig*.json"

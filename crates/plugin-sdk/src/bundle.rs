@@ -201,6 +201,11 @@ pub enum BundleError {
     EmptyOAuthProfileId,
     #[error("duplicate oauth profile id: {0}")]
     DuplicateOAuthProfile(String),
+    #[error("oauth profile {profile:?} field {field:?} must be a non-empty https:// url")]
+    InsecureOauthUrl {
+        profile: String,
+        field: &'static str,
+    },
     #[error("invalid provider id: {0:?}")]
     InvalidProviderId(String),
     #[error("tool name must not be empty")]
@@ -316,6 +321,23 @@ impl PluginBundleManifest {
             }
             if !seen_oauth_ids.insert(profile.id.as_str()) {
                 return Err(BundleError::DuplicateOAuthProfile(profile.id.clone()));
+            }
+            for (field, url) in [
+                ("authorize-url", &profile.authorize_url),
+                ("token-url", &profile.token_url),
+                (
+                    "device-authorization-url",
+                    &profile.device_authorization_url,
+                ),
+            ] {
+                if let Some(url) = url {
+                    if !url.starts_with("https://") {
+                        return Err(BundleError::InsecureOauthUrl {
+                            profile: profile.id.clone(),
+                            field,
+                        });
+                    }
+                }
             }
         }
 
@@ -617,6 +639,139 @@ authorize-url = "https://example.com/authorize"
         let profile = &manifest.oauth[0];
         assert!(profile.device_authorization_url.is_none());
         assert!(profile.client_id.is_none());
+    }
+
+    #[test]
+    fn rejects_non_https_authorize_url() {
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "acme-cloud"
+authorize-url = "http://example.com/authorize"
+"#;
+        let err = PluginBundleManifest::from_toml(toml_str)
+            .expect_err("non-https authorize-url should fail validation");
+        assert!(matches!(
+            err,
+            BundleError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "authorize-url"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_https_token_url() {
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "acme-cloud"
+token-url = "http://relay.example.com/token/acme"
+"#;
+        let err = PluginBundleManifest::from_toml(toml_str)
+            .expect_err("non-https token-url should fail validation");
+        assert!(matches!(
+            err,
+            BundleError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "token-url"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_https_device_authorization_url() {
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "acme-cloud"
+device-authorization-url = "http://example.com/device/code"
+"#;
+        let err = PluginBundleManifest::from_toml(toml_str)
+            .expect_err("non-https device-authorization-url should fail validation");
+        assert!(matches!(
+            err,
+            BundleError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "device-authorization-url"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_string_token_url() {
+        // An explicit empty string is present-but-blank, not the `None` a
+        // profile that simply omits the field would parse to — it must be
+        // rejected the same as any other non-https value.
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "acme-cloud"
+token-url = ""
+"#;
+        let err = PluginBundleManifest::from_toml(toml_str)
+            .expect_err("empty token-url should fail validation");
+        assert!(matches!(
+            err,
+            BundleError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "token-url"
+        ));
+    }
+
+    #[test]
+    fn https_oauth_urls_validate() {
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "acme-cloud"
+authorize-url = "https://example.com/authorize"
+token-url = "https://relay.example.com/token/acme"
+device-authorization-url = "https://example.com/device/code"
+"#;
+        PluginBundleManifest::from_toml(toml_str).expect("https oauth urls should validate");
+    }
+
+    #[test]
+    fn oauth_profile_without_any_urls_still_validates() {
+        // A profile that omits all three URL fields (`None`, not an empty
+        // string) is untouched by the https check.
+        let toml_str = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+component = "acme.wasm"
+
+[[oauth]]
+id = "acme-cloud"
+"#;
+        PluginBundleManifest::from_toml(toml_str)
+            .expect("an oauth profile declaring no urls should still validate");
     }
 
     #[test]

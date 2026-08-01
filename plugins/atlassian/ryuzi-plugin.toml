@@ -1,6 +1,6 @@
 id = "atlassian"
 name = "Atlassian"
-version = "0.1.0"
+version = "0.2.0"
 wit-api = ">=0.1.0, <0.2.0"
 lifecycle = "per-call"
 component = "atlassian.wasm"
@@ -28,10 +28,39 @@ network = ["api.atlassian.com", "auth.atlassian.com"]
 # and Confluence tools — Atlassian Cloud's 3LO grant is per-app, not
 # per-product, and `GET /oauth/token/accessible-resources` (the `auth_status`
 # tool) returns every Jira/Confluence site the single granted token can reach.
+#
+# authorize vs token are split across two different hosts on purpose:
+#   - `authorize-url` stays pointed directly at `auth.atlassian.com` — user
+#     consent is a browser redirect, carries no secret, and has no reason to
+#     be relayed.
+#   - `token-url` is routed through the Ryuzi OAuth relay
+#     (`ryuzi-oauth-relay`, a small Cloudflare Worker) instead of calling
+#     `auth.atlassian.com/oauth/token` directly. Atlassian's 3LO token
+#     exchange is a CONFIDENTIAL-client grant (it requires a client secret
+#     alongside the client id), and this is a public repo — the secret
+#     cannot be baked into a shipped manifest. The relay holds that secret
+#     server-side (a Worker secret, never checked in) and forwards the token
+#     exchange on the component's behalf; the host still drives the
+#     redirect/PKCE dance exactly as before, it just posts to the relay's
+#     `/token/atlassian` instead of Atlassian's own endpoint.
+#   - `client-id` below is the first-party app's PUBLIC client id (safe to
+#     publish — it already appears in plaintext in every authorize URL) so
+#     Connect works with zero user configuration out of the box.
+#   - `client-id-setting`/`client-secret-setting` below are kept, but note
+#     the LIMITATION routing through the relay introduces: `resolve_client_id`
+#     still prefers a user-set client id when the host builds the authorize
+#     URL, yet the token exchange now posts to the relay, which ALWAYS
+#     substitutes the first-party client id and secret. A code minted for a
+#     user-supplied client would therefore be redeemed under the wrong
+#     client and rejected. Overriding the client id is consequently NOT
+#     supported while `token-url` points at the relay. Supporting it needs
+#     the host to post directly to `auth.atlassian.com/oauth/token` when
+#     both override settings carry values — tracked as a follow-up.
 [[oauth]]
 id = "atlassian-cloud"
 authorize-url = "https://auth.atlassian.com/authorize"
-token-url = "https://auth.atlassian.com/oauth/token"
+token-url = "https://ryuzi-oauth-relay.alfin1993.workers.dev/token/atlassian"
+client-id = "TzsfAgE5OhPFnmOAkHctBv9JDb4FNTdE"
 scopes = [
   "read:jira-work",
   "write:jira-work",

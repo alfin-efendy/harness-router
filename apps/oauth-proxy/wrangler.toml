@@ -1,0 +1,15 @@
+name = "ryuzi-oauth-relay"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+[vars]
+ATLASSIAN_CLIENT_ID = "TzsfAgE5OhPFnmOAkHctBv9JDb4FNTdE"
+BITBUCKET_CLIENT_ID = ""   # filled when the Bitbucket consumer is registered
+
+# Rate limiting, keyed on the caller's IP (see src/index.ts). Guarded on absence in
+# src/index.ts so local `wrangler dev` and `bun test` (where this binding is not
+# available) still work without it.
+[[ratelimits]]
+name = "OAUTH_RELAY_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 30, period = 60 }
