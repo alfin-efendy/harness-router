@@ -4,7 +4,7 @@ compatibility_date = "2026-08-01"
 
 [vars]
 ATLASSIAN_CLIENT_ID = "TzsfAgE5OhPFnmOAkHctBv9JDb4FNTdE"
-BITBUCKET_CLIENT_ID = ""   # filled when the Bitbucket consumer is registered
+BITBUCKET_CLIENT_ID = "yg5R40U6Z62cJzzHLVOWygbgLE3aNPuL"
 
 # Rate limiting, keyed on the caller's IP (see src/index.ts). Guarded on absence in
 # src/index.ts so local `wrangler dev` and `bun test` (where this binding is not
