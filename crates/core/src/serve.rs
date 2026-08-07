@@ -829,7 +829,7 @@ mod tests {
         let body: Value = resp.json().await.unwrap();
 
         assert_eq!(body["id"], "anthropic");
-        assert_eq!(body["contract"], 1);
+        assert_eq!(body["contract"], 2);
         assert_eq!(body["provider"]["format"], "anthropic");
         assert_eq!(body["enabled"], true);
         assert_eq!(body["source"], "builtin");

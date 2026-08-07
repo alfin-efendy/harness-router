@@ -2349,19 +2349,18 @@ async fn plugin_release_detail(
         }
         None => None,
     };
-    let declared_manifest =
-        match crate::plugins::component_catalog::declared_manifest(plugin_id)
-            .map(ComponentManifestInfo::from)
-        {
-            Some(mut manifest) => {
-                // Same store enrichment the active manifest gets: a token or
-                // client-id override stored from a previous install survives
-                // uninstall, so the pre-install preview reflects it too.
-                enrich_oauth_profile_status(cp.store(), plugin_id, &mut manifest).await;
-                Some(manifest)
-            }
-            None => None,
-        };
+    let declared_manifest = match crate::plugins::component_catalog::declared_manifest(plugin_id)
+        .map(ComponentManifestInfo::from)
+    {
+        Some(mut manifest) => {
+            // Same store enrichment the active manifest gets: a token or
+            // client-id override stored from a previous install survives
+            // uninstall, so the pre-install preview reflects it too.
+            enrich_oauth_profile_status(cp.store(), plugin_id, &mut manifest).await;
+            Some(manifest)
+        }
+        None => None,
+    };
     Ok(ComponentReleaseDetail {
         plugin_id: plugin_id.to_string(),
         releases: releases
@@ -2406,12 +2405,12 @@ async fn enrich_oauth_profile_status(
             // (PR-3: user-supplied client id until first-party ids are baked).
             let setting_key = crate::plugins::component_catalog::declared_manifest(plugin_id)
                 .and_then(|bundle| {
-                bundle
-                    .oauth
-                    .into_iter()
-                    .find(|p| p.id == profile.id)
-                    .and_then(|p| p.client_id_setting)
-            });
+                    bundle
+                        .oauth
+                        .into_iter()
+                        .find(|p| p.id == profile.id)
+                        .and_then(|p| p.client_id_setting)
+                });
             if let Some(key) = setting_key {
                 profile.client_id_configured = store
                     .get_setting_raw(&key)
@@ -5935,7 +5934,7 @@ writes = true
             let sha = format!("{:x}", Sha256::digest(component_bytes));
 
             let manifest_toml = format!(
-                "id = \"{plugin_id}\"\nname = \"{plugin_id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"plugin.wasm\"\n\n[[tools]]\nname = \"{tool_name}\"\ndescription = \"Only present in the installed release.\"\n"
+                "contract = 2\nid = \"{plugin_id}\"\nname = \"{plugin_id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"plugin.wasm\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n\n[[tools]]\nname = \"{tool_name}\"\ndescription = \"Only present in the installed release.\"\n"
             );
             std::fs::write(version_dir.join("ryuzi-plugin.toml"), &manifest_toml)
                 .expect("write fixture manifest");

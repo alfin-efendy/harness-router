@@ -4,7 +4,9 @@
 //! by `llm_router::connections`; the manifest exists purely so a provider
 //! shows up in the plugin host/catalog UI alongside real plugins.
 
-use ryuzi_plugin_sdk::{AuthKind, AuthSpec, ModelDef, PluginManifest, ProviderSpec, CONTRACT_VERSION};
+use ryuzi_plugin_sdk::{
+    AuthKind, AuthSpec, ModelDef, PluginManifest, ProviderSpec, CONTRACT_VERSION,
+};
 
 use crate::llm_router::connections::{self, effective_models};
 use crate::llm_router::registry::{

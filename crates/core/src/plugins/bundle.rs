@@ -109,7 +109,8 @@ pub fn verify_bundle(
     // Step 1: parse the manifest and the raw release bytes.
     let manifest_toml = std::fs::read_to_string(staging_dir.join("ryuzi-plugin.toml"))
         .context("reading ryuzi-plugin.toml")?;
-    let manifest = PluginManifest::from_toml(&manifest_toml).context("parsing ryuzi-plugin.toml")?;
+    let manifest =
+        PluginManifest::from_toml(&manifest_toml).context("parsing ryuzi-plugin.toml")?;
     let Some(component) = manifest.component.as_ref() else {
         bail!("bundle manifest `{}` declares no [component]", manifest.id);
     };

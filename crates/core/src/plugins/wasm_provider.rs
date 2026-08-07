@@ -477,24 +477,29 @@ pub(crate) async fn install_bundle_on_disk(
     std::fs::write(version_dir.join(component_name), &bytes).unwrap();
     let sha = format!("{:x}", Sha256::digest(&bytes));
 
-    let provider_ids_line = if provider_ids.is_empty() {
-        String::new()
+    let provider_block = if provider_ids.is_empty() {
+        // An empty `[provider]` block still exists (so `resolved_provider_ids()`
+        // falls back to the manifest id) but declares no explicit ids.
+        "\n[provider]\n".to_string()
     } else {
         let quoted = provider_ids
             .iter()
             .map(|p| format!("\"{p}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("provider-ids = [{quoted}]\n")
+        format!("\n[provider]\nids = [{quoted}]\n")
     };
     let manifest = format!(
-        "id = \"{plugin_id}\"\n\
+        "contract = 2\n\
+         id = \"{plugin_id}\"\n\
          name = \"{plugin_id}\"\n\
          version = \"{version}\"\n\
+         \n\
+         [component]\n\
+         file = \"{component_name}\"\n\
          wit-api = \"^0.1.0\"\n\
          lifecycle = \"per-call\"\n\
-         component = \"{component_name}\"\n\
-         {provider_ids_line}"
+         {provider_block}"
     );
     std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
 

@@ -1122,7 +1122,7 @@ mod tests {
         let component = format!("{id}.wasm");
         let component_url = format!("{base}/{id}.wasm");
         let manifest_toml = format!(
-            "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+            "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"{component}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
         )
         .into_bytes();
         let release_json = format!(

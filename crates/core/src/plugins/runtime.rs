@@ -2120,11 +2120,13 @@ mod tests {
         assert_eq!(compiled.provider_ids, vec!["mimo-free".to_string()]);
 
         // ONE rule governs the credential grant: the EXPLICIT manifest
-        // `provider-ids`. A bundle that declares none gets none — the
-        // `resolved_provider_ids` `[id]` fallback (for transport registration)
-        // must never seed a credential authorization set.
-        let undeclared = installed_fixture_bundle("component-noop");
-        assert!(undeclared.manifest.provider.is_none());
+        // `provider.ids`. A bundle that declares a `[provider]` block but no
+        // explicit ids (the mimo/opencode shape, exercised by
+        // `resolved_provider_ids` — see `plugin-sdk::manifest`) gets none —
+        // the `resolved_provider_ids` `[id]` fallback (for transport
+        // registration) must never seed a credential authorization set.
+        let mut undeclared = installed_fixture_bundle("component-noop");
+        undeclared.manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec::default());
         assert_eq!(
             undeclared.manifest.resolved_provider_ids(),
             vec![undeclared.manifest.id.clone()],
@@ -2135,7 +2137,7 @@ mod tests {
             .expect("noop fixture should compile");
         assert!(
             compiled.provider_ids.is_empty(),
-            "an undeclared bundle must carry no provider credential authorization"
+            "a bundle with no explicit provider.ids must carry no provider credential authorization"
         );
     }
 

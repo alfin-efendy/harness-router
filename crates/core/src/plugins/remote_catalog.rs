@@ -1384,7 +1384,7 @@ mod tests {
     fn feed_json(seq: u64) -> String {
         format!(
             r#"{{"schemaVersion":1,"sequence":{seq},"generatedAt":0,
-                "entries":[{{"id":"acme","manifestToml":"contract=1\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}}],
+                "entries":[{{"id":"acme","manifestToml":"contract=2\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}}],
                 "blocked":[]}}"#
         )
     }
@@ -1736,8 +1736,8 @@ mod tests {
         let feed = concat!(
             r#"{"schemaVersion":1,"sequence":8,"generatedAt":0,"#,
             r#""entries":["#,
-            r#"{"id":"bad","manifestToml":"contract=1\nid=\"bad\"\nname=\"\"\nversion=\"1.0.0\""},"#,
-            r#"{"id":"good","manifestToml":"contract=1\nid=\"good\"\nname=\"Good\"\nversion=\"2.0.0\""}"#,
+            r#"{"id":"bad","manifestToml":"contract=2\nid=\"bad\"\nname=\"\"\nversion=\"1.0.0\""},"#,
+            r#"{"id":"good","manifestToml":"contract=2\nid=\"good\"\nname=\"Good\"\nversion=\"2.0.0\""}"#,
             r#"],"blocked":[]}"#,
         );
         let bytes = feed.as_bytes().to_vec();

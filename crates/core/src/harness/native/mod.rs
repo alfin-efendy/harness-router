@@ -1332,7 +1332,7 @@ mod tests {
     #[test]
     fn native_plugin_manifest_has_expected_identity() {
         let plugin = native_plugin();
-        assert_eq!(plugin.manifest.contract, 1);
+        assert_eq!(plugin.manifest.contract, 2);
         assert_eq!(plugin.manifest.id, "native");
         assert_eq!(plugin.manifest.name, "Ryuzi");
         assert_eq!(plugin.manifest.publisher, "ryuzi");

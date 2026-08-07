@@ -148,11 +148,10 @@ fn build_artifacts(
     // the real manifest rather than hardcoding, so bumping a shipped bundle
     // never breaks these tests. `wit-api` stays literal: the manifest declares
     // a RANGE (`>=0.1.0, <0.2.0`), a release declares the concrete version.
-    let declared_version = PluginManifest::from_toml(
-        std::str::from_utf8(&manifest_toml).expect("manifest is utf-8"),
-    )
-    .expect("real bundle manifest must parse")
-    .version;
+    let declared_version =
+        PluginManifest::from_toml(std::str::from_utf8(&manifest_toml).expect("manifest is utf-8"))
+            .expect("real bundle manifest must parse")
+            .version;
     let wasm = std::fs::read(wasm_path).unwrap();
     let sha = format!("{:x}", Sha256::digest(&wasm));
     let component_url = format!("{base}/{plugin_id}.wasm");
