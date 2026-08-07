@@ -124,6 +124,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<JobInfo>> {
             notify_success: job.notify_success,
             notify_fail: job.notify_fail,
             model_override: job.model_override,
+            plugin_id: job.plugin_id,
             history: runs
                 .into_iter()
                 .map(|r| RunInfo {

@@ -1699,6 +1699,36 @@ async confirmSkillInstall(runnerId: string | null, token: string) : Promise<Resu
 }
 },
 /**
+ * Task 11/12 phase 1: stage a local-folder or git-URL plugin source
+ * (cloning/copying it, never touching the original) and return the
+ * `PluginSourceInstallBegin` trust prompt the wizard must show before
+ * `confirm_plugin_source_install` can proceed.
+ */
+async beginPluginSourceInstall(runnerId: string | null, source: string) : Promise<Result<PluginSourceInstallBegin, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_source_install", { runnerId, source }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Phase 2: complete a staged plugin-source install after the user has
+ * acknowledged its `PluginSourceInstallBegin` trust prompt (`acceptTrust`
+ * only matters when `trustRequired` was `true` — it gates the unsigned
+ * `[[mcp]]`/`[component]` surfaces, never the skills/commands/hooks/jobs
+ * surfaces, which always activate). The token is single-use. Returns the
+ * newly-installed plugin's full `PluginInfo` row.
+ */
+async confirmPluginSourceInstall(runnerId: string | null, token: string, acceptTrust: boolean) : Promise<Result<PluginInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("confirm_plugin_source_install", { runnerId, token, acceptTrust }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Update one installed pack. `force` overrides the local-edits guard but
  * never the pinned guard or the hook-script re-ack gate.
  */
@@ -2105,7 +2135,14 @@ builtin: boolean; skillCount: number; toolCount: number; knowledgeCount: number;
  */
 export type AgentToolUsageInfo = { tool: string; count: number; lastUsed: number }
 export type AgentValidationInfo = { field: string; message: string }
-export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
+export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[];
+/**
+ * The plugin that owns this server, when it was synced from a plugin's
+ * `[[mcp]]` declaration rather than added by the user. Cockpit uses it
+ * to badge the row and to warn before removing a plugin-managed app —
+ * deleting one only makes it reappear on the plugin's next sync.
+ */
+pluginId: string | null }
 /**
  * The user's decision on a tool-approval request from the native runtime's
  * permission gate.
@@ -2171,7 +2208,14 @@ export type AutomationActionInput = { kind: "agent.run"; config: AutomationAgent
 export type AutomationAgentRunActionInput = { projectId: string; branch: string; gatewayId: string; prompt: string; agentId: string | null; modelOverride: string | null; subtask: boolean }
 export type AutomationHookAttemptInfo = { runId: string; ordinal: number; startedAt: number; finishedAt: number | null; httpStatus: number | null; error: string | null }
 export type AutomationHookDetail = { hook: AutomationHookInfo; action: AutomationActionInfo; runs: AutomationHookRunInfo[] }
-export type AutomationHookInfo = { id: string; name: string; triggerKind: TriggerKind; actionKind: ActionKind; enabled: boolean; inboundPath: string | null; createdAt: number; updatedAt: number }
+export type AutomationHookInfo = { id: string; name: string; triggerKind: TriggerKind; actionKind: ActionKind; enabled: boolean; inboundPath: string | null; createdAt: number; updatedAt: number;
+/**
+ * The plugin that installed this hook, if any — mirrors
+ * `crate::automation::HookRow.plugin_id`. `None` for a user-created
+ * hook. Task 12 addition: lets the Automations screen distinguish
+ * plugin-owned rows from user-created ones.
+ */
+pluginId: string | null }
 export type AutomationHookInput = { name: string; triggerKind: TriggerKind; action: AutomationActionInput; enabled?: boolean }
 export type AutomationHookRunInfo = { id: string; hookId: string; status: string; sessionPk: string | null; error: string | null; attemptCount: number; lastHttpStatus: number | null; queuedAt: number; startedAt: number | null; finishedAt: number | null; attempts: AutomationHookAttemptInfo[] }
 export type AutomationWebhookHeaderInfo = { name: string; configured: boolean }
@@ -2248,7 +2292,7 @@ export type CommandFileInputDto = ({ description: string; template: string; agen
  * supplied separately for updates so a save cannot rename a file by accident.
  */
 export type CommandFileMutationDto = { description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }
-export type CommandOriginInfo = "builtin" | "global" | "project"
+export type CommandOriginInfo = "builtin" | "global" | "project" | "plugin"
 /**
  * `component_bootstrap_status` RPC result (Task 11a): whether the first-party
  * component bootstrap has a pending retryable failure Cockpit should surface,
@@ -2536,7 +2580,14 @@ export type JobInfo = { id: string; name: string; cron: string; mode: string; na
  * by a future `app_jobs` tool); surfaced here so a later job editor can
  * read and round-trip it without another DTO change.
  */
-modelOverride?: string | null }
+modelOverride?: string | null;
+/**
+ * The plugin that installed this job, if any — mirrors
+ * `crate::scheduler::JobRow.plugin_id`. `None` for a user-created job.
+ * Task 12 addition: lets the scheduler screen distinguish plugin-owned
+ * rows from user-created ones.
+ */
+pluginId?: string | null }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean;
 /**
  * See `JobInfo::model_override`.
@@ -2653,7 +2704,19 @@ kind: string; setting: string | null; env: string | null; helpUrl: string | null
  * the process environment. Never reveals the value itself.
  */
 configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
-export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; homepage: string | null; publisher: string }
+export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; homepage: string | null; publisher: string;
+/**
+ * Command names (`.md` file stems) found under an installed plugin's
+ * `commands/` directory. Empty for a `Builtin` plugin or one with no
+ * commands surface.
+ */
+commands: string[];
+/**
+ * Skill directory names found under an installed plugin's `skills/`
+ * directory (each carries a `SKILL.md`). Empty for a `Builtin` plugin
+ * or one with no skills surface.
+ */
+skills: string[]; hooks: PluginHookInfo[]; jobs: PluginJobInfo[] }
 export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean;
 /**
  * A persisted (non-empty) row exists for `key`. Never the value itself.
@@ -2678,6 +2741,39 @@ options: string[];
  * a persisted credential.
  */
 default: string | null }
+/**
+ * One `[[hooks]]` entry a v2 plugin manifest declares, synced into
+ * `automation_hooks` (`crate::plugins::automation_sync::sync_plugin_automations`)
+ * and re-read back here as a first-class `HookRow`. Task 12 addition to
+ * `PluginDetail` — lets the plugin detail view show a plugin's own
+ * automations without a separate round trip through the Automations screen.
+ */
+export type PluginHookInfo = {
+/**
+ * The stored row name: `"<plugin-id>/<name>"`.
+ */
+name: string;
+/**
+ * Canonical dotted trigger (`crate::automation::TriggerKind::as_str`).
+ */
+trigger: string;
+/**
+ * The Claude Code alias spelling for `trigger`, when one exists (e.g.
+ * `"Stop"` for `"session.end"`) — see `crate::automation::claude_alias_for`.
+ */
+triggerAlias: string | null;
+/**
+ * `"agent.run"` | `"webhook.outbound"`.
+ */
+action: string; enabled: boolean;
+/**
+ * `true` for an `agent.run` hook with an empty `project_id` — the sync
+ * convention every plugin-installed `agent.run` hook starts with (no
+ * plugin can guess the user's project). `PluginHost`'s enable guard
+ * refuses enabling a hook while this is `true`; Cockpit uses it to open
+ * a target editor instead of a plain enable switch.
+ */
+needsTarget: boolean }
 export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[];
 /**
  * The exclusive capability slot this plugin's manifest claims (e.g.
@@ -2796,7 +2892,40 @@ toolCount: number | null;
  * skill_count`) — `None` for every other kind, and for a synthesized
  * curated pack not yet installed.
  */
-skillCount: number | null }
+skillCount: number | null;
+/**
+ * Which v2 surfaces this plugin's manifest actually provides. Members
+ * are exactly `"provider" | "tools" | "mcp" | "skills" | "commands" |
+ * "hooks" | "jobs"`, always emitted in that stable order. Derived
+ * straight off the manifest (`provider.is_some()`, `!tools.is_empty()`,
+ * `!mcp.is_empty()`, `!hooks.is_empty()`, `!jobs.is_empty()`) except for
+ * `skills`/`commands`, which check whether an INSTALLED plugin's
+ * `skills/`/`commands/` directories actually contain content (a
+ * `Builtin` plugin — no directory of its own — never reports either).
+ * `gateway` is deliberately never a member: it is an internal-only
+ * surface, first-party-gated structurally (see
+ * `crate::plugins::runtime`'s `HostPolicy::allow_gateway`), never a
+ * public capability a plugin author or Cockpit's UI should see listed.
+ */
+surfaces: string[];
+/**
+ * How this plugin arrived on disk — `"catalog"` (signed feed,
+ * trusted-by-construction) | `"local-path"` | `"git"` (Task 11's
+ * unsigned tiered-trust installs), mirroring
+ * `crate::plugins::host::InstallProvenance`. `None` for a `Builtin`
+ * plugin (first-party native or embedded catalog — no install
+ * provenance to report).
+ */
+provenance: string | null;
+/**
+ * `true` when this plugin's unsigned `[[mcp]]`/`[component]` surfaces
+ * were explicitly trust-accepted (`plugin.<id>.trusted == "true"`) OR
+ * the plugin's provenance is trusted by construction (`Catalog` or
+ * `Builtin`) — see `crate::plugins::host::component_surfaces_trusted`,
+ * the single gate every consuming surface checks. Cockpit uses this to
+ * show whether an unsigned plugin's riskier surfaces are actually live.
+ */
+trusted: boolean }
 export type PluginInstallBeginResult = {
 /**
  * `none` | `api-key` | `token` | `oauth`.
@@ -2832,6 +2961,26 @@ callbackMode: string; oauthBegin: PluginOauthBeginResult | null;
  * Discovery/DCR failure detail (shown on the manual client id form).
  */
 dcrError: string | null }
+/**
+ * One `[[jobs]]` entry a v2 plugin manifest declares, synced into `jobs`
+ * (same module as [`PluginHookInfo`]) and re-read back as a `JobRow`.
+ */
+export type PluginJobInfo = {
+/**
+ * The stored row id: `"<plugin-id>/<name>"`.
+ */
+id: string; name: string;
+/**
+ * Natural-language schedule text when the row's `mode == "natural"`,
+ * else the resolved cron expression — whichever is the human-readable
+ * form for this row.
+ */
+schedule: string; enabled: boolean;
+/**
+ * `true` for a job with an empty `project_id` — same "no plugin can
+ * guess the user's project" convention as [`PluginHookInfo::needs_target`].
+ */
+needsTarget: boolean }
 export type PluginMcpInfo = { name: string;
 /**
  * `stdio` | `http`.
@@ -2865,6 +3014,43 @@ export type PluginProfileDeviceFlowStart = { deviceCode: string; userCode: strin
  */
 export type PluginProfilePkceStart = { authorizeUrl: string; state: string; verifier: string }
 /**
+ * Mirror of `crate::plugins::install_sources::ComponentToolSummary`.
+ */
+export type PluginSourceComponentToolInfo = { name: string; writes: boolean }
+/**
+ * Mirror of `crate::plugins::install_sources::ComponentTrustSummary`.
+ */
+export type PluginSourceComponentTrustInfo = { networkHosts: string[]; tools: PluginSourceComponentToolInfo[] }
+/**
+ * Mirror of `crate::plugins::install_sources::PluginTrustPrompt` — what
+ * `begin_plugin_source_install` returns, shown to the user before
+ * `confirm_plugin_source_install` touches the live install dir.
+ */
+export type PluginSourceInstallBegin = { token: string; id: string; name: string; publisher: string; surfaces: PluginSourceSurfacesInfo; mcpServers: PluginSourceMcpServerInfo[]; component: PluginSourceComponentTrustInfo | null;
+/**
+ * `true` iff `mcp_servers` is non-empty or `component` is `Some` — the
+ * wizard should only show the explicit-trust checkbox in that case.
+ */
+trustRequired: boolean }
+/**
+ * Mirror of `crate::plugins::install_sources::McpServerSummary`.
+ */
+export type PluginSourceMcpServerInfo = { name: string;
+/**
+ * `stdio` | `http`.
+ */
+transport: string;
+/**
+ * stdio: `"<command> <args...>"`; http: the URL.
+ */
+detail: string }
+/**
+ * Mirror of `crate::plugins::install_sources::PluginSurfacesSummary`. Widened
+ * from `usize` to `u32` crossing the Tauri IPC boundary, matching this
+ * module's existing convention for every other DTO count field.
+ */
+export type PluginSourceSurfacesInfo = { commands: number; skills: number; hooks: number; jobs: number }
+/**
  * One entry `plugin_tools` lists for a plugin: an agent-facing tool, an
  * installed skill, or a provider's model — `kind` discriminates which.
  * `writes` is only meaningful (`Some`) for `kind == "tool"`, mirroring
@@ -2895,8 +3081,10 @@ live: boolean; entries: PluginToolEntry[] }
  * of guessing from a substring match between the MCP server name and a
  * manifest id. `None` (everywhere this is optional) means the action is the
  * core agent itself (a built-in tool), not a plugin. Resolved at the
- * mcp-server→plugin binding (`ControlPlane::attach_plugin_mcp_servers`),
- * never by parsing the tool/server name string.
+ * mcp-server→plugin binding — `mcp_servers.plugin_id` (Task 7's
+ * `crate::plugins::mcp_sync::sync_plugin_mcp`), re-derived per session by
+ * `ControlPlane::mcp_principals_for` — never by parsing the tool/server
+ * name string.
  *
  * Carries no gating semantics: this is visibility/attribution metadata for
  * the approval prompt, not an input to the permission DECISION.

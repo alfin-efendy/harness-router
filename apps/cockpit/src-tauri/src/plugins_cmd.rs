@@ -45,8 +45,10 @@ use tokio::sync::oneshot;
 pub use ryuzi_core::api::types::{
     CatalogStatus, ComponentBootstrapStatus, ComponentManifestInfo, ComponentOauthProfileInfo,
     ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, PluginAuthInfo, PluginDetail,
-    PluginFieldInfo, PluginInfo, PluginInstallBeginResult, PluginMcpInfo, PluginOauthBeginResult,
-    PluginProfileDeviceFlowStart, PluginProfilePkceStart, PluginToolEntry, PluginToolsResult,
+    PluginFieldInfo, PluginHookInfo, PluginInfo, PluginInstallBeginResult, PluginJobInfo,
+    PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, PluginProfilePkceStart,
+    PluginSourceComponentToolInfo, PluginSourceComponentTrustInfo, PluginSourceInstallBegin,
+    PluginSourceMcpServerInfo, PluginSourceSurfacesInfo, PluginToolEntry, PluginToolsResult,
     SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
 
@@ -835,6 +837,49 @@ pub async fn confirm_skill_install(
         .rpc(
             "confirm_skill_install",
             serde_json::json!({ "token": token }),
+        )
+        .await
+}
+
+/// Task 11/12 phase 1: stage a local-folder or git-URL plugin source
+/// (cloning/copying it, never touching the original) and return the
+/// `PluginSourceInstallBegin` trust prompt the wizard must show before
+/// `confirm_plugin_source_install` can proceed.
+#[tauri::command]
+#[specta::specta]
+pub async fn begin_plugin_source_install(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    source: String,
+) -> R<PluginSourceInstallBegin> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "begin_plugin_source_install",
+            serde_json::json!({ "source": source }),
+        )
+        .await
+}
+
+/// Phase 2: complete a staged plugin-source install after the user has
+/// acknowledged its `PluginSourceInstallBegin` trust prompt (`acceptTrust`
+/// only matters when `trustRequired` was `true` — it gates the unsigned
+/// `[[mcp]]`/`[component]` surfaces, never the skills/commands/hooks/jobs
+/// surfaces, which always activate). The token is single-use. Returns the
+/// newly-installed plugin's full `PluginInfo` row.
+#[tauri::command]
+#[specta::specta]
+pub async fn confirm_plugin_source_install(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    token: String,
+    accept_trust: bool,
+) -> R<PluginInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "confirm_plugin_source_install",
+            serde_json::json!({ "token": token, "accept_trust": accept_trust }),
         )
         .await
 }

@@ -494,6 +494,21 @@ impl TriggerKind {
     }
 }
 
+/// The Claude Code alias spelling for a canonical `trigger`
+/// (`TriggerKind::as_str`'s output), when one exists — the inverse of
+/// `ryuzi_plugin_sdk::CLAUDE_ALIASES`. ORDER MATTERS: `CLAUDE_ALIASES` lists
+/// `Stop` before `SessionEnd` for `session.end` deliberately (see that
+/// table's doc), so this returns the FIRST matching alias in table order
+/// rather than building a `HashMap` (which would make the winner
+/// nondeterministic / last-write-wins). Used by `crate::api::plugins_api` to
+/// populate `PluginHookInfo.trigger_alias`.
+pub fn claude_alias_for(trigger: &str) -> Option<&'static str> {
+    ryuzi_plugin_sdk::CLAUDE_ALIASES
+        .iter()
+        .find(|(_, canonical)| *canonical == trigger)
+        .map(|(alias, _)| *alias)
+}
+
 impl FromStr for TriggerKind {
     type Err = anyhow::Error;
 
@@ -2936,6 +2951,20 @@ mod tests {
             TriggerKind::ToolBefore
         );
         assert!(TriggerKind::from_str("NotARealAlias").is_err());
+    }
+
+    #[test]
+    fn claude_alias_for_picks_the_first_listed_alias_for_session_end() {
+        // `session.end` has two Claude aliases (`Stop`, `SessionEnd`); the
+        // table lists `Stop` first, so that's the one that must win — never
+        // `SessionEnd`, and never nondeterministic.
+        assert_eq!(claude_alias_for("session.end"), Some("Stop"));
+        assert_eq!(claude_alias_for("tool.before"), Some("PreToolUse"));
+        assert_eq!(claude_alias_for("tool.after"), Some("PostToolUse"));
+        assert_eq!(claude_alias_for("session.start"), Some("SessionStart"));
+        // A trigger with no Claude alias at all.
+        assert_eq!(claude_alias_for("webhook.inbound"), None);
+        assert_eq!(claude_alias_for("not-a-trigger"), None);
     }
 
     #[tokio::test]

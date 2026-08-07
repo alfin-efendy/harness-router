@@ -25,6 +25,7 @@ function makeApp(overrides: Partial<AppInfo> = {}): AppInfo {
     authDetail: null,
     tools: [],
     agentAccess: [{ agentId: "native", allowed: true }],
+    pluginId: null,
     ...overrides,
   };
 }

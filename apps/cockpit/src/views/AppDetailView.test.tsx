@@ -47,6 +47,7 @@ const slackApp: AppInfo = {
   authDetail: "SLACK_BOT_TOKEN",
   tools: [{ name: "channels_list", desc: "List channels the bot can see", perm: "ask" }],
   agentAccess: [],
+  pluginId: null,
 };
 
 // Same shape as `slackApp` but never discovered any tools and is in the

@@ -29,6 +29,7 @@
 
 use super::{ok, params, ApiError};
 use crate::api::types::*;
+use crate::automation;
 use crate::control::ControlPlane;
 use crate::domain::CoreEvent;
 use crate::plugins::oauth::{
@@ -36,10 +37,12 @@ use crate::plugins::oauth::{
     register_oauth_client, OauthServerMetadata, PluginOauthToken,
 };
 use crate::plugins::providers;
-use crate::plugins::{CorePlugin, InstallProvenance, PluginSource};
+use crate::plugins::{host, CorePlugin, InstallProvenance, PluginSource};
+use crate::scheduler;
 use crate::serve::ApiState;
 use crate::settings::SettingsStore;
 use crate::store::{PluginOauthClient, RemoteCatalogRow, Store};
+use anyhow::Context;
 use reqwest::Url;
 use ryuzi_plugin_sdk::{
     AuthKind, AuthSpec, FieldKind, McpServerDef, McpTransportDef, SettingField,
@@ -47,6 +50,7 @@ use ryuzi_plugin_sdk::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) const HANDLES: &[&str] = &[
@@ -285,10 +289,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "begin_plugin_source_install" => {
             let a: SourceP = params(p)?;
-            ok(
+            let prompt =
                 crate::plugins::install_sources::begin_plugin_install_from_source(&a.source)
-                    .await?,
-            )
+                    .await?;
+            ok(PluginSourceInstallBegin::from(prompt))
         }
         "confirm_plugin_source_install" => {
             let a: ConfirmPluginSourceInstallP = params(p)?;
@@ -417,13 +421,20 @@ async fn confirm_skill_install(
 /// just completed (mcp/component surfaces may still be inert if
 /// `accept_trust` was withheld while `trust_required` — the install itself
 /// always succeeds).
+///
+/// Task 12: returns the newly-installed plugin's full `PluginInfo` row
+/// (surfaces, status, etc.) rather than the bare
+/// `install_sources::InstalledPluginInfo` — via
+/// [`plugin_info_for_freshly_installed`], since `cp.plugins()` doesn't know
+/// about this id yet (registration only happens at the next daemon boot,
+/// which `plugins_restart_required` signals).
 async fn confirm_plugin_source_install(
     cp: &ControlPlane,
     token: &str,
     accept_trust: bool,
-) -> anyhow::Result<crate::plugins::install_sources::InstalledPluginInfo> {
+) -> anyhow::Result<PluginInfo> {
     let settings = SettingsStore::new(cp.store().clone());
-    let info = crate::plugins::install_sources::confirm_plugin_install(
+    let installed = crate::plugins::install_sources::confirm_plugin_install(
         token,
         accept_trust,
         cp.store(),
@@ -432,7 +443,92 @@ async fn confirm_plugin_source_install(
     .await?;
     cp.mark_plugins_restart_required();
     cp.emit(CoreEvent::PluginsChanged);
-    Ok(info)
+    plugin_info_for_freshly_installed(cp, &settings, &installed).await
+}
+
+/// Preview the `PluginInfo` row a just-confirmed
+/// [`crate::plugins::install_sources::confirm_plugin_install`] call will
+/// resolve to once the daemon restarts and
+/// [`crate::plugins::install_installed_plugins`] registers it as a real
+/// `CorePlugin` — that boot-registration path is the only thing that ever
+/// adds this id to `cp.plugins()`, so `assemble_detail`/`plugin_detail`
+/// cannot resolve it yet. Re-reads the manifest straight off
+/// `installed.dir` and builds the exact same manifest-only `CorePlugin`
+/// shape (`harness`/`gateway`/`connector`/`provider` all `None`)
+/// `install_installed_plugins` constructs, so this preview and the
+/// post-restart row can never disagree. A throwaway, single-plugin
+/// [`crate::plugins::PluginHost`] is used only to reuse its real
+/// `is_enabled` logic rather than re-deriving it here.
+async fn plugin_info_for_freshly_installed(
+    cp: &ControlPlane,
+    settings: &SettingsStore,
+    installed: &crate::plugins::install_sources::InstalledPluginInfo,
+) -> anyhow::Result<PluginInfo> {
+    let manifest_toml = std::fs::read_to_string(installed.dir.join("ryuzi-plugin.toml"))
+        .with_context(|| {
+            format!(
+                "reading the newly-installed plugin's manifest at {}",
+                installed.dir.display()
+            )
+        })?;
+    let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(&manifest_toml)
+        .context("parsing the newly-installed plugin's manifest")?;
+    let mut host = crate::plugins::PluginHost::new();
+    host.add(CorePlugin {
+        manifest,
+        harness: None,
+        gateway: None,
+        connector: None,
+        provider: None,
+        source: PluginSource::Installed {
+            dir: installed.dir.clone(),
+            provenance: installed.provenance.clone(),
+        },
+    });
+    let plugin = host.get(&installed.id).context("just registered")?;
+    let enabled = host.is_enabled(settings, &installed.id).await?;
+    let configured =
+        plugin_auth_configured(cp.store(), &installed.id, plugin.manifest.auth.as_ref()).await?;
+    let kind = derive_kind(&plugin).unwrap_or("integration");
+    let ctx = installed_ctx(cp.store()).await?;
+    let active_release = cp.store().active_component_release(&installed.id).await?;
+    let is_installed = compute_installed(
+        cp.store(),
+        &plugin,
+        kind,
+        enabled,
+        configured,
+        &ctx,
+        active_release.is_some(),
+    )
+    .await?;
+    let record = cp.store().get_plugin_install(&installed.id).await?;
+    let skill_count = (kind == "skill-pack")
+        .then(|| {
+            ctx.installed_skills
+                .iter()
+                .find(|s| {
+                    s.plugin_id.as_deref() == Some(installed.id.as_str()) || s.id == installed.id
+                })
+                .map(|s| s.skill_count as u32)
+        })
+        .flatten();
+    Ok(plugin_info(
+        &plugin,
+        enabled,
+        configured,
+        kind,
+        is_installed,
+        PluginInfoContext {
+            install: record.as_ref(),
+            remote: None,
+            owns_slot: false,
+            attach_failed: None,
+            active_version: active_release.as_ref().map(|r| r.version.as_str()),
+            skill_count,
+            trusted: host::component_surfaces_trusted(settings, &plugin).await,
+        },
+    ))
 }
 
 /// Update one installed pack. `force` overrides the local-edits guard but
@@ -640,6 +736,121 @@ struct PluginInfoContext<'a> {
     /// meaningful for `kind == "skill-pack"` rows; `plugin_info` ignores it
     /// (forces `None`) for every other kind.
     skill_count: Option<u32>,
+    /// `crate::plugins::host::component_surfaces_trusted`'s verdict for this
+    /// plugin — feeds `PluginInfo.trusted` (Task 12). Resolved by the caller
+    /// (an async settings read) rather than inside `plugin_info` itself,
+    /// which stays a plain sync function.
+    trusted: bool,
+}
+
+/// Command names (`.md` file stems, non-recursive) directly under `dir` —
+/// mirrors `install_sources::count_markdown_files`'s trust-prompt scan, but
+/// returns the names themselves rather than just a count. Empty (never an
+/// error) for a missing directory.
+fn list_command_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md") && e.path().is_file())
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Skill directory names (each carrying a `SKILL.md`, non-recursive) directly
+/// under `dir` — mirrors `install_sources::count_skill_dirs`'s trust-prompt
+/// scan, but returns the names themselves rather than just a count. Empty
+/// (never an error) for a missing directory.
+fn list_skill_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir() && e.path().join("SKILL.md").is_file())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Command/skill names discoverable on disk for `source` — only an
+/// `Installed` plugin carries a directory of its own; a `Builtin` plugin
+/// (native runtime or an embedded catalog manifest, no directory) always
+/// reports both empty. Shared by `plugin_info`'s `surfaces` derivation and
+/// `assemble_detail`'s `PluginDetail.commands`/`.skills` fields so the two
+/// never disagree.
+struct PluginContentNames {
+    commands: Vec<String>,
+    skills: Vec<String>,
+}
+
+fn plugin_content_names(source: &PluginSource) -> PluginContentNames {
+    match source {
+        PluginSource::Installed { dir, .. } => PluginContentNames {
+            commands: list_command_names(&dir.join("commands")),
+            skills: list_skill_names(&dir.join("skills")),
+        },
+        PluginSource::Builtin => PluginContentNames {
+            commands: Vec::new(),
+            skills: Vec::new(),
+        },
+    }
+}
+
+/// Which v2 surfaces `plugin` actually provides, in the stable order
+/// `PluginInfo.surfaces` documents: `provider, tools, mcp, skills, commands,
+/// hooks, jobs`. Gateway is deliberately never considered — it is an
+/// internal-only surface (see `PluginInfo.surfaces`'s doc).
+fn plugin_surfaces(plugin: &CorePlugin) -> Vec<String> {
+    let m = &plugin.manifest;
+    let content = plugin_content_names(&plugin.source);
+    let mut surfaces = Vec::new();
+    if m.provider.is_some() {
+        surfaces.push("provider".to_string());
+    }
+    if !m.tools.is_empty() {
+        surfaces.push("tools".to_string());
+    }
+    if !m.mcp.is_empty() {
+        surfaces.push("mcp".to_string());
+    }
+    if !content.skills.is_empty() {
+        surfaces.push("skills".to_string());
+    }
+    if !content.commands.is_empty() {
+        surfaces.push("commands".to_string());
+    }
+    if !m.hooks.is_empty() {
+        surfaces.push("hooks".to_string());
+    }
+    if !m.jobs.is_empty() {
+        surfaces.push("jobs".to_string());
+    }
+    surfaces
+}
+
+/// `PluginInfo.provenance`: `None` for a `Builtin` plugin, else the
+/// `crate::plugins::host::InstallProvenance` label Cockpit expects.
+fn plugin_provenance(source: &PluginSource) -> Option<String> {
+    match source {
+        PluginSource::Builtin => None,
+        PluginSource::Installed { provenance, .. } => Some(
+            match provenance {
+                InstallProvenance::Catalog => "catalog",
+                InstallProvenance::LocalPath => "local-path",
+                InstallProvenance::GitUrl(_) => "git",
+            }
+            .to_string(),
+        ),
+    }
 }
 
 fn plugin_info(
@@ -707,6 +918,9 @@ fn plugin_info(
             .then(|| crate::plugins::component_catalog::declared_tool_count(&m.id))
             .flatten(),
         skill_count: (kind == "skill-pack").then_some(ctx.skill_count).flatten(),
+        surfaces: plugin_surfaces(plugin),
+        provenance: plugin_provenance(&plugin.source),
+        trusted: ctx.trusted,
     }
 }
 
@@ -1563,6 +1777,7 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
                 attach_failed: attach_failed.get(&plugin.manifest.id).map(String::as_str),
                 active_version: active_releases.get(&plugin.manifest.id).map(String::as_str),
                 skill_count,
+                trusted: host::component_surfaces_trusted(&settings, &plugin).await,
             },
         ));
     }
@@ -1647,6 +1862,16 @@ fn curated_pack_row(
         auth_kind: "none".to_string(),
         tool_count: None,
         skill_count: installed.then_some(skill_count).flatten(),
+        // A curated pack IS a skills surface by definition — mirrors
+        // `categories: vec!["skills"]` above, unconditional on `installed`
+        // (a Browse-tile pack still "provides" skills, just not yet on
+        // disk).
+        surfaces: vec!["skills".to_string()],
+        // Curated packs resolve via `skills_install`'s own git-clone path,
+        // not `install_sources`'s tiered-trust model — no
+        // `InstallProvenance`/trust concept applies to them.
+        provenance: None,
+        trusted: false,
     }
 }
 
@@ -1712,6 +1937,19 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
                 .map(|s| s.skill_count as u32)
         })
         .flatten();
+    let content = plugin_content_names(&plugin.source);
+    let hooks = automation::list_hooks(cp.store())
+        .await?
+        .into_iter()
+        .filter(|h| h.plugin_id.as_deref() == Some(id))
+        .map(plugin_hook_info)
+        .collect();
+    let jobs = scheduler::list_jobs(cp.store())
+        .await?
+        .into_iter()
+        .filter(|j| j.plugin_id.as_deref() == Some(id))
+        .map(plugin_job_info)
+        .collect();
 
     Ok(PluginDetail {
         info: plugin_info(
@@ -1727,6 +1965,7 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
                 attach_failed: attach_failed.as_deref(),
                 active_version: active_release.as_ref().map(|r| r.version.as_str()),
                 skill_count,
+                trusted: host::component_surfaces_trusted(&settings, &plugin).await,
             },
         ),
         auth,
@@ -1735,7 +1974,43 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
         models,
         homepage: m.homepage.clone(),
         publisher: m.publisher.clone(),
+        commands: content.commands,
+        skills: content.skills,
+        hooks,
+        jobs,
     })
+}
+
+/// `PluginDetail.hooks`'s per-row mapping from a stored `HookRow`.
+fn plugin_hook_info(hook: automation::HookRow) -> PluginHookInfo {
+    let trigger = hook.trigger_kind.as_str();
+    PluginHookInfo {
+        name: hook.name,
+        trigger: trigger.to_string(),
+        trigger_alias: automation::claude_alias_for(trigger).map(str::to_string),
+        action: hook.action_kind.as_str().to_string(),
+        enabled: hook.enabled,
+        needs_target: hook
+            .action
+            .agent_run()
+            .is_some_and(|a| a.project_id.trim().is_empty()),
+    }
+}
+
+/// `PluginDetail.jobs`'s per-row mapping from a stored `JobRow`.
+fn plugin_job_info(job: scheduler::JobRow) -> PluginJobInfo {
+    let schedule = if job.mode == "natural" && !job.natural_text.is_empty() {
+        job.natural_text
+    } else {
+        job.cron
+    };
+    PluginJobInfo {
+        id: job.id,
+        name: job.name,
+        schedule,
+        enabled: job.enabled,
+        needs_target: job.project_id.trim().is_empty(),
+    }
 }
 
 /// `assemble_detail`'s fallback when `id` isn't a registered `CorePlugin`: an
@@ -1770,6 +2045,14 @@ async fn curated_pack_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<Plug
         models: vec![],
         homepage: Some(pack.repo.to_string()),
         publisher: String::new(),
+        // A curated pack has no `[[commands]]`/`[[hooks]]`/`[[jobs]]`
+        // manifest surface — `skill_count` on `info` already carries its
+        // size; naming every individual skill here is out of scope (no
+        // per-skill-name index exists for a curated pack today).
+        commands: vec![],
+        skills: vec![],
+        hooks: vec![],
+        jobs: vec![],
     })
 }
 
@@ -3393,6 +3676,7 @@ mod tests {
             attach_failed: None,
             active_version: None,
             skill_count: None,
+            trusted: false,
         }
     }
 
@@ -3562,6 +3846,214 @@ mod tests {
         };
         let info_same = plugin_info(&plugin, true, true, "integration", true, ctx_same);
         assert_eq!(info_same.status, "ok");
+    }
+
+    // ---------- surfaces (Task 12) ----------
+
+    #[test]
+    fn plugin_info_surfaces_derives_from_manifest_in_stable_order() {
+        // tools requires `[component]`; mcp and hooks do not — this is the
+        // brief's exact case: tools+mcp+hooks, no provider/jobs, so the
+        // expected order is `["tools", "mcp", "hooks"]` (provider/skills/
+        // commands/jobs all absent).
+        let toml = r#"
+contract = 2
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+
+[component]
+file = "acme.wasm"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+
+[[tools]]
+name = "do-thing"
+description = "does a thing"
+writes = false
+
+[[mcp]]
+name = "srv"
+transport = "stdio"
+command = "run-server"
+
+[[hooks]]
+name = "notify"
+trigger = "session.end"
+action = "webhook.outbound"
+
+[hooks.config]
+url = "https://example.com/notify"
+method = "POST"
+"#;
+        let manifest = PluginManifest::from_toml(toml).unwrap();
+        let plugin = CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            provider: None,
+            source: PluginSource::Builtin,
+        };
+        let info = plugin_info(&plugin, true, false, "integration", true, no_ctx(false));
+        assert_eq!(
+            info.surfaces,
+            vec!["tools".to_string(), "mcp".to_string(), "hooks".to_string()]
+        );
+    }
+
+    #[test]
+    fn plugin_info_surfaces_never_lists_gateway() {
+        // `gateway = true` is a real, valid v2 manifest shape (internal-only,
+        // first-party-gated elsewhere) — `surfaces` must never expose it as a
+        // public capability regardless of what else the manifest declares.
+        let toml = r#"
+contract = 2
+id = "acme-gw"
+name = "Acme Gateway"
+version = "0.1.0"
+gateway = true
+
+[component]
+file = "acme-gw.wasm"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+
+[[tools]]
+name = "do-thing"
+description = "does a thing"
+"#;
+        let manifest = PluginManifest::from_toml(toml).unwrap();
+        assert!(manifest.gateway);
+        let plugin = CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            provider: None,
+            source: PluginSource::Builtin,
+        };
+        let info = plugin_info(&plugin, true, false, "integration", true, no_ctx(false));
+        assert!(!info.surfaces.iter().any(|s| s == "gateway"));
+        assert_eq!(info.surfaces, vec!["tools".to_string()]);
+    }
+
+    #[test]
+    fn plugin_info_provenance_and_trusted_mirror_source_and_context() {
+        let builtin = harness_only("native");
+        let builtin_info = plugin_info(&builtin, true, false, "integration", false, no_ctx(false));
+        assert!(builtin_info.provenance.is_none());
+        assert!(!builtin_info.trusted, "no_ctx defaults trusted to false");
+
+        let installed = CorePlugin {
+            source: PluginSource::Installed {
+                dir: std::path::PathBuf::from("/tmp/whatever"),
+                provenance: InstallProvenance::GitUrl("https://example.com/repo.git".into()),
+            },
+            ..connector_only("acme")
+        };
+        let installed_info =
+            plugin_info(&installed, true, false, "integration", true, no_ctx(false));
+        assert_eq!(installed_info.provenance.as_deref(), Some("git"));
+
+        let trusted_ctx = PluginInfoContext {
+            trusted: true,
+            ..no_ctx(false)
+        };
+        let trusted_info = plugin_info(&installed, true, false, "integration", true, trusted_ctx);
+        assert!(trusted_info.trusted);
+    }
+
+    // ---------- hooks/jobs mapping (Task 12) ----------
+
+    fn agent_run_hook(trigger: automation::TriggerKind, project_id: &str) -> automation::HookRow {
+        automation::HookRow {
+            id: "h1".to_string(),
+            name: "acme/triage".to_string(),
+            trigger_kind: trigger,
+            action_kind: automation::ActionKind::AgentRun,
+            enabled: false,
+            inbound_path: None,
+            action: automation::HookActionInput::AgentRun(automation::AgentRunAction {
+                project_id: project_id.to_string(),
+                branch: String::new(),
+                gateway_id: String::new(),
+                prompt: "triage this".to_string(),
+                agent_id: None,
+                model_override: None,
+                subtask: false,
+            }),
+            created_at: 0,
+            updated_at: 0,
+            plugin_id: Some("acme".to_string()),
+        }
+    }
+
+    #[test]
+    fn plugin_hook_info_needs_target_flips_once_a_project_is_set() {
+        let targetless = plugin_hook_info(agent_run_hook(automation::TriggerKind::SessionEnd, ""));
+        assert_eq!(targetless.name, "acme/triage");
+        assert_eq!(targetless.trigger, "session.end");
+        assert_eq!(targetless.trigger_alias.as_deref(), Some("Stop"));
+        assert_eq!(targetless.action, "agent.run");
+        assert!(
+            targetless.needs_target,
+            "empty project_id on an agent.run hook needs a target"
+        );
+
+        let targeted = plugin_hook_info(agent_run_hook(
+            automation::TriggerKind::SessionEnd,
+            "proj-1",
+        ));
+        assert!(
+            !targeted.needs_target,
+            "a filled-in project_id no longer needs a target"
+        );
+    }
+
+    #[test]
+    fn plugin_job_info_needs_target_and_schedule_derivation() {
+        let natural_targetless = scheduler::JobRow {
+            id: "acme/nightly".to_string(),
+            name: "nightly".to_string(),
+            cron: "0 2 * * *".to_string(),
+            mode: "natural".to_string(),
+            natural_text: "every day at 2am".to_string(),
+            project_id: String::new(),
+            branch: "main".to_string(),
+            gateway: "local".to_string(),
+            enabled: false,
+            prompt: "run the nightly audit".to_string(),
+            notify_success: false,
+            notify_fail: false,
+            pre_check: String::new(),
+            model_override: None,
+            plugin_id: Some("acme".to_string()),
+        };
+        let info = plugin_job_info(natural_targetless.clone());
+        assert_eq!(info.id, "acme/nightly");
+        assert_eq!(
+            info.schedule, "every day at 2am",
+            "natural mode shows the natural text"
+        );
+        assert!(info.needs_target, "empty project_id needs a target");
+
+        let targeted = scheduler::JobRow {
+            project_id: "proj-1".to_string(),
+            ..natural_targetless.clone()
+        };
+        assert!(!plugin_job_info(targeted).needs_target);
+
+        let cron_mode = scheduler::JobRow {
+            mode: "cron".to_string(),
+            natural_text: String::new(),
+            ..natural_targetless
+        };
+        assert_eq!(
+            plugin_job_info(cron_mode).schedule,
+            "0 2 * * *",
+            "cron mode falls back to the resolved cron expression"
+        );
     }
 
     // ---------- remote-catalog enrichment (assemble_list) ----------

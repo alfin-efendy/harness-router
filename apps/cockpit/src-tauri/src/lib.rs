@@ -217,6 +217,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::cancel_plugin_install,
             plugins_cmd::begin_skill_install,
             plugins_cmd::confirm_skill_install,
+            plugins_cmd::begin_plugin_source_install,
+            plugins_cmd::confirm_plugin_source_install,
             plugins_cmd::update_plugin,
             plugins_cmd::update_all_plugins,
             plugins_cmd::set_plugin_pin,

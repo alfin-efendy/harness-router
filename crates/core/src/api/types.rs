@@ -207,6 +207,12 @@ pub struct JobInfo {
     /// read and round-trip it without another DTO change.
     #[serde(default)]
     pub model_override: Option<String>,
+    /// The plugin that installed this job, if any — mirrors
+    /// `crate::scheduler::JobRow.plugin_id`. `None` for a user-created job.
+    /// Task 12 addition: lets the scheduler screen distinguish plugin-owned
+    /// rows from user-created ones.
+    #[serde(default)]
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -292,6 +298,11 @@ pub struct AutomationHookInfo {
     pub inbound_path: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The plugin that installed this hook, if any — mirrors
+    /// `crate::automation::HookRow.plugin_id`. `None` for a user-created
+    /// hook. Task 12 addition: lets the Automations screen distinguish
+    /// plugin-owned rows from user-created ones.
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -505,6 +516,7 @@ impl From<crate::automation::HookRow> for AutomationHookInfo {
             inbound_path: value.inbound_path,
             created_at: value.created_at,
             updated_at: value.updated_at,
+            plugin_id: value.plugin_id,
         }
     }
 }
@@ -980,6 +992,33 @@ pub struct PluginInfo {
     /// skill_count`) — `None` for every other kind, and for a synthesized
     /// curated pack not yet installed.
     pub skill_count: Option<u32>,
+    /// Which v2 surfaces this plugin's manifest actually provides. Members
+    /// are exactly `"provider" | "tools" | "mcp" | "skills" | "commands" |
+    /// "hooks" | "jobs"`, always emitted in that stable order. Derived
+    /// straight off the manifest (`provider.is_some()`, `!tools.is_empty()`,
+    /// `!mcp.is_empty()`, `!hooks.is_empty()`, `!jobs.is_empty()`) except for
+    /// `skills`/`commands`, which check whether an INSTALLED plugin's
+    /// `skills/`/`commands/` directories actually contain content (a
+    /// `Builtin` plugin — no directory of its own — never reports either).
+    /// `gateway` is deliberately never a member: it is an internal-only
+    /// surface, first-party-gated structurally (see
+    /// `crate::plugins::runtime`'s `HostPolicy::allow_gateway`), never a
+    /// public capability a plugin author or Cockpit's UI should see listed.
+    pub surfaces: Vec<String>,
+    /// How this plugin arrived on disk — `"catalog"` (signed feed,
+    /// trusted-by-construction) | `"local-path"` | `"git"` (Task 11's
+    /// unsigned tiered-trust installs), mirroring
+    /// `crate::plugins::host::InstallProvenance`. `None` for a `Builtin`
+    /// plugin (first-party native or embedded catalog — no install
+    /// provenance to report).
+    pub provenance: Option<String>,
+    /// `true` when this plugin's unsigned `[[mcp]]`/`[component]` surfaces
+    /// were explicitly trust-accepted (`plugin.<id>.trusted == "true"`) OR
+    /// the plugin's provenance is trusted by construction (`Catalog` or
+    /// `Builtin`) — see `crate::plugins::host::component_surfaces_trusted`,
+    /// the single gate every consuming surface checks. Cockpit uses this to
+    /// show whether an unsigned plugin's riskier surfaces are actually live.
+    pub trusted: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -1068,6 +1107,50 @@ pub struct PluginMcpInfo {
     pub command_or_url: String,
 }
 
+/// One `[[hooks]]` entry a v2 plugin manifest declares, synced into
+/// `automation_hooks` (`crate::plugins::automation_sync::sync_plugin_automations`)
+/// and re-read back here as a first-class `HookRow`. Task 12 addition to
+/// `PluginDetail` — lets the plugin detail view show a plugin's own
+/// automations without a separate round trip through the Automations screen.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginHookInfo {
+    /// The stored row name: `"<plugin-id>/<name>"`.
+    pub name: String,
+    /// Canonical dotted trigger (`crate::automation::TriggerKind::as_str`).
+    pub trigger: String,
+    /// The Claude Code alias spelling for `trigger`, when one exists (e.g.
+    /// `"Stop"` for `"session.end"`) — see `crate::automation::claude_alias_for`.
+    pub trigger_alias: Option<String>,
+    /// `"agent.run"` | `"webhook.outbound"`.
+    pub action: String,
+    pub enabled: bool,
+    /// `true` for an `agent.run` hook with an empty `project_id` — the sync
+    /// convention every plugin-installed `agent.run` hook starts with (no
+    /// plugin can guess the user's project). `PluginHost`'s enable guard
+    /// refuses enabling a hook while this is `true`; Cockpit uses it to open
+    /// a target editor instead of a plain enable switch.
+    pub needs_target: bool,
+}
+
+/// One `[[jobs]]` entry a v2 plugin manifest declares, synced into `jobs`
+/// (same module as [`PluginHookInfo`]) and re-read back as a `JobRow`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginJobInfo {
+    /// The stored row id: `"<plugin-id>/<name>"`.
+    pub id: String,
+    pub name: String,
+    /// Natural-language schedule text when the row's `mode == "natural"`,
+    /// else the resolved cron expression — whichever is the human-readable
+    /// form for this row.
+    pub schedule: String,
+    pub enabled: bool,
+    /// `true` for a job with an empty `project_id` — same "no plugin can
+    /// guess the user's project" convention as [`PluginHookInfo::needs_target`].
+    pub needs_target: bool,
+}
+
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginDetail {
@@ -1078,6 +1161,16 @@ pub struct PluginDetail {
     pub models: Vec<String>,
     pub homepage: Option<String>,
     pub publisher: String,
+    /// Command names (`.md` file stems) found under an installed plugin's
+    /// `commands/` directory. Empty for a `Builtin` plugin or one with no
+    /// commands surface.
+    pub commands: Vec<String>,
+    /// Skill directory names found under an installed plugin's `skills/`
+    /// directory (each carries a `SKILL.md`). Empty for a `Builtin` plugin
+    /// or one with no skills surface.
+    pub skills: Vec<String>,
+    pub hooks: Vec<PluginHookInfo>,
+    pub jobs: Vec<PluginJobInfo>,
 }
 
 // --- Skill/plugin distribution DTOs (trust prompt, update, doctor) ---
@@ -1197,6 +1290,128 @@ impl From<crate::skills_install::UpdateOutcome> for UpdateOutcomeDto {
 pub struct UpdateOutcomeEntry {
     pub id: String,
     pub outcome: UpdateOutcomeDto,
+}
+
+// --- Task 11/12: install a plugin from a local folder or a git URL ---
+//
+// Thin camelCase mirrors of `crate::plugins::install_sources`'s
+// `PluginTrustPrompt` (+ its nested summary shapes) — same rationale as
+// `TrustPromptDto` above: the core types stay snake-case-agnostic
+// (`Serialize`/`Deserialize` only, no specta `Type`) since Task 11's RPC
+// layer passes them wire-side as-is; Task 12 owns the Cockpit-facing
+// camelCase translation.
+
+/// Mirror of `crate::plugins::install_sources::McpServerSummary`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSourceMcpServerInfo {
+    pub name: String,
+    /// `stdio` | `http`.
+    pub transport: String,
+    /// stdio: `"<command> <args...>"`; http: the URL.
+    pub detail: String,
+}
+
+impl From<crate::plugins::install_sources::McpServerSummary> for PluginSourceMcpServerInfo {
+    fn from(value: crate::plugins::install_sources::McpServerSummary) -> Self {
+        Self {
+            name: value.name,
+            transport: value.transport,
+            detail: value.detail,
+        }
+    }
+}
+
+/// Mirror of `crate::plugins::install_sources::ComponentToolSummary`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSourceComponentToolInfo {
+    pub name: String,
+    pub writes: bool,
+}
+
+impl From<crate::plugins::install_sources::ComponentToolSummary> for PluginSourceComponentToolInfo {
+    fn from(value: crate::plugins::install_sources::ComponentToolSummary) -> Self {
+        Self {
+            name: value.name,
+            writes: value.writes,
+        }
+    }
+}
+
+/// Mirror of `crate::plugins::install_sources::ComponentTrustSummary`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSourceComponentTrustInfo {
+    pub network_hosts: Vec<String>,
+    pub tools: Vec<PluginSourceComponentToolInfo>,
+}
+
+impl From<crate::plugins::install_sources::ComponentTrustSummary>
+    for PluginSourceComponentTrustInfo
+{
+    fn from(value: crate::plugins::install_sources::ComponentTrustSummary) -> Self {
+        Self {
+            network_hosts: value.network_hosts,
+            tools: value.tools.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Mirror of `crate::plugins::install_sources::PluginSurfacesSummary`. Widened
+/// from `usize` to `u32` crossing the Tauri IPC boundary, matching this
+/// module's existing convention for every other DTO count field.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSourceSurfacesInfo {
+    pub commands: u32,
+    pub skills: u32,
+    pub hooks: u32,
+    pub jobs: u32,
+}
+
+impl From<crate::plugins::install_sources::PluginSurfacesSummary> for PluginSourceSurfacesInfo {
+    fn from(value: crate::plugins::install_sources::PluginSurfacesSummary) -> Self {
+        Self {
+            commands: value.commands as u32,
+            skills: value.skills as u32,
+            hooks: value.hooks as u32,
+            jobs: value.jobs as u32,
+        }
+    }
+}
+
+/// Mirror of `crate::plugins::install_sources::PluginTrustPrompt` — what
+/// `begin_plugin_source_install` returns, shown to the user before
+/// `confirm_plugin_source_install` touches the live install dir.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSourceInstallBegin {
+    pub token: String,
+    pub id: String,
+    pub name: String,
+    pub publisher: String,
+    pub surfaces: PluginSourceSurfacesInfo,
+    pub mcp_servers: Vec<PluginSourceMcpServerInfo>,
+    pub component: Option<PluginSourceComponentTrustInfo>,
+    /// `true` iff `mcp_servers` is non-empty or `component` is `Some` — the
+    /// wizard should only show the explicit-trust checkbox in that case.
+    pub trust_required: bool,
+}
+
+impl From<crate::plugins::install_sources::PluginTrustPrompt> for PluginSourceInstallBegin {
+    fn from(value: crate::plugins::install_sources::PluginTrustPrompt) -> Self {
+        Self {
+            token: value.token,
+            id: value.id,
+            name: value.name,
+            publisher: value.publisher,
+            surfaces: value.surfaces.into(),
+            mcp_servers: value.mcp_servers.into_iter().map(Into::into).collect(),
+            component: value.component.map(Into::into),
+            trust_required: value.trust_required,
+        }
+    }
 }
 
 /// Mirror of `crate::plugins::doctor::DoctorFinding`. Already secret-free at
