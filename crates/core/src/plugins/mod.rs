@@ -21,6 +21,7 @@
 //! catalog in one call.
 
 pub mod artifact_verify;
+pub mod automation_sync;
 pub mod bundle;
 pub mod capabilities;
 pub mod catalog_feed_key;
@@ -408,12 +409,23 @@ pub async fn toggle_enabled(
     // `PluginHost::is_enabled`'s component branch. Component-ness is read off
     // `manifest.component.is_some()` (v2) regardless of `source`.
     if plugin.manifest.component.is_some() {
-        return settings
+        settings
             .set(
                 &qualified_setting_key(id, "enabled"),
                 if enable { "true" } else { "false" },
             )
-            .await;
+            .await?;
+        // Task 10: a component's `[[hooks]]`/`[[jobs]]` sync into the
+        // Automation/Scheduler domains on enable — same "flip from disabled
+        // to enabled" trigger point `mcp_sync` already uses below for
+        // connectors. Disable deliberately never calls
+        // `automation_sync::remove_plugin_automations` — a synced row (and
+        // any target/enablement the user set on it) survives a
+        // disable/enable cycle; only uninstall removes it.
+        if enable {
+            automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
+        }
+        return Ok(());
     }
     // A component-BACKED provider (mimo/opencode + COMPONENT_BACKED_PROVIDER_IDS):
     // its plugin-list row is the CATALOG builtin (that registration won the id),
@@ -428,24 +440,32 @@ pub async fn toggle_enabled(
     if plugin.manifest.provider.is_some()
         && crate::plugins::component_catalog::is_component_bundle(id)
     {
-        return settings
+        settings
             .set(
                 &qualified_setting_key(id, "enabled"),
                 if enable { "true" } else { "false" },
             )
-            .await;
+            .await?;
+        if enable {
+            automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
+        }
+        return Ok(());
     }
     // Gateway-capable (native OR component-backed, e.g. Discord) uses the
     // SAME `plugin.<id>.enabled` key every other axis does — Task 4 retired
     // the `enabled_gateways` CSV so a gateway toggle can never drift from the
     // `PluginHost::is_enabled`/`component_plugin_enabled` read side.
     if plugin.gateway.is_some() {
-        return settings
+        settings
             .set(
                 &qualified_setting_key(id, "enabled"),
                 if enable { "true" } else { "false" },
             )
-            .await;
+            .await?;
+        if enable {
+            automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
+        }
+        return Ok(());
     }
     if plugin.manifest.experimental {
         anyhow::bail!("{id} is experimental — nothing to enable");
@@ -468,6 +488,9 @@ pub async fn toggle_enabled(
     // disabled plugin's servers out of new sessions.
     if enable {
         mcp_sync::sync_plugin_mcp(&settings.store(), settings, &plugin).await?;
+        // Task 10: same enable-time trigger as the mcp sync just above, for
+        // this plugin's `[[hooks]]`/`[[jobs]]` presets.
+        automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
     }
     Ok(())
 }

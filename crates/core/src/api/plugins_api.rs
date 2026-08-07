@@ -1984,6 +1984,10 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
     // below, not just connector-only, since nothing stops a manifest of any
     // kind from also declaring `[[mcp]]`).
     crate::plugins::mcp_sync::remove_plugin_mcp(cp.store(), id).await?;
+    // Task 10: an uninstalled plugin's synced hooks/jobs (and their run
+    // history) must not survive — mirrors the mcp cascade just above. A
+    // no-op for a plugin that never synced any automation row.
+    crate::plugins::automation_sync::remove_plugin_automations(cp.store(), id).await?;
     match derive_kind(&plugin) {
         Some("provider") => {
             let family = provider_family(id);
@@ -2168,6 +2172,10 @@ async fn complete_plugin_oauth(
     if let Some(plugin) = cp.plugins().get(&plugin_id) {
         let settings = SettingsStore::new(cp.store().clone());
         crate::plugins::mcp_sync::sync_plugin_mcp(cp.store(), &settings, &plugin).await?;
+        // Task 10: same "install completion" moment as the mcp sync above —
+        // a fresh credential can be the last thing standing between install
+        // and this plugin's `[[hooks]]`/`[[jobs]]` presets existing at all.
+        crate::plugins::automation_sync::sync_plugin_automations(cp.store(), &plugin).await?;
     }
     Ok(build_auth_info(cp.store(), &plugin_id, &auth).await?)
 }
@@ -2465,6 +2473,16 @@ async fn install_component_plugin(
     // for rollback, the just-revoked — version serving traffic.
     crate::plugins::wasm_provider::unregister_wasm_providers_for_plugin(plugin_id);
     hot_reload_provider_transports(cp).await;
+    // Task 10: a fresh install OR an update to a new release re-syncs this
+    // plugin's `[[hooks]]`/`[[jobs]]` presets — a no-op on first install
+    // (nothing existed to preserve) and a re-sync on update (see
+    // `automation_sync`'s module doc for what survives vs. what's
+    // refreshed). Best-effort against whatever manifest the host already
+    // knows for `plugin_id`; a plugin the host doesn't recognize (shouldn't
+    // happen post-install) is silently skipped.
+    if let Some(plugin) = cp.plugins().get(plugin_id) {
+        crate::plugins::automation_sync::sync_plugin_automations(cp.store(), &plugin).await?;
+    }
     cp.emit(CoreEvent::PluginsChanged);
     plugin_release_detail(cp, plugin_id).await
 }
@@ -2538,6 +2556,11 @@ async fn rollback_component_plugin(
     // A rolled-back ENABLED provider bundle hot-swaps to the restored release
     // (discovery compiles the now-active version; replace semantics).
     hot_reload_provider_transports(cp).await;
+    // Task 10: a rollback reverts the plugin to a prior release too — re-sync
+    // so its `[[hooks]]`/`[[jobs]]` presets match what that release declares.
+    if let Some(plugin) = cp.plugins().get(plugin_id) {
+        crate::plugins::automation_sync::sync_plugin_automations(cp.store(), &plugin).await?;
+    }
     cp.emit(CoreEvent::PluginsChanged);
     plugin_release_detail(cp, plugin_id).await
 }
