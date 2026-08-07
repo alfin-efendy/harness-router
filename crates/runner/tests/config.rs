@@ -80,8 +80,9 @@ fn list_shows_redaction_defaults_and_unset() {
     assert!(text.contains("approval_timeout_ms = 300000 (default)"));
     assert!(text.contains("native_tools.version = v1 (default)"));
     assert!(text.contains("workdir_root = (unset)"));
-    // No native gateway seed anymore: `enabled_gateways` is unset on a fresh db.
-    assert!(text.contains("enabled_gateways = (unset)"));
+    // Task 4 retired the `enabled_gateways` CSV/`ConfigField` entirely —
+    // gateway enablement now lives at `plugin.<id>.enabled`, a dynamic
+    // `plugin.*` key, not a static `GLOBAL_FIELDS` row this listing enumerates.
     assert_eq!(out.len(), ryuzi_core::settings::all_fields().len());
     assert_eq!(out[0].split(" = ").next(), Some("workdir_root"));
 }

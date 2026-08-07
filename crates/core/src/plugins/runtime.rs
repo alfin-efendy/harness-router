@@ -140,6 +140,17 @@ pub struct HostPolicy {
     /// self-set bearer is dropped on every redirect and never coexists with a
     /// host-injected OAuth bearer.
     pub allow_self_auth: bool,
+    /// Grants the `ryuzi:gateway/gateway` EXPORT: a component that structurally
+    /// exports it is only permitted to link/instantiate as a gateway when this
+    /// is `true`. Like `allow_self_auth`, this is derived SOLELY from the
+    /// installed release's verified provenance — `signing_key_id ==
+    /// first_party_key::FIRST_PARTY_KEY_ID` — NEVER from the bundle's own
+    /// manifest `gateway = true` declaration, which only controls discovery
+    /// (whether a bundle is even worth compiling to look for the export), not
+    /// permission (whether the export is allowed to exist). This keeps the
+    /// gateway surface first-party-only: a third-party component may still
+    /// export the interface structurally, but validation denies it.
+    pub allow_gateway: bool,
     pub limits: ResourceLimits,
 }
 
@@ -154,6 +165,7 @@ impl HostPolicy {
             allow_websocket: false,
             allow_provider_auth: false,
             allow_self_auth: false,
+            allow_gateway: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -180,6 +192,11 @@ impl HostPolicy {
     ///   by `verify_bundle` from the trusted-key match, NEVER from manifest
     ///   content or anything a component can forge. Every other bundle keeps the
     ///   strict Task 8 `Authorization` stripping.
+    /// - `allow_gateway` (permit the `ryuzi:gateway/gateway` export to
+    ///   validate) — derived EXACTLY like `allow_self_auth`, off the same
+    ///   verified `signing_key_id == first_party_key::FIRST_PARTY_KEY_ID`
+    ///   check, never off the manifest's own `gateway = true` declaration
+    ///   (which only decides discovery, not permission).
     pub fn for_installed_bundle(bundle: &InstalledBundle) -> Self {
         Self {
             allow_network: !bundle.manifest.permissions.network.is_empty(),
@@ -202,6 +219,8 @@ impl HostPolicy {
                 .is_some_and(|p| !p.ids.is_empty())
                 && !bundle.manifest.permissions.network.is_empty(),
             allow_self_auth: bundle.release_record.signing_key_id
+                == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
+            allow_gateway: bundle.release_record.signing_key_id
                 == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
             limits: ResourceLimits::default(),
         }
@@ -331,6 +350,16 @@ fn validate_component_interfaces(
             return Err(PluginRuntimeError::DeniedExport {
                 name: name.to_string(),
                 reason: "not declared by the ryuzi:plugin@0.1.0 world".to_string(),
+            });
+        }
+        // The gateway export is structurally allowed by the world (any
+        // component may declare it), but PERMITTED only under a first-party-
+        // signed host policy — see `HostPolicy::allow_gateway`'s doc for why
+        // this is never derived from the manifest's own `gateway = true`.
+        if name == GATEWAY_EXPORT && !policy.allow_gateway {
+            return Err(PluginRuntimeError::DeniedExport {
+                name: name.to_string(),
+                reason: "gateway export requires a first-party-signed release".to_string(),
             });
         }
         exports.push(name.to_string());
@@ -1884,6 +1913,38 @@ mod tests {
             panic!("invalid bytes must not validate");
         };
         assert!(matches!(error, PluginRuntimeError::MalformedComponent(_)));
+    }
+
+    /// The `ryuzi:gateway/gateway` export is a first-party-only surface: a
+    /// component that genuinely exports it must still be REJECTED at
+    /// validation unless `HostPolicy::allow_gateway` is granted — the
+    /// signing-key-derived flag `HostPolicy::for_installed_bundle` sets, never
+    /// anything a component or its manifest can claim for itself. Drives the
+    /// real `component-gateway` fixture (not a hand-written WAT stub) so a
+    /// wit-bindgen-retained export edge is what's actually being gated.
+    #[test]
+    fn gateway_export_requires_first_party_policy() {
+        build_fixture_components();
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let bytes = std::fs::read(fixture_artifact("component-gateway"))
+            .expect("gateway fixture component should be built");
+        let manifest = manifest(vec![]);
+        let mut policy = HostPolicy {
+            allow_gateway: false,
+            ..HostPolicy::deny_all()
+        };
+        let result = runtime.validate_component_bytes(&manifest, &bytes, &policy);
+        let Err(err) = result else {
+            panic!("an unsigned/non-first-party policy must deny the gateway export");
+        };
+        assert!(
+            matches!(err, PluginRuntimeError::DeniedExport { ref name, .. } if name.contains("gateway")),
+            "expected a DeniedExport naming the gateway interface, got {err:?}"
+        );
+        policy.allow_gateway = true;
+        runtime
+            .validate_component_bytes(&manifest, &bytes, &policy)
+            .expect("gateway export must validate once policy.allow_gateway is granted");
     }
 
     #[test]

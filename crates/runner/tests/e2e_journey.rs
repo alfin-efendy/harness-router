@@ -39,8 +39,10 @@ fn config_survives_a_full_daemon_lifecycle() {
         .success()
         .stdout(predicate::str::contains("high"));
 
-    // 2. Seed zero-gateway settings so the daemon never touches the network
-    //    (same seeding as crates/runner/tests/daemon.rs).
+    // 2. Seed settings so the daemon never touches the network (same seeding
+    //    as crates/runner/tests/daemon.rs). A fresh db already boots
+    //    zero-gateway — Task 4 retired the `enabled_gateways` CSV, so there
+    //    is no longer a seed to clear.
     std::env::set_var("XDG_DATA_HOME", &data_home);
     std::env::set_var("HOME", &home);
     let db_path = ryuzi_core::paths::db_path();
@@ -50,7 +52,6 @@ fn config_survives_a_full_daemon_lifecycle() {
         rt.block_on(async {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "").await.unwrap();
             settings.set("auto_update", "off").await.unwrap();
         });
     }

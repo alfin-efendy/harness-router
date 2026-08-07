@@ -1932,7 +1932,8 @@ async fn set_plugin_enabled(cp: &ControlPlane, id: String, enabled: bool) -> Res
     crate::plugins::toggle_enabled(cp.plugins(), &settings, &id, enabled).await?;
     // Spec B1: provider transports are hot — enabling registers the transport
     // now, disabling unregisters it. Other kinds keep their existing axes
-    // (connectors re-discover per session; gateways gate on enabled_gateways).
+    // (connectors re-discover per session; gateways gate on the same
+    // `plugin.<id>.enabled` key, read fresh on the next attach/restart).
     let kind = cp.plugins().get(&id);
     let is_provider = kind.as_deref().and_then(derive_kind) == Some("provider");
     if is_provider && crate::plugins::component_catalog::is_component_bundle(&id) {
@@ -1991,7 +1992,7 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             // Spec B1: an uninstalled provider must stay off — clear the
             // transport key or the next hot reload would re-register it.
             cp.store()
-                .delete_setting_raw(&format!("plugin.{id}.enabled"))
+                .delete_setting_raw(&crate::plugins::qualified_setting_key(id, "enabled"))
                 .await?;
             Ok(())
         }

@@ -24,9 +24,10 @@ impl ProviderCatalog {
 /// Native (in-process) gateway descriptors. Discord — the only historical
 /// entry — migrated to a signed WASM component bundle (which declares its own
 /// settings in its manifest), so this is empty today. The
-/// `GatewayDescriptor`/`ProviderCatalog` machinery and the `enabled_gateways`
-/// settings plumbing are retained as generic infrastructure a future native
-/// gateway would populate.
+/// `GatewayDescriptor`/`ProviderCatalog` machinery is retained as generic
+/// infrastructure a future native gateway would populate; its enablement
+/// would use the same `plugin.<id>.enabled` key every other plugin does
+/// (Task 4 retired the old `enabled_gateways` CSV entirely).
 pub static CATALOG: ProviderCatalog = ProviderCatalog { gateways: &[] };
 
 /// All fields in schema order: globals, then each gateway's fields.

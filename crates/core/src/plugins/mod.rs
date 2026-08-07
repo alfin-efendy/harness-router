@@ -77,7 +77,7 @@ mod discord_e2e;
 #[cfg(test)]
 mod atlassian_bitbucket_e2e;
 
-use crate::settings::{csv, SettingsStore};
+use crate::settings::SettingsStore;
 use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
@@ -363,7 +363,9 @@ pub fn register_builtin_plugin_fields() {
 /// [`PluginHost::is_enabled`]'s read side:
 /// - unknown id → an error (`"unknown plugin: {id}"`)
 /// - harness-capable → an error (the native runtime is always enabled)
-/// - gateway-capable → add/remove `id` in the `enabled_gateways` CSV setting
+/// - gateway-capable → set `plugin.<id>.enabled` to `"true"`/`"false"` — the
+///   same key every other capability axis uses (Task 4 retired the
+///   `enabled_gateways` CSV)
 /// - experimental (docs-only, no capability) → an error, since
 ///   `is_enabled` always reports it disabled regardless of any
 ///   `plugin.<id>.enabled` write (see that method's doc) — toggling would
@@ -405,7 +407,7 @@ pub async fn toggle_enabled(
     if plugin.manifest.component.is_some() {
         return settings
             .set(
-                &format!("plugin.{id}.enabled"),
+                &qualified_setting_key(id, "enabled"),
                 if enable { "true" } else { "false" },
             )
             .await;
@@ -425,13 +427,22 @@ pub async fn toggle_enabled(
     {
         return settings
             .set(
-                &format!("plugin.{id}.enabled"),
+                &qualified_setting_key(id, "enabled"),
                 if enable { "true" } else { "false" },
             )
             .await;
     }
+    // Gateway-capable (native OR component-backed, e.g. Discord) uses the
+    // SAME `plugin.<id>.enabled` key every other axis does — Task 4 retired
+    // the `enabled_gateways` CSV so a gateway toggle can never drift from the
+    // `PluginHost::is_enabled`/`component_plugin_enabled` read side.
     if plugin.gateway.is_some() {
-        return toggle_csv(settings, "enabled_gateways", id, enable).await;
+        return settings
+            .set(
+                &qualified_setting_key(id, "enabled"),
+                if enable { "true" } else { "false" },
+            )
+            .await;
     }
     if plugin.manifest.experimental {
         anyhow::bail!("{id} is experimental — nothing to enable");
@@ -441,29 +452,10 @@ pub async fn toggle_enabled(
     }
     settings
         .set(
-            &format!("plugin.{id}.enabled"),
+            &qualified_setting_key(id, "enabled"),
             if enable { "true" } else { "false" },
         )
         .await
-}
-
-/// Add (or remove) `id` in a CSV settings value, preserving the existing
-/// entries' order and never introducing a duplicate.
-async fn toggle_csv(
-    settings: &SettingsStore,
-    key: &str,
-    id: &str,
-    enable: bool,
-) -> anyhow::Result<()> {
-    let mut values = csv(settings.get(key).await?.as_deref());
-    if enable {
-        if !values.iter().any(|v| v == id) {
-            values.push(id.to_string());
-        }
-    } else {
-        values.retain(|v| v != id);
-    }
-    settings.set(key, &values.join(",")).await
 }
 
 /// Whether the remote catalog's signed feed has blocked `id`, per the cached
@@ -492,14 +484,12 @@ pub async fn is_blocked(store: &Store, id: &str) -> (bool, Option<String>) {
 /// Best-effort per id: a single plugin's settings write failing is logged
 /// and does not abort the rest of the sweep.
 ///
-/// Scope note: the `plugin.<id>.enabled=false` key this writes is the
-/// *connector*-plugin enable flag. It is a deliberate no-op for gateway ids
-/// (which are toggled via the `enabled_gateways` CSV, not per-id settings) and
-/// for harness- or manifest-only ids. That is correct for the real domain
-/// here — remote-catalog entries are always connector plugins, so a blocked id
-/// always maps to this key — but do not repurpose this sweep for
-/// gateway/harness blocks without also handling their distinct enable
-/// mechanisms.
+/// Scope note: the `plugin.<id>.enabled=false` key this writes is now the
+/// SAME key every capability axis reads (Task 4 unified gateway enablement
+/// onto it too), so this sweep correctly disables a blocked gateway id as
+/// well as a blocked connector id. It remains a no-op for harness- or
+/// manifest-only ids, which is correct for the real domain here —
+/// remote-catalog entries are never harness/manifest-only.
 pub async fn apply_blocked_denylist(
     store: &Store,
     settings: &SettingsStore,
@@ -514,7 +504,10 @@ pub async fn apply_blocked_denylist(
         .collect();
     for id in &blocked {
         if host.get(id).is_some() && host.is_enabled(settings, id).await.unwrap_or(false) {
-            match settings.set(&format!("plugin.{id}.enabled"), "false").await {
+            match settings
+                .set(&qualified_setting_key(id, "enabled"), "false")
+                .await
+            {
                 Ok(()) => tracing::warn!("catalog: auto-disabled blocked plugin {id}"),
                 Err(e) => {
                     tracing::warn!("catalog: failed to auto-disable blocked plugin {id}: {e}")
@@ -854,27 +847,32 @@ mod toggle_enabled_tests {
     }
 
     #[tokio::test]
-    async fn gateway_capable_toggles_enabled_gateways_csv() {
+    async fn gateway_capable_toggles_plugin_enabled_key() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
-        // A fresh store no longer seeds `enabled_gateways` (the native Discord
-        // seed was removed with the native gateway), so this starts empty and
-        // proves the CSV add/remove round-trip in isolation.
         host.add(gateway_only("slack"));
 
         toggle_enabled(&host, &settings, "slack", true)
             .await
             .unwrap();
         assert_eq!(
-            settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("slack")
+            settings
+                .get("plugin.slack.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
         );
         toggle_enabled(&host, &settings, "slack", false)
             .await
             .unwrap();
         assert_eq!(
-            settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("")
+            settings
+                .get("plugin.slack.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("false")
         );
     }
 

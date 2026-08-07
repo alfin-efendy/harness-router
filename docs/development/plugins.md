@@ -73,9 +73,9 @@ its own registries: register `native` unconditionally, then call
 `ryuzi_core::plugins::install_builtins` (providers, then the embedded
 catalog) and finally `ryuzi_core::plugins::load_skill_pack_plugins`. Gateway
 WASM component bundles are discovered off-disk and wired separately in the
-same function (`build_wasm_gateways`); the native `enabled_gateways` +
-`extra_gateway_factories` seam remains as generic infrastructure but has no
-built-in gateway today. Because plugin registration runs once at daemon
+same function (`build_wasm_gateways`); the native `extra_gateway_factories`
+seam (each factory gated on its own `plugin.<id>.enabled` setting) remains as
+generic infrastructure but has no built-in gateway today. Because plugin registration runs once at daemon
 startup, installing or refreshing a skill pack requires restarting the
 daemon to pick it up — there is no hot-reload.
 
@@ -889,10 +889,11 @@ enablement by capability, in this priority order:
 1. Unknown `id` → `false`.
 2. `native` (the built-in agent harness) → always `true`; the agent is not
    toggleable.
-3. Gateway-capable (a native `CorePlugin` with a gateway factory) → whether
-   `id` is in the `enabled_gateways` CSV setting. There is no built-in native
-   gateway today; WASM gateway component bundles are enabled via
-   `plugin.<id>.enabled` instead (see `component_plugin_enabled`).
+3. Gateway-capable (a native `CorePlugin` with a gateway factory) →
+   `plugin.<id>.enabled == "true"`, the same key every other capability axis
+   uses. There is no built-in native gateway today; WASM gateway component
+   bundles (e.g. Discord) are enabled through the same key via
+   `component_plugin_enabled`.
 4. `experimental = true` (docs-only: `ngrok`, `vercel-sandbox`, `zep`) →
    always `false` — there is no capability to enable, and this wins even if
    a stray `plugin.<id>.enabled = true` row exists.
@@ -911,10 +912,9 @@ Two equivalent ways to flip it — there is no CLI surface for either:
   sidebar's Plugins section or the Browse card's "Configure" button) has
   the same switch. Cockpit's `set_plugin_enabled` Tauri command
   (`{ id, enabled }`) is what the switch calls.
-- **Settings keys directly**: `enabled_gateways` is a CSV
-  string (add/remove `id`, preserving order, no duplicates —
-  `toggle_enabled`'s `toggle_csv` helper); everything else is
-  `plugin.<id>.enabled` (`"true"`/`"false"`). Cockpit's `set_plugin_enabled`
+- **Settings keys directly**: every plugin's enablement — gateway included —
+  lives at `plugin.<id>.enabled` (`"true"`/`"false"`), built via
+  `plugins::host::qualified_setting_key`. Cockpit's `set_plugin_enabled`
   command delegates to `ryuzi_core::plugins::toggle_enabled` — the single
   source of truth both the settings rows and [`PluginHost::is_enabled`]'s
   read side agree with.
@@ -1259,9 +1259,19 @@ rather than a subprocess. First-party bundle sources live under
 
 | Role | WIT export | Bundle(s) |
 | --- | --- | --- |
-| Gateway | `ryuzi:gateway/gateway@0.1.0` | `discord` |
+| Gateway | `ryuzi:gateway/gateway@0.1.0` | `discord` (first-party-only — see below) |
 | Connector | `ryuzi:connector/connector@0.1.0` | `github`, `atlassian`, `bitbucket` |
 | Provider | `ryuzi:provider/provider@0.1.0` | `mimo`, `opencode`, plus the Task-16c LLM-provider ports (`openai`, `openrouter`, `groq`, `deepseek`, `mistral`, `xai`, `nvidia`, `huggingface`, `google`, `anthropic`, `anthropic-oauth`, `qwen`) |
+
+The `ryuzi:gateway/gateway` export is structurally allowed by the
+`ryuzi:plugin@0.1.0` world (any component may declare it), but validation
+denies it unless `HostPolicy::allow_gateway` is granted — and that flag is
+derived SOLELY from the installed release's verified `signing_key_id ==
+first_party_key::FIRST_PARTY_KEY_ID`, exactly like `allow_self_auth` below,
+never from the bundle's own manifest `gateway = true` declaration (which only
+controls *discovery* — whether a bundle is even worth compiling to look for
+the export — not *permission*). A third-party component can structurally
+export the interface but will never validate as a gateway.
 
 Each bundle's own manifest is `ryuzi-plugin.toml` — the same filename as the
 declarative `PluginManifest` above, but a DIFFERENT schema
@@ -1387,6 +1397,7 @@ provenance — no grant is ever caller-supplied:
 | `allow_oauth` | Manifest declares at least one `[[oauth]]` profile |
 | `allow_provider_auth` | Manifest declares `provider-ids` AND at least one network host (an injected credential needs somewhere to go) |
 | `allow_self_auth` | The installed release's recorded `signing_key_id` is the first-party key (gates e.g. `mimo`'s own bootstrap-JWT header) |
+| `allow_gateway` | The installed release's recorded `signing_key_id` is the first-party key (gates whether the `ryuzi:gateway/gateway` export is permitted to validate at all — same derivation as `allow_self_auth`, never the manifest's own `gateway = true`) |
 
 The host-injected-credential guarantee: `capabilities::settings` returns an
 EMPTY value for a secret field, and `capabilities::http`

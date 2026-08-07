@@ -6710,10 +6710,15 @@ mod tests {
     async fn settings_raw_roundtrip_and_seeds() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        // No gateway seed on open anymore (the native Discord seed was removed
-        // with the native gateway) — a fresh store has no `enabled_gateways`.
+        // No gateway seed on open anymore (the native Discord seed was
+        // removed with the native gateway, and Task 4 retired the
+        // `enabled_gateways` CSV entirely) — a fresh store has no
+        // `plugin.discord.enabled` row.
         assert_eq!(
-            store.get_setting_raw("enabled_gateways").await.unwrap(),
+            store
+                .get_setting_raw("plugin.discord.enabled")
+                .await
+                .unwrap(),
             None
         );
         // Upsert + empty string is a real value:

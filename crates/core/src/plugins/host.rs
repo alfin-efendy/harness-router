@@ -31,7 +31,7 @@ use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 use crate::connector::{Connector, ConnectorRegistry};
 use crate::gateway::{GatewayFactory, GatewayRegistry};
 use crate::harness::HarnessFactory;
-use crate::settings::{csv, SettingsStore};
+use crate::settings::SettingsStore;
 
 /// Process-wide registry of every `plugin.*` settings key any installed
 /// plugin has declared, populated by [`PluginHost::add`]. Backs
@@ -323,12 +323,16 @@ impl PluginHost {
     /// - unknown id → `false`
     /// - harness-capable → always `true` (the native runtime cannot be
     ///   disabled)
-    /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
     /// - component bundle → explicit `plugin.<id>.enabled` wins in either
     ///   direction (`"false"` disables, `"true"` enables); with no setting,
     ///   enabled iff an active release exists on disk
     ///   (`Store::active_component_release`) — a successful install counts as
     ///   enabled without a separate enable write
+    /// - gateway-capable (a native, non-component `GatewayFactory`; the WASM
+    ///   Discord path is always component-backed and returns above) →
+    ///   `plugin.<id>.enabled == "true"` (defaults to `false`) — the SAME key
+    ///   and format every other capability axis uses (Task 4 retired the
+    ///   `enabled_gateways` CSV so every plugin's enablement lives at one key)
     /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector/extension capability)
     ///   → always `true`
@@ -350,8 +354,8 @@ impl PluginHost {
             return component_plugin_enabled(settings, id).await;
         }
         if plugin.gateway.is_some() {
-            let enabled = csv(settings.get("enabled_gateways").await?.as_deref());
-            return Ok(enabled.iter().any(|g| g == id));
+            let key = qualified_setting_key(id, "enabled");
+            return Ok(settings.get(&key).await?.as_deref() == Some("true"));
         }
         if plugin.manifest.experimental {
             // Experimental catalog entries (ngrok/zep/vercel-sandbox) are
@@ -866,17 +870,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_enabled_gateway_capability_follows_enabled_gateways() {
+    async fn is_enabled_gateway_capability_follows_plugin_enabled_key() {
         let (_store, settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
-        // Deliberately NOT "discord" — a fresh `Store` seeds
-        // `enabled_gateways = "discord"` (see `store.rs`'s migration seed),
-        // which would make this id enabled from the start and defeat the
-        // "off by default" half of this test.
         host.add(gateway_only("slack"));
 
         assert!(!host.is_enabled(&settings, "slack").await.unwrap());
-        settings.set("enabled_gateways", "slack").await.unwrap();
+        settings.set("plugin.slack.enabled", "true").await.unwrap();
         assert!(host.is_enabled(&settings, "slack").await.unwrap());
     }
 

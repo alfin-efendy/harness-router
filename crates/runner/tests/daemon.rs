@@ -34,15 +34,15 @@ fn lifecycle(entry: &str) {
         .expect("db_path must have a parent dir")
         .to_path_buf();
 
-    // Seed settings BEFORE spawning: empty enabled_gateways (zero-gateway
-    // daemon). The Store is opened and dropped here so the child owns the
+    // Seed settings BEFORE spawning: a fresh db already boots zero-gateway
+    // (Task 4 retired the `enabled_gateways` CSV — there is no seed left to
+    // clear). The Store is opened and dropped here so the child owns the
     // only live handle.
     {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "").await.unwrap();
             settings.set("auto_update", "off").await.unwrap();
         });
     }

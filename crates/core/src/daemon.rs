@@ -20,7 +20,7 @@ use crate::llm_router::server::RouterServer;
 use crate::plugins::Registries;
 use crate::policy;
 use crate::router::Router;
-use crate::settings::{csv, SettingsStore, CATALOG};
+use crate::settings::{SettingsStore, CATALOG};
 use crate::store::Store;
 use crate::telemetry::{ConsoleTelemetry, Telemetry};
 use futures::FutureExt;
@@ -43,9 +43,9 @@ pub struct BuildDaemonOpts {
     /// Console, or OTLP behind the `otel` feature once `otel_endpoint` is set.
     pub telemetry: Option<Arc<dyn Telemetry>>,
     /// Native (in-process) gateway factories available to wire, keyed by the
-    /// id an entry in the `enabled_gateways` setting names. Empty in
-    /// production today — Discord migrated to a WASM component bundle (wired
-    /// via `build_wasm_gateways` below) — but retained as the generic
+    /// id whose `plugin.<id>.enabled` setting gates whether it starts. Empty
+    /// in production today — Discord migrated to a WASM component bundle
+    /// (wired via `build_wasm_gateways` below) — but retained as the generic
     /// injection seam a future native gateway (and the daemon tests) use.
     pub extra_gateway_factories: Vec<(String, Arc<dyn GatewayFactory>)>,
     /// Test seam: replace the single native harness factory with a fake.
@@ -393,8 +393,8 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// `Store::open` → settings → telemetry select → `Registries` (always
 /// installs the native plugin, then `install_builtins`, then applies
 /// `opts.harness_factory` if set) → `ControlPlane::new_with_telemetry`
-/// → gateways (from `enabled_gateways` + `extra_gateway_factories` + the
-/// provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
+/// → gateways (from `extra_gateway_factories`, each gated on its own
+/// `plugin.<id>.enabled` setting, + the provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
 /// → a second, inbound-only `Router` handed to every gateway via
 /// `Gateway::set_router` (Task 6 — see `router.rs`'s module doc for why two
 /// instances) → the approval fan-out spawned on another `cp.subscribe()`
@@ -534,15 +534,24 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let factories: HashMap<String, Arc<dyn GatewayFactory>> =
         opts.extra_gateway_factories.into_iter().collect();
     let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
-    for id in csv(settings.get("enabled_gateways").await?.as_deref()) {
-        let Some(factory) = factories.get(&id) else {
-            continue; // no registered factory for this id — skip silently
-        };
+    for (id, factory) in &factories {
+        // Task 4: every plugin's enablement — native gateway factories
+        // included — lives at `plugin.<id>.enabled`, the same key
+        // `PluginHost::is_enabled`'s gateway branch reads. No CSV to consult;
+        // a factory with no explicit enable write simply never starts.
+        let enabled = settings
+            .get(&crate::plugins::qualified_setting_key(id, "enabled"))
+            .await?
+            .as_deref()
+            == Some("true");
+        if !enabled {
+            continue;
+        }
         // Assemble the gateway's config from its CATALOG-declared settings
         // fields, if any. A native gateway with no catalog descriptor (or no
         // declared fields) builds with an empty config.
         let mut config = serde_json::Map::new();
-        if let Some(descriptor) = CATALOG.gateway(&id) {
+        if let Some(descriptor) = CATALOG.gateway(id) {
             for field in descriptor.fields {
                 let value = settings.get(field.key).await?.unwrap_or_default();
                 config.insert(field.key.to_string(), serde_json::Value::String(value));
@@ -1748,8 +1757,14 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            // Raw write: `plugin.acme-gw.enabled` is a synthetic test id never
+            // registered via `PluginHost::add`, so the validated `SettingsStore::set`
+            // would reject it as "unknown setting" — the daemon's boot loop only
+            // ever READS this key, never validates it.
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let daemon = build_daemon(BuildDaemonOpts {
@@ -1777,9 +1792,17 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings
-                .set("enabled_gateways", "acme-gw,bogus")
+            // Raw writes: these synthetic test ids are never registered via
+            // `PluginHost::add`, so the validated `SettingsStore::set` would
+            // reject them as "unknown setting". "bogus" is enabled but has no
+            // registered factory — proves an enabled id with nothing to wire
+            // it is skipped, not just a disabled one.
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
+            store
+                .set_setting_raw("plugin.bogus.enabled", "true")
                 .await
                 .unwrap();
         }
@@ -1811,8 +1834,10 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
@@ -1890,8 +1915,10 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
@@ -1996,8 +2023,10 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
@@ -3873,8 +3902,10 @@ mod tests {
         .await;
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let captured = Arc::new(Mutex::new(None));

@@ -1659,6 +1659,10 @@ mod gateway_impl_tests {
     async fn build_test_gateway(config: GatewayConfig) -> (WasmGateway, tempfile::NamedTempFile) {
         build_fixtures();
         let mut policy = HostPolicy::deny_all();
+        // The gateway export is first-party-only now (Task 4); this test
+        // fixture stands in for a first-party-signed component — see the
+        // identical grant in `wasm_gateway`'s own `build_test_supervisor`.
+        policy.allow_gateway = true;
         policy.limits.timeout = Duration::from_secs(5);
         let component_path = gateway_artifact();
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -2865,7 +2869,12 @@ mod gateway_impl_tests {
                 version: version.into(),
                 source_url: "https://example.invalid".into(),
                 sha256: sha,
-                signing_key_id: "test".into(),
+                // Task 4: the gateway export is first-party-only —
+                // `HostPolicy::for_installed_bundle` derives `allow_gateway`
+                // from exactly this field, so a non-first-party signing key
+                // here would make every gateway compile denied and every
+                // "constructed" assertion below fail closed.
+                signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.into(),
                 installed_at: 0,
                 active: false,
                 revoked: false,

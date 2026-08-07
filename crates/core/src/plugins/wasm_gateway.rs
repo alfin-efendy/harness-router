@@ -794,6 +794,11 @@ mod tests {
         timeout: Duration,
     ) -> (WasmGatewaySupervisor, tempfile::NamedTempFile) {
         let mut policy = HostPolicy::deny_all();
+        // The gateway export is first-party-only now (Task 4); this test
+        // fixture stands in for a first-party-signed component, so grant it
+        // explicitly the same way `for_installed_bundle` would derive it from
+        // a real `signing_key_id == FIRST_PARTY_KEY_ID` release.
+        policy.allow_gateway = true;
         policy.limits.timeout = timeout;
         let component_path = gateway_artifact();
         let tmp = tempfile::NamedTempFile::new().unwrap();
