@@ -189,6 +189,17 @@ pub const HEALTHY_RESET_AFTER: Duration = Duration::from_secs(60);
 /// would have let succeed in a few milliseconds. Small-but-real durations
 /// sidestep that race entirely: every timer here is real, so a real
 /// process's real response always has time to arrive first.
+// `SupervisorConfig` and everything built on it below (`backoff_for_attempt`,
+// `mark_restarting`, `ping_once`, `supervise`, `SupervisedExtension::spawn`/
+// `spawn_with_config`) are only reachable from `#[cfg(test)]` now:
+// `ExtensionHost::spawn_all` (the one production entry point) was neutered to
+// a no-op when `CorePlugin.extension` was removed for the v2 unified
+// manifest — the SDK's `[[extension]]` surface no longer exists, so no
+// plugin can ever supply an `ExtensionFactory` to discover and spawn here.
+// Kept (not deleted) and `#[allow(dead_code)]`d rather than ripped out: Task
+// 3 owns the full deletion of Track D subprocess extensions; this task only
+// severs the plugin-manifest feed into it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct SupervisorConfig {
     ping_interval: Duration,
@@ -220,6 +231,7 @@ impl Default for SupervisorConfig {
 /// 2^attempt_index, cfg.restart_backoff_cap)`. `attempt_index` is clamped
 /// before exponentiation so this never overflows `Duration`'s internal
 /// representation even if called with a very large index.
+#[allow(dead_code)]
 fn backoff_for_attempt(attempt_index: usize, cfg: &SupervisorConfig) -> Duration {
     let exp = attempt_index.min(10) as u32;
     let scaled = cfg.restart_backoff_base.saturating_mul(1u32 << exp);
@@ -636,6 +648,7 @@ impl ExtensionProc {
 /// `confirmed_events`/`tools`. Always followed by either another respawn
 /// attempt (replacing this placeholder with a real result) or a give-up
 /// (replacing it with `Failed`) — see [`supervise`].
+#[allow(dead_code)]
 async fn mark_restarting(state: &Arc<Mutex<ExtensionProc>>, spec: &ExtensionSpec) {
     let mut guard = state.lock().await;
     *guard = ExtensionProc {
@@ -654,6 +667,7 @@ async fn mark_restarting(state: &Arc<Mutex<ExtensionProc>>, spec: &ExtensionSpec
 /// it. `false` covers every unhealthy case uniformly: not currently
 /// `Running`, no transport, a JSON-RPC error reply, a timeout, or the
 /// transport already closed because the child exited.
+#[allow(dead_code)]
 async fn ping_once(state: &Arc<Mutex<ExtensionProc>>, ping_timeout: Duration) -> bool {
     let io = {
         let guard = state.lock().await;
@@ -850,6 +864,7 @@ impl ExtensionCaller for ToolCallHandle {
 /// mid-wait always wins over "keep waiting" or "restart" — see the module
 /// doc's "Shutdown stops supervision" section for why this rules out a
 /// restart-after-shutdown race.
+#[allow(dead_code)]
 async fn supervise(
     spec: ExtensionSpec,
     state: Arc<Mutex<ExtensionProc>>,
@@ -1007,6 +1022,7 @@ impl SupervisedExtension {
     /// Spawn+handshake `spec` and start supervision using the production
     /// timing (see [`SupervisorConfig::default`]). This is the entry point
     /// [`ExtensionHost::spawn_all`] uses.
+    #[allow(dead_code)]
     async fn spawn(spec: ExtensionSpec) -> SupervisedExtension {
         SupervisedExtension::spawn_with_config(spec, SupervisorConfig::default()).await
     }
@@ -1020,6 +1036,7 @@ impl SupervisedExtension {
     /// doc). Test-only knob: production always goes through [`Self::spawn`]
     /// (`SupervisorConfig::default()`); this module's tests substitute tiny
     /// real durations instead — see [`SupervisorConfig`]'s doc for why.
+    #[allow(dead_code)]
     async fn spawn_with_config(spec: ExtensionSpec, cfg: SupervisorConfig) -> SupervisedExtension {
         let proc = ExtensionProc::spawn_and_handshake(spec.clone()).await;
         let state = Arc::new(Mutex::new(proc));
@@ -1053,6 +1070,7 @@ impl SupervisedExtension {
     /// is `None`, so there is nothing to cancel/join, and `state`'s
     /// `ExtensionProc` has no `child`/`io` to tear down.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn fixed_for_test(
         spec: ExtensionSpec,
         status: ExtensionStatus,
@@ -1241,51 +1259,12 @@ impl ExtensionHost {
     /// detached background task, after the daemon has genuinely started
     /// (see `ControlPlane::spawn_extensions`'s doc for why it must never be
     /// awaited inline on a startup-latency-sensitive path).
-    pub async fn spawn_all(&self, host: &PluginHost, ctx: &ExtensionCtx) {
-        for plugin in host.list() {
-            let Some(factory) = plugin.extension.clone() else {
-                continue;
-            };
-            match host.is_enabled(&ctx.settings, &plugin.manifest.id).await {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!(
-                        "{}: could not determine whether the extension plugin is enabled: {e}",
-                        plugin.manifest.id
-                    );
-                    continue;
-                }
-            }
-            let specs = match factory.extensions(ctx).await {
-                Ok(specs) => specs,
-                Err(e) => {
-                    tracing::warn!("{}: failed to resolve extensions: {e}", plugin.manifest.id);
-                    continue;
-                }
-            };
-            let mut procs = Vec::with_capacity(specs.len());
-            for spec in specs {
-                procs.push(SupervisedExtension::spawn(spec).await);
-            }
-            // Resolve this plugin's Principal HERE — the only place a
-            // spawned entry's owning `CorePlugin.manifest.id`/`.name` are
-            // definitively known (mirrors `ControlPlane::attach_plugin_mcp_servers`'s
-            // own resolution site) — and record it BEFORE the `procs` entry
-            // so a concurrent `tool_provision_entries` read can never observe
-            // a plugin id in `procs` with no matching `principals` entry yet.
-            self.principals.write().await.insert(
-                plugin.manifest.id.clone(),
-                Principal {
-                    plugin_id: plugin.manifest.id.clone(),
-                    plugin_name: plugin.manifest.name.clone(),
-                },
-            );
-            self.procs
-                .write()
-                .await
-                .insert(plugin.manifest.id.clone(), procs);
-        }
+    pub async fn spawn_all(&self, _host: &PluginHost, _ctx: &ExtensionCtx) {
+        // `CorePlugin.extension` was removed when core adopted the v2
+        // unified manifest (the SDK's `[[extension]]` surface no longer
+        // exists), so no plugin can ever supply an `ExtensionFactory` here
+        // anymore. This sweep is now a permanent no-op pending Task 3's
+        // full deletion of Track D subprocess extensions.
     }
 
     /// A snapshot of every spawned extension for `plugin_id`, in spawn
@@ -1323,6 +1302,7 @@ impl ExtensionHost {
     /// exact `Failed`/`Restarting`/`Running` state deterministically, instead
     /// of racing a real supervisor's restart-with-backoff timing.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn insert_for_test(&self, plugin_id: &str, ext: SupervisedExtension) {
         self.procs
             .write()
@@ -1797,108 +1777,13 @@ mod tests {
         }
     }
 
-    // ---------- ExtensionHost: gating + aggregate spawn/shutdown ----------
-
-    #[cfg(unix)]
-    struct FakeExtensionFactory {
-        specs: Vec<ExtensionSpec>,
-    }
-
-    #[cfg(unix)]
-    #[async_trait]
-    impl super::super::ExtensionFactory for FakeExtensionFactory {
-        async fn extensions(&self, _ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
-            Ok(self.specs.clone())
-        }
-    }
-
-    #[cfg(unix)]
-    fn manifest(id: &str) -> PluginManifest {
-        PluginManifest {
-            contract: 1,
-            id: id.to_string(),
-            name: id.to_string(),
-            version: String::new(),
-            publisher: String::new(),
-            description: String::new(),
-            homepage: None,
-            icon: None,
-            categories: vec![],
-            slot: None,
-            verified: false,
-            experimental: false,
-            auth: None,
-            settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
-            provider: None,
-        }
-    }
-
-    #[cfg(unix)]
-    fn extension_only(id: &str, specs: Vec<ExtensionSpec>) -> CorePlugin {
-        CorePlugin {
-            manifest: manifest(id),
-            harness: None,
-            gateway: None,
-            connector: None,
-            extension: Some(Arc::new(FakeExtensionFactory { specs })),
-            provider: None,
-            source: PluginSource::Builtin,
-        }
-    }
-
-    #[cfg(unix)]
-    async fn open_ctx() -> (ExtensionCtx, Arc<Store>, tempfile::NamedTempFile) {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
-        let settings = SettingsStore::new(store.clone());
-        (ExtensionCtx { settings }, store, tmp)
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawn_all_only_spawns_for_an_enabled_extension_plugin_then_shutdown_all_stops_it() {
-        let (ctx, store, _tmp) = open_ctx().await;
-        let mut host = PluginHost::new();
-        host.add(extension_only(
-            "disabled-ext",
-            vec![spec("noop", "cat", &[])],
-        ));
-        host.add(extension_only(
-            "enabled-ext",
-            vec![spec(
-                "lifecycle",
-                "sh",
-                &[
-                    "-c",
-                    "read -r _line; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true,\"events\":[]}}'; read -r _line2",
-                ],
-            )],
-        ));
-        store
-            .set_setting_raw("plugin.enabled-ext.enabled", "true")
-            .await
-            .unwrap();
-
-        let ext_host = ExtensionHost::new();
-        ext_host.spawn_all(&host, &ctx).await;
-
-        assert!(
-            ext_host.get("disabled-ext").await.is_empty(),
-            "a disabled extension-capable plugin must not be spawned"
-        );
-        let running = ext_host.get("enabled-ext").await;
-        assert_eq!(running.len(), 1);
-        assert_eq!(running[0].status, ExtensionStatus::Running);
-
-        ext_host.shutdown_all(SHUTDOWN_GRACE).await;
-        assert_eq!(
-            ext_host.get("enabled-ext").await[0].status,
-            ExtensionStatus::Stopped
-        );
-    }
+    // NOTE: the former "ExtensionHost: gating + aggregate spawn/shutdown"
+    // test section (which proved `spawn_all` discovers and spawns a plugin's
+    // `ExtensionFactory` via `CorePlugin.extension`) was deleted here: that
+    // field no longer exists on `CorePlugin` (the v2 SDK manifest has no
+    // `[[extension]]` surface), `spawn_all` is now a permanent no-op, and no
+    // plugin can ever be discovered this way pending Task 3's full deletion
+    // of Track D subprocess extensions.
 
     // ---------- DT4: supervision (health ping, restart-with-backoff, give-up, shutdown races) ----------
     // A real, minimal `sh` subprocess plays the fake extension (same
@@ -2309,103 +2194,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_give_up_extension_never_affects_a_healthy_sibling() {
-        let (ctx, store, _tmp) = open_ctx().await;
-        let mut host = PluginHost::new();
-        host.add(extension_only(
-            "broken-plugin",
-            vec![never_spawns_spec("broken")],
-        ));
-        host.add(extension_only(
-            "healthy-plugin",
-            vec![ack_forever_spec("healthy", None)],
-        ));
-        store
-            .set_setting_raw("plugin.broken-plugin.enabled", "true")
-            .await
-            .unwrap();
-        store
-            .set_setting_raw("plugin.healthy-plugin.enabled", "true")
-            .await
-            .unwrap();
-
-        let ext_host = ExtensionHost::new();
-        ext_host.spawn_all(&host, &ctx).await;
-
-        // Checked immediately (no wait): the broken extension's own
-        // supervisor is independently retrying/backing off in the
-        // background (its status may already be `Failed` from the initial
-        // attempt or `Restarting` if its supervisor task got a scheduling
-        // turn first — either is "not Running", which is the only thing
-        // this test needs), but the healthy sibling must be completely
-        // unaffected either way.
-        let healthy = ext_host.get("healthy-plugin").await;
-        assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].status, ExtensionStatus::Running);
-        let broken = ext_host.get("broken-plugin").await;
-        assert_eq!(broken.len(), 1);
-        assert!(
-            matches!(
-                broken[0].status,
-                ExtensionStatus::Failed(_) | ExtensionStatus::Restarting
-            ),
-            "the broken extension must be unhealthy, got {:?}",
-            broken[0].status
-        );
-
-        ext_host.shutdown_all(TEST_GRACE).await;
-        assert_eq!(
-            ext_host.get("healthy-plugin").await[0].status,
-            ExtensionStatus::Stopped
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shutdown_all_stops_every_proc_concurrently() {
-        // Three procs that never react to `extension/shutdown` themselves
-        // (the ack-forever loop just keeps acking anything it reads,
-        // including the shutdown notification) so every one of them must
-        // ride out the full `grace` hard-kill fallback in
-        // `ExtensionProc::shutdown` — sequential would take ~3x `grace`;
-        // concurrent (`join_all`) takes ~1x. No `start_paused` here: this
-        // test asserts real wall-clock concurrency, so `grace` is kept small
-        // to stay fast either way.
-        let grace = Duration::from_millis(200);
-        let (ctx, store, _tmp) = open_ctx().await;
-        let mut host = PluginHost::new();
-        host.add(extension_only(
-            "multi",
-            vec![
-                ack_forever_spec("one", None),
-                ack_forever_spec("two", None),
-                ack_forever_spec("three", None),
-            ],
-        ));
-        store
-            .set_setting_raw("plugin.multi.enabled", "true")
-            .await
-            .unwrap();
-
-        let ext_host = ExtensionHost::new();
-        ext_host.spawn_all(&host, &ctx).await;
-        for snap in ext_host.get("multi").await {
-            assert_eq!(snap.status, ExtensionStatus::Running);
-        }
-
-        let start = std::time::Instant::now();
-        ext_host.shutdown_all(grace).await;
-        let elapsed = start.elapsed();
-
-        for snap in ext_host.get("multi").await {
-            assert_eq!(snap.status, ExtensionStatus::Stopped);
-        }
-        assert!(
-            elapsed < grace * 2,
-            "shutdown_all of 3 procs each needing the full grace period took {elapsed:?} \
-             (>= 2x grace={grace:?}) — looks sequential, not concurrent"
-        );
-    }
+    // NOTE: `a_give_up_extension_never_affects_a_healthy_sibling` and
+    // `shutdown_all_stops_every_proc_concurrently` were deleted here: both
+    // proved `ExtensionHost` behavior across MULTIPLE plugins discovered via
+    // `spawn_all`'s `CorePlugin.extension` sweep, which is now a permanent
+    // no-op (see the note above and `spawn_all`'s doc comment) — that
+    // integration is categorically impossible now that `CorePlugin` no
+    // longer carries an extension-factory field.
 }

@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
-use ryuzi_plugin_sdk::{PluginBundleManifest, PluginRelease};
+use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -89,7 +89,7 @@ struct SignatureEnvelope {
 /// its `release.json` carries a valid signature from a trusted key.
 #[derive(Debug, Clone)]
 pub struct VerifiedBundle {
-    pub manifest: PluginBundleManifest,
+    pub manifest: PluginManifest,
     pub release: PluginRelease,
     pub signing_key_id: String,
     pub staging_dir: PathBuf,
@@ -109,8 +109,10 @@ pub fn verify_bundle(
     // Step 1: parse the manifest and the raw release bytes.
     let manifest_toml = std::fs::read_to_string(staging_dir.join("ryuzi-plugin.toml"))
         .context("reading ryuzi-plugin.toml")?;
-    let manifest =
-        PluginBundleManifest::from_toml(&manifest_toml).context("parsing ryuzi-plugin.toml")?;
+    let manifest = PluginManifest::from_toml(&manifest_toml).context("parsing ryuzi-plugin.toml")?;
+    let Some(component) = manifest.component.as_ref() else {
+        bail!("bundle manifest `{}` declares no [component]", manifest.id);
+    };
 
     let release_bytes =
         std::fs::read(staging_dir.join("release.json")).context("reading release.json")?;
@@ -137,14 +139,14 @@ pub fn verify_bundle(
     let canonical_root = staging_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing staging dir {}", staging_dir.display()))?;
-    let component_path = staging_dir.join(&manifest.component);
+    let component_path = staging_dir.join(&component.file);
     let canonical_component = component_path
         .canonicalize()
         .with_context(|| format!("canonicalizing component path {}", component_path.display()))?;
     if !canonical_component.starts_with(&canonical_root) {
         bail!(
             "component path {:?} escapes the staging directory",
-            manifest.component
+            component.file
         );
     }
 
@@ -206,7 +208,7 @@ pub fn verify_bundle(
 /// matching release ledger row. No component code is loaded or executed.
 #[derive(Debug, Clone)]
 pub struct InstalledBundle {
-    pub manifest: PluginBundleManifest,
+    pub manifest: PluginManifest,
     pub release: PluginRelease,
     pub release_record: ComponentPluginReleaseRecord,
     pub root: PathBuf,
@@ -453,7 +455,7 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
         if record.version != version || record.plugin_id != plugin_id || record.revoked {
             bail!("active pointer and release ledger mismatch for {plugin_id}");
         }
-        let manifest = PluginBundleManifest::from_toml(&std::fs::read_to_string(
+        let manifest = PluginManifest::from_toml(&std::fs::read_to_string(
             canonical_version_root.join("ryuzi-plugin.toml"),
         )?)?;
         let release =
@@ -466,7 +468,10 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
         {
             bail!("active bundle metadata mismatch for {plugin_id}");
         }
-        let component_path = canonical_version_root.join(&manifest.component);
+        let Some(component) = manifest.component.as_ref() else {
+            bail!("active bundle manifest for {plugin_id} declares no [component]");
+        };
+        let component_path = canonical_version_root.join(&component.file);
         let canonical_component = component_path.canonicalize()?;
         if !canonical_component.starts_with(&canonical_version_root) {
             bail!("active component escapes bundle root");
@@ -522,12 +527,15 @@ mod tests {
     fn manifest_toml(id: &str, version: &str) -> String {
         format!(
             r#"
+contract = 2
 id = "{id}"
 name = "Acme Connector"
 version = "{version}"
+
+[component]
+file = "acme_connector.wasm"
 wit-api = "^0.1.0"
 lifecycle = "singleton"
-component = "acme_connector.wasm"
 "#
         )
     }
@@ -1223,12 +1231,15 @@ component = "acme_connector.wasm"
             dir.path().join("ryuzi-plugin.toml"),
             format!(
                 r#"
+contract = 2
 id = "acme-connector"
 name = "Acme Connector"
 version = "0.1.0"
+
+[component]
+file = "../{outside_name}"
 wit-api = "^0.1.0"
 lifecycle = "singleton"
-component = "../{outside_name}"
 "#
             ),
         )

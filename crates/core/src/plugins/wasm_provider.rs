@@ -615,8 +615,8 @@ pub(crate) async fn build_test_transport_with_grants(
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        NetworkPermission, OAuthProfile, PluginBundleManifest, PluginLifecycle, PluginPermissions,
-        PluginRelease,
+        ComponentSpec, NetworkPermission, OAuthProfile, PluginLifecycle, PluginManifest,
+        PluginPermissions, PluginRelease, ProviderSpec,
     };
 
     let mut policy = HostPolicy::deny_all();
@@ -707,15 +707,26 @@ pub(crate) async fn build_test_transport_with_grants(
         provider_ids: grants.provider_ids.clone(),
     });
     let bundle = InstalledBundle {
-        manifest: PluginBundleManifest {
+        manifest: PluginManifest {
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: provider_id.to_string(),
             name: provider_id.to_string(),
             version: "0.1.0".to_string(),
-            wit_api: "^0.1.0".to_string(),
-            lifecycle: PluginLifecycle::Singleton,
-            component: "plugin.wasm".to_string(),
             publisher: String::new(),
             description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            component: Some(ComponentSpec {
+                file: "plugin.wasm".to_string(),
+                wit_api: "^0.1.0".to_string(),
+                lifecycle: PluginLifecycle::Singleton,
+            }),
             permissions: PluginPermissions {
                 network: grants
                     .network_allowlist
@@ -745,9 +756,15 @@ pub(crate) async fn build_test_transport_with_grants(
                     extra_authorize_params: Default::default(),
                 })
                 .collect(),
-            provider_ids: grants.provider_ids.clone(),
+            provider: Some(ProviderSpec {
+                ids: grants.provider_ids.clone(),
+                ..Default::default()
+            }),
             tools: vec![],
-            settings: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         },
         release: PluginRelease {
             id: provider_id.to_string(),

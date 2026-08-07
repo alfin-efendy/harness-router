@@ -669,6 +669,14 @@ pub(crate) async fn discover_gateway_components(
     let mut components = Vec::new();
     for bundle in bundles {
         let id = bundle.manifest.id.clone();
+        // Gateway discovery keys off the manifest's own `gateway = true`
+        // declaration — cheaper than compiling every non-gateway bundle just
+        // to learn it doesn't export `ryuzi:gateway/gateway` (IMP-2's
+        // `exports_gateway()` check below still guards against a manifest
+        // that lies about it).
+        if !bundle.manifest.gateway {
+            continue;
+        }
         match crate::plugins::host::component_plugin_enabled(settings, &id).await {
             Ok(true) => {}
             Ok(false) => continue,
@@ -768,7 +776,7 @@ mod tests {
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
     };
     use std::path::PathBuf;
 
@@ -801,20 +809,34 @@ mod tests {
             provider_ids: vec![],
         });
         let bundle = InstalledBundle {
-            manifest: PluginBundleManifest {
+            manifest: PluginManifest {
+                contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
                 id: "acme-gateway".to_string(),
                 name: "acme-gateway".to_string(),
                 version: "0.1.0".to_string(),
-                wit_api: "^0.1.0".to_string(),
-                lifecycle: PluginLifecycle::Singleton,
-                component: "plugin.wasm".to_string(),
                 publisher: String::new(),
                 description: String::new(),
+                homepage: None,
+                icon: None,
+                categories: vec![],
+                slot: None,
+                verified: false,
+                experimental: false,
+                auth: None,
+                settings: vec![],
+                component: Some(ComponentSpec {
+                    file: "plugin.wasm".to_string(),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: PluginLifecycle::Singleton,
+                }),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
-                provider_ids: vec![],
+                provider: None,
                 tools: vec![],
-                settings: vec![],
+                mcp: vec![],
+                hooks: vec![],
+                jobs: vec![],
+                gateway: true,
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),

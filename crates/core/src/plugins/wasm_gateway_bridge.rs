@@ -1636,7 +1636,7 @@ mod gateway_impl_tests {
     use crate::store::{ComponentPluginReleaseRecord, Store};
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1674,20 +1674,34 @@ mod gateway_impl_tests {
             provider_ids: vec![],
         });
         let bundle = InstalledBundle {
-            manifest: PluginBundleManifest {
+            manifest: PluginManifest {
+                contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
                 id: "acme-gateway".to_string(),
                 name: "acme-gateway".to_string(),
                 version: "0.1.0".to_string(),
-                wit_api: "^0.1.0".to_string(),
-                lifecycle: PluginLifecycle::Singleton,
-                component: "plugin.wasm".to_string(),
                 publisher: String::new(),
                 description: String::new(),
+                homepage: None,
+                icon: None,
+                categories: vec![],
+                slot: None,
+                verified: false,
+                experimental: false,
+                auth: None,
+                settings: vec![],
+                component: Some(ComponentSpec {
+                    file: "plugin.wasm".to_string(),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: PluginLifecycle::Singleton,
+                }),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
-                provider_ids: vec![],
+                provider: None,
                 tools: vec![],
-                settings: vec![],
+                mcp: vec![],
+                hooks: vec![],
+                jobs: vec![],
+                gateway: true,
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),
@@ -2833,7 +2847,7 @@ mod gateway_impl_tests {
         std::fs::write(
             version_dir.join("ryuzi-plugin.toml"),
             format!(
-                "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+                "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\ngateway = true\n\n[component]\nfile = \"{component}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
             ),
         )
         .unwrap();

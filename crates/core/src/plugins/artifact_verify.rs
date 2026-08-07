@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use ryuzi_plugin_sdk::{PluginBundleManifest, PluginRelease};
+use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 
 /// One verified stem's summary, for the caller to log/assert on.
 #[derive(Debug, Clone)]
@@ -64,15 +64,19 @@ pub fn verify_artifacts_dir(
         let release_bytes = read(".release.json")?;
         let sig_bytes = read(".release.json.sig")?;
 
-        let manifest = PluginBundleManifest::from_toml(
+        let manifest = PluginManifest::from_toml(
             std::str::from_utf8(&manifest_bytes)
                 .with_context(|| format!("{stem}: manifest is not UTF-8"))?,
         )
         .with_context(|| format!("{stem}: parsing manifest"))?;
+        let component = manifest
+            .component
+            .as_ref()
+            .with_context(|| format!("{stem}: manifest declares no [component]"))?;
         let release = PluginRelease::from_json(&release_bytes)
             .with_context(|| format!("{stem}: parsing release.json"))?;
         if let Some(base) = expect_base {
-            let expected = format!("{}/{}", base.trim_end_matches('/'), manifest.component);
+            let expected = format!("{}/{}", base.trim_end_matches('/'), component.file);
             if release.component_url != expected {
                 bail!(
                     "{stem}: component_url {:?} != expected {expected:?}",
@@ -83,14 +87,14 @@ pub fn verify_artifacts_dir(
 
         // Same pre-write guard the install pipeline runs: the component name
         // must stay inside the restage dir before anything is copied there.
-        super::remote_catalog::sanitize_staged_component(&manifest.component)
+        super::remote_catalog::sanitize_staged_component(&component.file)
             .with_context(|| format!("{stem}: component filename"))?;
         let staged = tempfile::tempdir().context("creating restage dir")?;
         std::fs::write(staged.path().join("ryuzi-plugin.toml"), &manifest_bytes)?;
         std::fs::write(staged.path().join("release.json"), &release_bytes)?;
         std::fs::write(staged.path().join("plugin.sig"), &sig_bytes)?;
-        let wasm_src = dir.join(&manifest.component);
-        std::fs::copy(&wasm_src, staged.path().join(&manifest.component))
+        let wasm_src = dir.join(&component.file);
+        std::fs::copy(&wasm_src, staged.path().join(&component.file))
             .with_context(|| format!("{stem}: copying {}", wasm_src.display()))?;
 
         let bundle = crate::plugins::bundle::verify_bundle(staged.path(), trusted_keys)
@@ -135,9 +139,10 @@ mod tests {
         let wasm = b"\0asm test bytes".to_vec();
         let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
         let manifest = format!(
-            "id = \"{id}\"\nname = \"Test\"\nversion = \"{version}\"\n\
-             wit-api = \">=0.1.0, <0.2.0\"\nlifecycle = \"per-call\"\n\
-             component = \"{component}\"\npublisher = \"Ryuzi\"\ndescription = \"test\"\n"
+            "contract = 2\nid = \"{id}\"\nname = \"Test\"\nversion = \"{version}\"\n\
+             publisher = \"Ryuzi\"\ndescription = \"test\"\n\n\
+             [component]\nfile = \"{component}\"\n\
+             wit-api = \">=0.1.0, <0.2.0\"\nlifecycle = \"per-call\"\n"
         );
         let release = format!(
             "{{\n  \"id\": \"{id}\",\n  \"version\": \"{version}\",\n  \"wit-api\": \"0.1.0\",\n  \

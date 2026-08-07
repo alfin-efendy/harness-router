@@ -24,7 +24,7 @@ use crate::plugins::capabilities::wit_bindings::ryuzi::settings::settings as set
 use crate::plugins::capabilities::wit_bindings::ryuzi::storage::storage as storage_iface;
 use crate::plugins::capabilities::wit_bindings::websocket::ryuzi::websocket::websocket as websocket_iface;
 use crate::plugins::capabilities::PluginCapabilityContext;
-use ryuzi_plugin_sdk::PluginBundleManifest;
+use ryuzi_plugin_sdk::PluginManifest;
 use std::sync::Arc;
 use wasmtime::{
     component::{Component, HasSelf, Instance, Linker},
@@ -192,7 +192,11 @@ impl HostPolicy {
             // credential authorization) and declare at least one outbound host,
             // since an injected credential is only ever useful on a real
             // request and `AllowedHttpClient` refuses every host otherwise.
-            allow_provider_auth: !bundle.manifest.provider_ids.is_empty()
+            allow_provider_auth: bundle
+                .manifest
+                .provider
+                .as_ref()
+                .is_some_and(|p| !p.ids.is_empty())
                 && !bundle.manifest.permissions.network.is_empty(),
             allow_self_auth: bundle.release_record.signing_key_id
                 == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
@@ -268,7 +272,7 @@ fn build_component_engine() -> Result<Engine, PluginRuntimeError> {
 /// export — IMP-2). `component` must have been compiled against `engine`.
 fn validate_component_interfaces(
     engine: &Engine,
-    manifest: &PluginBundleManifest,
+    manifest: &PluginManifest,
     component: &Component,
     policy: &HostPolicy,
 ) -> Result<Vec<String>, PluginRuntimeError> {
@@ -350,7 +354,7 @@ impl ComponentRuntime {
     /// [`Self::compile`]).
     fn validate_component_bytes(
         &self,
-        manifest: &PluginBundleManifest,
+        manifest: &PluginManifest,
         bytes: &[u8],
         policy: &HostPolicy,
     ) -> Result<Component, PluginRuntimeError> {
@@ -362,7 +366,12 @@ impl ComponentRuntime {
 
     /// Validates the component staged by a signed bundle under deny-all policy.
     pub fn validate_component(&self, bundle: &VerifiedBundle) -> Result<(), PluginRuntimeError> {
-        let bytes = std::fs::read(bundle.staging_dir.join(&bundle.manifest.component))
+        let component = bundle
+            .manifest
+            .component
+            .as_ref()
+            .expect("verified bundle has a component");
+        let bytes = std::fs::read(bundle.staging_dir.join(&component.file))
             .map_err(|error| PluginRuntimeError::ComponentRead(error.to_string()))?;
         self.validate_component_bytes(&bundle.manifest, &bytes, &HostPolicy::deny_all())
             .map(|_| ())
@@ -414,12 +423,17 @@ impl ComponentRuntime {
             .collect();
         // The router provider ids this bundle is authorized to borrow a stored
         // user API key for. ONE rule governs that authorization: the EXPLICIT
-        // manifest `provider-ids`, read from the same field
+        // manifest `[provider] ids`, read from the same field
         // `HostPolicy::allow_provider_auth` gates the capability grant on. The
         // `[id]` fallback of `resolved_provider_ids` exists for transport
         // registration and must never widen a credential grant, so it is
         // deliberately not used here.
-        let provider_ids = bundle.manifest.provider_ids.clone();
+        let provider_ids = bundle
+            .manifest
+            .provider
+            .as_ref()
+            .map(|p| p.ids.clone())
+            .unwrap_or_default();
         Ok(CompiledComponent {
             engine,
             component,
@@ -1358,16 +1372,27 @@ mod tests {
         )
     }
 
-    fn manifest(network: Vec<&str>) -> PluginBundleManifest {
-        PluginBundleManifest {
+    fn manifest(network: Vec<&str>) -> PluginManifest {
+        PluginManifest {
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: "acme".to_string(),
             name: "Acme".to_string(),
             version: "0.1.0".to_string(),
-            wit_api: "^0.1.0".to_string(),
-            lifecycle: PluginLifecycle::Singleton,
-            component: "plugin.wasm".to_string(),
             publisher: String::new(),
             description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            component: Some(ryuzi_plugin_sdk::ComponentSpec {
+                file: "plugin.wasm".to_string(),
+                wit_api: "^0.1.0".to_string(),
+                lifecycle: PluginLifecycle::Singleton,
+            }),
             permissions: PluginPermissions {
                 network: network
                     .into_iter()
@@ -1375,9 +1400,12 @@ mod tests {
                     .collect(),
             },
             oauth: vec![],
-            provider_ids: vec![],
+            provider: None,
             tools: vec![],
-            settings: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         }
     }
 
@@ -1939,7 +1967,10 @@ mod tests {
         const FIXTURE: &str = "component-provider-auth-import";
         build_fixture_components();
         let mut bundle = installed_fixture_bundle_with_network(FIXTURE, vec!["api.openai.com"]);
-        bundle.manifest.provider_ids = vec!["openai".to_string()];
+        bundle.manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec {
+            ids: vec!["openai".to_string()],
+            ..Default::default()
+        });
         let policy = HostPolicy::for_installed_bundle(&bundle);
         assert!(
             policy.allow_provider_auth,
@@ -2037,7 +2068,10 @@ mod tests {
     fn host_policy_grants_provider_auth_only_with_declared_provider_ids_and_network() {
         fn bundle_with(provider_ids: Vec<&str>, network: Vec<&str>) -> InstalledBundle {
             let mut manifest = manifest(network);
-            manifest.provider_ids = provider_ids.into_iter().map(str::to_string).collect();
+            manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec {
+                ids: provider_ids.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            });
             InstalledBundle {
                 manifest,
                 release: release(),
@@ -2075,7 +2109,10 @@ mod tests {
     async fn compile_carries_declared_provider_ids_into_the_capability_context() {
         build_fixture_components();
         let mut bundle = installed_fixture_bundle("component-noop");
-        bundle.manifest.provider_ids = vec!["mimo-free".to_string()];
+        bundle.manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec {
+            ids: vec!["mimo-free".to_string()],
+            ..Default::default()
+        });
         let runtime = ComponentRuntime::new().expect("runtime should configure");
         let compiled = runtime
             .compile(&bundle, HostPolicy::for_installed_bundle(&bundle))
@@ -2087,7 +2124,7 @@ mod tests {
         // `resolved_provider_ids` `[id]` fallback (for transport registration)
         // must never seed a credential authorization set.
         let undeclared = installed_fixture_bundle("component-noop");
-        assert!(undeclared.manifest.provider_ids.is_empty());
+        assert!(undeclared.manifest.provider.is_none());
         assert_eq!(
             undeclared.manifest.resolved_provider_ids(),
             vec![undeclared.manifest.id.clone()],

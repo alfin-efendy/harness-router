@@ -36,7 +36,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use ryuzi_plugin_sdk::PluginBundleManifest;
+use ryuzi_plugin_sdk::PluginManifest;
 
 use crate::api::types::ComponentManifestInfo;
 use crate::domain::Principal;
@@ -89,16 +89,16 @@ fn bitbucket_wasm_path() -> PathBuf {
 
 /// Each component's own committed manifest — the single source of truth for
 /// its declared OAuth profile(s) and network allowlist.
-fn atlassian_manifest() -> PluginBundleManifest {
+fn atlassian_manifest() -> PluginManifest {
     let toml = std::fs::read_to_string(atlassian_manifest_path())
         .expect("reading plugins/atlassian/ryuzi-plugin.toml");
-    PluginBundleManifest::from_toml(&toml).expect("parsing the atlassian bundle manifest")
+    PluginManifest::from_toml(&toml).expect("parsing the atlassian bundle manifest")
 }
 
-fn bitbucket_manifest() -> PluginBundleManifest {
+fn bitbucket_manifest() -> PluginManifest {
     let toml = std::fs::read_to_string(bitbucket_manifest_path())
         .expect("reading plugins/bitbucket/ryuzi-plugin.toml");
-    PluginBundleManifest::from_toml(&toml).expect("parsing the bitbucket bundle manifest")
+    PluginManifest::from_toml(&toml).expect("parsing the bitbucket bundle manifest")
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ fn build_artifacts(
     // the real manifest rather than hardcoding, so bumping a shipped bundle
     // never breaks these tests. `wit-api` stays literal: the manifest declares
     // a RANGE (`>=0.1.0, <0.2.0`), a release declares the concrete version.
-    let declared_version = PluginBundleManifest::from_toml(
+    let declared_version = PluginManifest::from_toml(
         std::str::from_utf8(&manifest_toml).expect("manifest is utf-8"),
     )
     .expect("real bundle manifest must parse")

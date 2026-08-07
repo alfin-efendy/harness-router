@@ -31,7 +31,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use ryuzi_plugin_sdk::{OAuthProfile, PluginBundleManifest};
+use ryuzi_plugin_sdk::{OAuthProfile, PluginManifest};
 
 use crate::domain::Principal;
 use crate::plugins::build_github_component_once;
@@ -67,7 +67,7 @@ fn github_manifest_path() -> PathBuf {
 /// requires the release descriptor's version to equal the manifest's.
 fn github_manifest_version() -> String {
     let toml = std::fs::read_to_string(github_manifest_path()).unwrap();
-    ryuzi_plugin_sdk::PluginBundleManifest::from_toml(&toml)
+    ryuzi_plugin_sdk::PluginManifest::from_toml(&toml)
         .unwrap()
         .version
 }
@@ -79,10 +79,10 @@ fn github_wasm_path() -> PathBuf {
 /// The component's own committed manifest — the single source of truth for the
 /// tools' metadata, the network allowlist, and the declared `github` OAuth
 /// profile that the OAuth e2e below drives.
-fn github_manifest() -> PluginBundleManifest {
+fn github_manifest() -> PluginManifest {
     let toml = std::fs::read_to_string(github_manifest_path())
         .expect("reading plugins/github/ryuzi-plugin.toml");
-    PluginBundleManifest::from_toml(&toml).expect("parsing the github bundle manifest")
+    PluginManifest::from_toml(&toml).expect("parsing the github manifest")
 }
 
 // ---------------------------------------------------------------------------

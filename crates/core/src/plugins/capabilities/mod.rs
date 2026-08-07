@@ -148,7 +148,7 @@ mod tests {
         // another test's plugin in the same test binary.
         let id = "task7-capredact-plugin";
         let manifest = ryuzi_plugin_sdk::PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: "Redaction Test Plugin".to_string(),
             version: String::new(),
@@ -170,10 +170,15 @@ mod tests {
                 ..Default::default()
             }),
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = crate::plugins::PluginHost::new();
         host.add(crate::plugins::CorePlugin {
@@ -181,7 +186,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: crate::plugins::PluginSource::Builtin,
         });

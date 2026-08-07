@@ -503,7 +503,7 @@ mod tests {
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -542,20 +542,34 @@ mod tests {
             provider_ids: vec![],
         });
         let bundle = InstalledBundle {
-            manifest: PluginBundleManifest {
+            manifest: PluginManifest {
+                contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
                 id: plugin_id.to_string(),
                 name: plugin_id.to_string(),
                 version: "0.1.0".to_string(),
-                wit_api: "^0.1.0".to_string(),
-                lifecycle: PluginLifecycle::Singleton,
-                component: "plugin.wasm".to_string(),
                 publisher: String::new(),
                 description: String::new(),
+                homepage: None,
+                icon: None,
+                categories: vec![],
+                slot: None,
+                verified: false,
+                experimental: false,
+                auth: None,
+                settings: vec![],
+                component: Some(ComponentSpec {
+                    file: "plugin.wasm".to_string(),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: PluginLifecycle::Singleton,
+                }),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
-                provider_ids: vec![],
+                provider: None,
                 tools: vec![],
-                settings: vec![],
+                mcp: vec![],
+                hooks: vec![],
+                jobs: vec![],
+                gateway: false,
             },
             release: PluginRelease {
                 id: plugin_id.to_string(),

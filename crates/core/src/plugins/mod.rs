@@ -87,7 +87,10 @@ pub use extension::{
     ExtensionCtx, ExtensionEvents, ExtensionFactory, ExtensionHost, ExtensionProc,
     ExtensionSnapshot, ExtensionSpec, ExtensionStatus,
 };
-pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSource, Registries};
+pub use host::{
+    plugin_field, plugin_fields_all, qualified_setting_key, CorePlugin, InstallProvenance,
+    PluginHost, PluginSource, Registries,
+};
 
 /// Build every `tests/fixtures/*` component EXACTLY ONCE per test process.
 ///
@@ -293,17 +296,13 @@ pub fn install_providers(regs: &mut Registries) {
 /// Coarse plugin classification shared by the plugins list
 /// (`api::plugins_api::derive_kind`) and the agent configuration catalog
 /// (`agents::catalog::build_live_catalog`). Priority order matters: a
-/// provider manifest wins over runtime meta (ollama is both), and a
-/// skill-pack source wins over connector shape.
+/// provider manifest wins over runtime meta (ollama is both).
 pub fn plugin_kind(plugin: &CorePlugin) -> &'static str {
     if plugin.manifest.provider.is_some() {
         return "provider";
     }
     if plugin.harness.is_some() {
         return "runtime";
-    }
-    if matches!(plugin.source, PluginSource::SkillPack(_)) {
-        return "skill-pack";
     }
     if plugin.gateway.is_some()
         || plugin
@@ -362,98 +361,6 @@ pub fn register_builtin_plugin_fields() {
     let mut regs = Registries::new();
     regs.add_plugin(crate::harness::native::native_plugin());
     install_builtins(&mut regs);
-    load_skill_pack_plugins(&mut regs);
-}
-
-/// Discover and register installed skill-pack plugins from
-/// `~/.config/ryuzi/plugins/*/ryuzi-plugin.toml`. Call after
-/// [`install_builtins`] so a skill-pack manifest can never shadow a
-/// built-in (`Registries::add_plugin` keeps the first registration for a
-/// given id — see `host`'s module doc).
-///
-/// Only directories the skills installer produced are accepted: the
-/// directory must carry a `.ryuzi-skill.json` provenance stamp
-/// (`skills_install::install_plugin_pack` writes it), or — legacy packs
-/// installed before the stamp existed — the directory's own name must
-/// equal the manifest's plugin id *and* the skills root must hold
-/// materialized provenance naming that same id, in which case the stamp
-/// is healed into the plugin directory one time. The dir-name check
-/// blocks a hand-authored directory from spoofing another installed
-/// pack's id to ride its materialized provenance into a heal. Hand-authored
-/// manifests match neither and are skipped with a `tracing::warn!`.
-///
-/// A missing config directory is not an error (most installs have none).
-/// A plugin directory that fails to parse or fails manifest validation is
-/// logged via `tracing::warn!` and skipped — never panics, and never
-/// stops the rest of the scan.
-pub fn load_skill_pack_plugins(regs: &mut Registries) {
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("could not resolve home directory — skipping skill-pack plugin discovery");
-        return;
-    };
-    let config = home.join(".config/ryuzi");
-    load_skill_pack_plugins_from(regs, &config.join("plugins"), &config.join("skills"));
-}
-
-/// The scan behind [`load_skill_pack_plugins`], factored out so tests can
-/// pass tempdirs instead of the real config directories.
-pub(crate) fn load_skill_pack_plugins_from(
-    regs: &mut Registries,
-    plugins_root: &std::path::Path,
-    skills_root: &std::path::Path,
-) {
-    let Ok(entries) = std::fs::read_dir(plugins_root) else {
-        return; // no skill-pack plugin directory — nothing to do
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let manifest_path = dir.join("ryuzi-plugin.toml");
-        let text = match std::fs::read_to_string(&manifest_path) {
-            Ok(text) => text,
-            Err(_) => continue, // no manifest in this directory — not a plugin
-        };
-        let manifest = match ryuzi_plugin_sdk::PluginManifest::from_toml(&text) {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                tracing::warn!(
-                    "skipping skill-pack plugin at {}: invalid manifest: {e}",
-                    manifest_path.display()
-                );
-                continue;
-            }
-        };
-        // Skill-pack provenance gate: accept the installer's stamp, or
-        // heal a legacy install from the skills root's materialized
-        // provenance; skip hand-authored manifests (neither).
-        let stamped = dir.join(crate::skills_install::PROVENANCE_FILE).is_file()
-            || crate::skills_install::stamp_legacy_skill_pack_provenance(
-                skills_root,
-                &dir,
-                &manifest.id,
-            );
-        if !stamped {
-            tracing::warn!(
-                "skipping {}: not an installed skill pack (no .ryuzi-skill.json stamp and no \
-                 materialized skill provenance for `{}` in the skills root) — hand-authored \
-                 plugin manifests are no longer loaded",
-                manifest_path.display(),
-                manifest.id
-            );
-            continue;
-        }
-        match declarative::declarative_plugin(manifest, PluginSource::SkillPack(dir.clone())) {
-            Ok(plugin) => regs.add_plugin(plugin),
-            Err(e) => {
-                tracing::warn!(
-                    "skipping skill-pack plugin at {}: {e}",
-                    manifest_path.display()
-                );
-            }
-        }
-    }
 }
 
 /// Toggle `id`'s enablement — the single source of truth behind Cockpit's
@@ -499,8 +406,9 @@ pub async fn toggle_enabled(
     // (`component_plugin_enabled`). Flip that same key — otherwise the
     // manifest-only branch below would refuse ("always available") and the
     // component could never be turned on through the UI. Mirrors
-    // `PluginHost::is_enabled`'s component branch.
-    if plugin.source == PluginSource::Component {
+    // `PluginHost::is_enabled`'s component branch. Component-ness is read off
+    // `manifest.component.is_some()` (v2) regardless of `source`.
+    if plugin.manifest.component.is_some() {
         return settings
             .set(
                 &format!("plugin.{id}.enabled"),
@@ -832,7 +740,7 @@ mod toggle_enabled_tests {
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: id.to_string(),
             version: String::new(),
@@ -846,10 +754,15 @@ mod toggle_enabled_tests {
             experimental: false,
             auth: None,
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         }
     }
 
@@ -859,7 +772,6 @@ mod toggle_enabled_tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -871,7 +783,6 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -883,7 +794,6 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -895,23 +805,30 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
     }
 
     /// A first-party component bundle row: manifest-only (its capability runs
-    /// off-disk) with `PluginSource::Component`.
+    /// off-disk). Component-ness is read off `manifest.component.is_some()`
+    /// (v2), not a dedicated `PluginSource` variant.
     fn component_only(id: &str) -> CorePlugin {
         CorePlugin {
-            manifest: manifest(id),
+            manifest: PluginManifest {
+                component: Some(ryuzi_plugin_sdk::ComponentSpec {
+                    file: format!("{id}.wasm"),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: ryuzi_plugin_sdk::PluginLifecycle::PerCall,
+                }),
+                version: "0.1.0".to_string(),
+                ..manifest(id)
+            },
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
-            source: PluginSource::Component,
+            source: PluginSource::Builtin,
         }
     }
 
@@ -1276,198 +1193,6 @@ mod toggle_enabled_tests {
     }
 }
 
-#[cfg(test)]
-mod load_skill_pack_plugins_tests {
-    use super::*;
-
-    const VALID_MANIFEST: &str = r#"
-contract = 1
-id = "acme-user"
-name = "Acme User Plugin"
-
-[[mcp]]
-name = "svc"
-transport = "stdio"
-command = "acme-mcp"
-"#;
-
-    fn write_manifest(plugins_root: &std::path::Path, plugin_dir: &str, toml_str: &str) {
-        let dir = plugins_root.join(plugin_dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ryuzi-plugin.toml"), toml_str).unwrap();
-    }
-
-    /// The stamp `skills_install::install_plugin_pack` writes into the
-    /// plugin directory (snake_case keys — see `SkillInstallProvenance`).
-    fn stamp_pack(plugins_root: &std::path::Path, plugin_dir: &str, plugin_id: &str) {
-        std::fs::write(
-            plugins_root.join(plugin_dir).join(".ryuzi-skill.json"),
-            format!(
-                r#"{{"source":"https://github.com/acme/pack","plugin_id":"{plugin_id}","installed_at":"2026-07-10T00:00:00.000Z"}}"#
-            ),
-        )
-        .unwrap();
-    }
-
-    /// Legacy layout: provenance lives only in a materialized skill dir
-    /// under the skills root (installs that predate the plugin-dir stamp).
-    fn write_legacy_skills_provenance(skills_root: &std::path::Path, plugin_id: &str) {
-        let dir = skills_root.join(format!("{plugin_id}--triage"));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(".ryuzi-skill.json"),
-            format!(
-                r#"{{"source":"https://github.com/acme/pack","plugin_id":"{plugin_id}","installed_at":"2026-01-01T00:00:00.000Z"}}"#
-            ),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn stamped_skill_pack_registers_with_skill_pack_source() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "acme", VALID_MANIFEST);
-        stamp_pack(plugins_root.path(), "acme", "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        let plugin = regs
-            .plugins
-            .get("acme-user")
-            .expect("stamped skill pack should register");
-        assert!(
-            plugin.connector.is_some(),
-            "manifest has an [[mcp]] entry, so it should be connector-capable"
-        );
-        assert_eq!(
-            plugin.source,
-            PluginSource::SkillPack(plugins_root.path().join("acme")),
-            "source should record the manifest's own directory"
-        );
-    }
-
-    #[test]
-    fn legacy_pack_with_skills_root_provenance_loads_and_gets_stamped() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        // The heal only trusts a directory whose name equals the manifest's
-        // plugin id (see `stamp_legacy_skill_pack_provenance`), matching
-        // `install_plugin_pack`'s invariant that packs always live at
-        // `plugins_root/<plugin_id>` — so this legacy-layout fixture uses
-        // "acme-user" for both the directory and the manifest id.
-        write_manifest(plugins_root.path(), "acme-user", VALID_MANIFEST);
-        write_legacy_skills_provenance(skills_root.path(), "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_some(),
-            "legacy pack must load"
-        );
-        assert!(
-            plugins_root
-                .path()
-                .join("acme-user/.ryuzi-skill.json")
-                .is_file(),
-            "one-time heal must stamp the plugin directory"
-        );
-    }
-
-    #[test]
-    fn legacy_heal_rejects_dir_name_spoofing_an_installed_id() {
-        // A hand-authored directory named anything other than the manifest's
-        // plugin id must not be healed or loaded, even when it claims a real
-        // installed pack's id and that id has genuine materialized
-        // skills-root provenance — otherwise a spoofed manifest could ride
-        // another pack's provenance to get itself permanently trusted.
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "impostor", VALID_MANIFEST);
-        write_legacy_skills_provenance(skills_root.path(), "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_none(),
-            "dir name mismatching the claimed plugin id must not be healed or loaded"
-        );
-        assert!(
-            !plugins_root
-                .path()
-                .join("impostor/.ryuzi-skill.json")
-                .is_file(),
-            "the impostor directory must not receive a provenance stamp"
-        );
-    }
-
-    #[test]
-    fn hand_authored_manifest_without_provenance_is_skipped() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "acme", VALID_MANIFEST);
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_none(),
-            "no stamp and no skills-root provenance means the directory is skipped"
-        );
-    }
-
-    #[test]
-    fn broken_toml_is_skipped_without_panicking_and_other_packs_still_load() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "broken", "this is not valid toml {{{");
-        write_manifest(plugins_root.path(), "acme", VALID_MANIFEST);
-        stamp_pack(plugins_root.path(), "acme", "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_some(),
-            "the well-formed sibling pack should still load"
-        );
-        assert_eq!(
-            regs.plugins.list().len(),
-            1,
-            "the broken manifest must not register anything"
-        );
-    }
-
-    #[test]
-    fn manifest_id_colliding_with_a_builtin_is_skipped_by_add_plugin() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(
-            plugins_root.path(),
-            "fake-anthropic",
-            r#"
-contract = 1
-id = "anthropic"
-name = "Fake Anthropic"
-"#,
-        );
-        stamp_pack(plugins_root.path(), "fake-anthropic", "anthropic");
-
-        let mut regs = Registries::new();
-        install_builtins(&mut regs); // registers the real "anthropic" provider plugin
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        let plugin = regs.plugins.get("anthropic").unwrap();
-        assert_eq!(
-            plugin.source,
-            PluginSource::Builtin,
-            "first registration (the builtin) must win over the colliding pack"
-        );
-    }
-}
 
 #[cfg(test)]
 mod install_builtins_tests {
@@ -1528,9 +1253,8 @@ mod install_builtins_tests {
             let Some(plugin) = regs.plugins.get(id) else {
                 continue; // not every excluded id is in the router CATALOG
             };
-            assert_ne!(
-                plugin.source,
-                host::PluginSource::Component,
+            assert!(
+                plugin.manifest.component.is_none(),
                 "`{id}` must stay owned by its builtin, not the component"
             );
         }

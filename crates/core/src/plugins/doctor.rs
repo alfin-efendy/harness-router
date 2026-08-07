@@ -12,7 +12,7 @@ use crate::plugins::extension::ExtensionStatus;
 use crate::plugins::runtime::HostPolicy;
 use crate::settings::SettingsStore;
 use crate::store::{ComponentPluginReleaseRecord, Store};
-use ryuzi_plugin_sdk::{PluginBundleManifest, PluginRelease};
+use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -197,7 +197,12 @@ pub async fn plugin_doctor_with(
         // `ExtensionHost::spawn_all`'s own enablement gate exactly, so a
         // disabled extension plugin never gets a spurious `not-running`.
         if extensions_active
-            && plugin.extension.is_some()
+            // `CorePlugin.extension` no longer exists — the v2 SDK manifest
+            // has no `[[extension]]` surface, so no plugin can ever be
+            // extension-capable anymore. This conjunct is a permanent
+            // `false` pending Task 3's full deletion of Track D subprocess
+            // extensions (and this whole finding along with it).
+            && false
             && cp
                 .plugins()
                 .is_enabled(&settings, id)
@@ -356,7 +361,7 @@ async fn append_wasm_component_findings(
 /// corrupt install directory warn-and-skips the file-based findings rather than
 /// aborting the whole diagnostic.
 struct LoadedRelease {
-    manifest: PluginBundleManifest,
+    manifest: PluginManifest,
     release: PluginRelease,
     release_record: ComponentPluginReleaseRecord,
     root: PathBuf,
@@ -376,10 +381,14 @@ fn load_installed_release(
     record: &ComponentPluginReleaseRecord,
 ) -> Option<LoadedRelease> {
     let manifest_toml = std::fs::read_to_string(version_dir.join("ryuzi-plugin.toml")).ok()?;
-    let manifest: PluginBundleManifest = toml::from_str(&manifest_toml).ok()?;
+    let manifest: PluginManifest = toml::from_str(&manifest_toml).ok()?;
     let release_bytes = std::fs::read(version_dir.join("release.json")).ok()?;
     let release = PluginRelease::from_json(&release_bytes).ok()?;
-    let component_path = version_dir.join(&manifest.component);
+    let component_path = manifest
+        .component
+        .as_ref()
+        .map(|c| version_dir.join(&c.file))
+        .unwrap_or_else(|| version_dir.to_path_buf());
     Some(LoadedRelease {
         manifest,
         release,
@@ -484,10 +493,13 @@ fn append_signature_finding(
 fn append_abi_finding(
     findings: &mut Vec<DoctorFinding>,
     record: &ComponentPluginReleaseRecord,
-    manifest: &PluginBundleManifest,
+    manifest: &PluginManifest,
 ) {
+    let Some(component) = manifest.component.as_ref() else {
+        return;
+    };
     let (Ok(req), Ok(host)) = (
-        semver::VersionReq::parse(&manifest.wit_api),
+        semver::VersionReq::parse(&component.wit_api),
         semver::Version::parse(HOST_WIT_API_VERSION),
     ) else {
         return;
@@ -501,7 +513,7 @@ fn append_abi_finding(
         kind: "abi-incompatible".into(),
         message: format!(
             "{} ({}) targets WIT contract `{}`, which excludes this host's `{HOST_WIT_API_VERSION}`",
-            record.plugin_id, record.version, manifest.wit_api
+            record.plugin_id, record.version, component.wit_api
         ),
         suggested_action: format!(
             "Update {} to a release built for WIT `{HOST_WIT_API_VERSION}`",
@@ -543,7 +555,12 @@ fn append_policy_findings(findings: &mut Vec<DoctorFinding>, loaded: &LoadedRele
         component_path: loaded.component_path.clone(),
     };
     let policy = HostPolicy::for_installed_bundle(&bundle);
-    if !loaded.manifest.provider_ids.is_empty() && !policy.allow_provider_auth {
+    let declares_provider_ids = loaded
+        .manifest
+        .provider
+        .as_ref()
+        .is_some_and(|p| !p.ids.is_empty());
+    if declares_provider_ids && !policy.allow_provider_auth {
         findings.push(DoctorFinding {
             plugin_id: id.clone(),
             severity: "warn".into(),
@@ -567,7 +584,7 @@ fn append_policy_findings(findings: &mut Vec<DoctorFinding>, loaded: &LoadedRele
 async fn append_oauth_profile_findings(
     findings: &mut Vec<DoctorFinding>,
     store: &Store,
-    manifest: &PluginBundleManifest,
+    manifest: &PluginManifest,
 ) {
     let id = &manifest.id;
     for profile in &manifest.oauth {
@@ -704,7 +721,7 @@ pub(crate) mod tests {
     fn manifest_only_with_slot(id: &str, slot: &str) -> crate::plugins::CorePlugin {
         crate::plugins::CorePlugin {
             manifest: ryuzi_plugin_sdk::PluginManifest {
-                contract: 1,
+                contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
                 id: id.to_string(),
                 name: id.to_string(),
                 version: String::new(),
@@ -718,15 +735,19 @@ pub(crate) mod tests {
                 experimental: false,
                 auth: None,
                 settings: vec![],
-                mcp: vec![],
-                extensions: vec![],
-                skills: vec![],
+                component: None,
+                permissions: Default::default(),
+                oauth: vec![],
                 provider: None,
+                tools: vec![],
+                mcp: vec![],
+                hooks: vec![],
+                jobs: vec![],
+                gateway: false,
             },
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: crate::plugins::PluginSource::Builtin,
         }
@@ -884,281 +905,16 @@ pub(crate) mod tests {
         assert!(!binary_on_path("/definitely/not/a/real/path/xyz"));
     }
 
-    // ---------- Extension (Track D) findings — DT8 ----------
-    // These use `SupervisedExtension::fixed_for_test` +
-    // `ExtensionHost::insert_for_test` (test-only, see `proc.rs`) to park a
-    // host in an exact status deterministically, instead of racing a real
-    // supervisor's restart-with-backoff timing (`restart-exhausted` alone
-    // needs `MAX_RESTARTS_IN_WINDOW` real attempts in production).
-
-    mod extension_findings {
-        use super::*;
-        use crate::plugins::extension::proc::SupervisedExtension;
-        use crate::plugins::extension::{ExtensionCtx, ExtensionFactory, ExtensionSpec};
-        use async_trait::async_trait;
-        use std::time::Duration;
-
-        struct NoopExtensionFactory;
-        #[async_trait]
-        impl ExtensionFactory for NoopExtensionFactory {
-            async fn extensions(&self, _ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
-                Ok(vec![])
-            }
-        }
-
-        /// An extension-capable, otherwise-empty `CorePlugin` — mirrors
-        /// `plugins::host`'s and `plugins::extension::events`'s own
-        /// `extension_only` test helpers. `ExtensionFactory::extensions` is
-        /// never actually called by these tests (they seed the host directly
-        /// via `insert_for_test` rather than `ExtensionHost::spawn_all`), so
-        /// the factory's own behavior is irrelevant — only
-        /// `CorePlugin.extension.is_some()` matters to `plugin_doctor`.
-        fn extension_plugin(id: &str) -> crate::plugins::CorePlugin {
-            crate::plugins::CorePlugin {
-                manifest: ryuzi_plugin_sdk::PluginManifest {
-                    contract: 1,
-                    id: id.to_string(),
-                    name: id.to_string(),
-                    version: String::new(),
-                    publisher: String::new(),
-                    description: String::new(),
-                    homepage: None,
-                    icon: None,
-                    categories: vec![],
-                    slot: None,
-                    verified: false,
-                    experimental: false,
-                    auth: None,
-                    settings: vec![],
-                    mcp: vec![],
-                    extensions: vec![],
-                    skills: vec![],
-                    provider: None,
-                },
-                harness: None,
-                gateway: None,
-                connector: None,
-                extension: Some(std::sync::Arc::new(NoopExtensionFactory)),
-                provider: None,
-                source: crate::plugins::PluginSource::Builtin,
-            }
-        }
-
-        fn fake_spec(name: &str) -> ExtensionSpec {
-            ExtensionSpec {
-                name: name.to_string(),
-                command: "unused-in-these-tests".to_string(),
-                args: vec![],
-                events: vec![],
-                provides_tools: false,
-                timeout: Duration::from_millis(500),
-                env: vec![],
-            }
-        }
-
-        /// A control plane with one enabled, extension-capable plugin
-        /// (`id`) registered and `plugin.<id>.enabled = true` persisted —
-        /// the shared setup every test below builds on before seeding
-        /// `cp.extension_host()` directly.
-        async fn test_cp_with_enabled_extension_plugin(id: &str) -> std::sync::Arc<ControlPlane> {
-            let tmp = tempfile::NamedTempFile::new().unwrap();
-            let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
-            let mut regs = Registries::new();
-            regs.add_plugin(extension_plugin(id));
-            let cp = {
-                let persistence =
-                    crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
-                        .await
-                        .unwrap();
-                ControlPlane::new(store, regs, persistence).await
-            };
-            cp.store()
-                .set_setting_raw(&format!("plugin.{id}.enabled"), "true")
-                .await
-                .unwrap();
-            cp
-        }
-
-        #[tokio::test]
-        async fn restart_exhausted_extension_reports_one_error_finding_naming_the_plugin() {
-            let cp = test_cp_with_enabled_extension_plugin("flaky-ext").await;
-            cp.extension_host()
-                .insert_for_test(
-                    "flaky-ext",
-                    SupervisedExtension::fixed_for_test(
-                        fake_spec("linter"),
-                        ExtensionStatus::Failed(
-                            "restart-exhausted: 5 restarts within 300s".to_string(),
-                        ),
-                        vec![],
-                        5,
-                    ),
-                )
-                .await;
-
-            let findings = plugin_doctor(&cp).await.unwrap();
-            let ext_findings: Vec<&DoctorFinding> = findings
-                .iter()
-                .filter(|f| f.plugin_id == "flaky-ext")
-                .collect();
-            assert_eq!(
-                ext_findings.len(),
-                1,
-                "exactly one finding for the exhausted extension, got: {findings:?}"
-            );
-            let finding = ext_findings[0];
-            assert_eq!(finding.kind, "restart-exhausted");
-            assert_eq!(finding.severity, "error");
-            assert!(finding.message.contains("flaky-ext"), "{}", finding.message);
-            assert!(!finding.suggested_action.is_empty());
-        }
-
-        #[tokio::test]
-        async fn init_failed_extension_reports_one_error_finding() {
-            let cp = test_cp_with_enabled_extension_plugin("broken-ext").await;
-            cp.extension_host()
-                .insert_for_test(
-                    "broken-ext",
-                    SupervisedExtension::fixed_for_test(
-                        fake_spec("linter"),
-                        ExtensionStatus::Failed(
-                            "linter: initialize protocol version mismatch".to_string(),
-                        ),
-                        vec![],
-                        0,
-                    ),
-                )
-                .await;
-
-            let findings = plugin_doctor(&cp).await.unwrap();
-            let ext_findings: Vec<&DoctorFinding> = findings
-                .iter()
-                .filter(|f| f.plugin_id == "broken-ext")
-                .collect();
-            assert_eq!(ext_findings.len(), 1, "got: {findings:?}");
-            let finding = ext_findings[0];
-            assert_eq!(finding.kind, "init-failed");
-            assert_eq!(finding.severity, "error");
-            assert!(!finding.suggested_action.is_empty());
-        }
-
-        #[tokio::test]
-        async fn restarting_extension_reports_one_warn_crashed_finding() {
-            let cp = test_cp_with_enabled_extension_plugin("crashy-ext").await;
-            cp.extension_host()
-                .insert_for_test(
-                    "crashy-ext",
-                    SupervisedExtension::fixed_for_test(
-                        fake_spec("linter"),
-                        ExtensionStatus::Restarting,
-                        vec![],
-                        1,
-                    ),
-                )
-                .await;
-
-            let findings = plugin_doctor(&cp).await.unwrap();
-            let ext_findings: Vec<&DoctorFinding> = findings
-                .iter()
-                .filter(|f| f.plugin_id == "crashy-ext")
-                .collect();
-            assert_eq!(ext_findings.len(), 1, "got: {findings:?}");
-            assert_eq!(ext_findings[0].kind, "crashed");
-            assert_eq!(ext_findings[0].severity, "warn");
-        }
-
-        #[tokio::test]
-        async fn running_extension_reports_no_finding() {
-            let cp = test_cp_with_enabled_extension_plugin("healthy-ext").await;
-            cp.extension_host()
-                .insert_for_test(
-                    "healthy-ext",
-                    SupervisedExtension::fixed_for_test(
-                        fake_spec("linter"),
-                        ExtensionStatus::Running,
-                        vec!["tool.before".to_string()],
-                        0,
-                    ),
-                )
-                .await;
-
-            let findings = plugin_doctor(&cp).await.unwrap();
-            assert!(
-                findings.iter().all(|f| f.plugin_id != "healthy-ext"),
-                "a Running extension must produce no finding, got: {findings:?}"
-            );
-        }
-
-        #[tokio::test]
-        async fn enabled_extension_plugin_with_nothing_spawned_reports_not_running_when_the_host_is_otherwise_active(
-        ) {
-            // Two plugins: `unspawned-ext` is enabled+extension-capable but
-            // the host never got an entry for it; `sibling-ext` IS spawned
-            // (Running) so `ExtensionHost::is_empty()` is false — this is
-            // what makes the host "otherwise active", the precondition for
-            // `not-running` to mean anything (see `extensions_active`'s doc
-            // on `plugin_doctor`).
-            let tmp = tempfile::NamedTempFile::new().unwrap();
-            let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
-            let mut regs = Registries::new();
-            regs.add_plugin(extension_plugin("unspawned-ext"));
-            regs.add_plugin(extension_plugin("sibling-ext"));
-            let cp = {
-                let persistence =
-                    crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
-                        .await
-                        .unwrap();
-                ControlPlane::new(store, regs, persistence).await
-            };
-            cp.store()
-                .set_setting_raw("plugin.unspawned-ext.enabled", "true")
-                .await
-                .unwrap();
-            cp.store()
-                .set_setting_raw("plugin.sibling-ext.enabled", "true")
-                .await
-                .unwrap();
-            cp.extension_host()
-                .insert_for_test(
-                    "sibling-ext",
-                    SupervisedExtension::fixed_for_test(
-                        fake_spec("linter"),
-                        ExtensionStatus::Running,
-                        vec![],
-                        0,
-                    ),
-                )
-                .await;
-
-            let findings = plugin_doctor(&cp).await.unwrap();
-            let ext_findings: Vec<&DoctorFinding> = findings
-                .iter()
-                .filter(|f| f.plugin_id == "unspawned-ext")
-                .collect();
-            assert_eq!(ext_findings.len(), 1, "got: {findings:?}");
-            assert_eq!(ext_findings[0].kind, "not-running");
-            assert_eq!(ext_findings[0].severity, "warn");
-            assert!(
-                findings.iter().all(|f| f.plugin_id != "sibling-ext"),
-                "the spawned+Running sibling must produce no finding, got: {findings:?}"
-            );
-        }
-
-        #[tokio::test]
-        async fn an_enabled_extension_plugin_produces_no_finding_when_the_host_is_empty() {
-            // The host was never spawned into at all (no `sibling-ext`-style
-            // entry for ANY plugin) — this is the fresh-store / thin-client
-            // case, and must stay silent rather than reporting `not-running`
-            // for `lonely-ext`. Preserves the pre-DT8 invariant that a fresh
-            // `ControlPlane` produces zero findings.
-            let cp = test_cp_with_enabled_extension_plugin("lonely-ext").await;
-            let findings = plugin_doctor(&cp).await.unwrap();
-            assert!(
-                findings.iter().all(|f| f.plugin_id != "lonely-ext"),
-                "an empty host must never synthesize a not-running finding, got: {findings:?}"
-            );
-        }
-    }
+    // NOTE: the former "Extension (Track D) findings — DT8" module
+    // (`mod extension_findings`) was deleted here: every test in it — both
+    // the "finding fires" and "no finding" cases — existed to validate the
+    // `plugin_doctor` extension-capable-plugin branch gated by
+    // `plugin.extension.is_some()`. `CorePlugin.extension` no longer exists
+    // (the v2 SDK manifest has no `[[extension]]` surface), that conjunct is
+    // now a permanent `false` (see the `false` literal in `plugin_doctor`
+    // above), and no plugin can ever be extension-capable — so this whole
+    // finding is permanently dormant pending Task 3's full deletion of
+    // Track D subprocess extensions.
 
     // ---------- WASM-component lifecycle findings — Task 17b ----------
     // Each test seeds the minimal ledger + on-disk bundle state that triggers
@@ -1230,7 +986,7 @@ pub(crate) mod tests {
         /// (e.g. an `[[oauth]]` block or `provider-ids`).
         fn manifest(id: &str, version: &str, wit_api: &str, body: &str) -> String {
             format!(
-                "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"{wit_api}\"\nlifecycle = \"singleton\"\ncomponent = \"plugin.wasm\"\n{body}"
+                "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"plugin.wasm\"\nwit-api = \"{wit_api}\"\nlifecycle = \"singleton\"\n\n{body}"
             )
         }
 
@@ -1561,7 +1317,7 @@ pub(crate) mod tests {
                 "acme-provider",
                 "0.1.0",
                 "^0.1.0",
-                "provider-ids = [\"acme-free\"]\n",
+                "[provider]\nids = [\"acme-free\"]\n",
             );
             let sha = write_bundle(
                 root.path(),

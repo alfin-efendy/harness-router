@@ -31,7 +31,6 @@ use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 use crate::connector::{Connector, ConnectorRegistry};
 use crate::gateway::{GatewayFactory, GatewayRegistry};
 use crate::harness::HarnessFactory;
-use crate::plugins::extension::ExtensionFactory;
 use crate::settings::{csv, SettingsStore};
 
 /// Process-wide registry of every `plugin.*` settings key any installed
@@ -120,7 +119,7 @@ fn register_plugin_fields(manifest: &PluginManifest) {
             }
         }
     }
-    let enabled_key = format!("plugin.{}.enabled", manifest.id);
+    let enabled_key = qualified_setting_key(&manifest.id, "enabled");
     fields.insert(
         enabled_key.clone(),
         (
@@ -142,19 +141,35 @@ fn register_plugin_fields(manifest: &PluginManifest) {
 /// Where a plugin's manifest/behavior came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginSource {
-    /// Shipped inside the `ryuzi` binary (the native harness, the discord gateway).
+    /// Shipped inside the `ryuzi` binary: the native harness, provider
+    /// CATALOG rows, and the embedded first-party component manifests.
     Builtin,
-    /// Installed as a skill pack by the skills installer
-    /// (`crate::skills_install`) — carries the manifest's own on-disk
-    /// directory.
-    SkillPack(std::path::PathBuf),
-    /// A signed WASM component bundle shipped first-party from `plugins/<id>`
-    /// (see `crate::plugins::component_catalog`). Registered manifest-only:
-    /// the executable capability is still discovered off disk in
-    /// `daemon::build_daemon` from the *installed* bundle root, so this entry
-    /// exists purely to make the bundle visible and enumerable through
-    /// `list_plugins`.
-    Component,
+    /// Installed on disk under `~/.config/ryuzi/plugins/<id>/`.
+    Installed {
+        dir: std::path::PathBuf,
+        provenance: InstallProvenance,
+    },
+}
+
+/// How an [`PluginSource::Installed`] plugin arrived on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallProvenance {
+    /// Came through the signed catalog feed (first-party verified).
+    Catalog,
+    /// Unsigned local folder install.
+    LocalPath,
+    /// Unsigned git-clone install (records the source URL).
+    GitUrl(String),
+}
+
+/// The one namespacing site for a bare v2 settings key: v2 manifests keep
+/// `[[settings]]`/`auth.setting` keys BARE (`token`, not
+/// `plugin.discord.token`); every settings read/write and DTO build that
+/// needs the persisted, store-facing key routes through this so the
+/// `plugin.<id>.<key>` format (unchanged from v1) is constructed in exactly
+/// one place.
+pub fn qualified_setting_key(plugin_id: &str, bare_key: &str) -> String {
+    format!("plugin.{plugin_id}.{bare_key}")
 }
 
 /// A manifest bound to the behavioral capabilities it advertises. Each
@@ -165,15 +180,8 @@ pub struct CorePlugin {
     pub harness: Option<Arc<dyn HarnessFactory>>,
     pub gateway: Option<Arc<dyn GatewayFactory>>,
     pub connector: Option<Arc<dyn Connector>>,
-    /// Supervised subprocess "code plugin" capability (Track D). Mirrors
-    /// `connector` in every way that matters here: a live instance (not a
-    /// factory-by-config), gated by [`PluginHost::is_enabled`] the same way,
-    /// and — like `connector` — deliberately NOT fanned into a registry by
-    /// [`Registries::add_plugin`]; it is consumed directly from the host
-    /// (`plugins::extension::ExtensionHost::spawn_all`).
-    pub extension: Option<Arc<dyn ExtensionFactory>>,
     /// Live WASM component model-provider capability (Task 10). Like
-    /// `connector`/`extension`, a live instance rather than a factory-by-config,
+    /// `connector`, a live instance rather than a factory-by-config,
     /// and deliberately NOT fanned into `Registries` by
     /// [`Registries::add_plugin`]: it is consumed directly — the router looks it
     /// up through the process-wide registry in
@@ -186,7 +194,7 @@ pub struct CorePlugin {
 }
 
 impl CorePlugin {
-    /// Which of the five extension axes this plugin advertises. `runtime`
+    /// Which of the capability axes this plugin advertises. `runtime`
     /// means a live `HarnessFactory` (the native runtime).
     ///
     /// Single source of truth for `ryuzi_core::serve`'s `GET /plugins`
@@ -210,9 +218,6 @@ impl CorePlugin {
         }
         if self.connector.is_some() {
             caps.push("connector");
-        }
-        if self.extension.is_some() {
-            caps.push("extension");
         }
         caps
     }
@@ -337,7 +342,7 @@ impl PluginHost {
             // The native runtime is the only harness and is always enabled.
             return Ok(true);
         }
-        if plugin.source == PluginSource::Component {
+        if plugin.manifest.component.is_some() {
             // PR-2 fix A — one rule, one implementation: the catalog gate and
             // the runtime-attach gate must never disagree (a wedged install
             // would be bindable but never attach), so this delegates to the
@@ -358,7 +363,7 @@ impl PluginHost {
             // `experimental = false`, so this never affects them.
             return Ok(false);
         }
-        if plugin.connector.is_none() && plugin.extension.is_none() {
+        if plugin.connector.is_none() {
             // Manifest-only plugin (e.g. a provider metadata entry
             // with no behavioral capability of its own) — always enabled.
             return Ok(true);
@@ -398,7 +403,7 @@ pub async fn component_plugin_enabled(settings: &SettingsStore, id: &str) -> any
 }
 
 /// Whether `id`'s installed component has every setting its derived auth
-/// requires (the `component_catalog::derive_bundle_auth` contract: an
+/// requires (the `component_catalog::derive_manifest_auth` contract: an
 /// embedded manifest secret+required field, e.g. discord's bot token). `true`
 /// when the embedded bundle manifest declares no such field —
 /// there is nothing to configure, so an enabled component is free to attach —
@@ -414,11 +419,11 @@ pub async fn component_required_settings_configured(
     settings: &SettingsStore,
     id: &str,
 ) -> anyhow::Result<bool> {
-    let Some(bundle) = crate::plugins::component_catalog::declared_bundle_manifest(id) else {
+    let Some(manifest) = crate::plugins::component_catalog::declared_manifest(id) else {
         return Ok(true);
     };
-    for field in bundle.settings.iter().filter(|f| f.secret && f.required) {
-        let key = format!("plugin.{id}.{}", field.key);
+    for field in manifest.settings.iter().filter(|f| f.secret && f.required) {
+        let key = qualified_setting_key(id, &field.key);
         let configured = settings
             .get(&key)
             .await?
@@ -566,7 +571,7 @@ mod tests {
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: id.to_string(),
             version: String::new(),
@@ -580,10 +585,15 @@ mod tests {
             experimental: false,
             auth: None,
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         }
     }
 
@@ -593,7 +603,6 @@ mod tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -605,7 +614,6 @@ mod tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -617,7 +625,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -629,7 +636,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -644,44 +650,31 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
     }
 
-    struct FakeExtensionFactory;
-    #[async_trait]
-    impl crate::plugins::extension::ExtensionFactory for FakeExtensionFactory {
-        async fn extensions(
-            &self,
-            _ctx: &crate::plugins::extension::ExtensionCtx,
-        ) -> anyhow::Result<Vec<crate::plugins::extension::ExtensionSpec>> {
-            Ok(vec![])
-        }
-    }
-
-    fn extension_only(id: &str) -> CorePlugin {
-        CorePlugin {
-            manifest: manifest(id),
-            harness: None,
-            gateway: None,
-            connector: None,
-            extension: Some(Arc::new(FakeExtensionFactory)),
-            provider: None,
-            source: PluginSource::Builtin,
-        }
-    }
-
+    /// A manifest-only component-bundle plugin (`manifest.component` set,
+    /// no live capability) — the v2 replacement for the old
+    /// `PluginSource::Component` marker: component-ness is now read off
+    /// `manifest.component.is_some()` regardless of `source`.
     fn component_only(id: &str) -> CorePlugin {
         CorePlugin {
-            manifest: manifest(id),
+            manifest: PluginManifest {
+                component: Some(ryuzi_plugin_sdk::ComponentSpec {
+                    file: format!("{id}.wasm"),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: ryuzi_plugin_sdk::PluginLifecycle::PerCall,
+                }),
+                version: "0.1.0".to_string(),
+                ..manifest(id)
+            },
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
-            source: PluginSource::Component,
+            source: PluginSource::Builtin,
         }
     }
 
@@ -944,24 +937,6 @@ mod tests {
         assert!(host.is_enabled(&settings, "github").await.unwrap());
     }
 
-    #[tokio::test]
-    async fn is_enabled_extension_only_plugin_defaults_false_until_setting_flips_true() {
-        let (store, settings, _tmp) = open_settings().await;
-        let mut host = PluginHost::new();
-        host.add(extension_only("acme-ext"));
-
-        assert!(
-            !host.is_enabled(&settings, "acme-ext").await.unwrap(),
-            "an extension-capable plugin (like a connector-capable one) must default to disabled"
-        );
-
-        store
-            .set_setting_raw("plugin.acme-ext.enabled", "true")
-            .await
-            .unwrap();
-        assert!(host.is_enabled(&settings, "acme-ext").await.unwrap());
-    }
-
     // PR-2 fix A: a component bundle with an ACTIVE release on disk counts as
     // enabled even when `plugin.<id>.enabled` was never written — the install
     // succeeded, so agents may bind it. Explicit "false" still disables.
@@ -1114,12 +1089,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn capabilities_reports_extension_when_the_axis_is_present() {
-        let plugin = extension_only("acme-ext");
-        assert_eq!(plugin.capabilities(), vec!["extension"]);
-    }
-
     // Task 10's first real collision: a bundle-bridged manifest (discord) now
     // declares `auth.setting` pointing at one of its OWN `settings[]` keys
     // (the derived token auth setting IS the declared field). The doc-stated
@@ -1153,7 +1122,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         };

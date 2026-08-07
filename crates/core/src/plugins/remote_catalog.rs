@@ -13,7 +13,7 @@ use crate::control::ControlPlane;
 use crate::plugins::bundle::ComponentBundleInstaller;
 use crate::settings::SettingsStore;
 use crate::store::{ComponentPluginReleaseRecord, RemoteCatalogRow, Store};
-use ryuzi_plugin_sdk::{PluginBundleManifest, PluginManifest, PluginRelease};
+use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 
 /// Default feed location: the `catalog.json` asset attached to the latest
 /// GitHub release. Overridable via settings for self-hosted feeds.
@@ -672,7 +672,7 @@ pub async fn install_component_release(
     // (larger) wasm download — so a malformed feed fails fast, and to learn the
     // component filename to stage the wasm under. `verify_bundle` re-parses and
     // re-checks everything; this parse only drives staging.
-    let manifest = PluginBundleManifest::from_toml(
+    let manifest = PluginManifest::from_toml(
         std::str::from_utf8(&manifest_bytes).context("fetched ryuzi-plugin.toml is not UTF-8")?,
     )
     .context("parsing fetched ryuzi-plugin.toml")?;
@@ -701,7 +701,10 @@ pub async fn install_component_release(
     //   1. Arbitrary-file-write: the staged wasm filename must stay inside the
     //      staging dir (no absolute path / drive-UNC prefix / `..`).
     //   2. SSRF: the wasm must be fetched from the release base's own origin.
-    sanitize_staged_component(&manifest.component)?;
+    let Some(component) = manifest.component.as_ref() else {
+        anyhow::bail!("release feed manifest `{plugin_id}` declares no [component]");
+    };
+    sanitize_staged_component(&component.file)?;
     require_same_origin(base_url, &release.component_url)?;
 
     // Download the component wasm named by the release.
@@ -718,7 +721,7 @@ pub async fn install_component_release(
     std::fs::write(staging_path.join("plugin.sig"), &sig_bytes)?;
     // Stage the wasm under the exact filename the manifest names; verify_bundle
     // resolves and canonicalizes `manifest.component` against the staging root.
-    let component_dest = staging_path.join(&manifest.component);
+    let component_dest = staging_path.join(&component.file);
     if let Some(parent) = component_dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -897,7 +900,7 @@ mod component_install_tests {
         let wasm = format!("wasm bytes for {id} {version}").into_bytes();
         let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
         let manifest_toml = format!(
-            "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+            "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"{component}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
         )
         .into_bytes();
         let release_json = format!(

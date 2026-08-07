@@ -129,7 +129,7 @@ mod tests {
     /// `register_test_plugin` helper.
     fn register_test_plugin(id: &str) {
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Task7 Test Plugin {id}"),
             version: String::new(),
@@ -156,10 +156,15 @@ mod tests {
                 options: Vec::new(),
                 default: None,
             }],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -167,7 +172,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });

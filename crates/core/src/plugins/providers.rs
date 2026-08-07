@@ -4,9 +4,7 @@
 //! by `llm_router::connections`; the manifest exists purely so a provider
 //! shows up in the plugin host/catalog UI alongside real plugins.
 
-use ryuzi_plugin_sdk::{
-    AuthKind, AuthSpec, ModelDef, PluginManifest, ProviderMeta, CONTRACT_VERSION,
-};
+use ryuzi_plugin_sdk::{AuthKind, AuthSpec, ModelDef, PluginManifest, ProviderSpec, CONTRACT_VERSION};
 
 use crate::llm_router::connections::{self, effective_models};
 use crate::llm_router::registry::{
@@ -95,19 +93,24 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
             experimental: false,
             auth: Some(auth_spec(d.auth)),
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
-            provider: Some(ProviderMeta {
-                format: format_label(d.format).to_string(),
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
+            provider: Some(ProviderSpec {
+                ids: vec![],
+                format: Some(format_label(d.format).to_string()),
                 base_url: d.base_url.map(|s| s.to_string()),
                 models: models_to_defs(d.models),
             }),
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         },
         harness: None,
         gateway: None,
         connector: None,
-        extension: None,
         provider: None,
         source: PluginSource::Builtin,
     }
@@ -188,7 +191,8 @@ mod tests {
         );
 
         let provider = plugin.manifest.provider.expect("provider block");
-        assert_eq!(provider.format, "anthropic");
+        assert_eq!(provider.format.as_deref(), Some("anthropic"));
+        assert!(provider.ids.is_empty());
         assert_eq!(
             provider.base_url.as_deref(),
             Some("https://api.anthropic.com/v1")
