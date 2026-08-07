@@ -1462,7 +1462,6 @@ mod tests {
                 "component-http-import" => "ryuzi_component_http_fixture.wasm",
                 "component-connector" => "ryuzi_component_connector_fixture.wasm",
                 "component-hooks" => "ryuzi_component_hooks_fixture.wasm",
-                "component-hooks-loop" => "ryuzi_component_hooks_loop_fixture.wasm",
                 "component-provider" => "ryuzi_component_provider_fixture.wasm",
                 "component-gateway" => "ryuzi_component_gateway_fixture.wasm",
                 "component-websocket-import" => "ryuzi_component_websocket_fixture.wasm",

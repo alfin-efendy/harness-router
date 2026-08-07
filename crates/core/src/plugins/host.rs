@@ -1113,7 +1113,7 @@ mod tests {
 
     // Final-review fix: enabled ("should this run") and configured ("can it
     // actually start") are separate axes. `discord` is the one embedded
-    // catalog manifest (`component_catalog::declared_bundle_manifest`) with a
+    // catalog manifest (`component_catalog::declared_manifest`) with a
     // `secret + required` settings field (its bot token), so it is the id
     // that exercises the real gate; a synthetic id with no embedded manifest
     // must report configured unconditionally (nothing to configure).

@@ -35,9 +35,10 @@ use crate::plugins::runtime::{CompiledComponent, ComponentInstance, PluginRuntim
 
 /// One enabled component bundle, compiled once and ready to instantiate a
 /// fresh, isolated instance per operation. Shared by the connector adapter
-/// (this module) and the hook adapter ([`crate::plugins::wasm_hooks`]); both
-/// re-instantiate per call so concurrent sessions never share mutable Wasm
-/// state.
+/// (this module) and the MCP bridge ([`crate::plugins::mcp_component`]),
+/// which calls back into [`WasmActivation::connector_invoke`] over the same
+/// `ryuzi:connector/connector` export; both re-instantiate per call so
+/// concurrent sessions never share mutable Wasm state.
 pub struct WasmActivation {
     compiled: Arc<CompiledComponent>,
     ctx: Arc<PluginCapabilityContext>,

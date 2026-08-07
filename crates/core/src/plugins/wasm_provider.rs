@@ -295,7 +295,7 @@ pub fn unregister_wasm_providers_for_plugin(plugin_id: &str) {
 /// ENABLED ones that export `ryuzi:provider/provider`, compile each once, and
 /// register a live [`WasmProviderTransport`] into the process-wide
 /// [`register_wasm_provider`] registry under EACH router provider id the bundle
-/// declares (`PluginBundleManifest::resolved_provider_ids`, which falls back to
+/// declares (`PluginManifest::resolved_provider_ids`, which falls back to
 /// the bundle id when none are declared) — the provider analogue of
 /// [`crate::plugins::wasm_gateway::discover_gateway_components`]. Returns the
 /// provider ids registered (for logging / test cleanup); the daemon consumes no

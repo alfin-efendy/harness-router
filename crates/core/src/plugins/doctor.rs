@@ -29,10 +29,9 @@ pub struct DoctorFinding {
     pub plugin_id: String,
     pub severity: String, // "warn" | "error"
     // "reconnect-required" | "missing-binary" | "attach-failed" | "blocked" |
-    // "slot-conflict" | "not-running" | "crashed" | "restart-exhausted" |
-    // "init-failed" | "signature-invalid" | "hash-mismatch" | "abi-incompatible"
-    // | "revoked" | "policy-violation" | "oauth-profile-unhealthy" |
-    // "gateway-restart-exhausted"
+    // "slot-conflict" | "signature-invalid" | "hash-mismatch" |
+    // "abi-incompatible" | "revoked" | "policy-violation" |
+    // "oauth-profile-unhealthy" | "gateway-restart-exhausted"
     pub kind: String,
     pub message: String,
     pub suggested_action: String,
@@ -424,7 +423,7 @@ fn append_abi_finding(
 /// Finding #5 — policy violations, defined concretely from the EXISTING
 /// manifest + host-policy machinery (no new policy engine):
 ///
-/// 1. Structural: the installed manifest fails [`PluginBundleManifest::validate`]
+/// 1. Structural: the installed manifest fails [`PluginManifest::validate`]
 ///    (e.g. a network allowlist entry that is not a valid host). `error`.
 /// 2. Grant mismatch: the manifest declares router `provider-ids` (requesting
 ///    the `ryuzi:provider-auth` capability) but [`HostPolicy::for_installed_bundle`]
@@ -1237,7 +1236,7 @@ pub(crate) mod tests {
             let (cp, store, _db) = cp_with_store().await;
             let root = tempfile::tempdir().unwrap();
             // A network allowlist entry carrying a scheme is not a valid host, so
-            // `PluginBundleManifest::validate` rejects it.
+            // `PluginManifest::validate` rejects it.
             let m = manifest(
                 "acme-connector",
                 "0.1.0",

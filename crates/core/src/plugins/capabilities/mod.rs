@@ -75,7 +75,7 @@ pub struct PluginCapabilityContext {
     /// `HostPolicy::allow_provider_auth` gates the capability grant on, so one
     /// rule governs both. Host-internal call sites that only need transport
     /// registration may seed it from
-    /// `PluginBundleManifest::resolved_provider_ids` (which falls back to the
+    /// `PluginManifest::resolved_provider_ids` (which falls back to the
     /// bundle id); that never widens a credential grant, because with no
     /// declared `provider-ids` the capability is not linked at all.
     pub provider_ids: Vec<String>,

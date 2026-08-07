@@ -1430,9 +1430,9 @@ pub struct DoctorFinding {
     /// `warn` | `error`.
     pub severity: String,
     /// `reconnect-required` | `missing-binary` | `attach-failed` | `blocked` |
-    /// `slot-conflict` | `not-running` | `crashed` | `restart-exhausted` |
-    /// `init-failed` (the last four are Track D extension findings — DT8,
-    /// see `crate::plugins::doctor::plugin_doctor`'s extension section).
+    /// `slot-conflict` | `signature-invalid` | `hash-mismatch` |
+    /// `abi-incompatible` | `revoked` | `policy-violation` |
+    /// `oauth-profile-unhealthy` | `gateway-restart-exhausted`.
     pub kind: String,
     pub message: String,
     pub suggested_action: String,
@@ -1631,7 +1631,7 @@ pub struct ComponentReleaseDetail {
     /// Task 12 addition — see [`ComponentManifestInfo`]'s doc.
     pub active_manifest: Option<ComponentManifestInfo>,
     /// PR-1 (pre-install metadata): the manifest `id`'s EMBEDDED first-party
-    /// bundle declares (`component_catalog::declared_bundle_manifest`) —
+    /// bundle declares (`component_catalog::declared_manifest`) —
     /// available before any release is fetched, because it is compiled into
     /// the binary. `None` for non-component ids. UI reads
     /// `activeManifest ?? declaredManifest` so the verified on-disk manifest

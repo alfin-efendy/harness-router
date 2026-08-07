@@ -2149,7 +2149,7 @@ async fn plugin_tools(cp: &ControlPlane, id: &str) -> Result<PluginToolsResult, 
     })
 }
 
-/// Step 2's tool source for [`plugin_tools`]: prefer the currently-active
+/// Step 1's tool source for [`plugin_tools`]: prefer the currently-active
 /// installed bundle's on-disk manifest, falling back to the embedded
 /// first-party manifest. Mirrors `plugin_release_detail`'s own
 /// active-release-then-disk read exactly (including gating the disk read on
@@ -6409,7 +6409,7 @@ writes = true
     /// Stages a REAL, `load_active_bundles`-verifiable component bundle
     /// directly at the production [`crate::plugins::bundle::installed_bundle_root`]
     /// path — the exact root `declared_component_tool_entries` reads
-    /// (`plugins_api.rs`'s step-2 tool source). Unlike `doctor.rs`'s
+    /// (`plugins_api.rs`'s step-1 tool source). Unlike `doctor.rs`'s
     /// `WasmComponentDoctorInputs::bundle_root`, `declared_component_tool_entries`
     /// has no injected-root test seam, so pinning its "installed manifest wins
     /// over embedded" precedence has no choice but to write the real per-user
@@ -6627,10 +6627,10 @@ writes = true
     // `SkillPackFixture` and its `plugin_tools_skill_pack_lists_skills` test
     // were deleted here: both exercised `plugins::load_skill_pack_plugins_from`
     // registering a disk-sourced `CorePlugin` (`PluginSource::SkillPack`) for
-    // `plugin_tools`' step-3 skill-pack branch. That loader was deleted in
+    // `plugin_tools`' step-2 skill-pack branch. That loader was deleted in
     // this same v2 manifest migration — full plugin-folder installs are
     // deferred to a later task ("Task 11") — so the scenario is categorically
-    // impossible for now. `plugin_tools`' step 3
+    // impossible for now. `plugin_tools`' step 2
     // (`skills_install::get_installed_skill_pack`) itself is untouched and
     // still covered elsewhere (e.g. `InstalledCuratedPackFixture`-backed
     // tests), since that ledger is independent of the deleted loader.

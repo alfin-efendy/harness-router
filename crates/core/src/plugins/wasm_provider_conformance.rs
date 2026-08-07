@@ -1111,7 +1111,7 @@ const OPENAI_FORMAT_FIXTURES: &[&OpenAiFormatFixture] = &[
 /// battery that grants capabilities itself.
 ///
 /// For every ported provider, the committed `ryuzi-plugin.toml` must:
-/// - parse and validate as a `PluginBundleManifest`;
+/// - parse and validate as a `PluginManifest`;
 /// - declare `provider-ids` EXPLICITLY (the `[id]` fallback does not authorize
 ///   `ryuzi:provider-auth`) and name exactly this provider;
 /// - allowlist exactly one host, and that host must be the host of the

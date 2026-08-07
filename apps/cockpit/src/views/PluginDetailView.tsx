@@ -70,7 +70,7 @@ function formatLedgerTimestamp(ms: number): string {
 // driven entirely by `plugin_release_detail`. Pure helpers here are exported
 // so they stay unit-testable without mounting the view.
 
-/** Human label for a `PluginBundleManifest.lifecycle` value (already a plain
+/** Human label for a `PluginManifest.lifecycle` value (already a plain
  *  kebab-case string on the wire — see `ComponentManifestInfo.lifecycle`). */
 export function componentLifecycleLabel(lifecycle: string): string {
   switch (lifecycle) {

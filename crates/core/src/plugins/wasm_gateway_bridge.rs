@@ -2988,7 +2988,7 @@ mod gateway_impl_tests {
 
     /// Final-review fix: enabled is not the same as configured. `discord` is
     /// the one embedded catalog manifest
-    /// (`component_catalog::declared_bundle_manifest`) with a `secret +
+    /// (`component_catalog::declared_manifest`) with a `secret +
     /// required` settings field (its bot token) — installing this throwaway
     /// fixture component under the literal id `"discord"` is what exercises
     /// `component_required_settings_configured` here, since that check reads

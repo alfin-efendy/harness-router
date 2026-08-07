@@ -22,7 +22,6 @@ Artifacts are written only below each fixture's `target/` directory:
 - `component-http-import/target/wasm32-wasip2/release/ryuzi_component_http_fixture.wasm`
 - `component-connector/target/wasm32-wasip2/release/ryuzi_component_connector_fixture.wasm`
 - `component-hooks/target/wasm32-wasip2/release/ryuzi_component_hooks_fixture.wasm`
-- `component-hooks-loop/target/wasm32-wasip2/release/ryuzi_component_hooks_loop_fixture.wasm`
 
 The script materializes `wit/deps/` from `crates/plugin-sdk/wit/` at build time.
 Neither generated dependency files, Cargo lockfiles, nor `.wasm` artifacts are
@@ -33,10 +32,7 @@ component linking for policy tests. `component-connector` exports
 connector adapter); `component-hooks` exports `ryuzi:hooks/hooks@0.1.0` and
 branches on the payload text (`deny` → reject, `boom` → loop, `spinreject` →
 spin then reject) to exercise the gating deny, fail-open-on-timeout, and
-epoch-isolation paths. `component-hooks-loop` exports the same hooks interface
-but its `handle` always loops (ignoring the payload); paired with
-`component-hooks`'s `spinreject` it proves one component's timeout cannot trip
-another's epoch deadline (per-component engines).
+epoch-isolation paths.
 
 Each fixture exports only the single interface it is testing — component
 runtimes reach a subset-exporting component's export via the per-interface
