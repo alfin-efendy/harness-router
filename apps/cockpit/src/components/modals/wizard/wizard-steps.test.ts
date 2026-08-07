@@ -12,13 +12,43 @@ function input(overrides: Partial<WizardPlanInput> = {}): WizardPlanInput {
     trustRequired: false,
     hasOauthProfiles: false,
     freeBuiltin: false,
+    hasContents: false,
     ...overrides,
   };
 }
 
-test("component connector with oauth + settings includes all six steps", () => {
+test("component connector with oauth + settings includes all six pre-Task-15 steps", () => {
   const steps = planWizardSteps(input({ componentBacked: true, authKind: "oauth", hasSettings: true }));
   expect(steps).toEqual(["overview", "permissions", "install", "connect", "settings", "done"]);
+});
+
+// ---------- Task 15: contents step ----------
+
+test("hasContents inserts 'contents' right after overview", () => {
+  const steps = planWizardSteps(input({ hasContents: true }));
+  expect(steps).toEqual(["overview", "contents", "install", "done"]);
+});
+
+test("contents absent when hasContents is false", () => {
+  const steps = planWizardSteps(input({ hasContents: false }));
+  expect(steps).not.toContain("contents");
+});
+
+test("full order is exactly overview, contents, permissions, install, connect, settings, done when every gate is on", () => {
+  const steps = planWizardSteps(
+    input({
+      hasContents: true,
+      componentBacked: true,
+      authKind: "oauth",
+      hasSettings: true,
+    }),
+  );
+  expect(steps).toEqual(["overview", "contents", "permissions", "install", "connect", "settings", "done"]);
+});
+
+test("trustRequired still forces permissions when hasContents is also true (order stays contents-before-permissions)", () => {
+  const steps = planWizardSteps(input({ kind: "skill-pack", hasContents: true, trustRequired: true }));
+  expect(steps).toEqual(["overview", "contents", "permissions", "install", "done"]);
 });
 
 // Spec A2: a provider still defaults to a connect step (paid providers need an
@@ -87,6 +117,7 @@ test("component with authKind none and no declared oauth profile has no connect 
 
 test("stepLabel maps every step id to its display label", () => {
   expect(stepLabel("overview")).toBe("Overview");
+  expect(stepLabel("contents")).toBe("What you get");
   expect(stepLabel("permissions")).toBe("Permissions");
   expect(stepLabel("install")).toBe("Install");
   expect(stepLabel("connect")).toBe("Connect");

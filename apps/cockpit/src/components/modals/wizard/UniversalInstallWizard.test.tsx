@@ -59,6 +59,9 @@ function detailFixture(): PluginDetail {
       authKind: "oauth",
       toolCount: null,
       skillCount: null,
+      surfaces: [],
+      provenance: null,
+      trusted: true,
     },
     auth: {
       kind: "oauth",
@@ -76,6 +79,10 @@ function detailFixture(): PluginDetail {
     models: [],
     homepage: null,
     publisher: "Notion",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   };
 }
 
@@ -131,6 +138,9 @@ function providerDetailFixture(): PluginDetail {
       authKind: "none",
       toolCount: null,
       skillCount: null,
+      surfaces: [],
+      provenance: null,
+      trusted: true,
     },
     auth: null,
     settings: [],
@@ -138,6 +148,10 @@ function providerDetailFixture(): PluginDetail {
     models: [],
     homepage: null,
     publisher: "Groq",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   };
 }
 
@@ -180,6 +194,9 @@ function familyMemberProviderDetailFixture(): PluginDetail {
       authKind: "none",
       toolCount: null,
       skillCount: null,
+      surfaces: [],
+      provenance: null,
+      trusted: true,
     },
     auth: null,
     settings: [],
@@ -187,6 +204,10 @@ function familyMemberProviderDetailFixture(): PluginDetail {
     models: [],
     homepage: null,
     publisher: "Anthropic",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   };
 }
 
@@ -230,6 +251,9 @@ function tokenAuthDetailFixture(authOverrides: Partial<NonNullable<PluginDetail[
       authKind: "token",
       toolCount: null,
       skillCount: null,
+      surfaces: [],
+      provenance: null,
+      trusted: true,
     },
     auth: {
       kind: "token",
@@ -248,6 +272,10 @@ function tokenAuthDetailFixture(authOverrides: Partial<NonNullable<PluginDetail[
     models: [],
     homepage: null,
     publisher: "GitHub (official)",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   };
 }
 
@@ -287,6 +315,9 @@ function skillPackDetailFixture(): PluginDetail {
       authKind: "none",
       toolCount: null,
       skillCount: null,
+      surfaces: [],
+      provenance: null,
+      trusted: true,
     },
     auth: null,
     settings: [],
@@ -294,6 +325,10 @@ function skillPackDetailFixture(): PluginDetail {
     models: [],
     homepage: null,
     publisher: "Superpowers",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   };
 }
 
@@ -614,6 +649,53 @@ test("the progress bar has one segment per planned step", async () => {
   const dialog = screen.getByRole("dialog", { name: "Install Notion" });
   const segments = dialog.querySelectorAll(".rounded-full.h-1, .h-1.rounded-full");
   expect(segments.length).toBe(6);
+});
+
+// ---------- Task 15: "What you get" contents step ----------
+
+test("hasContents inserts a 'What you get' step right after overview and renders the plugin's commands/skills", async () => {
+  detailData = { ...detailFixture(), commands: ["review", "deploy"], skills: ["release-notes"] };
+  await renderWizard();
+
+  const dialog = screen.getByRole("dialog", { name: "Install Notion" });
+  expect(within(dialog).getByText("Step 1 of 7 — Overview")).toBeTruthy();
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  expect(within(dialog).getByText("Step 2 of 7 — What you get")).toBeTruthy();
+  expect(within(dialog).getByText("/review")).toBeTruthy();
+  expect(within(dialog).getByText("/deploy")).toBeTruthy();
+  expect(within(dialog).getByText("release-notes")).toBeTruthy();
+});
+
+test("a plugin declaring only hooks/jobs (no commands/skills) still plans the contents step, with a hooks/jobs summary line", async () => {
+  detailData = {
+    ...detailFixture(),
+    hooks: [
+      {
+        id: "h1",
+        name: "notion/sync",
+        trigger: "session.end",
+        triggerAlias: "Stop",
+        action: "webhook.outbound",
+        enabled: true,
+        needsTarget: false,
+      },
+    ],
+    jobs: [{ id: "j1", name: "Nightly sync", schedule: "0 3 * * *", enabled: true, needsTarget: false }],
+  };
+  await renderWizard();
+  const dialog = screen.getByRole("dialog", { name: "Install Notion" });
+
+  act(() => within(dialog).getByRole("button", { name: "Continue" }).click());
+  expect(within(dialog).getByText("Step 2 of 7 — What you get")).toBeTruthy();
+  expect(within(dialog).getByText(/Also installs 1 automation hook and 1 scheduled job/)).toBeTruthy();
+});
+
+test("a plugin with no commands/skills/hooks/jobs plans no contents step", async () => {
+  await renderWizard();
+  const dialog = screen.getByRole("dialog", { name: "Install Notion" });
+  expect(within(dialog).queryByText(/What you get/)).toBeNull();
+  expect(within(dialog).getByText("Step 1 of 6 — Overview")).toBeTruthy();
 });
 
 test("Continue advances to the next step and updates the header", async () => {

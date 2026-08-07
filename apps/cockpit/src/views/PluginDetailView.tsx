@@ -35,6 +35,7 @@ import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
 import type { WizardStepId } from "@/components/modals/wizard/wizard-steps";
 import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
+import { PluginContentsList } from "@/components/plugins/PluginContentsList";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { deriveSetupChecklist, SetupChecklist } from "@/components/plugins/SetupChecklist";
 import { declaredToolEntries } from "@/lib/plugin-hub";
@@ -1152,30 +1153,7 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
 
         {activeTab === "contents" && (
           <div data-testid="tab-panel-contents">
-            {detail.commands.length > 0 && (
-              <Card className="mb-3">
-                <CardHeader>
-                  <CardTitle>Commands</CardTitle>
-                </CardHeader>
-                {detail.commands.map((name) => (
-                  <CardRow key={name}>
-                    <span className="min-w-0 flex-1 truncate font-mono text-xs">/{name}</span>
-                  </CardRow>
-                ))}
-              </Card>
-            )}
-            {detail.skills.length > 0 && (
-              <Card className="mb-3">
-                <CardHeader>
-                  <CardTitle>Skills</CardTitle>
-                </CardHeader>
-                {detail.skills.map((name) => (
-                  <CardRow key={name}>
-                    <span className="min-w-0 flex-1 truncate text-[13px]">{name}</span>
-                  </CardRow>
-                ))}
-              </Card>
-            )}
+            <PluginContentsList commands={detail.commands} skills={detail.skills} />
           </div>
         )}
 
