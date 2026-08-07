@@ -835,6 +835,50 @@ lifecycle = "singleton"
         );
     }
 
+    /// The point of skip-and-warn: a bundle that fails verification must not
+    /// take its healthy siblings down with it. Without this, one stale
+    /// contract-1 install left over from before the v2 migration would blind
+    /// every other plugin on the machine.
+    #[tokio::test]
+    async fn loader_skips_one_bad_bundle_but_still_loads_a_good_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+
+        for plugin_id in ["acme-connector", "good-plugin"] {
+            let staging = tempfile::tempdir().unwrap();
+            write_valid_bundle_for_plugin(
+                staging.path(),
+                &signing_key(),
+                KEY_ID,
+                plugin_id,
+                "0.1.0",
+            );
+            installer
+                .install_verified(verify_bundle(staging.path(), &trusted_keys()).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // Tamper with exactly one of the two installed bundles.
+        fs::write(
+            root.path().join("acme-connector/0.1.0/acme_connector.wasm"),
+            b"mutated after installation",
+        )
+        .unwrap();
+
+        let loaded = load_active_bundles(root.path(), &store)
+            .await
+            .expect("a rejected bundle must not fail the whole load");
+        let ids: Vec<&str> = loaded.iter().map(|b| b.manifest.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["good-plugin"],
+            "the untampered sibling must still load while the tampered one is skipped"
+        );
+    }
+
     #[tokio::test]
     async fn failed_activation_after_pointer_restores_pointer_and_database_state() {
         let root = tempfile::tempdir().unwrap();
