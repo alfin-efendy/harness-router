@@ -843,6 +843,21 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
         Err(_) => return,
     };
     for job in jobs.into_iter().filter(|j| j.enabled) {
+        // I1 fix: `job.enabled` alone used to gate firing, so disabling a
+        // plugin left its `[[jobs]]` presets still due-checked and firing —
+        // the scheduler-side twin of `automation::list_enabled_hooks`'s bug.
+        // A job with no `plugin_id` (user-created) is unaffected; a
+        // plugin-owned job is skipped unless its owner reads explicitly
+        // enabled, matching every other plugin-enablement read's
+        // default-to-disabled convention.
+        if let Some(plugin_id) = &job.plugin_id {
+            let key = crate::plugins::host::qualified_setting_key(plugin_id, "enabled");
+            let plugin_enabled =
+                store.get_setting_raw(&key).await.ok().flatten().as_deref() == Some("true");
+            if !plugin_enabled {
+                continue;
+            }
+        }
         let key = format!("job_last_fired.{}", job.id);
         let last_fired: i64 = store
             .get_setting(&key)
@@ -1042,6 +1057,98 @@ mod tests {
             .unwrap()
             .expect("liveness recorded");
         assert!(val.parse::<i64>().unwrap() > 0);
+    }
+
+    // I1: a plugin-owned job that's DUE must not fire while its owning
+    // plugin is disabled — the scheduler-side twin of
+    // `automation::list_enabled_hooks_excludes_a_disabled_plugins_hook_but_
+    // keeps_user_hooks`. Bypasses `tick()`'s own first-sighting anchor (a
+    // brand-new job never fires on its first tick — it just anchors) by
+    // seeding `job_last_fired` far in the past, so the job reads as
+    // genuinely due on the very first `tick()` call this test makes.
+    #[tokio::test]
+    async fn tick_skips_a_due_jobs_disabled_plugin_but_fires_once_enabled() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            crate::control::ControlPlane::new(
+                store.clone(),
+                crate::plugins::Registries::new(),
+                persistence,
+            )
+            .await
+        };
+
+        let mut job = sample_job("acme/nightly");
+        job.plugin_id = Some("acme".into());
+        upsert_job(&store, job.clone()).await.unwrap();
+
+        let key = format!("job_last_fired.{}", job.id);
+        let long_ago = crate::paths::now_ms() - 10 * 24 * 60 * 60 * 1000;
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                &key,
+                &long_ago.to_string(),
+            )
+            .await
+            .unwrap();
+
+        // No `plugin.acme.enabled` setting yet (default-to-disabled) — the
+        // fire anchor must not advance at all.
+        tick(&cp).await;
+        assert_eq!(
+            store.get_setting(&key).await.unwrap(),
+            Some(long_ago.to_string()),
+            "a disabled plugin's due job must not fire"
+        );
+
+        // Enable the plugin — the SAME due job must now attempt to fire
+        // (the anchor advances to "now").
+        store
+            .set_setting_raw("plugin.acme.enabled", "true")
+            .await
+            .unwrap();
+        tick(&cp).await;
+        let after: i64 = store
+            .get_setting(&key)
+            .await
+            .unwrap()
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!(
+            after > long_ago,
+            "an enabled plugin's due job must attempt to fire (anchor must advance)"
+        );
+
+        // A user-created job (no plugin_id) is unaffected either way.
+        let mut user_job = sample_job("user/nightly");
+        user_job.plugin_id = None;
+        upsert_job(&store, user_job.clone()).await.unwrap();
+        let user_key = format!("job_last_fired.{}", user_job.id);
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                &user_key,
+                &long_ago.to_string(),
+            )
+            .await
+            .unwrap();
+        tick(&cp).await;
+        let user_after: i64 = store
+            .get_setting(&user_key)
+            .await
+            .unwrap()
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!(
+            user_after > long_ago,
+            "a user-created job must never be gated on any plugin's enablement"
+        );
     }
 
     #[tokio::test]

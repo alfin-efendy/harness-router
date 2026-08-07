@@ -1346,6 +1346,20 @@ pub async fn find_inbound_hook(store: &Store, path: &str) -> anyhow::Result<Opti
         .await
 }
 
+/// Every enabled hook for `trigger`, EXCLUDING a plugin-owned row whose
+/// owning plugin is currently disabled.
+///
+/// I1 fix: `automation_hooks.enabled` alone used to gate this query, so
+/// disabling a plugin left its hooks (in particular `webhook.outbound`
+/// presets, which may ship enabled on first sync — see
+/// `plugins::automation_sync`'s module doc) still firing and POSTing to the
+/// plugin author's URL after the user turned the plugin off. Joins against
+/// the `settings` table's `plugin.<plugin_id>.enabled` row for any hook that
+/// carries a `plugin_id`; a row with no `plugin_id` (user-created) is
+/// unaffected — the join only excludes when `plugin_id IS NOT NULL AND
+/// settings.value != 'true'` (covers both an explicit `"false"` and no
+/// setting row at all, matching every other "is this plugin enabled" read's
+/// default-to-disabled convention).
 pub async fn list_enabled_hooks(
     store: &Store,
     trigger: TriggerKind,
@@ -1353,8 +1367,19 @@ pub async fn list_enabled_hooks(
     let trigger = trigger.as_str().to_string();
     store
         .with_conn(move |c| {
+            let cols: String = HOOK_COLUMNS
+                .split(',')
+                .map(|col| format!("h.{col}"))
+                .collect::<Vec<_>>()
+                .join(",");
             let mut statement = c.prepare(&format!(
-                "SELECT {HOOK_COLUMNS} FROM automation_hooks WHERE enabled=1 AND trigger_kind=?1 ORDER BY created_at DESC"
+                "SELECT {cols} FROM automation_hooks h \
+                 LEFT JOIN settings s \
+                   ON h.plugin_id IS NOT NULL \
+                   AND s.key = 'plugin.' || h.plugin_id || '.enabled' \
+                 WHERE h.enabled=1 AND h.trigger_kind=?1 \
+                   AND (h.plugin_id IS NULL OR s.value='true') \
+                 ORDER BY h.created_at DESC"
             ))?;
             let hooks = statement
                 .query_map(params![trigger], hook_from)?
@@ -3046,6 +3071,87 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // I1: `list_enabled_hooks` (the scheduler-adjacent trigger fan-out's
+    // read side, `control.rs`'s only caller) must exclude an enabled hook
+    // whose OWNING PLUGIN is disabled — the class of bug that let a
+    // `webhook.outbound` preset (which may ship enabled on first sync, per
+    // `plugins::automation_sync`'s module doc) keep POSTing to its author's
+    // URL after the user disabled the plugin.
+    #[tokio::test]
+    async fn list_enabled_hooks_excludes_a_disabled_plugins_hook_but_keeps_user_hooks() {
+        let (store, _db) = mem_store().await;
+        let plugin_hook = HookRow {
+            id: new_id(),
+            name: "acme/notify".into(),
+            trigger_kind: TriggerKind::SessionEnd,
+            action_kind: ActionKind::WebhookOutbound,
+            enabled: true,
+            inbound_path: None,
+            action: HookActionInput::WebhookOutbound(WebhookOutboundAction {
+                url: "https://acme.example.com/webhook".into(),
+                method: "POST".into(),
+                headers: Vec::new(),
+                payload_template: None,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, plugin_hook.clone()).await.unwrap();
+
+        let user_hook = create_hook(
+            &store,
+            HookInput::outbound(
+                "User hook",
+                TriggerKind::SessionEnd,
+                "https://example.org",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        // No `plugin.acme.enabled` setting yet — the default-to-disabled
+        // convention every other plugin-enablement read uses.
+        let enabled = list_enabled_hooks(&store, TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        let names: Vec<&str> = enabled.iter().map(|h| h.name.as_str()).collect();
+        assert!(
+            !names.contains(&"acme/notify"),
+            "a plugin hook must not fire while its plugin is disabled (no setting), got: {names:?}"
+        );
+        assert!(
+            names.contains(&user_hook.name.as_str()),
+            "a user-created hook (no plugin_id) must be unaffected, got: {names:?}"
+        );
+
+        // Explicit "false" — same exclusion.
+        store
+            .set_setting_raw("plugin.acme.enabled", "false")
+            .await
+            .unwrap();
+        let enabled = list_enabled_hooks(&store, TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        assert!(!enabled.iter().any(|h| h.name == "acme/notify"));
+
+        // Enabling the plugin lets its hook fire again.
+        store
+            .set_setting_raw("plugin.acme.enabled", "true")
+            .await
+            .unwrap();
+        let enabled = list_enabled_hooks(&store, TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        let names: Vec<&str> = enabled.iter().map(|h| h.name.as_str()).collect();
+        assert!(
+            names.contains(&"acme/notify"),
+            "an enabled plugin's hook must fire again, got: {names:?}"
+        );
+        assert!(names.contains(&user_hook.name.as_str()));
     }
 
     #[tokio::test]
