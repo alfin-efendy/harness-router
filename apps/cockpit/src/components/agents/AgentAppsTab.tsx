@@ -9,7 +9,7 @@ import { mutationFromDetail } from "./agentMutation";
 // `detail.pluginTools` ids resolve against installed plugins by their
 // provider segment (see `tool_filter_for_profile` in the native harness,
 // which splits on the first '.' to match
-// `mcp__provider__tool`/`ext__provider__tool`/`wasm__provider__tool`
+// `mcp__provider__tool`/`wasm__provider__tool`
 // names). Catalog pluginTools entries themselves carry the BARE plugin
 // manifest id (one entry per installed plugin — `build_live_catalog`), so
 // for those the provider is simply the id.

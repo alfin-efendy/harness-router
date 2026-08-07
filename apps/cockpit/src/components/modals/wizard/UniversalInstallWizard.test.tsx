@@ -1443,7 +1443,6 @@ test("skill-pack trust path: the permissions step shows the trust prompt, and ac
       skills: ["triage", "review"],
       hookScripts: [],
       totalBytes: 2048,
-      runsCode: false,
       curated: false,
     },
     plugin: null,

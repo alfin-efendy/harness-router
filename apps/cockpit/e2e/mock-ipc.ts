@@ -1145,15 +1145,9 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   // `CatalogStatus` shape.
   catalog_status: { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 },
   refresh_catalog: { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 },
-  // An extension-capable plugin's detail view calls `extension_status` on
-  // mount (Track D observability, DT8) — same "without a fixture the
-  // unmocked fallback returns `null` and the view crashes" lesson as
-  // `catalog_status` above. Empty list is a safe default (no plugin in these
-  // fixtures declares an `extension` capability).
-  extension_status: [],
   // Task 12: PluginsView's retryable bootstrap banner calls this on mount —
   // same "without a fixture the unmocked fallback returns `null` and the
-  // view crashes" lesson as `catalog_status`/`extension_status` above.
+  // view crashes" lesson as `catalog_status` above.
   // `plugin_release_detail` (the other Task 12 mount-time call) is dispatched
   // dynamically further down instead of listed here, since it takes an `id`.
   component_bootstrap_status: { pending: false, message: null },

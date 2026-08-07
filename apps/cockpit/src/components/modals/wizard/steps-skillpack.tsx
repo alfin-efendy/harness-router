@@ -1,7 +1,7 @@
 import { CircleAlert } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Badge, Button, Switch } from "@ryuzi/ui";
+import { Button, Switch } from "@ryuzi/ui";
 import { commands } from "@/bindings";
 import { StatusDot } from "@/components/common/bits";
 import { LOCAL_RUNNER } from "@/lib/session-key";
@@ -10,7 +10,6 @@ import { useMountedRef } from "./steps-component";
 import type { WizardCtx } from "./UniversalInstallWizard";
 
 const WARN = "#F59E0B";
-const DANGER = "#EF4444";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -133,19 +132,6 @@ export function SkillTrustStep({ ctx }: { ctx: WizardCtx; onNext: () => void }) 
           ? "This is a curated pack, but it runs code — review what it installs before Cockpit trusts it."
           : "This source isn't a curated pack — review what it installs before Cockpit trusts it."}
       </p>
-
-      {trust.runsCode && (
-        <div
-          className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-[12.5px] font-medium"
-          style={{ borderColor: DANGER, color: DANGER }}
-        >
-          <CircleAlert aria-hidden size={16} strokeWidth={2} className="shrink-0" />
-          <span className="flex items-center gap-2">
-            <Badge variant="destructive">Runs code</Badge>
-            This plugin runs code in a supervised subprocess — review it carefully before trusting it.
-          </span>
-        </div>
-      )}
 
       <div className="flex flex-col gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]">
         <div>

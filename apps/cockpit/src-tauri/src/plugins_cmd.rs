@@ -8,9 +8,8 @@
 //! `cancel_plugin_install`), the skill/plugin distribution surface
 //! (`begin_skill_install` / `confirm_skill_install` / `update_plugin` /
 //! `update_all_plugins` / `set_plugin_pin` / `plugin_doctor` /
-//! `plugins_restart_required`), the remote catalog surface
-//! (`refresh_catalog` / `catalog_status`), and the extension (Track D "code
-//! plugin") observability surface (`extension_status`).
+//! `plugins_restart_required`), and the remote catalog surface
+//! (`refresh_catalog` / `catalog_status`).
 //!
 //! Behavior change from the pre-daemon version: `begin_plugin_oauth` and
 //! `begin_plugin_install` no longer open the system browser directly — the
@@ -45,11 +44,10 @@ use tokio::sync::oneshot;
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
     CatalogStatus, ComponentBootstrapStatus, ComponentManifestInfo, ComponentOauthProfileInfo,
-    ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, ExtensionStatusEntry,
-    PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo, PluginInstallBeginResult,
-    PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, PluginProfilePkceStart,
-    PluginToolEntry, PluginToolsResult, SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto,
-    UpdateOutcomeEntry,
+    ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, PluginAuthInfo, PluginDetail,
+    PluginFieldInfo, PluginInfo, PluginInstallBeginResult, PluginMcpInfo, PluginOauthBeginResult,
+    PluginProfileDeviceFlowStart, PluginProfilePkceStart, PluginToolEntry, PluginToolsResult,
+    SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -935,24 +933,6 @@ pub async fn refresh_catalog(engine: Engine<'_>, runner_id: Option<String>) -> R
 pub async fn catalog_status(engine: Engine<'_>, runner_id: Option<String>) -> R<CatalogStatus> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client.rpc("catalog_status", serde_json::json!({})).await
-}
-
-// ---------- Extension (Track D "code plugin") observability: DT8 ----------
-
-/// Per-extension live state (running/starting/restarting/failed/stopped/
-/// not-running), restart count, and sanitized last error — one entry per
-/// extension the daemon's `ExtensionHost` currently knows about, across
-/// every enabled extension-capable plugin. Read-only, never mutates state
-/// (no spawn/restart/shutdown). `PluginDetailView` calls this for an
-/// extension-capable plugin and filters the result down to its own `id`.
-#[tauri::command]
-#[specta::specta]
-pub async fn extension_status(
-    engine: Engine<'_>,
-    runner_id: Option<String>,
-) -> R<Vec<ExtensionStatusEntry>> {
-    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client.rpc("extension_status", serde_json::json!({})).await
 }
 
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------

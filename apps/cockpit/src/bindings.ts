@@ -1794,22 +1794,6 @@ async catalogStatus(runnerId: string | null) : Promise<Result<CatalogStatus, Cmd
 }
 },
 /**
- * Per-extension live state (running/starting/restarting/failed/stopped/
- * not-running), restart count, and sanitized last error — one entry per
- * extension the daemon's `ExtensionHost` currently knows about, across
- * every enabled extension-capable plugin. Read-only, never mutates state
- * (no spawn/restart/shutdown). `PluginDetailView` calls this for an
- * extension-capable plugin and filters the result down to its own `id`.
- */
-async extensionStatus(runnerId: string | null) : Promise<Result<ExtensionStatusEntry[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("extension_status", { runnerId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * The release ledger for a component plugin (mimo/opencode today): every
  * recorded release plus the active version and (Task 12) the active
  * version's manifest-derived permission metadata. Read-only, never mutates
@@ -2521,45 +2505,6 @@ kind: string; message: string; suggestedAction: string }
 export type EffectiveEffortSource = "project" | "session" | "routeTarget" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
-/**
- * `extension_status` rpc result — one entry per extension (Track D "code
- * plugin") the daemon's `ExtensionHost` currently knows about (DT8). Mirrors
- * `plugins::extension::{ExtensionSnapshot, ExtensionStatus}` flattened into
- * a specta-able, UI-friendly shape (same rationale as `DoctorFinding`
- * mirroring `plugins::doctor::DoctorFinding`) rather than deriving `Type` on
- * the core enum directly. `crate::api::extension_status_api` builds these
- * field by field (no `From` impl) since `ExtensionStatus::Failed`'s reason
- * needs to fan out into both `status` (the canned string) and `last_error`
- * (the sanitized detail) — a single `From` conversion would need the same
- * branching anyway.
- */
-export type ExtensionStatusEntry = { pluginId: string;
-/**
- * The manifest's `[[extension]] name` — unique within its own plugin,
- * not globally (mirrors `ExtensionSnapshot::name`'s own namespace note).
- */
-name: string;
-/**
- * `running` | `starting` | `restarting` | `failed` | `stopped` |
- * `not-running` (the last one has no `ExtensionStatus` counterpart — it
- * means the plugin declares an extension and is enabled, but the host
- * has no spawned entry for it at all, e.g. a still-pending spawn or a
- * resolution failure prior to ever reaching `Failed`).
- */
-status: string;
-/**
- * Lifetime count of restart attempts DT4's supervisor has made for this
- * entry. Always `0` for an entry that has never needed a restart
- * (including the synthetic `not-running` entries, which were never
- * spawned at all).
- */
-restartCount: number;
-/**
- * Present only when `status == "failed"` — `ExtensionStatus::Failed`'s
- * already-sanitized reason (`proc::sanitize_init_error`/the
- * `restart-exhausted: ...` marker), never extension-supplied raw text.
- */
-lastError: string | null; confirmedEvents: string[]; toolCount: number }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string;
 /**
@@ -3076,17 +3021,10 @@ export type TriggerKind = "session.start" | "tool.before" | "tool.after" | "sess
  */
 export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number;
 /**
- * Mirrors `TrustPrompt::runs_code`: true when the staged manifest
- * declares `[[extension]]` (code execution, Track D) — the wizard must
- * show a distinct warning for this, not just fold it into the
- * hook-script list.
- */
-runsCode: boolean;
-/**
  * Mirrors `TrustPrompt::curated`: true when the source is one of the
- * curated skill packs, so this prompt only exists because `runs_code`
- * is true — the wizard uses this to avoid the misleading "this source
- * isn't curated" framing for a curated-but-code-running install.
+ * curated skill packs — surfaced so the wizard can distinguish "this
+ * prompt exists because the source is arbitrary/unvetted" from a
+ * curated source that still stops here for some other reason.
  */
 curated: boolean }
 export type TurnInput = { text: string; mentions?: AgentMention[]; context: ChatContextArg | null; attachments?: string[]; git: GitOptions | null }

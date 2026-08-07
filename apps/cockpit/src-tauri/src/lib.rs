@@ -225,7 +225,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             audit_cmd::list_audit,
             plugins_cmd::refresh_catalog,
             plugins_cmd::catalog_status,
-            plugins_cmd::extension_status,
             plugins_cmd::plugin_release_detail,
             plugins_cmd::install_component_plugin,
             plugins_cmd::rollback_component_plugin,

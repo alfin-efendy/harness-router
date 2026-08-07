@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { DoctorFinding, ExtensionStatusEntry, PluginDetail, PluginToolEntry } from "@/bindings";
+import type { DoctorFinding, PluginDetail, PluginToolEntry } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
@@ -180,52 +180,6 @@ const freshDetail: PluginDetail = {
     configured: false,
     kind: "integration",
     installed: false,
-    family: null,
-    pinned: false,
-    sourceSpec: null,
-    resolvedCommit: null,
-    installedAt: null,
-    updatedAt: null,
-    trustTier: null,
-    catalogVersion: null,
-    componentBacked: false,
-    blockedReason: null,
-    status: "not-installed",
-    statusDetail: null,
-    authKind: "none",
-    toolCount: null,
-    skillCount: null,
-  },
-  auth: null,
-  settings: [],
-  mcp: [],
-  models: [],
-  homepage: null,
-  publisher: "Acme",
-};
-
-// A plugin declaring an `[[extension]]` (Track D "code plugin") capability —
-// exercises the Extension status card (DT8), gated on
-// `info.capabilities.includes("extension")`.
-const extensionDetail: PluginDetail = {
-  info: {
-    id: "acme-ext",
-    name: "Acme Ext",
-    description: "Ships a supervised extension subprocess.",
-    icon: "sparkles",
-    categories: [],
-    slot: null,
-    ownsSlot: false,
-    verified: false,
-    experimental: false,
-    enabled: true,
-    source: "catalog",
-    capabilities: ["extension"],
-    configured: false,
-    kind: "integration",
-    // enabled: true above → installed_flag's `configured || enabled` is true
-    // (needed so the Health tab, which carries the Extension card, exists).
-    installed: true,
     family: null,
     pinned: false,
     sourceSpec: null,
@@ -492,7 +446,6 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "acme-rich") return ok(richFieldsDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
   if (id === "acme-fresh") return ok(freshDetail);
-  if (id === "acme-ext") return ok(extensionDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
   // First-party component (WASM bundle) plugins are registered manifest-only
   // now, so `plugin_detail` resolves them. The release ledger + install gate
@@ -520,8 +473,6 @@ const pluginsRestartRequired = mock(() => ok(false));
 const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
 let doctorFindingsFixture: DoctorFinding[] = [];
 const pluginDoctor = mock(() => ok(doctorFindingsFixture));
-let extensionStatusFixture: ExtensionStatusEntry[] = [];
-const extensionStatus = mock(() => ok(extensionStatusFixture));
 const updatePlugin = mock((_runnerId: string, _id: string, _force: boolean) => ok({ kind: "updated" as const }));
 const setPluginPin = mock((_runnerId: string, id: string, pinned: boolean, _reason: string | null) => {
   if (id === "acme-pack") acmePackPinned = pinned;
@@ -730,7 +681,6 @@ mock.module("@/bindings", () => ({
     updatePlugin,
     setPluginPin,
     uninstallPlugin,
-    extensionStatus,
     pluginReleaseDetail,
     installComponentPlugin,
     rollbackComponentPlugin,
@@ -763,7 +713,6 @@ beforeEach(() => {
   updatePlugin.mockClear();
   setPluginPin.mockClear();
   uninstallPlugin.mockClear();
-  extensionStatus.mockClear();
   pluginReleaseDetail.mockClear();
   installComponentPlugin.mockClear();
   rollbackComponentPlugin.mockClear();
@@ -772,7 +721,6 @@ beforeEach(() => {
   setPluginOauthClientId.mockClear();
   pluginTools.mockClear();
   doctorFindingsFixture = [];
-  extensionStatusFixture = [];
   acmePackPinned = false;
   mimoReleaseFixture = emptyReleaseDetail("mimo");
   componentReleaseFixtures = {};
@@ -1224,85 +1172,6 @@ test("omits the attach-failed banner when doctor has no finding for this plugin"
   expect(screen.queryByText("Attach failed")).toBeNull();
 });
 
-// ---------- Extension (Track D "code plugin") status card — DT8 ----------
-
-test("a non-extension plugin never calls extension_status and renders no Extension card", async () => {
-  render(<PluginDetailView id="github" />);
-  await screen.findByText("GitHub");
-
-  expect(extensionStatus).not.toHaveBeenCalled();
-  expect(screen.queryByText("Extension")).toBeNull();
-  expect(screen.queryByText("Runs code")).toBeNull();
-});
-
-test("an extension-capable plugin fetches extension_status and shows the Runs code badge", async () => {
-  extensionStatusFixture = [];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-
-  // "Runs code" is a hero badge (always visible); the Extension card itself
-  // moved into the Health tab.
-  expect(screen.getByText("Runs code")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-  expect(await screen.findByText("Extension")).toBeTruthy();
-  await waitFor(() => expect(extensionStatus).toHaveBeenCalled());
-  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
-});
-
-test("renders a Running extension's status badge", async () => {
-  extensionStatusFixture = [
-    {
-      pluginId: "acme-ext",
-      name: "linter",
-      status: "running",
-      restartCount: 0,
-      lastError: null,
-      confirmedEvents: ["tool.before"],
-      toolCount: 2,
-    },
-  ];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-
-  expect(await screen.findByText("linter")).toBeTruthy();
-  expect(screen.getByText("Running")).toBeTruthy();
-  expect(screen.queryByText(/restart/)).toBeNull();
-});
-
-test("renders a Failed extension's restart count and sanitized last error", async () => {
-  extensionStatusFixture = [
-    {
-      pluginId: "acme-ext",
-      name: "linter",
-      status: "failed",
-      restartCount: 5,
-      lastError: "linter: restart-exhausted: 5 restarts within 300s",
-      confirmedEvents: [],
-      toolCount: 0,
-    },
-  ];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-
-  expect(await screen.findByText("Failed")).toBeTruthy();
-  expect(screen.getByText("5 restarts")).toBeTruthy();
-  expect(screen.getByText("linter: restart-exhausted: 5 restarts within 300s")).toBeTruthy();
-});
-
-test("extension_status entries for a different plugin are filtered out", async () => {
-  extensionStatusFixture = [
-    { pluginId: "other-plugin", name: "other", status: "running", restartCount: 0, lastError: null, confirmedEvents: [], toolCount: 0 },
-  ];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-
-  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
-  expect(screen.queryByText("other")).toBeNull();
-});
-
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
 //
 // mimo/opencode are registered manifest-only `CorePlugin`s now, so
@@ -1708,9 +1577,8 @@ test("initialTab deep-link is honored when the tab is visible (App.tsx's Fix →
 });
 
 test("initialTab snaps back to overview when the requested tab isn't visible for this plugin", async () => {
-  // github has no doctor findings and isn't an extension plugin, so it has
-  // no Health tab at all — a stale/irrelevant deep link must not strand the
-  // view on dead tab state.
+  // github has no doctor findings, so it has no Health tab at all — a
+  // stale/irrelevant deep link must not strand the view on dead tab state.
   render(<PluginDetailView id="github" initialTab="health" />);
   await screen.findByText("GitHub");
 
