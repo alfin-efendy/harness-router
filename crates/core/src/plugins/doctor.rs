@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use crate::control::ControlPlane;
 use crate::gateway::GatewayRestartHealth;
 use crate::plugins::bundle::InstalledBundle;
-use crate::plugins::extension::ExtensionStatus;
 use crate::plugins::runtime::HostPolicy;
 use crate::settings::SettingsStore;
 use crate::store::{ComponentPluginReleaseRecord, Store};
@@ -97,7 +96,6 @@ pub async fn plugin_doctor_with(
     // (`doctor_is_empty_on_a_fresh_store_and_findings_are_secret_free`) true
     // without special-casing every extension-capable plugin's own enablement
     // check.
-    let extensions_active = !cp.extension_host().is_empty().await;
 
     // Exclusive capability slot conflicts (Feature C2): a later claimant for
     // an already-owned `slot` never became owner (`PluginHost::add` — first
@@ -187,93 +185,6 @@ pub async fn plugin_doctor_with(
                         .unwrap_or_else(|| format!("{id} failed to attach")),
                     suggested_action: format!("Check {id}'s configuration"),
                 });
-            }
-        }
-
-        // 4. Extension (Track D "code plugin") runtime health — DT8. Only
-        // meaningful once we know the host is actually spawning extensions
-        // at all (see `extensions_active`'s doc above) and this plugin
-        // declares `[[extension]]` and is enabled — mirrors
-        // `ExtensionHost::spawn_all`'s own enablement gate exactly, so a
-        // disabled extension plugin never gets a spurious `not-running`.
-        if extensions_active
-            // `CorePlugin.extension` no longer exists — the v2 SDK manifest
-            // has no `[[extension]]` surface, so no plugin can ever be
-            // extension-capable anymore. This conjunct is a permanent
-            // `false` pending Task 3's full deletion of Track D subprocess
-            // extensions (and this whole finding along with it).
-            && false
-            && cp
-                .plugins()
-                .is_enabled(&settings, id)
-                .await
-                .unwrap_or(false)
-        {
-            let snapshots = cp.extension_host().get(id).await;
-            if snapshots.is_empty() {
-                // Enabled and the host is active elsewhere, but nothing was
-                // ever spawned for THIS plugin (e.g. its `ExtensionFactory`
-                // resolution failed, or a spawn is still pending).
-                findings.push(DoctorFinding {
-                    plugin_id: id.clone(),
-                    severity: "warn".into(),
-                    kind: "not-running".into(),
-                    message: format!("{id} declares an extension, but none is currently running"),
-                    suggested_action: format!("Restart the daemon or check {id}'s extension logs"),
-                });
-            }
-            for snap in &snapshots {
-                match &snap.status {
-                    ExtensionStatus::Failed(reason) if reason.starts_with("restart-exhausted") => {
-                        findings.push(DoctorFinding {
-                            plugin_id: id.clone(),
-                            severity: "error".into(),
-                            kind: "restart-exhausted".into(),
-                            message: format!(
-                                "{id}'s extension `{}` gave up restarting: {reason}",
-                                snap.name
-                            ),
-                            suggested_action: format!(
-                                "Check {id}'s extension binary, then re-enable or reinstall {id}"
-                            ),
-                        });
-                    }
-                    ExtensionStatus::Failed(reason) => {
-                        findings.push(DoctorFinding {
-                            plugin_id: id.clone(),
-                            severity: "error".into(),
-                            kind: "init-failed".into(),
-                            message: format!(
-                                "{id}'s extension `{}` failed to start: {reason}",
-                                snap.name
-                            ),
-                            suggested_action: format!(
-                                "Check {id}'s extension binary and configuration"
-                            ),
-                        });
-                    }
-                    ExtensionStatus::Restarting => {
-                        findings.push(DoctorFinding {
-                            plugin_id: id.clone(),
-                            severity: "warn".into(),
-                            kind: "crashed".into(),
-                            message: format!(
-                                "{id}'s extension `{}` crashed and is restarting",
-                                snap.name
-                            ),
-                            suggested_action: format!(
-                                "Watch {id} — repeated crashes will exhaust its restart budget"
-                            ),
-                        });
-                    }
-                    // Running: healthy. Starting: mid-handshake, not yet
-                    // resolved either way. Stopped: a graceful shutdown
-                    // completed (daemon stop or an explicit disable), the
-                    // expected terminal state — not a problem.
-                    ExtensionStatus::Running
-                    | ExtensionStatus::Starting
-                    | ExtensionStatus::Stopped => {}
-                }
             }
         }
     }
