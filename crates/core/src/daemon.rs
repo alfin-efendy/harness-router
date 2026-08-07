@@ -413,6 +413,38 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
+    // v1 -> v2 first-upgrade migration (plugins v2 Task 5): drop any
+    // contract-1 component install trees (+ their release-ledger rows) and
+    // carry a legacy `enabled_gateways` CSV value forward into per-plugin
+    // `plugin.<id>.enabled` keys. MUST run before anything below touches the
+    // plugins install root or the component bootstrap/registries start
+    // registering `plugin.*` fields — see `plugins::migrate_v2`'s module doc.
+    // Non-propagating (warn-and-continue), mirroring the component-bootstrap
+    // block below it: a failure to clean up one leftover install must never
+    // refuse to start the whole daemon — `load_active_bundles` already
+    // skip-and-warns any v1 leftover this migration failed to remove.
+    {
+        let plugins_root = match opts.component_bootstrap.as_ref() {
+            Some(cfg) => cfg.root.clone(),
+            None => crate::plugins::bundle::installed_bundle_root(),
+        };
+        let settings = SettingsStore::new(Arc::clone(&store));
+        match crate::plugins::migrate_v2::run(&store, &settings, &plugins_root).await {
+            Ok(report) if !report.is_empty() => {
+                tracing::info!(
+                    dropped_installs = ?report.dropped_installs,
+                    migrated_gateway_ids = ?report.migrated_gateway_ids,
+                    "plugins: v1 -> v2 first-upgrade migration ran"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "plugins: v1 -> v2 first-upgrade migration failed (continuing boot): {error}"
+                );
+            }
+        }
+    }
     // Auto-connect the MiMo/OpenCode free tiers on first run so a fresh
     // install has runnable models (and the `free` route below has candidates)
     // without any "Add account" step. Idempotent + self-healing: recreates missing built-in free rows on every start.

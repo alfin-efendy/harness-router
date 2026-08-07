@@ -29,6 +29,7 @@ pub mod declarative;
 pub mod doctor;
 pub mod first_party_key;
 pub mod host;
+pub mod migrate_v2;
 pub mod oauth;
 pub mod providers;
 pub mod remote_catalog;

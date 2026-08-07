@@ -16,7 +16,7 @@ CREATE TABLE artifacts (id TEXT PRIMARY KEY,source_session_pk TEXT NOT NULL,sour
 CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT,gateway TEXT,conversation_id TEXT,actor TEXT,action TEXT,tool TEXT,decision TEXT,at INTEGER, session_pk TEXT, origin TEXT);
 CREATE TABLE automation_hook_attempts (run_id TEXT NOT NULL,ordinal INTEGER NOT NULL,started_at INTEGER NOT NULL,finished_at INTEGER,http_status INTEGER,error TEXT,PRIMARY KEY(run_id, ordinal),FOREIGN KEY(run_id) REFERENCES automation_hook_runs(id));
 CREATE TABLE automation_hook_runs (id TEXT PRIMARY KEY NOT NULL,hook_id TEXT NOT NULL,status TEXT NOT NULL,envelope_json TEXT NOT NULL,snapshot_json TEXT NOT NULL,session_pk TEXT,error TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,last_http_status INTEGER,queued_at INTEGER NOT NULL,started_at INTEGER,finished_at INTEGER);
-CREATE TABLE automation_hooks (id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL COLLATE NOCASE UNIQUE,trigger_kind TEXT NOT NULL,action_kind TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,inbound_path TEXT UNIQUE,config_json TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE automation_hooks (id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL COLLATE NOCASE UNIQUE,trigger_kind TEXT NOT NULL,action_kind TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,inbound_path TEXT UNIQUE,config_json TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL, plugin_id TEXT);
 CREATE TABLE background_events (id TEXT PRIMARY KEY NOT NULL,target_session_pk TEXT NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,claimed_by TEXT,delivered_at INTEGER, origin_run_id TEXT);
 CREATE TABLE catalog_feed_state (id INTEGER PRIMARY KEY CHECK (id = 1),sequence INTEGER NOT NULL,updated_at INTEGER NOT NULL,outcome TEXT NOT NULL);
 CREATE TABLE component_plugin_releases (plugin_id TEXT NOT NULL,version TEXT NOT NULL,source_url TEXT NOT NULL,sha256 TEXT NOT NULL,signing_key_id TEXT NOT NULL,installed_at INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 0,revoked INTEGER NOT NULL DEFAULT 0,revocation_reason TEXT,PRIMARY KEY (plugin_id, version));
@@ -27,9 +27,9 @@ CREATE TABLE endpoint_keys (id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',ke
 CREATE TABLE gateway_events (id INTEGER PRIMARY KEY AUTOINCREMENT,gateway_id TEXT NOT NULL,at INTEGER NOT NULL,level TEXT NOT NULL DEFAULT 'info',text TEXT NOT NULL);
 CREATE TABLE gateways (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,host TEXT,port INTEGER,username TEXT,fs_mode TEXT NOT NULL DEFAULT 'projects',paths TEXT NOT NULL DEFAULT '[]',created_at INTEGER, fingerprint TEXT, device_token TEXT);
 CREATE TABLE job_runs (id TEXT PRIMARY KEY,job_id TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'running',started_at INTEGER NOT NULL,finished_at INTEGER,session_pk TEXT,error TEXT,add_lines INTEGER,del_lines INTEGER,note TEXT,log TEXT);
-CREATE TABLE jobs (id TEXT PRIMARY KEY,name TEXT NOT NULL,cron TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'cron',natural_text TEXT NOT NULL DEFAULT '',project_id TEXT NOT NULL,branch TEXT NOT NULL DEFAULT 'main',gateway TEXT NOT NULL DEFAULT 'local',enabled INTEGER NOT NULL DEFAULT 1,prompt TEXT NOT NULL,notify_success INTEGER NOT NULL DEFAULT 0,notify_fail INTEGER NOT NULL DEFAULT 1,created_at INTEGER, pre_check TEXT NOT NULL DEFAULT '', model_override TEXT);
+CREATE TABLE jobs (id TEXT PRIMARY KEY,name TEXT NOT NULL,cron TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'cron',natural_text TEXT NOT NULL DEFAULT '',project_id TEXT NOT NULL,branch TEXT NOT NULL DEFAULT 'main',gateway TEXT NOT NULL DEFAULT 'local',enabled INTEGER NOT NULL DEFAULT 1,prompt TEXT NOT NULL,notify_success INTEGER NOT NULL DEFAULT 0,notify_fail INTEGER NOT NULL DEFAULT 1,created_at INTEGER, pre_check TEXT NOT NULL DEFAULT '', model_override TEXT, plugin_id TEXT);
 CREATE TABLE mcp_agent_access (server_id TEXT NOT NULL,agent_id TEXT NOT NULL,allowed INTEGER NOT NULL DEFAULT 1,PRIMARY KEY (server_id, agent_id));
-CREATE TABLE mcp_servers (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'MCP server',color TEXT NOT NULL DEFAULT '#8B8B8B',description TEXT NOT NULL DEFAULT '',transport TEXT NOT NULL DEFAULT 'stdio',command TEXT,args TEXT NOT NULL DEFAULT '[]',env TEXT NOT NULL DEFAULT '{}',url TEXT,scope TEXT NOT NULL DEFAULT 'global',scope_gateways TEXT NOT NULL DEFAULT '[]',version TEXT,publisher TEXT,status TEXT NOT NULL DEFAULT 'unknown',status_detail TEXT,auth_kind TEXT NOT NULL DEFAULT 'none',auth_detail TEXT,created_at INTEGER);
+CREATE TABLE mcp_servers (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'MCP server',color TEXT NOT NULL DEFAULT '#8B8B8B',description TEXT NOT NULL DEFAULT '',transport TEXT NOT NULL DEFAULT 'stdio',command TEXT,args TEXT NOT NULL DEFAULT '[]',env TEXT NOT NULL DEFAULT '{}',url TEXT,scope TEXT NOT NULL DEFAULT 'global',scope_gateways TEXT NOT NULL DEFAULT '[]',version TEXT,publisher TEXT,status TEXT NOT NULL DEFAULT 'unknown',status_detail TEXT,auth_kind TEXT NOT NULL DEFAULT 'none',auth_detail TEXT,created_at INTEGER, plugin_id TEXT);
 CREATE TABLE mcp_tools (server_id TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',perm TEXT NOT NULL DEFAULT 'ask',PRIMARY KEY (server_id, name));
 CREATE TABLE messages (session_pk TEXT NOT NULL,seq INTEGER NOT NULL,role TEXT NOT NULL,block_type TEXT NOT NULL,payload TEXT NOT NULL,tool_call_id TEXT,status TEXT,tool_kind TEXT,created_at INTEGER NOT NULL, speaker TEXT,PRIMARY KEY (session_pk, seq));
 CREATE VIRTUAL TABLE messages_fts USING fts5( text, session_pk UNINDEXED, seq UNINDEXED, tokenize = 'porter unicode61' );
@@ -105,12 +105,14 @@ CREATE INDEX artifact_references_target_idx ON artifact_references(target_sessio
 CREATE INDEX artifacts_source_session_idx ON artifacts(source_session_pk, created_at);
 CREATE INDEX idx_agent_learning_delivery ON agent_learning_queue(agent_id, status, sequence);
 CREATE INDEX idx_automation_hook_runs_hook ON automation_hook_runs(hook_id, queued_at DESC);
+CREATE INDEX idx_automation_hooks_plugin ON automation_hooks(plugin_id);
 CREATE INDEX idx_background_events_origin ON background_events(origin_run_id, delivered_at);
 CREATE INDEX idx_background_events_target ON background_events(target_session_pk, delivered_at);
 CREATE UNIQUE INDEX idx_component_plugin_releases_active ON component_plugin_releases(plugin_id) WHERE active=1;
 CREATE INDEX idx_context_checkpoints_session ON context_checkpoints(session_pk, boundary_seq);
 CREATE INDEX idx_gateway_events ON gateway_events(gateway_id, at);
 CREATE INDEX idx_job_runs_job ON job_runs(job_id, started_at);
+CREATE INDEX idx_jobs_plugin ON jobs(plugin_id);
 CREATE INDEX idx_messages_session ON messages(session_pk, seq);
 CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);
 CREATE INDEX idx_request_log_conn ON request_log(connection_id, ts);

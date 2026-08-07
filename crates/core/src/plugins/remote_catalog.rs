@@ -557,7 +557,14 @@ fn release_base_url_for(build_tag: Option<&str>, version: Option<&str>) -> Strin
 /// is respected and bootstrap never re-runs. It stays
 /// ABSENT while any bundle is still missing, so a transient failure is retried
 /// on the next boot.
-pub const FIRST_PARTY_BOOTSTRAP_MARKER: &str = "first_party_components_bootstrapped_v1";
+///
+/// `_v2` spelling (plugins v2 Task 5): the v1-marked-string is intentionally
+/// gone, not aliased. `migrate_v2::run` drops every v1 install tree so a
+/// previously-bootstrapped user's mimo/opencode bundles no longer exist
+/// on disk; renaming the marker means their old `..._v1` row simply no
+/// longer matches, `component_bootstrap_status` reads it as "not yet
+/// bootstrapped", and first-party install re-runs to re-seed them.
+pub const FIRST_PARTY_BOOTSTRAP_MARKER: &str = "first_party_components_bootstrapped_v2";
 
 /// Settings key holding a human-readable retry message when the last bootstrap
 /// attempt landed NOTHING (every download/verify failed). Read by the
