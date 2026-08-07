@@ -507,7 +507,15 @@ impl FromStr for TriggerKind {
             "scheduler.run.failed" => Ok(Self::SchedulerRunFailed),
             "gateway.status.changed" => Ok(Self::GatewayStatusChanged),
             "webhook.inbound" => Ok(Self::WebhookInbound),
-            _ => bail!("unknown automation trigger kind: {value}"),
+            // Not a canonical spelling outright — try a Claude Code alias
+            // (`PreToolUse`, `Stop`, ...) before giving up, so API payloads
+            // may use either spelling while serde/DB storage stay canonical.
+            // `canonical_trigger` always resolves to one of the arms above,
+            // so this recursion is exactly one level deep.
+            _ => match ryuzi_plugin_sdk::canonical_trigger(value) {
+                Some(canonical) => Self::from_str(canonical),
+                None => bail!("unknown automation trigger kind: {value}"),
+            },
         }
     }
 }
@@ -671,6 +679,12 @@ pub struct HookRow {
     pub action: HookActionInput,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The plugin that installed this hook, if any (slot-4 origin column).
+    /// `None` for a user-created hook. Written only by
+    /// `plugins::automation_sync` — `create_hook`/`update_hook` (the user-facing
+    /// mutation path) never set this.
+    #[serde(default)]
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -918,8 +932,7 @@ fn inbound_path(trigger_kind: TriggerKind) -> Option<String> {
     (trigger_kind == TriggerKind::WebhookInbound).then(|| format!("wh_{}", Uuid::new_v4().simple()))
 }
 
-const HOOK_COLUMNS: &str =
-    "id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at";
+const HOOK_COLUMNS: &str = "id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at,plugin_id";
 const RUN_COLUMNS: &str = "id,hook_id,status,envelope_json,snapshot_json,session_pk,error,attempt_count,last_http_status,queued_at,started_at,finished_at";
 
 fn sql_json_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> rusqlite::Error {
@@ -1111,6 +1124,7 @@ fn hook_from(row: &Row<'_>) -> rusqlite::Result<HookRow> {
         action: decode_action_from_storage(&config_json).map_err(sql_json_error)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        plugin_id: row.get(9)?,
     })
 }
 
@@ -1176,6 +1190,9 @@ pub async fn create_hook(store: &Store, input: HookInput) -> Result<HookRow, Hoo
         action: input.action,
         created_at: now,
         updated_at: now,
+        // The user-facing create path never attributes a hook to a plugin —
+        // only `plugins::automation_sync::put_hook_row` sets this.
+        plugin_id: None,
     };
     let stored = hook.clone();
     store
@@ -1183,8 +1200,8 @@ pub async fn create_hook(store: &Store, input: HookInput) -> Result<HookRow, Hoo
             let config_json = encode_action_for_storage(&stored.action)
                 .map_err(sql_json_error)?;
             c.execute(
-                "INSERT INTO automation_hooks(id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO automation_hooks(id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at,plugin_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     stored.id,
                     stored.name,
@@ -1195,6 +1212,7 @@ pub async fn create_hook(store: &Store, input: HookInput) -> Result<HookRow, Hoo
                     config_json,
                     stored.created_at,
                     stored.updated_at,
+                    stored.plugin_id,
                 ],
             )?;
             Ok(())
@@ -1407,7 +1425,56 @@ pub async fn delete_hook(store: &Store, id: &str) -> anyhow::Result<()> {
         .await
 }
 
+/// Delete every hook `plugin_id` owns, and — unlike [`delete_hook`], which
+/// deliberately leaves a hook's run history behind as an audit trail — their
+/// run history (`automation_hook_runs` + `automation_hook_attempts`) too.
+/// The uninstall counterpart of `plugins::automation_sync::sync_plugin_automations`;
+/// called only from `plugins::automation_sync::remove_plugin_automations`, so
+/// every plugin-hook lifecycle operation has one obvious home.
+pub async fn delete_hooks_and_runs_for_plugin(
+    store: &Store,
+    plugin_id: &str,
+) -> anyhow::Result<()> {
+    let plugin_id = plugin_id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "DELETE FROM automation_hook_attempts WHERE run_id IN \
+                 (SELECT r.id FROM automation_hook_runs r \
+                  JOIN automation_hooks h ON h.id = r.hook_id WHERE h.plugin_id = ?1)",
+                params![plugin_id],
+            )?;
+            c.execute(
+                "DELETE FROM automation_hook_runs WHERE hook_id IN \
+                 (SELECT id FROM automation_hooks WHERE plugin_id = ?1)",
+                params![plugin_id],
+            )?;
+            c.execute(
+                "DELETE FROM automation_hooks WHERE plugin_id = ?1",
+                params![plugin_id],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// Flip a hook's `enabled` flag. Enabling is refused with a clear,
+/// user-facing message when the hook's action is `agent.run` and it has no
+/// `project_id` yet — a plugin-installed `agent.run` hook lands exactly in
+/// this state on first sync (no target project a plugin could ever guess),
+/// and flipping it on blind would try to run an agent nowhere. Task 16's UI
+/// opens an editor instead of calling this directly for such a row; this is
+/// the backend refusal that makes that necessary regardless of caller.
 pub async fn toggle_hook(store: &Store, id: &str, enabled: bool) -> anyhow::Result<()> {
+    if enabled {
+        if let Some(hook) = get_hook(store, id).await? {
+            if let HookActionInput::AgentRun(config) = &hook.action {
+                if config.project_id.trim().is_empty() {
+                    bail!("pick a project first — this hook has no project to run in");
+                }
+            }
+        }
+    }
     let id = id.to_string();
     let updated_at = now_ms();
     store
@@ -1419,6 +1486,84 @@ pub async fn toggle_hook(store: &Store, id: &str, enabled: bool) -> anyhow::Resu
             if changed == 0 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             }
+            Ok(())
+        })
+        .await
+}
+
+/// Fetch a single hook row by id, or `None` if it does not exist.
+pub async fn get_hook(store: &Store, id: &str) -> anyhow::Result<Option<HookRow>> {
+    let id = id.to_string();
+    store
+        .with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {HOOK_COLUMNS} FROM automation_hooks WHERE id=?1"),
+                params![id],
+                hook_from,
+            )
+            .optional()
+        })
+        .await
+}
+
+/// Look up a hook row by its (unique, NOCASE) `name` — used by
+/// `plugins::automation_sync` to find a plugin's previously-synced row
+/// (named `"{plugin_id}/{def.name}"`) across a re-sync, so its `id` and any
+/// user-set fields survive.
+pub async fn find_hook_by_name(store: &Store, name: &str) -> anyhow::Result<Option<HookRow>> {
+    let name = name.to_string();
+    store
+        .with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {HOOK_COLUMNS} FROM automation_hooks WHERE name=?1"),
+                params![name],
+                hook_from,
+            )
+            .optional()
+        })
+        .await
+}
+
+/// Direct hook-row insert-or-update keyed by `id`, bypassing the
+/// user-input validation `create_hook`/`update_hook` enforce (in particular
+/// `validate_action`'s unconditional non-empty-`project_id` requirement for
+/// `agent.run`). Used only by `plugins::automation_sync`, whose rows may
+/// legitimately be written with an empty `agent.run` target — installed
+/// disabled, with no project a plugin could ever guess. The caller (sync)
+/// owns every merge decision (what a re-sync overwrites vs. preserves);
+/// this just persists whatever fully-formed [`HookRow`] it is given.
+/// `inbound_path` is still managed here exactly like `update_hook`: a
+/// `webhook.inbound` row keeps its existing path (COALESCE) or mints one,
+/// every other trigger clears it.
+pub async fn put_hook_row(store: &Store, hook: HookRow) -> anyhow::Result<()> {
+    store
+        .with_conn(move |c| {
+            let config_json =
+                encode_action_for_storage(&hook.action).map_err(sql_json_error)?;
+            // Candidate inbound_path if this insert wins outright (no existing
+            // row): only webhook.inbound rows ever get one.
+            let candidate_inbound_path = inbound_path(hook.trigger_kind);
+            c.execute(
+                "INSERT INTO automation_hooks(id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at,plugin_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   name=excluded.name, trigger_kind=excluded.trigger_kind, action_kind=excluded.action_kind, \
+                   enabled=excluded.enabled, \
+                   inbound_path=CASE WHEN excluded.trigger_kind='webhook.inbound' THEN COALESCE(automation_hooks.inbound_path, excluded.inbound_path) ELSE NULL END, \
+                   config_json=excluded.config_json, updated_at=excluded.updated_at, plugin_id=excluded.plugin_id",
+                params![
+                    hook.id,
+                    hook.name,
+                    hook.trigger_kind.as_str(),
+                    hook.action_kind.as_str(),
+                    hook.enabled as i64,
+                    candidate_inbound_path,
+                    config_json,
+                    hook.created_at,
+                    hook.updated_at,
+                    hook.plugin_id,
+                ],
+            )?;
             Ok(())
         })
         .await
@@ -2761,5 +2906,172 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
+    }
+
+    #[test]
+    fn trigger_kind_from_str_accepts_claude_aliases_and_stays_canonical() {
+        assert_eq!(
+            TriggerKind::from_str("PreToolUse").unwrap(),
+            TriggerKind::ToolBefore
+        );
+        assert_eq!(
+            TriggerKind::from_str("PostToolUse").unwrap(),
+            TriggerKind::ToolAfter
+        );
+        assert_eq!(
+            TriggerKind::from_str("SessionStart").unwrap(),
+            TriggerKind::SessionStart
+        );
+        assert_eq!(
+            TriggerKind::from_str("Stop").unwrap(),
+            TriggerKind::SessionEnd
+        );
+        assert_eq!(
+            TriggerKind::from_str("SessionEnd").unwrap(),
+            TriggerKind::SessionEnd
+        );
+        // Canonical spellings still resolve directly.
+        assert_eq!(
+            TriggerKind::from_str("tool.before").unwrap(),
+            TriggerKind::ToolBefore
+        );
+        assert!(TriggerKind::from_str("NotARealAlias").is_err());
+    }
+
+    #[tokio::test]
+    async fn put_hook_row_bypasses_validation_and_find_hook_by_name_round_trips() {
+        let (store, _db) = mem_store().await;
+        // An `agent.run` hook with an EMPTY project id would be rejected by
+        // `create_hook`'s `validate_action` — exactly the shape a plugin's
+        // first sync must be able to write (installed disabled, no project
+        // a plugin could ever guess).
+        let row = HookRow {
+            id: new_id(),
+            name: "acme/triage".into(),
+            trigger_kind: TriggerKind::ToolBefore,
+            action_kind: ActionKind::AgentRun,
+            enabled: false,
+            inbound_path: None,
+            action: HookActionInput::AgentRun(AgentRunAction {
+                project_id: String::new(),
+                branch: String::new(),
+                gateway_id: String::new(),
+                prompt: "Triage this".into(),
+                agent_id: None,
+                model_override: None,
+                subtask: false,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, row.clone()).await.unwrap();
+
+        let found = find_hook_by_name(&store, "acme/triage")
+            .await
+            .unwrap()
+            .expect("row must be findable by name");
+        assert_eq!(found.id, row.id);
+        assert_eq!(found.plugin_id.as_deref(), Some("acme"));
+        assert!(!found.enabled);
+
+        assert!(find_hook_by_name(&store, "acme/does-not-exist")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn toggle_hook_refuses_to_enable_a_targetless_agent_run_hook() {
+        let (store, _db) = mem_store().await;
+        let row = HookRow {
+            id: new_id(),
+            name: "acme/triage".into(),
+            trigger_kind: TriggerKind::ToolBefore,
+            action_kind: ActionKind::AgentRun,
+            enabled: false,
+            inbound_path: None,
+            action: HookActionInput::AgentRun(AgentRunAction {
+                project_id: String::new(),
+                branch: String::new(),
+                gateway_id: String::new(),
+                prompt: "Triage this".into(),
+                agent_id: None,
+                model_override: None,
+                subtask: false,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, row.clone()).await.unwrap();
+
+        let error = toggle_hook(&store, &row.id, true).await.unwrap_err();
+        assert!(
+            error.to_string().contains("pick a project first"),
+            "unexpected error message: {error}"
+        );
+        let still_disabled = find_hook_by_name(&store, "acme/triage")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!still_disabled.enabled);
+
+        // Disabling always stays allowed, targetless or not.
+        toggle_hook(&store, &row.id, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_hooks_and_runs_for_plugin_cascades_only_that_plugins_rows() {
+        let (store, _db) = mem_store().await;
+        let owned = HookRow {
+            id: new_id(),
+            name: "acme/notify".into(),
+            trigger_kind: TriggerKind::SessionEnd,
+            action_kind: ActionKind::WebhookOutbound,
+            enabled: true,
+            inbound_path: None,
+            action: HookActionInput::WebhookOutbound(WebhookOutboundAction {
+                url: "https://example.com".into(),
+                method: "POST".into(),
+                headers: Vec::new(),
+                payload_template: None,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, owned.clone()).await.unwrap();
+        let owned_run = create_run(&store, &owned.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        let user_hook = create_hook(
+            &store,
+            HookInput::outbound(
+                "User hook",
+                TriggerKind::SessionEnd,
+                "https://example.org",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let user_run = create_run(&store, &user_hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        delete_hooks_and_runs_for_plugin(&store, "acme")
+            .await
+            .unwrap();
+
+        let remaining_hooks = list_hooks(&store).await.unwrap();
+        assert_eq!(remaining_hooks.len(), 1);
+        assert_eq!(remaining_hooks[0].id, user_hook.id);
+        assert!(list_runs(&store, &owned.id).await.unwrap().is_empty());
+        let user_runs = list_runs(&store, &user_hook.id).await.unwrap();
+        assert_eq!(user_runs.len(), 1);
+        assert_eq!(user_runs[0].id, user_run.id);
+        let _ = owned_run;
     }
 }

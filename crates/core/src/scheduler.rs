@@ -34,6 +34,11 @@ pub struct JobRow {
     /// Model id this job's session should start with, overriding the
     /// project's/agent's default. `None` keeps the ordinary resolution.
     pub model_override: Option<String>,
+    /// The plugin that installed this job, if any (slot-4 origin column).
+    /// `None` for a user-created job. Written only by
+    /// `plugins::automation_sync` — the Scheduler screen's create/update
+    /// commands never set this.
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,7 +184,7 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 const JOB_COLS: &str =
-    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override";
+    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id";
 
 fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
@@ -197,6 +202,7 @@ fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         notify_fail: r.get::<_, i64>(11)? != 0,
         pre_check: r.get(12)?,
         model_override: r.get(13)?,
+        plugin_id: r.get(14)?,
     })
 }
 
@@ -233,25 +239,59 @@ pub async fn upsert_job(store: &Store, job: JobRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
+                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
                  ON CONFLICT(id) DO UPDATE SET \
                    name=excluded.name, cron=excluded.cron, mode=excluded.mode, \
                    natural_text=excluded.natural_text, project_id=excluded.project_id, \
                    branch=excluded.branch, gateway=excluded.gateway, \
                    enabled=excluded.enabled, prompt=excluded.prompt, \
                    notify_success=excluded.notify_success, notify_fail=excluded.notify_fail, \
-                   pre_check=excluded.pre_check, model_override=excluded.model_override",
+                   pre_check=excluded.pre_check, model_override=excluded.model_override, \
+                   plugin_id=excluded.plugin_id",
                 params![
                     job.id, job.name, job.cron, job.mode, job.natural_text, job.project_id,
                     job.branch, job.gateway, job.enabled as i64, job.prompt,
                     job.notify_success as i64, job.notify_fail as i64, job.pre_check,
-                    job.model_override, now
+                    job.model_override, job.plugin_id, now
                 ],
             )
             .map(|_| ())
         })
         .await
+}
+
+/// Delete every job `plugin_id` owns, and their run history — the uninstall
+/// counterpart of `plugins::automation_sync::sync_plugin_automations`. Called
+/// only from `plugins::automation_sync::remove_plugin_automations`.
+pub async fn delete_jobs_and_runs_for_plugin(store: &Store, plugin_id: &str) -> anyhow::Result<()> {
+    let plugin_id = plugin_id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "DELETE FROM job_runs WHERE job_id IN (SELECT id FROM jobs WHERE plugin_id=?1)",
+                params![plugin_id],
+            )?;
+            c.execute("DELETE FROM jobs WHERE plugin_id=?1", params![plugin_id])?;
+            Ok(())
+        })
+        .await
+}
+
+/// Flip a job's `enabled` flag. Enabling is refused with a clear,
+/// user-facing message when the job has no `project_id` yet — a
+/// plugin-installed job lands exactly in this state on first sync (no
+/// target project a plugin could ever guess), and flipping it on blind
+/// would try to run an agent nowhere.
+pub async fn toggle(store: &Store, id: &str, enabled: bool) -> anyhow::Result<()> {
+    let mut job = get_job(store, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("unknown job: {id}"))?;
+    if enabled && job.project_id.trim().is_empty() {
+        anyhow::bail!("pick a project first — this job has no project to run in");
+    }
+    job.enabled = enabled;
+    upsert_job(store, job).await
 }
 
 pub async fn delete_job(store: &Store, id: &str) -> anyhow::Result<()> {
@@ -1024,6 +1064,7 @@ mod tests {
             notify_fail: true,
             pre_check: "git status --short".into(),
             model_override: None,
+            plugin_id: None,
         };
         upsert_job(&store, job.clone()).await.unwrap();
         assert_eq!(get_job(&store, "j1").await.unwrap().unwrap(), job);
@@ -1092,6 +1133,7 @@ mod tests {
             notify_fail: false,
             pre_check: String::new(),
             model_override: None,
+            plugin_id: None,
         }
     }
 

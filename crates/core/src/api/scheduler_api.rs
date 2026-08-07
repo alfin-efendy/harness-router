@@ -165,6 +165,7 @@ async fn create_job(state: &ApiState, input: JobInput) -> Result<Vec<JobInfo>, A
             // Wake-gate editing lands with the scheduler panel rework.
             pre_check: String::new(),
             model_override: input.model_override,
+            plugin_id: None,
         },
     )
     .await?;
@@ -198,6 +199,10 @@ async fn update_job(
             notify_fail: input.notify_fail,
             pre_check: existing.pre_check.clone(),
             model_override: input.model_override,
+            // Editing an existing job never changes its origin attribution —
+            // a plugin-installed job the user fills in a project for stays
+            // attributed to that plugin.
+            plugin_id: existing.plugin_id,
         },
     )
     .await?;
@@ -206,11 +211,12 @@ async fn update_job(
 
 async fn toggle_job(state: &ApiState, id: String, enabled: bool) -> Result<Vec<JobInfo>, ApiError> {
     let cp = &state.cp;
-    let mut job = scheduler::get_job(cp.store(), &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("unknown job: {id}")))?;
-    job.enabled = enabled;
-    scheduler::upsert_job(cp.store(), job).await?;
+    if scheduler::get_job(cp.store(), &id).await?.is_none() {
+        return Err(ApiError::not_found(format!("unknown job: {id}")));
+    }
+    scheduler::toggle(cp.store(), &id, enabled)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     // Re-anchor so enabling doesn't immediately fire a long-past occurrence.
     cp.store()
         .set_setting(
