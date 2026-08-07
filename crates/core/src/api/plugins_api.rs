@@ -2318,6 +2318,16 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
     // history) must not survive — mirrors the mcp cascade just above. A
     // no-op for a plugin that never synced any automation row.
     crate::plugins::automation_sync::remove_plugin_automations(cp.store(), id).await?;
+    // C5 fix: `plugin.<id>.trusted` is Task 11's sole tiered-trust flag —
+    // its only write site is `install_sources::confirm_plugin_install`, and
+    // uninstall never cleared it (only `manifest.settings` keys are deleted
+    // below, and `trusted` is never one of those). Left set, installing a
+    // DIFFERENT source under the SAME id would silently inherit the old
+    // trust grant and skip the trust prompt entirely. A no-op (not an
+    // error) for a plugin that was never unsigned-installed.
+    cp.store()
+        .delete_setting_raw(&crate::plugins::qualified_setting_key(id, "trusted"))
+        .await?;
     match derive_kind(&plugin) {
         Some("provider") => {
             let family = provider_family(id);
@@ -2330,11 +2340,20 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
                 }
                 crate::llm_router::connections::remove_connection(cp.store(), &row.id).await?;
             }
-            // Spec B1: an uninstalled provider must stay off — clear the
-            // transport key or the next hot reload would re-register it.
+            // C4 fix: an uninstalled provider must stay off. DELETING the
+            // key (the old behavior) let `host::component_plugin_enabled`'s
+            // no-explicit-setting fallback ("enabled iff an active release
+            // exists") flip it straight back ON the moment any active
+            // release existed — write an explicit "false" instead, which
+            // wins over that fallback in either direction, and deactivate
+            // any component release so nothing stays "active" for this id.
             cp.store()
-                .delete_setting_raw(&crate::plugins::qualified_setting_key(id, "enabled"))
+                .set_setting_raw(
+                    &crate::plugins::qualified_setting_key(id, "enabled"),
+                    "false",
+                )
                 .await?;
+            cp.store().deactivate_component_releases(id).await?;
             Ok(())
         }
         Some("gateway") => {
@@ -2373,7 +2392,14 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             for field in &plugin.manifest.settings {
                 cp.store().delete_setting_raw(&field.key).await?;
             }
-            if plugin.connector.is_some() && !plugin.manifest.experimental {
+            // C2 fix carried through here: a manifest-only, mcp-declaring
+            // plugin (every source-installed connector — see
+            // `install_installed_plugins`'s doc) is an enableable axis even
+            // with `connector == None`, so it must be flipped off on
+            // uninstall exactly like a live connector would be.
+            if (plugin.connector.is_some() || !plugin.manifest.mcp.is_empty())
+                && !plugin.manifest.experimental
+            {
                 crate::plugins::toggle_enabled(cp.plugins(), &settings, id, false).await?;
             }
             // Component-backed integrations (and the catalog stand-in a
@@ -2384,7 +2410,39 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             cp.store().deactivate_component_releases(id).await?;
             Ok(())
         }
+    }?;
+
+    // C3 fix: a source-installed plugin's `<root>/<id>/<version>/` +
+    // `current` pointer must not survive uninstall — otherwise the next
+    // boot's `install_installed_plugins` scan re-registers it straight off
+    // disk and re-exposes its commands/skills/hooks/jobs, silently undoing
+    // the uninstall the instant the daemon restarts. `dir` is the resolved
+    // VERSION directory (`<root>/<id>/<version>`, the exact path
+    // `install_sources::confirm_plugin_install_at` writes), so its parent is
+    // the whole per-plugin root (`<root>/<id>/`, which also holds the
+    // `current` pointer file) — remove that, not just the one version, so a
+    // stale pointer or an old version directory can't linger either. A
+    // no-op for `PluginSource::Builtin` (first-party/signed-catalog rows
+    // never use this module's install root at all) and for an
+    // already-missing directory (an uninstall retried after a partial
+    // failure).
+    if let PluginSource::Installed { dir, .. } = &plugin.source {
+        if let Some(plugin_root) = dir.parent() {
+            match std::fs::remove_dir_all(plugin_root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "removing installed plugin directory {}",
+                            plugin_root.display()
+                        )
+                    });
+                }
+            }
+        }
     }
+    Ok(())
 }
 
 /// Kind-aware post-uninstall reconcile — the `uninstall_plugin` dispatch
@@ -5011,13 +5069,21 @@ description = "does a thing"
 
     #[tokio::test]
     async fn uninstall_provider_clears_transport_enable_key() {
-        // Spec B1 / Fix 2: an uninstalled provider must stay off. Before this
-        // fix, `uninstall`'s provider arm only cleaned up connection rows —
+        // Spec B1 / Fix 2 / C4: an uninstalled provider must stay off. Before
+        // Fix 2, `uninstall`'s provider arm only cleaned up connection rows —
         // the `plugin.<id>.enabled` row (what `discover_provider_components`
         // reads to decide whether to (re-)register a live transport) was left
         // "true", so a later unrelated `hot_reload_provider_transports` call
         // (from ANY other install/enable) could resurrect the uninstalled
         // plugin's transport out of the still-active-on-disk bundle.
+        //
+        // C4 (whole-branch review): DELETING the key (Fix 2's original
+        // behavior) was itself wrong under v2 semantics — deleting it just
+        // uncovers `host::component_plugin_enabled`'s no-explicit-setting
+        // fallback ("enabled iff an active release exists"), which flips
+        // straight back to enabled the instant an active release exists. An
+        // explicit "false" is the only value that wins over that fallback in
+        // both directions, so that is what uninstall must leave behind.
         let cp = test_cp().await;
         cp.store()
             .set_setting_raw("plugin.mimo.enabled", "true")
@@ -5030,9 +5096,52 @@ description = "does a thing"
             cp.store()
                 .get_setting_raw("plugin.mimo.enabled")
                 .await
+                .unwrap()
+                .as_deref(),
+            Some("false"),
+            "uninstalling a provider must leave its transport-enable key explicitly false"
+        );
+    }
+
+    // C4 regression: an explicit "false" must survive even when an ACTIVE
+    // component release still exists on disk at uninstall time — the exact
+    // scenario where the OLD delete-the-key behavior re-enabled the plugin,
+    // because `component_plugin_enabled`'s no-explicit-setting fallback
+    // reads "an active release exists" as enabled.
+    #[tokio::test]
+    async fn uninstall_provider_stays_disabled_even_with_an_active_release() {
+        let cp = test_cp().await;
+        seed_active_component_release(&cp, "mimo").await;
+        cp.store()
+            .set_setting_raw("plugin.mimo.enabled", "true")
+            .await
+            .unwrap();
+        assert!(
+            crate::plugins::host::component_plugin_enabled(
+                &SettingsStore::new(cp.store().clone()),
+                "mimo"
+            )
+            .await
+            .unwrap(),
+            "sanity: mimo reads enabled before uninstall"
+        );
+
+        uninstall(&cp, "mimo").await.unwrap();
+
+        let settings = SettingsStore::new(cp.store().clone());
+        assert!(
+            !crate::plugins::host::component_plugin_enabled(&settings, "mimo")
+                .await
                 .unwrap(),
-            None,
-            "uninstalling a provider must clear its transport-enable key"
+            "an uninstalled provider must read disabled even with an active release still on disk"
+        );
+        assert_eq!(
+            cp.store()
+                .get_setting_raw("plugin.mimo.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("false")
         );
     }
 
@@ -5070,6 +5179,75 @@ description = "does a thing"
             .is_enabled(&settings, "acme-token")
             .await
             .unwrap());
+    }
+
+    // C3 + C5: a source-installed (`PluginSource::Installed`) plugin — the
+    // exact manifest-only shape `install_installed_plugins`'s boot scan
+    // registers (connector always `None`, even though this manifest
+    // declares `[[mcp]]`) — must have its on-disk install directory AND its
+    // `plugin.<id>.trusted` flag removed by uninstall, not just its DB rows.
+    #[tokio::test]
+    async fn uninstall_source_installed_plugin_removes_install_directory_and_trust_flag() {
+        let install_root = tempfile::tempdir().unwrap();
+        let plugin_root = install_root.path().join("acme-src");
+        let version_dir = plugin_root.join("0.1.0");
+        std::fs::create_dir_all(version_dir.join("commands")).unwrap();
+        std::fs::write(version_dir.join("commands").join("hello.md"), "# hi").unwrap();
+        std::fs::write(plugin_root.join("current"), "0.1.0").unwrap();
+
+        let mut acme_manifest = manifest("acme-src");
+        acme_manifest.mcp = vec![McpServerDef {
+            name: "svc".into(),
+            transport: McpTransportDef::Stdio,
+            command: Some("acme-mcp-server".into()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+        }];
+        let plugin = CorePlugin {
+            manifest: acme_manifest,
+            harness: None,
+            gateway: None,
+            // Manifest-only, exactly as `install_installed_plugins` always
+            // registers a source-installed plugin — its real connector only
+            // ever exists transiently, at install time.
+            connector: None,
+            provider: None,
+            source: PluginSource::Installed {
+                dir: version_dir.clone(),
+                provenance: InstallProvenance::LocalPath,
+            },
+        };
+        let cp = test_cp_with(vec![plugin]).await;
+        cp.store()
+            .set_setting_raw("plugin.acme-src.trusted", "true")
+            .await
+            .unwrap();
+        cp.store()
+            .set_setting_raw("plugin.acme-src.enabled", "true")
+            .await
+            .unwrap();
+        assert!(version_dir.join("commands").join("hello.md").is_file());
+
+        uninstall(&cp, "acme-src").await.unwrap();
+
+        assert!(
+            !plugin_root.exists(),
+            "the whole per-plugin install root (every version + the `current` \
+             pointer) must be removed, not just cleared from the DB — otherwise \
+             the next boot's install_installed_plugins scan re-registers it \
+             straight off disk"
+        );
+        assert_eq!(
+            cp.store()
+                .get_setting_raw("plugin.acme-src.trusted")
+                .await
+                .unwrap(),
+            None,
+            "the trust flag must be cleared so a reinstall under the same id \
+             re-prompts for trust rather than silently inheriting the old grant"
+        );
     }
 
     #[tokio::test]
@@ -6406,29 +6584,31 @@ writes = true
         assert!(discord.entries.is_empty());
     }
 
-    /// Stages a REAL, `load_active_bundles`-verifiable component bundle
-    /// directly at the production [`crate::plugins::bundle::installed_bundle_root`]
-    /// path — the exact root `declared_component_tool_entries` reads
-    /// (`plugins_api.rs`'s step-1 tool source). Unlike `doctor.rs`'s
-    /// `WasmComponentDoctorInputs::bundle_root`, `declared_component_tool_entries`
-    /// has no injected-root test seam, so pinning its "installed manifest wins
-    /// over embedded" precedence has no choice but to write the real per-user
-    /// install root. Mirrors `doctor.rs`'s `wasm_component_findings::write_bundle`
-    /// fixture (same signed-envelope shape) rather than inventing a new signing
-    /// path; the signature itself is inert for THIS test (`load_active_bundles`
-    /// never reads `plugin.sig` — only `verify_bundle`, a different call path,
-    /// does), but it is staged anyway to keep the fixture a faithful "real
+    /// Stages a REAL, `load_active_bundles`-verifiable component bundle at
+    /// [`crate::plugins::bundle::installed_bundle_root`] — the exact root
+    /// `declared_component_tool_entries` reads (`plugins_api.rs`'s step-1
+    /// tool source) — via the `RYUZI_PLUGINS_ROOT` test seam (I9 fix) rather
+    /// than the real per-user install root `declared_component_tool_entries`
+    /// has no OTHER way to redirect. Mirrors `doctor.rs`'s
+    /// `wasm_component_findings::write_bundle` fixture (same signed-envelope
+    /// shape) rather than inventing a new signing path; the signature itself
+    /// is inert for THIS test (`load_active_bundles` never reads
+    /// `plugin.sig` — only `verify_bundle`, a different call path, does),
+    /// but it is staged anyway to keep the fixture a faithful "real
     /// installed bundle".
     ///
-    /// `installed_bundle_root()` is process-global (same per-user path every
-    /// test run resolves to — see `StateDirGuard` in `daemon.rs`/`control/tests.rs`
-    /// for the same-shaped precedent), so every test using this fixture must be
-    /// `#[serial]`. It also NEVER hijacks a plugin id that is already installed
-    /// for real on this machine: `stage` refuses (returning `None`, skip-style)
-    /// rather than repointing a real install's `current` pointer at placeholder
-    /// bytes, since a SIGKILL mid-test could otherwise strand the real install.
+    /// I9 fix: `installed_bundle_root()` now honors the `RYUZI_PLUGINS_ROOT`
+    /// test seam, so this fixture points it at a hermetic tempdir it owns —
+    /// it no longer stages ANYTHING under the real per-user
+    /// `~/.config/ryuzi/plugins`. `RYUZI_PLUGINS_ROOT` is still
+    /// process-global, so every test using this fixture must be `#[serial]`
+    /// (same convention as `StateDirGuard` in `daemon.rs`/`control/tests.rs`).
+    /// There is no longer a "real install already exists" collision to guard
+    /// against — the tempdir is always fresh — so `stage` always succeeds;
+    /// it keeps returning `Option` only so the (now-dead) skip branch at its
+    /// one call site keeps compiling unchanged.
     struct InstalledBundleFixture {
-        plugin_root: std::path::PathBuf,
+        _root_dir: tempfile::TempDir,
     }
 
     impl InstalledBundleFixture {
@@ -6436,25 +6616,15 @@ writes = true
         /// `tool_name`. Returns `Some((fixture, component_sha256))` — the
         /// caller still owns recording + activating the release in the store
         /// (this only touches disk, matching `write_bundle` + `seed_active`'s
-        /// split in `doctor.rs`) — or `None` if `plugin_id` already has a real
-        /// install at this root, in which case nothing on disk is touched and
-        /// the caller must skip the test rather than proceed.
+        /// split in `doctor.rs`).
         fn stage(plugin_id: &str, version: &str, tool_name: &str) -> Option<(Self, String)> {
             use base64::Engine as _;
             use ed25519_dalek::{Signer, SigningKey};
             use sha2::{Digest, Sha256};
 
-            let root = crate::plugins::bundle::installed_bundle_root();
-            let plugin_root = root.join(plugin_id);
-            if plugin_root.exists() {
-                // A real install already lives here — refuse to touch it.
-                eprintln!(
-                    "skipping plugin_tools_prefers_installed_manifest_over_embedded: \
-                     a real install already exists at {} — refusing to hijack it",
-                    plugin_root.display()
-                );
-                return None;
-            }
+            let root_dir = tempfile::tempdir().expect("tempdir for RYUZI_PLUGINS_ROOT fixture");
+            std::env::set_var("RYUZI_PLUGINS_ROOT", root_dir.path());
+            let plugin_root = root_dir.path().join(plugin_id);
             let pointer_path = plugin_root.join("current");
             let version_dir = plugin_root.join(version);
             std::fs::create_dir_all(&version_dir)
@@ -6493,20 +6663,22 @@ writes = true
 
             std::fs::write(&pointer_path, version).expect("write fixture current pointer");
 
-            Some((Self { plugin_root }, sha))
+            Some((
+                Self {
+                    _root_dir: root_dir,
+                },
+                sha,
+            ))
         }
     }
 
-    impl Drop for InstalledBundleFixture {
-        fn drop(&mut self) {
-            // `stage`'s guard above guarantees `plugin_root` did NOT exist
-            // before this fixture created it, so it's always safe (and
-            // sufficient) to remove the whole thing on the way out.
-            // Best-effort: a cleanup failure must never mask (or panic over)
-            // the test's own assertion outcome.
-            let _ = std::fs::remove_dir_all(&self.plugin_root);
-        }
-    }
+    // No explicit `Drop` needed: `_root_dir`'s own `Drop` removes the whole
+    // hermetic tempdir (including the plugin root under it) from disk.
+    // `RYUZI_PLUGINS_ROOT` itself is deliberately left set afterward —
+    // matches this crate's existing process-global-env-guard convention
+    // (e.g. `daemon.rs`'s `StateDirGuard`, which never restores the prior
+    // value either): every `#[serial]` test that cares sets its own value
+    // first.
 
     // Task 4 follow-up (review finding): pins branch 2's "prefer the
     // currently-installed release's on-disk manifest over the embedded one"
@@ -6634,4 +6806,401 @@ writes = true
     // (`skills_install::get_installed_skill_pack`) itself is untouched and
     // still covered elsewhere (e.g. `InstalledCuratedPackFixture`-backed
     // tests), since that ledger is independent of the deleted loader.
+
+    // =========================================================================
+    // Whole-branch-review regression: the FULL lifecycle for an INSTALLED,
+    // declarative-plus-mcp third-party plugin.
+    //
+    // Every other test in this crate exercises an EMBEDDED first-party
+    // plugin (github/atlassian/bitbucket/discord/providers) — never a full
+    // install→enable→disable→re-enable→uninstall→restart cycle for a
+    // THIRD-PARTY plugin installed from a local folder. C1-C5 were five
+    // independent breaks in exactly that path, all invisible to the rest of
+    // the suite. These two tests drive the real public entry points
+    // (`install_sources::begin_plugin_install_from_source`/
+    // `confirm_plugin_install`, `toggle_enabled`, `uninstall`,
+    // `install_installed_plugins`) against a hermetic tempfile root — via
+    // the `RYUZI_PLUGINS_ROOT` seam I9 added — NEVER the real
+    // `~/.config/ryuzi/plugins`.
+    // =========================================================================
+
+    const LIFECYCLE_PLUGIN_MANIFEST: &str = r#"
+contract = 2
+id = "acme-lifecycle"
+name = "Acme Lifecycle"
+publisher = "acme"
+
+[[settings]]
+key = "region"
+label = "Region"
+
+[[mcp]]
+name = "svc"
+transport = "stdio"
+command = "acme-lifecycle-mcp-server"
+
+[[hooks]]
+name = "notify"
+trigger = "session.end"
+action = "webhook.outbound"
+
+[hooks.config]
+url = "https://acme.example.com/webhook"
+method = "POST"
+
+[[jobs]]
+name = "nightly"
+schedule = "every day at 2am"
+prompt = "Run the nightly audit"
+"#;
+
+    /// Process-global `RYUZI_PLUGINS_ROOT` guard (I9): every test using it
+    /// must be `#[serial]`. Owns a fresh tempdir for the lifetime of the
+    /// test; the env var itself is deliberately left set on drop, matching
+    /// this crate's `StateDirGuard`-style convention (`daemon.rs`).
+    struct PluginsRootGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl PluginsRootGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir for RYUZI_PLUGINS_ROOT");
+            std::env::set_var("RYUZI_PLUGINS_ROOT", dir.path());
+            Self { _dir: dir }
+        }
+    }
+
+    /// A real plugin FOLDER (not just the manifest) — `ryuzi-plugin.toml`
+    /// plus a `commands/` and `skills/` entry — the exact shape
+    /// `begin_plugin_install_from_source` stages from disk.
+    fn write_lifecycle_plugin_source() -> tempfile::TempDir {
+        let source_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_dir.path().join("ryuzi-plugin.toml"),
+            LIFECYCLE_PLUGIN_MANIFEST,
+        )
+        .unwrap();
+        let commands_dir = source_dir.path().join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(commands_dir.join("hello.md"), "# Hello\nSay hi.").unwrap();
+        let skill_dir = source_dir.path().join("skills").join("greeting");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: greeting\n---\nBody").unwrap();
+        source_dir
+    }
+
+    /// Stage + confirm a real local-folder install through the PUBLIC entry
+    /// points (`begin_plugin_install_from_source`/`confirm_plugin_install`) —
+    /// never the crate-private `confirm_plugin_install_at` — so this
+    /// exercises the exact path `RYUZI_PLUGINS_ROOT` (I9) exists to make
+    /// hermetic. `accept_trust: true` since the manifest declares `[[mcp]]`.
+    async fn install_lifecycle_plugin(
+        store: &Arc<Store>,
+        settings: &SettingsStore,
+    ) -> crate::plugins::install_sources::InstalledPluginInfo {
+        let source_dir = write_lifecycle_plugin_source();
+        let prompt = crate::plugins::install_sources::begin_plugin_install_from_source(
+            source_dir.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::plugins::install_sources::confirm_plugin_install(
+            &prompt.token,
+            true,
+            store,
+            settings,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Boots a `ControlPlane` with `acme-lifecycle` registered exactly the
+    /// way a real daemon restart would register it —
+    /// `install_installed_plugins`'s boot scan against the
+    /// (env-overridden) `installed_bundle_root()` — never the transient,
+    /// fully-behavioral `CorePlugin` `confirm_plugin_install` itself builds.
+    async fn boot_control_plane_with_lifecycle_plugin(store: Arc<Store>) -> Arc<ControlPlane> {
+        let mut regs = Registries::new();
+        crate::plugins::install_installed_plugins(
+            &mut regs,
+            &crate::plugins::bundle::installed_bundle_root(),
+        );
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        ControlPlane::new(store, regs, persistence).await
+    }
+
+    fn lifecycle_capability_ctx(
+        store: Arc<Store>,
+        settings: SettingsStore,
+    ) -> crate::plugins::capabilities::PluginCapabilityContext {
+        crate::plugins::capabilities::PluginCapabilityContext {
+            plugin_id: "acme-lifecycle".to_string(),
+            version: "0.0.0".to_string(),
+            settings,
+            store,
+            telemetry: Arc::new(crate::telemetry::NoopTelemetry),
+            network_allowlist: vec![],
+            oauth_profile_ids: vec![],
+            provider_ids: vec![],
+        }
+    }
+
+    // Part 1: install → configure a `[[settings]]` field and read it back
+    // through the capability path → the plugin reads enabled by default
+    // (C2) and everything it declares (mcp server, command/skill content
+    // roots, hook, job row) is live.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_lifecycle_install_configures_and_attaches_everything() {
+        let _root_guard = PluginsRootGuard::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+
+        let installed = install_lifecycle_plugin(&store, &settings).await;
+        assert_eq!(installed.id, "acme-lifecycle");
+        assert!(
+            installed.trusted,
+            "mcp requires trust; accept_trust was true"
+        );
+
+        // C2: installed == enabled by default, no separate "enable" click.
+        assert_eq!(
+            settings
+                .get("plugin.acme-lifecycle.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+
+        // C1 round-trip: configure the bare `[[settings]]` field via the
+        // QUALIFIED settings-tab path...
+        settings
+            .set("plugin.acme-lifecycle.region", "us-east-1")
+            .await
+            .expect("the qualified key must be recognized (C1)");
+        // ...and read it back via the WASM capability path (bare key,
+        // qualified internally).
+        let ctx = lifecycle_capability_ctx(store.clone(), settings.clone());
+        let scoped = crate::plugins::capabilities::settings::ScopedSettings::new(&ctx);
+        let (_, value, _) = scoped.get("region").await.unwrap();
+        assert_eq!(value, "us-east-1");
+
+        // A guest cannot use this same capability to self-enable/self-trust
+        // (I2) — sanity-checked here against the REAL registered plugin,
+        // not just the synthetic fixture in `capabilities::settings`'s own
+        // tests.
+        assert!(scoped.set("enabled", "true").await.is_err());
+        assert!(scoped.set("trusted", "true").await.is_err());
+
+        // Simulate the restart a real install always requires
+        // (`plugins_restart_required`) before the plugin is live in
+        // `PluginHost`.
+        let cp = boot_control_plane_with_lifecycle_plugin(store.clone()).await;
+        assert!(cp
+            .plugins()
+            .is_enabled(&settings, "acme-lifecycle")
+            .await
+            .unwrap());
+
+        // C2: the mcp server attaches.
+        let specs = crate::mcp::servers_for_session(&store, "native")
+            .await
+            .unwrap();
+        assert!(
+            specs.iter().any(|s| s.name == "acme-lifecycle-svc"),
+            "installed mcp server must attach once enabled, got: {specs:?}"
+        );
+
+        // The command/skill content roots resolve — the exact directories a
+        // session start reads `/command`s and skills from.
+        let roots = cp.enabled_plugin_content_roots().await;
+        let root = roots
+            .iter()
+            .find(|r| r.id == "acme-lifecycle")
+            .expect("content roots must resolve while enabled");
+        assert!(root.commands.join("hello.md").is_file());
+        assert!(root.skills.join("greeting").join("SKILL.md").is_file());
+
+        // I1: the hook fires (webhook.outbound presets may ship enabled on
+        // first sync).
+        let hooks = automation::list_enabled_hooks(&store, automation::TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        assert!(
+            hooks.iter().any(|h| h.name == "acme-lifecycle/notify"),
+            "the plugin's hook must be enabled+attached, got: {hooks:?}"
+        );
+
+        // The job row exists (jobs always install disabled — no plugin can
+        // guess a target project — but the row itself must exist).
+        let job = scheduler::get_job(&store, "acme-lifecycle/nightly")
+            .await
+            .unwrap()
+            .expect("job row must exist after install");
+        assert!(!job.enabled, "jobs install disabled by convention");
+    }
+
+    // Part 2: disable → everything goes quiet → re-enable → everything comes
+    // back with the user's per-tool perms intact → uninstall → every row,
+    // the trust key, and the install directory are gone → simulate a
+    // restart (re-run the boot registration against the same root) → the
+    // plugin does NOT come back.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_lifecycle_disable_reenable_uninstall_and_restart_does_not_resurrect_it() {
+        let _root_guard = PluginsRootGuard::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+
+        let installed = install_lifecycle_plugin(&store, &settings).await;
+        let cp = boot_control_plane_with_lifecycle_plugin(store.clone()).await;
+
+        // Simulate a real "Probe" (or a future real server response) having
+        // discovered a tool and the user having set a per-tool perm —
+        // `sync_plugin_mcp`'s own stdio probe fails in this sandbox (no
+        // real `acme-lifecycle-mcp-server` binary on PATH), so the tool row
+        // is seeded directly the way a successful probe would have left it.
+        const ROW_ID: &str = "acme-lifecycle-svc";
+        crate::mcp::replace_tools(&store, ROW_ID, vec![("do_thing".into(), String::new())])
+            .await
+            .unwrap();
+        crate::mcp::set_tool_perm(&store, ROW_ID, "do_thing", "deny")
+            .await
+            .unwrap();
+
+        // ---------- disable: everything goes quiet ----------
+        crate::plugins::toggle_enabled(cp.plugins(), &settings, "acme-lifecycle", false)
+            .await
+            .unwrap();
+        assert!(!cp
+            .plugins()
+            .is_enabled(&settings, "acme-lifecycle")
+            .await
+            .unwrap());
+
+        let specs = crate::mcp::servers_for_session(&store, "native")
+            .await
+            .unwrap();
+        assert!(
+            specs.iter().all(|s| s.name != ROW_ID),
+            "mcp server must detach while disabled, got: {specs:?}"
+        );
+        let roots = cp.enabled_plugin_content_roots().await;
+        assert!(
+            roots.iter().all(|r| r.id != "acme-lifecycle"),
+            "content roots must not resolve while disabled"
+        );
+        let hooks = automation::list_enabled_hooks(&store, automation::TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        assert!(
+            hooks.iter().all(|h| h.name != "acme-lifecycle/notify"),
+            "the hook must not fire while disabled, got: {hooks:?}"
+        );
+
+        // The row itself, and the user's per-tool perm, survive the
+        // disable — only session-attachment/hook-firing is gated (mcp.rs's
+        // own "disable never deletes rows" contract).
+        let tools = crate::mcp::list_tools(&store, ROW_ID).await.unwrap();
+        assert_eq!(
+            tools.iter().find(|t| t.name == "do_thing").unwrap().perm,
+            "deny"
+        );
+
+        // ---------- re-enable: everything comes back, perms intact ----------
+        crate::plugins::toggle_enabled(cp.plugins(), &settings, "acme-lifecycle", true)
+            .await
+            .unwrap();
+        assert!(cp
+            .plugins()
+            .is_enabled(&settings, "acme-lifecycle")
+            .await
+            .unwrap());
+
+        let specs = crate::mcp::servers_for_session(&store, "native")
+            .await
+            .unwrap();
+        assert!(specs.iter().any(|s| s.name == ROW_ID));
+        let tools = crate::mcp::list_tools(&store, ROW_ID).await.unwrap();
+        assert_eq!(
+            tools.iter().find(|t| t.name == "do_thing").unwrap().perm,
+            "deny",
+            "the user's per-tool perm must survive a disable/enable cycle"
+        );
+        let roots = cp.enabled_plugin_content_roots().await;
+        assert!(roots.iter().any(|r| r.id == "acme-lifecycle"));
+        let hooks = automation::list_enabled_hooks(&store, automation::TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        assert!(hooks.iter().any(|h| h.name == "acme-lifecycle/notify"));
+
+        // ---------- uninstall: rows, trust key, and the install directory
+        // are all gone ----------
+        uninstall(&cp, "acme-lifecycle").await.unwrap();
+
+        let specs = crate::mcp::servers_for_session(&store, "native")
+            .await
+            .unwrap();
+        assert!(specs.iter().all(|s| s.name != ROW_ID));
+        assert!(
+            crate::mcp::get_server(&store, ROW_ID)
+                .await
+                .unwrap()
+                .is_none(),
+            "the mcp row itself must be gone (Task 7 cascade)"
+        );
+        let remaining_hooks = automation::list_hooks(&store).await.unwrap();
+        assert!(remaining_hooks
+            .iter()
+            .all(|h| h.plugin_id.as_deref() != Some("acme-lifecycle")));
+        assert!(
+            scheduler::get_job(&store, "acme-lifecycle/nightly")
+                .await
+                .unwrap()
+                .is_none(),
+            "the job row must be gone (Task 10 cascade)"
+        );
+        // C1 carried through: the qualified settings key is cleared too.
+        assert_eq!(
+            store
+                .get_setting_raw("plugin.acme-lifecycle.region")
+                .await
+                .unwrap(),
+            None
+        );
+        // C5: the trust flag is cleared.
+        assert_eq!(
+            store
+                .get_setting_raw("plugin.acme-lifecycle.trusted")
+                .await
+                .unwrap(),
+            None,
+            "the trust flag must be cleared so a reinstall under the same id re-prompts"
+        );
+        // C3: the on-disk install directory is gone — both the version dir
+        // AND its parent (which also holds the `current` pointer).
+        assert!(
+            !installed.dir.exists(),
+            "the version directory must be gone"
+        );
+        assert!(
+            !installed.dir.parent().unwrap().exists(),
+            "the whole per-plugin install root (incl. the `current` pointer) must be gone"
+        );
+
+        // ---------- restart: the plugin does not come back ----------
+        let mut regs = Registries::new();
+        crate::plugins::install_installed_plugins(
+            &mut regs,
+            &crate::plugins::bundle::installed_bundle_root(),
+        );
+        assert!(
+            regs.plugins.get("acme-lifecycle").is_none(),
+            "a re-run of the boot registration scan must not resurrect an uninstalled plugin"
+        );
+    }
 }
