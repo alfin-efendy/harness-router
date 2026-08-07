@@ -85,18 +85,6 @@ pub async fn plugin_doctor_with(
     let mut findings = Vec::new();
     let attach = cp.store().list_plugin_attach().await.unwrap_or_default();
 
-    // Extension (Track D "code plugin") findings are gated on the host
-    // actually having spawned SOMETHING, for ANY plugin — an unconditionally
-    // empty host means this control plane never called
-    // `ExtensionHost::spawn_all` at all (every test `ControlPlane`, or a
-    // process that isn't the daemon's spawn host), not that a specific
-    // extension failed to start. Reporting `not-running` for every enabled
-    // extension-capable plugin in that case would be a false positive, not a
-    // real finding — this keeps the fresh-store/no-extensions invariant
-    // (`doctor_is_empty_on_a_fresh_store_and_findings_are_secret_free`) true
-    // without special-casing every extension-capable plugin's own enablement
-    // check.
-
     // Exclusive capability slot conflicts (Feature C2): a later claimant for
     // an already-owned `slot` never became owner (`PluginHost::add` — first
     // registration wins), but the arbitration should be observable rather
@@ -815,17 +803,6 @@ pub(crate) mod tests {
     fn binary_on_path_checks_an_absolute_path_directly() {
         assert!(!binary_on_path("/definitely/not/a/real/path/xyz"));
     }
-
-    // NOTE: the former "Extension (Track D) findings — DT8" module
-    // (`mod extension_findings`) was deleted here: every test in it — both
-    // the "finding fires" and "no finding" cases — existed to validate the
-    // `plugin_doctor` extension-capable-plugin branch gated by
-    // `plugin.extension.is_some()`. `CorePlugin.extension` no longer exists
-    // (the v2 SDK manifest has no `[[extension]]` surface), that conjunct is
-    // now a permanent `false` (see the `false` literal in `plugin_doctor`
-    // above), and no plugin can ever be extension-capable — so this whole
-    // finding is permanently dormant pending Task 3's full deletion of
-    // Track D subprocess extensions.
 
     // ---------- WASM-component lifecycle findings — Task 17b ----------
     // Each test seeds the minimal ledger + on-disk bundle state that triggers

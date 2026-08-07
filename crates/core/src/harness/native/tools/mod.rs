@@ -33,7 +33,6 @@ pub mod artifact;
 pub mod bash;
 pub mod delegate;
 pub mod edit;
-pub mod extension;
 pub mod glob;
 pub mod grep;
 pub mod ls;

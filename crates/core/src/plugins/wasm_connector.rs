@@ -7,28 +7,21 @@
 //! subprocess/HTTP MCP servers — and structurally cannot represent a tool
 //! whose implementation runs IN-PROCESS. The WIT `connector` interface
 //! (`list-tools` + `invoke`) is exactly such an in-process tool surface, so
-//! the correct seam is the extension-tools path, not `Connector`. This module
-//! mirrors [`crate::plugins::extension::tools`] (`ExtensionTools` /
-//! `ExtensionToolBinding`) and its `harness::native::tools::extension`
-//! counterpart, one-for-one:
+//! this module provides its own seam:
 //!
-//! - [`WasmTools::session_tools`] is the [`ExtensionTools::session_tools`]
-//!   analogue — it enumerates every enabled component bundle's
-//!   `connector.list-tools`, validates each definition, and yields a
+//! - [`WasmTools::session_tools`] enumerates every enabled component
+//!   bundle's `connector.list-tools`, validates each definition, and yields a
 //!   [`WasmToolBinding`] per surviving tool.
 //! - `harness::native::tools::wasm::WasmTool` wraps one binding as a native
 //!   [`Tool`](crate::harness::native::tools::Tool), converting the harness's
 //!   JSON tool input into a WIT `tool-call`, invoking the component, and
-//!   converting the WIT `tool-result` back into a tool output — the
-//!   `ExtensionTool` analogue.
+//!   converting the WIT `tool-result` back into a tool output.
 //!
 //! Every value is validated before registering it (a missing/blank tool name
 //! skips that tool with a warning, never a crash — an installed component is
 //! untrusted code) and a component trap/timeout during `list-tools`/`invoke`
 //! is caught and turned into a skipped tool / tool error, never a daemon
-//! crash, exactly like the extension path already guarantees.
-//!
-//! [`ExtensionTools::session_tools`]: crate::plugins::extension::ExtensionTools::session_tools
+//! crash.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -79,11 +72,6 @@ impl WasmActivation {
     /// Whether this component exports `ryuzi:connector/connector` (IMP-2).
     pub(crate) fn exports_connector(&self) -> bool {
         self.compiled.exports_connector()
-    }
-
-    /// Whether this component exports `ryuzi:hooks/hooks` (IMP-2).
-    pub(crate) fn exports_hooks(&self) -> bool {
-        self.compiled.exports_hooks()
     }
 
     /// Instantiate a fresh, isolated instance of this bundle's component,
@@ -143,8 +131,7 @@ impl WasmActivation {
     }
 }
 
-/// A typed, validated connector tool definition — the WASM analogue of
-/// [`crate::plugins::extension::ExtensionToolDef`], with the JSON input schema
+/// A typed, validated connector tool definition, with the JSON input schema
 /// synthesized from the WIT `tool-parameter` list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WasmToolDef {
@@ -167,18 +154,16 @@ pub struct WasmToolBinding {
 }
 
 /// The `wasm__<component>__<tool>` wire name a component tool is exposed to the
-/// model under — mirrors `plugins::extension::tools::full_tool_name`'s
-/// `ext__<extension>__<tool>` scheme. Single source of truth shared by
+/// model under. Single source of truth shared by
 /// [`WasmTools::session_tools`]'s collision dedup and
 /// `WasmTool::from_binding`'s own naming.
 pub(crate) fn wasm_tool_name(component_id: &str, tool_name: &str) -> String {
     format!("wasm__{component_id}__{tool_name}")
 }
 
-/// Gather every enabled component bundle's connector tools — the
-/// [`ExtensionTools`](crate::plugins::extension::ExtensionTools) analogue that
-/// `harness::native`'s session start (`connect_wasm_tools`, mirroring
-/// `connect_extension_tools`) calls through `SessionCtx.wasm_tools`.
+/// Gather every enabled component bundle's connector tools —
+/// `harness::native`'s session start (`connect_wasm_tools`) calls through
+/// `SessionCtx.wasm_tools`.
 #[async_trait]
 pub trait WasmTools: Send + Sync {
     async fn session_tools(&self) -> Vec<WasmToolBinding>;
@@ -685,17 +670,6 @@ mod tests {
     }
 
     // ---------- IMP-2: skip components lacking the connector export ----------
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn export_set_is_captured_per_component() {
-        build_fixtures();
-        let (connector, _c) =
-            build_activation(connector_artifact(), "acme-tools", HostPolicy::deny_all()).await;
-        let (hooks, _h) =
-            build_activation(hooks_artifact(), "acme-hooks", HostPolicy::deny_all()).await;
-        assert!(connector.exports_connector() && !connector.exports_hooks());
-        assert!(hooks.exports_hooks() && !hooks.exports_connector());
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_tools_skips_a_hooks_only_component_without_instantiating() {

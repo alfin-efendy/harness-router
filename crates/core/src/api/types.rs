@@ -1504,42 +1504,6 @@ impl From<crate::plugins::capabilities::oauth::DeviceFlowStart> for PluginProfil
     }
 }
 
-/// `extension_status` rpc result — one entry per extension (Track D "code
-/// plugin") the daemon's `ExtensionHost` currently knows about (DT8). Mirrors
-/// `plugins::extension::{ExtensionSnapshot, ExtensionStatus}` flattened into
-/// a specta-able, UI-friendly shape (same rationale as `DoctorFinding`
-/// mirroring `plugins::doctor::DoctorFinding`) rather than deriving `Type` on
-/// the core enum directly. `crate::api::extension_status_api` builds these
-/// field by field (no `From` impl) since `ExtensionStatus::Failed`'s reason
-/// needs to fan out into both `status` (the canned string) and `last_error`
-/// (the sanitized detail) — a single `From` conversion would need the same
-/// branching anyway.
-#[derive(Serialize, Deserialize, Type, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ExtensionStatusEntry {
-    pub plugin_id: String,
-    /// The manifest's `[[extension]] name` — unique within its own plugin,
-    /// not globally (mirrors `ExtensionSnapshot::name`'s own namespace note).
-    pub name: String,
-    /// `running` | `starting` | `restarting` | `failed` | `stopped` |
-    /// `not-running` (the last one has no `ExtensionStatus` counterpart — it
-    /// means the plugin declares an extension and is enabled, but the host
-    /// has no spawned entry for it at all, e.g. a still-pending spawn or a
-    /// resolution failure prior to ever reaching `Failed`).
-    pub status: String,
-    /// Lifetime count of restart attempts DT4's supervisor has made for this
-    /// entry. Always `0` for an entry that has never needed a restart
-    /// (including the synthetic `not-running` entries, which were never
-    /// spawned at all).
-    pub restart_count: u32,
-    /// Present only when `status == "failed"` — `ExtensionStatus::Failed`'s
-    /// already-sanitized reason (`proc::sanitize_init_error`/the
-    /// `restart-exhausted: ...` marker), never extension-supplied raw text.
-    pub last_error: Option<String>,
-    pub confirmed_events: Vec<String>,
-    pub tool_count: u32,
-}
-
 impl From<crate::plugins::doctor::DoctorFinding> for DoctorFinding {
     fn from(f: crate::plugins::doctor::DoctorFinding) -> Self {
         DoctorFinding {

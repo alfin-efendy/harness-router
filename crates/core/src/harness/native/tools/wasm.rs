@@ -2,14 +2,9 @@
 //! (`ryuzi:connector/connector`'s `list-tools`/`invoke`) as a native [`Tool`]
 //! named `wasm__<component>__<tool>`.
 //!
-//! Deliberately mirrors [`super::extension::ExtensionTool`]: same `Tool` impl
-//! shape and the same "a failing call becomes a tool ERROR, never a
-//! propagated `Err`/panic/hang" guarantee. The only differences are WHERE the
-//! call goes (a component's in-process `invoke` via
-//! [`crate::plugins::wasm_connector::WasmActivation`], instead of an
-//! extension subprocess's `tool/call`) and that every component tool carries a
-//! resolved plugin [`Principal`] unconditionally (a component always belongs
-//! to exactly one plugin).
+//! A failing call becomes a tool ERROR, never a propagated `Err`/panic/hang.
+//! Every component tool carries a resolved plugin [`Principal`]
+//! unconditionally (a component always belongs to exactly one plugin).
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::domain::Principal;

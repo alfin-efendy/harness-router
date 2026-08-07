@@ -80,7 +80,7 @@ pub struct PermGate<'a> {
     /// `write`/`revert` both report class `"edit"`), so keying this map by
     /// `spec.key` would alias their per-tool `Off`/`Allow` entries onto each
     /// other. Consulted only for non-namespaced (native) tools;
-    /// `mcp__`/`ext__`/`wasm__` calls never match an entry here.
+    /// `mcp__`/`wasm__` calls never match an entry here.
     pub native_decisions: &'a BTreeMap<String, NativeToolDecision>,
     /// The registry id of the tool actually being invoked (`Tool::name()`,
     /// e.g. `"write"`, `"grep"`, `"mcp__acme__search"`) — the ONLY key
@@ -103,13 +103,13 @@ pub struct PermGate<'a> {
     pub cancel: &'a CancellationToken,
 }
 
-/// Whether `key` names a plugin-provided tool (MCP, extension, or WASM
-/// component) rather than a native builtin — mirrors the same three-prefix
-/// check `tool_filter_for_profile` uses to resolve the native/plugin split.
-/// A namespaced key never has a `native_decisions` entry: the decision map
+/// Whether `key` names a plugin-provided tool (MCP or WASM component) rather
+/// than a native builtin — mirrors the same prefix check
+/// `tool_filter_for_profile` uses to resolve the native/plugin split. A
+/// namespaced key never has a `native_decisions` entry: the decision map
 /// only governs native (registry) tool ids.
 fn is_namespaced_tool_key(key: &str) -> bool {
-    key.starts_with("mcp__") || key.starts_with("ext__") || key.starts_with("wasm__")
+    key.starts_with("mcp__") || key.starts_with("wasm__")
 }
 
 /// Map a native permission key to the canonical tool name `policy` recognizes,
@@ -544,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_decision_is_only_consulted_for_non_namespaced_keys() {
-        // An `mcp__`/`ext__`/`wasm__` key never has a `native_decisions`
+        // An `mcp__`/`wasm__` key never has a `native_decisions`
         // entry, so an `Allow` mapped under its bare-looking key (which would
         // never actually occur, but proves the namespace guard) must not
         // short-circuit an MCP tool call.

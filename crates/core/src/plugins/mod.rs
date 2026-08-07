@@ -27,7 +27,6 @@ pub mod catalog_feed_key;
 pub mod component_catalog;
 pub mod declarative;
 pub mod doctor;
-pub mod extension;
 pub mod first_party_key;
 pub mod host;
 pub mod oauth;
@@ -37,7 +36,6 @@ pub mod runtime;
 pub mod wasm_connector;
 pub mod wasm_gateway;
 pub mod wasm_gateway_bridge;
-pub mod wasm_hooks;
 pub mod wasm_provider;
 pub mod wit;
 
@@ -83,10 +81,6 @@ use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
-pub use extension::{
-    ExtensionCtx, ExtensionEvents, ExtensionFactory, ExtensionHost, ExtensionProc,
-    ExtensionSnapshot, ExtensionSpec, ExtensionStatus,
-};
 pub use host::{
     plugin_field, plugin_fields_all, qualified_setting_key, CorePlugin, InstallProvenance,
     PluginHost, PluginSource, Registries,
@@ -98,7 +92,7 @@ pub use host::{
 /// `build-components.sh`'s `materialize_deps` rewrites each fixture's
 /// `wit/deps/` non-atomically (`rm -rf` then repopulate) — so two concurrent
 /// invocations corrupt each other and `cargo build` fails. Routing every
-/// fixture test (in `runtime`, `wasm_connector`, `wasm_hooks`) through this
+/// fixture test (in `runtime`, `wasm_connector`) through this
 /// shared `OnceLock` serializes the build to a single run the whole binary
 /// waits on, then reuses the artifacts.
 #[cfg(test)]

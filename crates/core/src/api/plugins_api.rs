@@ -1733,15 +1733,7 @@ async fn curated_pack_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<Plug
 /// actually has at least one entry, EXCEPT the last one, which always wins
 /// (it's the terminal fallback):
 ///
-/// 1. **Live extension tools** — this plugin declares the `extension`
-///    capability AND the host has at least one `Running` instance spawned
-///    for it right now. Tool defs come from the same source `extension_status`
-///    counts (`ExtensionSnapshot::tools`, raw `Value`s captured at
-///    `extension/initialize`), parsed through the typed
-///    [`crate::plugins::extension::tools::parse_tool_def`] accessor
-///    `harness::native` uses to wrap a live tool — a malformed def is
-///    skipped, never an error. `live: true`.
-/// 2. **Declared component tools** — `id` is a first-party WASM bundle
+/// 1. **Declared component tools** — `id` is a first-party WASM bundle
 ///    ([`crate::plugins::component_catalog::is_component_bundle`]). Prefers
 ///    the currently-*installed* release's on-disk manifest (same read
 ///    `plugin_release_detail` performs) so a post-install listing reflects
@@ -1749,18 +1741,18 @@ async fn curated_pack_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<Plug
 ///    ([`crate::plugins::component_catalog::declared_tools`]) so a bundle
 ///    not yet installed still shows "what you'll get". `live: false`. A
 ///    component-backed id with ZERO declared tools does NOT return here — it
-///    falls through to steps 3-4, because a component-backed *provider*
+///    falls through to steps 2-3, because a component-backed *provider*
 ///    (e.g. `mimo`, `opencode`: `is_component_bundle` is true for them, but
 ///    their embedded bundle manifest declares no `[[tools]]`) must still
-///    reach step 4's model list rather than short-circuit to an empty
+///    reach step 3's model list rather than short-circuit to an empty
 ///    result. A gateway like `discord` (also zero declared tools, no
 ///    provider capability) still ends up empty — it just gets there via
-///    step 4's empty-list fallback instead of step 2's early return.
-/// 3. **Skill packs** — `id` is an installed skill pack
+///    step 3's empty-list fallback instead of step 1's early return.
+/// 2. **Skill packs** — `id` is an installed skill pack
 ///    ([`crate::skills_install::get_installed_skill_pack`]): one entry per
 ///    installed skill, description-less (a skill's prose lives in its own
 ///    `SKILL.md`, not surfaced here). `live: false`.
-/// 4. **Providers** — `id`'s effective model list, via the same
+/// 3. **Providers** — `id`'s effective model list, via the same
 ///    [`providers::list_models`] internals `plugin_models` uses. This also
 ///    covers "anything else": `list_models` never errors for a non-provider
 ///    id, it just returns an empty list, so a known plugin id that matches
@@ -1770,53 +1762,13 @@ async fn curated_pack_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<Plug
 /// Unknown id -> the same `unknown plugin: {id}` `ApiError` `plugin_detail`
 /// (`assemble_detail`) uses.
 async fn plugin_tools(cp: &ControlPlane, id: &str) -> Result<PluginToolsResult, ApiError> {
-    let plugin = cp
-        .plugins()
+    cp.plugins()
         .get(id)
         .ok_or_else(|| ApiError::not_found(format!("unknown plugin: {id}")))?;
 
-    // 1. Live extension tools. `CorePlugin.extension` no longer exists — the
-    // v2 SDK manifest has no `[[extension]]` surface, so no plugin can ever
-    // be extension-capable anymore. This branch never fires (see
-    // `api::extension_status_api`'s identical note) pending Task 3's full
-    // deletion of Track D subprocess extensions.
-    if false {
-        let _ = &plugin;
-        let snapshots = cp.extension_host().get(id).await;
-        let running: Vec<_> = snapshots
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    crate::plugins::extension::ExtensionStatus::Running
-                )
-            })
-            .collect();
-        if !running.is_empty() {
-            let mut entries = Vec::new();
-            for snap in running {
-                for raw in &snap.tools {
-                    if let Some(def) = crate::plugins::extension::tools::parse_tool_def(raw) {
-                        entries.push(PluginToolEntry {
-                            name: def.name,
-                            description: def.description,
-                            kind: "tool".to_string(),
-                            writes: None,
-                        });
-                    }
-                }
-            }
-            return Ok(PluginToolsResult {
-                plugin_id: id.to_string(),
-                live: true,
-                entries,
-            });
-        }
-    }
-
-    // 2. Declared component tools. Only short-circuits when there's actually
+    // 1. Declared component tools. Only short-circuits when there's actually
     // something to show — a component-backed provider (mimo, opencode) has
-    // no declared tools and must fall through to step 4's model list instead
+    // no declared tools and must fall through to step 3's model list instead
     // of resolving to a misleadingly empty result.
     if crate::plugins::component_catalog::is_component_bundle(id) {
         let entries = declared_component_tool_entries(cp, id).await?;
@@ -1829,7 +1781,7 @@ async fn plugin_tools(cp: &ControlPlane, id: &str) -> Result<PluginToolsResult, 
         }
     }
 
-    // 3. Skill packs.
+    // 2. Skill packs.
     if let Some(pack) = crate::skills_install::get_installed_skill_pack(id) {
         let entries = pack
             .skills
@@ -1848,8 +1800,8 @@ async fn plugin_tools(cp: &ControlPlane, id: &str) -> Result<PluginToolsResult, 
         });
     }
 
-    // 4. Providers (and, by `list_models`'s own never-errors-just-empty
-    // contract, every other "known but nothing to list" id — step 5).
+    // 3. Providers (and, by `list_models`'s own never-errors-just-empty
+    // contract, every other "known but nothing to list" id).
     let entries = providers::list_models(cp.store(), id)
         .await?
         .into_iter()
@@ -5776,8 +5728,8 @@ writes = true
 
     // `install_builtins` registers every embedded component bundle
     // (`component_catalog::component_catalog_plugins`), github included, with
-    // no release ever installed and no running extension — so this must fall
-    // all the way through to branch 2's embedded-manifest fallback.
+    // no release ever installed — so this must fall through to branch 1's
+    // embedded-manifest fallback.
     #[tokio::test]
     async fn plugin_tools_falls_back_to_declared_manifest_tools() {
         let cp = test_cp().await;

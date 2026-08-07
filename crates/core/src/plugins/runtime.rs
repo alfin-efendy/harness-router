@@ -52,8 +52,11 @@ const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
 /// The `ryuzi:connector/connector` export interface name — the single source
 /// of truth shared by `ALLOWED_EXPORTS` and [`CompiledComponent::exports_connector`].
 pub(crate) const CONNECTOR_EXPORT: &str = "ryuzi:connector/connector@0.1.0";
-/// The `ryuzi:hooks/hooks` export interface name — shared by `ALLOWED_EXPORTS`
-/// and [`CompiledComponent::exports_hooks`].
+/// The `ryuzi:hooks/hooks` export interface name — permitted in
+/// `ALLOWED_EXPORTS` so a component may structurally export it, even though
+/// no host-side dispatcher currently consumes it (Task 3 deleted the
+/// subprocess-extension-era WASM hooks dispatcher; nothing reads this export
+/// today).
 pub(crate) const HOOKS_EXPORT: &str = "ryuzi:hooks/hooks@0.1.0";
 /// The `ryuzi:provider/provider` export interface name — shared by
 /// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_provider`] (Task 10).
@@ -544,13 +547,6 @@ impl CompiledComponent {
     /// (e.g. a hooks-only plugin) without instantiating them (IMP-2).
     pub(crate) fn exports_connector(&self) -> bool {
         self.exports.iter().any(|name| name == CONNECTOR_EXPORT)
-    }
-
-    /// Whether this component exports `ryuzi:hooks/hooks` — used by the hook
-    /// dispatcher to skip components with no hooks (e.g. a connector-only
-    /// plugin) without instantiating them or logging a warning (IMP-2).
-    pub(crate) fn exports_hooks(&self) -> bool {
-        self.exports.iter().any(|name| name == HOOKS_EXPORT)
     }
 
     /// Whether this component exports `ryuzi:provider/provider` — used by the
@@ -1448,7 +1444,7 @@ mod tests {
 
     fn build_fixture_components() {
         // Shared process-once build so concurrent fixture tests (here and in
-        // `wasm_connector`/`wasm_hooks`) never race `build-components.sh`'s
+        // `wasm_connector`) never race `build-components.sh`'s
         // non-atomic `wit/deps/` rewrite.
         crate::plugins::build_fixture_components_once();
     }

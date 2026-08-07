@@ -11,7 +11,6 @@ pub mod automation_api;
 pub mod connections_api;
 pub mod delegation_api;
 pub mod endpoint_api;
-pub mod extension_status_api;
 pub mod fsview_api;
 pub mod gateways_api;
 pub mod native_api;
@@ -161,9 +160,6 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
         m if remote_catalog_api::HANDLES.contains(&m) => {
             remote_catalog_api::dispatch(state, m, p).await
-        }
-        m if extension_status_api::HANDLES.contains(&m) => {
-            extension_status_api::dispatch(state, m, p).await
         }
         m if artifacts_api::HANDLES.contains(&m) => artifacts_api::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),

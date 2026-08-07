@@ -323,11 +323,6 @@ impl Daemon {
         self.learning_handle.abort();
         self.artifact_retention_handle.abort();
         self.router_server.stop().await;
-        // Track D: gracefully stop every spawned extension subprocess. Safe
-        // even when nothing was ever spawned (every test daemon, or a real
-        // daemon whose entry never reached `spawn_extensions`) — see
-        // `ControlPlane::shutdown_extensions`'s doc.
-        self.cp.shutdown_extensions().await;
         self.telemetry.shutdown();
     }
 

@@ -107,15 +107,6 @@ pub struct RunnerDeps {
     /// see `SessionCtx::extra_skill_dirs` for why this no longer carries
     /// plugin-bundled dirs in production.
     pub extra_skill_dirs: Vec<PathBuf>,
-    /// Live handle to the daemon's extension host (Track D), threaded
-    /// straight from `SessionCtx::extension_events` at session start — see
-    /// that field's doc. `None` in the common case (no extensions spawned)
-    /// and in every bare test `RunnerDeps`.
-    pub extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
-    /// Enabled WASM component bundles' hook dispatcher (Task 9), threaded from
-    /// `SessionCtx::wasm_hooks`. Fired alongside `extension_events` at every
-    /// `fire_hook` site. `None` in the common case and every bare test.
-    pub wasm_hooks: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
     pub model: Option<String>,
     /// Immutable effort/capability snapshot for the current turn.
     pub turn_effort_policy: Arc<TurnEffortPolicy>,
@@ -1939,8 +1930,6 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         attachments_dir: None,
         artifacts: deps.artifacts.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
-        extension_events: deps.extension_events.clone(),
-        wasm_hooks: deps.wasm_hooks.clone(),
         model,
         turn_effort_policy: Arc::new(effort_policy),
         meta,
@@ -2984,8 +2973,6 @@ async fn execute_tool_call(
 ) -> Value {
     let hook = super::hooks::fire_hook(
         &deps.work_dir,
-        deps.extension_events.as_ref(),
-        deps.wasm_hooks.as_ref(),
         super::hooks::HookEvent::ToolBefore,
         &json!({ "tool": tool_name, "input": input }),
     )
@@ -3450,8 +3437,6 @@ async fn fire_tool_after_observation(
     let after_payload = json!({ "tool": tool_name, "input": input, "result": hook_summary });
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
-        deps.extension_events.as_ref(),
-        deps.wasm_hooks.as_ref(),
         super::hooks::HookEvent::ToolAfter,
         &after_payload,
     )
@@ -4000,8 +3985,6 @@ fn record_native_tool_call_metrics(
 fn safe_tool_family(tool_name: &str, tool_kind: &str) -> &'static str {
     if tool_name.starts_with("mcp__") {
         "mcp"
-    } else if tool_name.starts_with("extension__") || tool_name.starts_with("ext__") {
-        "extension"
     } else if !is_builtin_metric_tool(tool_name) {
         "other"
     } else {
@@ -4019,8 +4002,6 @@ fn safe_tool_family(tool_name: &str, tool_kind: &str) -> &'static str {
 fn safe_tool_facade(tool_name: &str) -> &'static str {
     if tool_name.starts_with("mcp__") {
         "mcp"
-    } else if tool_name.starts_with("extension__") || tool_name.starts_with("ext__") {
-        "extension"
     } else if is_builtin_metric_tool(tool_name) {
         "builtin"
     } else {
@@ -4895,6 +4876,9 @@ mod tests {
         effects: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    // Only used by the `#[cfg(unix)]`-gated cancellation test below, which
+    // needs on-disk hook scripts (chmod +x) to observe hook dispatch.
+    #[cfg(unix)]
     struct CancellationAwareTool {
         started: Arc<tokio::sync::Notify>,
         effects: Arc<std::sync::atomic::AtomicUsize>,
@@ -5622,6 +5606,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl crate::harness::native::tools::Tool for CancellationAwareTool {
         fn name(&self) -> &str {
@@ -5908,8 +5893,6 @@ mod tests {
                 },
             )),
             extra_skill_dirs: vec![],
-            extension_events: None,
-            wasm_hooks: None,
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
             turn_effort_policy: Arc::new(TurnEffortPolicy {
@@ -6185,31 +6168,21 @@ mod tests {
             .contains("route"));
     }
 
-    /// A fixed [`crate::plugins::extension::ExtensionEvents`] fake that
-    /// denies exactly one `HookEvent` with a fixed reason and allows
-    /// everything else — enough to prove `RunnerDeps::extension_events` is
-    /// actually wired through the real `run_tool_call` fire site (Track D,
-    /// DT5), not just that `hooks::fire_hook`'s combine contract is correct
-    /// in isolation (that's covered by `hooks.rs`'s own unit tests).
-    struct FixedExtensionEvents {
-        deny_event: crate::harness::native::hooks::HookEvent,
-        reason: &'static str,
-    }
-
-    #[derive(Default)]
-    struct RecordingExtensionEvents {
-        calls: std::sync::Mutex<Vec<(crate::harness::native::hooks::HookEvent, serde_json::Value)>>,
-    }
-
+    // Only used by the `#[cfg(unix)]`-gated tests below, which need on-disk
+    // hook scripts (chmod +x) to observe hook dispatch alongside automation
+    // lifecycle observation.
+    #[cfg(unix)]
     struct BlockingAutomationSink {
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: std::sync::Arc<tokio::sync::Semaphore>,
     }
 
+    #[cfg(unix)]
     struct RecordingAutomationSink {
         observed: tokio::sync::mpsc::UnboundedSender<(crate::automation::TriggerKind, Value)>,
     }
 
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl crate::automation::AutomationEventSink for BlockingAutomationSink {
         async fn observe_lifecycle(
@@ -6227,6 +6200,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl crate::automation::AutomationEventSink for RecordingAutomationSink {
         async fn observe_lifecycle(
@@ -6239,39 +6213,28 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl crate::plugins::extension::ExtensionEvents for FixedExtensionEvents {
-        async fn dispatch(
-            &self,
-            event: crate::harness::native::hooks::HookEvent,
-            _payload: &Value,
-        ) -> crate::harness::native::hooks::HookResult {
-            if event == self.deny_event {
-                crate::harness::native::hooks::HookResult {
-                    allowed: false,
-                    message: Some(self.reason.to_string()),
-                }
-            } else {
-                crate::harness::native::hooks::HookResult::allow()
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::plugins::extension::ExtensionEvents for RecordingExtensionEvents {
-        async fn dispatch(
-            &self,
-            event: crate::harness::native::hooks::HookEvent,
-            payload: &Value,
-        ) -> crate::harness::native::hooks::HookResult {
-            self.calls.lock().unwrap().push((event, payload.clone()));
-            crate::harness::native::hooks::HookResult::allow()
-        }
-    }
-
+    /// A real `tool.before` on-disk deny hook proves the automation lifecycle
+    /// sink (even a slow/blocked one) is independent from the tool gate's own
+    /// hook-based deny decision: the gate still blocks the real tool call via
+    /// the ONE surviving hook sink (on-disk scripts), and the automation sink
+    /// still observes the call, regardless of which finishes first.
+    #[cfg(unix)]
     #[tokio::test]
     async fn blocked_lifecycle_sink_does_not_change_native_tool_gate_result() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        let hook_dir = dir.path().join(".ryuzi/hooks/tool.before");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let script = hook_dir.join("deny.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'blocked by policy hook'\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
         let selection = route_selection("a", "Primary");
         let llm = Arc::new(ScriptedLlm::with_selections(vec![
             (selection.clone(), tool_turn()),
@@ -6285,10 +6248,6 @@ mod tests {
             release: release.clone(),
         });
         deps.automation_events = Some(sink.clone());
-        deps.extension_events = Some(Arc::new(FixedExtensionEvents {
-            deny_event: crate::harness::native::hooks::HookEvent::ToolBefore,
-            reason: "blocked by policy extension",
-        }));
 
         run_turn(
             &deps,
@@ -6303,45 +6262,12 @@ mod tests {
             .iter()
             .find(|m| m.block_type == "tool_call")
             .expect("a tool_call row must exist");
-        assert_eq!(tool_call.payload["output"], "blocked by policy extension");
+        assert_eq!(tool_call.payload["output"], "blocked by policy hook");
         tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx.recv())
             .await
             .expect("automation lifecycle sink must run")
             .expect("automation lifecycle channel must remain open");
         release.add_permits(1);
-    }
-
-    #[tokio::test]
-    async fn tool_before_extension_deny_blocks_the_real_tool_call() {
-        let dir = tempfile::tempdir().unwrap();
-        let selection = route_selection("a", "Primary");
-        // Two scripted turns, exactly like `tool_after_hook_fires_once_...`:
-        // the tool call, then the follow-up response the agent loop makes
-        // once the (denied) tool_result is appended to history.
-        let llm = Arc::new(ScriptedLlm::with_selections(vec![
-            (selection.clone(), tool_turn()),
-            (selection, final_turn("done")),
-        ]));
-        let mut deps = deps_at(dir.path(), llm).await;
-        deps.extension_events = Some(Arc::new(FixedExtensionEvents {
-            deny_event: crate::harness::native::hooks::HookEvent::ToolBefore,
-            reason: "blocked by policy extension",
-        }));
-
-        run_turn(
-            &deps,
-            TurnPrompt::text("go", "go"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        let msgs = deps.store.list_messages("s1").await.unwrap();
-        let tool_call = msgs
-            .iter()
-            .find(|m| m.block_type == "tool_call")
-            .expect("a tool_call row must exist");
-        assert_eq!(tool_call.payload["output"], "blocked by policy extension");
     }
 
     #[tokio::test]
@@ -8804,8 +8730,6 @@ mod tests {
             final_turn("done"),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
-        let hook_calls = Arc::new(RecordingExtensionEvents::default());
-        deps.extension_events = Some(hook_calls.clone());
         deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(tool)]));
         deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_invalid".into()]);
         enable_v2(&mut deps);
@@ -8836,7 +8760,6 @@ mod tests {
             counters.execute.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
-        assert!(hook_calls.calls.lock().unwrap().is_empty());
         assert!(deps.snapshots.lock().await.is_empty());
         assert!(!would_write.exists());
 
@@ -8900,8 +8823,6 @@ mod tests {
             final_turn("done"),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
-        let hook_calls = Arc::new(RecordingExtensionEvents::default());
-        deps.extension_events = Some(hook_calls.clone());
         let telemetry = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let captured = telemetry.clone();
         deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
@@ -8939,7 +8860,6 @@ mod tests {
             counters.execute.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
-        assert!(hook_calls.calls.lock().unwrap().is_empty());
         assert!(deps.snapshots.lock().await.is_empty());
         assert!(!mutation.exists());
 
@@ -9003,8 +8923,6 @@ mod tests {
             final_turn("done"),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
-        let hooks = Arc::new(RecordingExtensionEvents::default());
-        deps.extension_events = Some(hooks.clone());
         deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
         deps.agent.tools =
             super::super::agents::ToolFilter::Only(vec!["missing_file_preflight_spy".into()]);
@@ -9048,7 +8966,6 @@ mod tests {
             .unwrap();
         assert_eq!(row.payload["input"]["path"], requested);
         assert!(!parent.join("store-navigation.ts").exists());
-        assert!(hooks.calls.lock().unwrap().is_empty());
         assert!(deps.snapshots.lock().await.is_empty());
         assert!(!mutation.exists());
         assert_eq!(
@@ -9238,8 +9155,6 @@ mod tests {
         // prompt" even though the assertion below is that ambiguity rejects
         // the call BEFORE the gate is ever reached.
         narrow_native_to_ask(&mut deps, "edit");
-        let hook_calls = Arc::new(RecordingExtensionEvents::default());
-        deps.extension_events = Some(hook_calls.clone());
         enable_v2(&mut deps);
 
         tokio::time::timeout(
@@ -9255,7 +9170,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
-        assert!(hook_calls.calls.lock().unwrap().is_empty());
         assert!(!deps.approvals.has_pending());
         assert!(deps.snapshots.lock().await.is_empty());
         let turns = deps
@@ -10417,17 +10331,30 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_absolute_read_path_is_logical_in_ledger_row_and_hooks() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notes.txt");
         std::fs::write(&file, "notes\n").unwrap();
+        // The on-disk `tool.before` script capture is the surviving-sink
+        // analogue of the deleted `RecordingExtensionEvents` spy — it proves
+        // the real `fire_hook` call site receives the LOGICAL path, not the
+        // absolute host path, exactly like the persisted ledger row.
+        let hook_dir = dir.path().join(".ryuzi/hooks/tool.before");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let capture = dir.path().join("captured-before.json");
+        let script = hook_dir.join("capture.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {}\n", capture.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
         let llm = Arc::new(V2RecordingLlm::new(vec![]));
         let mut deps = deps_at(dir.path(), llm).await;
         enable_v2(&mut deps);
         deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
-        let hook_calls = Arc::new(RecordingExtensionEvents::default());
-        deps.extension_events = Some(hook_calls.clone());
         let compiled = crate::harness::native::tool_plan::compile_candidate(
             &deps.tools,
             &deps.agent.tools,
@@ -10459,17 +10386,16 @@ mod tests {
             tool_row.payload["input"],
             json!({"path": "notes.txt", "offset": 1})
         );
-        let hooks = hook_calls.calls.lock().unwrap();
-        let before = hooks
-            .iter()
-            .find(|(event, _)| *event == crate::harness::native::hooks::HookEvent::ToolBefore)
-            .unwrap();
-        assert_eq!(before.1["input"], json!({"path": "notes.txt", "offset": 1}));
+        let hook_payload: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+        assert_eq!(
+            hook_payload["input"],
+            json!({"path": "notes.txt", "offset": 1})
+        );
         let persisted_and_hooked = format!(
             "{}{}",
             serde_json::to_string(&rows).unwrap(),
-            serde_json::to_string(&hooks.iter().map(|(_, payload)| payload).collect::<Vec<_>>())
-                .unwrap()
+            serde_json::to_string(&hook_payload).unwrap()
         );
         assert!(!persisted_and_hooked.contains(&host_root));
         assert!(!persisted_and_hooked.contains(r"\\?\"));
@@ -13442,9 +13368,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_cancellation_during_a_handler_completes_it_and_queued_siblings_as_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        // On-disk `tool.before`/`tool.after` capture scripts are the
+        // surviving-sink analogue of the deleted `RecordingExtensionEvents`
+        // spy — each appends its event's payload as one NDJSON line, tagged
+        // with the event kind (baked into which directory it lives in), so
+        // the test can still assert exactly which hooks fired for which
+        // tool.
+        let log = dir.path().join("hooks.ndjson");
+        for (event, tag) in [("tool.before", "before"), ("tool.after", "after")] {
+            let hook_dir = dir.path().join(".ryuzi/hooks").join(event);
+            std::fs::create_dir_all(&hook_dir).unwrap();
+            let script = hook_dir.join("capture.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n{{ printf '{{\"event\":\"{tag}\",\"payload\":'; cat; printf '}}\\n'; }} >> {}\nexit 0\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
         let started = Arc::new(tokio::sync::Notify::new());
         let first_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sibling_counters = Arc::new(GatewayCounters::default());
@@ -13479,8 +13430,6 @@ mod tests {
             move |line| captured_telemetry.lock().unwrap().push(line.to_string()),
             || 0,
         ));
-        let extension_events = Arc::new(RecordingExtensionEvents::default());
-        deps.extension_events = Some(extension_events.clone());
         let (automation_tx, mut automation_rx) = tokio::sync::mpsc::unbounded_channel();
         let automation_events = Arc::new(RecordingAutomationSink {
             observed: automation_tx,
@@ -13563,14 +13512,18 @@ mod tests {
                 .expect("persisted cancellation stays structured");
             assert_eq!(envelope["error"]["code"], "cancelled");
         }
-        let hook_calls = extension_events.calls.lock().unwrap().clone();
+        let hook_calls: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert!(hook_calls
             .iter()
-            .all(|(_, payload)| payload["tool"] != "never_run"));
+            .all(|entry| entry["payload"]["tool"] != "never_run"));
         let after_calls = hook_calls
             .iter()
-            .filter(|(event, _)| *event == crate::harness::native::hooks::HookEvent::ToolAfter)
-            .map(|(_, payload)| payload)
+            .filter(|entry| entry["event"] == "after")
+            .map(|entry| &entry["payload"])
             .collect::<Vec<_>>();
         assert_eq!(after_calls.len(), 1);
         assert!(after_calls.iter().all(|payload| {

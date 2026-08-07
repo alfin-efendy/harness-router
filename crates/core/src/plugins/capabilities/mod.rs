@@ -81,11 +81,7 @@ pub struct PluginCapabilityContext {
     pub provider_ids: Vec<String>,
 }
 
-/// Case-insensitive substrings that mark a field *name* as secret-shaped —
-/// mirrors `crate::plugins::extension::events::SECRET_SHAPED_MARKERS`
-/// (kept as a separate copy: that list screens free-form deny-reason
-/// *text*, this one screens setting/log *field names*, and the two lists
-/// are allowed to diverge independently over time).
+/// Case-insensitive substrings that mark a field *name* as secret-shaped.
 const SECRET_SHAPED_MARKERS: &[&str] = &[
     "authorization",
     "bearer",

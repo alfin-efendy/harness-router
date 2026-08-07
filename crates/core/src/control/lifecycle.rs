@@ -1611,35 +1611,11 @@ impl ControlPlane {
         // installed skill packs are materialized into ~/.config/ryuzi/skills
         // by skills_install and reach sessions via the global root.
         let extra_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
-        // Track D: thread the daemon's extension host in only when it has
-        // something spawned — `None` keeps every hook fire site a true
-        // no-op (zero extra dispatch/await) for the common case, and for
-        // every test `ControlPlane` (which never calls `spawn_extensions`).
-        let extension_host_empty = self.extension_host.is_empty().await;
-        let extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>> =
-            if extension_host_empty {
-                None
-            } else {
-                Some(self.extension_host.clone()
-                    as Arc<dyn crate::plugins::extension::ExtensionEvents>)
-            };
-        // DT6: the tool-provision sibling to `extension_events` above — same
-        // guard, same source (`self.extension_host`), so a daemon with no
-        // extensions spawned pays nothing extra building either the hook
-        // dispatch path or the session's tool registry.
-        let extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>> =
-            if extension_host_empty {
-                None
-            } else {
-                Some(self.extension_host.clone()
-                    as Arc<dyn crate::plugins::extension::ExtensionTools>)
-            };
         // Task 9: discover enabled WASM component bundles and expose their
-        // connector tools + hook dispatcher to this session, mirroring the
-        // extension seams above. `(None, None)` when no enabled component
+        // connector tools to this session. `None` when no enabled component
         // bundle is installed (the common case), so no component runtime is
         // even constructed.
-        let (wasm_tools, wasm_hooks) = self.build_wasm_session_providers(&settings).await;
+        let wasm_tools = self.build_wasm_session_providers(&settings).await;
         // `kind`/`agent` come from the session row rather than a caller
         // parameter — every caller of `start_harness_session` (fresh start,
         // cold-resume, crash-resume) has already inserted the row before
@@ -1715,10 +1691,7 @@ impl ControlPlane {
             mcp_servers,
             mcp_principals,
             extra_skill_dirs,
-            extension_events,
-            extension_tools,
             wasm_tools,
-            wasm_hooks,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             automation_events: Some(Arc::new(super::ControlPlaneAutomationSink(Arc::downgrade(
@@ -1753,13 +1726,12 @@ impl ControlPlane {
     /// Discover every active WASM component bundle
     /// ([`crate::plugins::bundle::load_active_bundles`]), keep only the ENABLED
     /// ([`crate::plugins::host::component_plugin_enabled`], the same
-    /// `plugin.<id>.enabled` convention connector/extension plugins use) AND
+    /// `plugin.<id>.enabled` convention connector plugins use) AND
     /// CONFIGURED (`component_required_settings_configured` — every setting
     /// its derived auth requires, e.g. discord's bot token, is actually
     /// stored) ones, and build one shared [`WasmActivation`] per attached
-    /// bundle. Returns a [`WasmTools`] provider (its connector tools) and a
-    /// [`WasmHookDispatcher`] (its `ryuzi:hooks/hooks` export) over the same
-    /// activations, to thread into the session next to the extension seams.
+    /// bundle. Returns a [`WasmTools`] provider (its connector tools) over
+    /// those activations, to thread into the session.
     ///
     /// Every failure mode is warn-and-skip: a missing bundle root, a discovery
     /// error, an unavailable component runtime, a per-bundle compile failure,
@@ -1767,39 +1739,35 @@ impl ControlPlane {
     /// affected bundle (or the whole set) rather than blocking the session
     /// from starting — a broken OR not-yet-configured component plugin must
     /// never brick a session, and a needs-setup one must never restart-loop
-    /// either. `(None, None)` when nothing enabled+configured is installed,
-    /// so the common case constructs no component runtime at all. Declarative
+    /// either. `None` when nothing enabled+configured is installed, so the
+    /// common case constructs no component runtime at all. Declarative
     /// connectors are untouched (this migration phase keeps both paths live).
     async fn build_wasm_session_providers(
         &self,
         settings: &SettingsStore,
-    ) -> (
-        Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
-        Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
-    ) {
+    ) -> Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>> {
         use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
         use crate::plugins::wasm_connector::{WasmActivation, WasmToolSet};
-        use crate::plugins::wasm_hooks::WasmHookDispatcher;
 
         let root = crate::plugins::bundle::installed_bundle_root();
         if !root.exists() {
-            return (None, None);
+            return None;
         }
         let bundles = match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
             Ok(bundles) => bundles,
             Err(error) => {
                 tracing::warn!("wasm: discovering component bundles failed: {error}");
-                return (None, None);
+                return None;
             }
         };
         if bundles.is_empty() {
-            return (None, None);
+            return None;
         }
         let runtime = match ComponentRuntime::new() {
             Ok(runtime) => runtime,
             Err(error) => {
                 tracing::warn!("wasm: component runtime unavailable: {error}");
-                return (None, None);
+                return None;
             }
         };
         let mut activations: Vec<Arc<WasmActivation>> = Vec::new();
@@ -1874,13 +1842,11 @@ impl ControlPlane {
             activations.push(Arc::new(WasmActivation::new(compiled, ctx, id, principal)));
         }
         if activations.is_empty() {
-            return (None, None);
+            return None;
         }
         let wasm_tools: Arc<dyn crate::plugins::wasm_connector::WasmTools> =
-            Arc::new(WasmToolSet::new(activations.clone()));
-        let wasm_hooks: Arc<dyn crate::plugins::extension::ExtensionEvents> =
-            Arc::new(WasmHookDispatcher::new(activations));
-        (Some(wasm_tools), Some(wasm_hooks))
+            Arc::new(WasmToolSet::new(activations));
+        Some(wasm_tools)
     }
 
     /// Extend `mcp_servers` with the MCP servers of every enabled,

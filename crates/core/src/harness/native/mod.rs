@@ -63,14 +63,12 @@ struct AdaptedPrimary {
 /// an empty decision map already means every native tool is `Ask` (enabled),
 /// so an agent with no plugin/app bindings still resolves to exactly the
 /// native registry, not a blanket allow that would also sweep in
-/// `mcp__`/`ext__`/`wasm__` tools it never configured.
+/// `mcp__`/`wasm__` tools it never configured.
 fn tool_filter_for_profile(
     profile: &crate::agents::types::AgentProfile,
     available: &[String],
 ) -> agents::ToolFilter {
-    let namespaced = |name: &str| {
-        name.starts_with("mcp__") || name.starts_with("ext__") || name.starts_with("wasm__")
-    };
+    let namespaced = |name: &str| name.starts_with("mcp__") || name.starts_with("wasm__");
     let mut allowed: Vec<String> = available
         .iter()
         .filter(|name| !namespaced(name))
@@ -89,7 +87,6 @@ fn tool_filter_for_profile(
                     .iter()
                     .filter(|name| {
                         *name == &format!("mcp__{provider}__{tool}")
-                            || *name == &format!("ext__{provider}__{tool}")
                             || *name == &format!("wasm__{provider}__{tool}")
                     })
                     .cloned(),
@@ -102,7 +99,6 @@ fn tool_filter_for_profile(
                     .iter()
                     .filter(|name| {
                         name.starts_with(&format!("mcp__{plugin}__"))
-                            || name.starts_with(&format!("ext__{plugin}__"))
                             || name.starts_with(&format!("wasm__{plugin}__"))
                     })
                     .cloned(),
@@ -261,34 +257,11 @@ async fn connect_mcp_tools(
     extra
 }
 
-/// Gather every currently-provided extension tool (Track D, DT6) from the
-/// daemon-global extension host and wrap each as a native `Tool` — the
-/// extension analogue of `connect_mcp_tools`, called at the same session-
-/// start point. `None` (the common case: no extensions spawned, and every
-/// bare test `SessionCtx`) is a true zero-cost no-op — no await, no extra
-/// tools — mirroring how `ctx.extension_events: None` keeps every hook fire
-/// site inert.
-async fn connect_extension_tools(
-    extension_tools: Option<&Arc<dyn crate::plugins::extension::ExtensionTools>>,
-) -> Vec<Arc<dyn tools::Tool>> {
-    let Some(host) = extension_tools else {
-        return Vec::new();
-    };
-    host.session_tools()
-        .await
-        .into_iter()
-        .map(|binding| {
-            Arc::new(tools::extension::ExtensionTool::from_binding(binding)) as Arc<dyn tools::Tool>
-        })
-        .collect()
-}
-
 /// Gather every enabled WASM component bundle's connector tool (Task 9) and
-/// wrap each as a native `Tool` — the component analogue of
-/// `connect_extension_tools`, called at the same session-start point and
-/// folded into the same registry. `None` (no enabled component bundle
-/// installed — the common case, and every bare test `SessionCtx`) is a true
-/// zero-cost no-op, mirroring `connect_extension_tools`.
+/// wrap each as a native `Tool` — called at the same session-start point as
+/// `connect_mcp_tools` and folded into the same registry. `None` (no enabled
+/// component bundle installed — the common case, and every bare test
+/// `SessionCtx`) is a true zero-cost no-op — no await, no extra tools.
 async fn connect_wasm_tools(
     wasm_tools: Option<&Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
 ) -> Vec<Arc<dyn tools::Tool>> {
@@ -361,12 +334,9 @@ impl Harness for NativeHarness {
         // worktree agents remain available only for slash-command/subagent
         // selection; they must never replace a durable primary by name.
         // Plugin hooks: observational — a `session.start` hook is notified but
-        // cannot block startup (only `tool.before` gates). Fires to both the
-        // on-disk script sink and (Track D) any subscribed extensions.
+        // cannot block startup (only `tool.before` gates).
         let _ = hooks::fire_hook(
             &ctx.work_dir,
-            ctx.extension_events.as_ref(),
-            ctx.wasm_hooks.as_ref(),
             hooks::HookEvent::SessionStart,
             &json!({
                 "session": ctx.session_pk.clone(),
@@ -388,18 +358,13 @@ impl Harness for NativeHarness {
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
         let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
-        // Track D, DT6: fold in every currently-provided extension tool
-        // alongside the MCP ones — both flow into the SAME registry, so the
-        // runner dispatches either through the identical `deps.tools.get(name)`
-        // path with no special-casing.
-        extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
         // Task 9: fold in every enabled WASM component bundle's connector tool
-        // alongside the MCP + extension ones — all flow into the SAME registry,
-        // dispatched through the identical `deps.tools.get(name)` path with no
+        // alongside the MCP ones — both flow into the SAME registry, dispatched
+        // through the identical `deps.tools.get(name)` path with no
         // special-casing by source.
         extra_tools.extend(connect_wasm_tools(ctx.wasm_tools.as_ref()).await);
         let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
-        // The registry is complete only after MCP and extension attachment.
+        // The registry is complete only after MCP and WASM-tool attachment.
         // Resolve this immutable profile against that final namespace so a
         // constrained explicit target cannot fall back to `ToolFilter::All`.
         let primary_turn = primary_turn_config_with_tools(
@@ -469,8 +434,6 @@ impl Harness for NativeHarness {
                     .flatten(),
                 artifacts: ctx.artifacts,
                 extra_skill_dirs: ctx.extra_skill_dirs,
-                extension_events: ctx.extension_events,
-                wasm_hooks: ctx.wasm_hooks,
                 model,
                 turn_effort_policy: Arc::new(effort_policy),
                 meta,
@@ -599,13 +562,10 @@ impl HarnessSession for NativeSession {
         // exactly one place — `ControlPlane::end_session`'s teardown, the
         // sole path that removes the live handle from `running` — so this
         // fires once per real session end, never on a `stop_session`
-        // interrupt (which cancels but does not `end()`). Fires to both the
-        // on-disk script sink and (Track D) any subscribed extensions.
+        // interrupt (which cancels but does not `end()`).
         let deps = self.deps.lock().unwrap().clone();
         let _ = hooks::fire_hook(
             &deps.work_dir,
-            deps.extension_events.as_ref(),
-            deps.wasm_hooks.as_ref(),
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
@@ -885,10 +845,7 @@ mod tests {
             mcp_servers: vec![],
             mcp_principals: std::collections::HashMap::new(),
             extra_skill_dirs: vec![],
-            extension_events: None,
-            extension_tools: None,
             wasm_tools: None,
-            wasm_hooks: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,
@@ -1190,16 +1147,6 @@ mod tests {
         );
     }
 
-    // NOTE: `refresh_primary_turn_keeps_bound_plugin_tools_advertised` was
-    // deleted here: it proved a BOUND plugin tool discovered through a
-    // `CorePlugin.extension`-driven `ExtensionHost::spawn_all` sweep (a
-    // `FakeExtFactory` wired via `extension: Some(...)`) survives a
-    // prompt-time refresh. `CorePlugin.extension` no longer exists (the v2
-    // SDK manifest has no `[[extension]]` surface), `spawn_all` is now a
-    // permanent no-op, and no plugin can ever be discovered this way — that
-    // whole integration is categorically impossible pending Task 3's full
-    // deletion of Track D subprocess extensions.
-
     #[test]
     fn profile_tool_filter_resolves_native_plugin_and_app_tools_without_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
@@ -1212,20 +1159,18 @@ mod tests {
             .permissions
             .native
             .insert("read".into(), NativeToolDecision::Allow);
-        profile.tools.plugins = vec!["github.search".into(), "lint.check".into()];
+        profile.tools.plugins = vec!["github.search".into()];
         profile.tools.apps = vec!["slack".into()];
         let available = vec![
             "read".into(),
             "write".into(),
             "mcp__github__search".into(),
-            "ext__lint__check".into(),
             "mcp__slack__send".into(),
         ];
 
         assert_eq!(
             tool_filter_for_profile(&profile, &available),
             agents::ToolFilter::Only(vec![
-                "ext__lint__check".into(),
                 "mcp__github__search".into(),
                 "mcp__slack__send".into(),
                 "read".into(),
@@ -1261,12 +1206,7 @@ mod tests {
             .native
             .insert("write".into(), NativeToolDecision::Off);
         profile.tools.plugins = vec!["github.search".into()];
-        let available = vec![
-            "read".into(),
-            "write".into(),
-            "mcp__github__search".into(),
-            "ext__lint__check".into(),
-        ];
+        let available = vec!["read".into(), "write".into(), "mcp__github__search".into()];
         assert_eq!(
             tool_filter_for_profile(&profile, &available),
             agents::ToolFilter::Only(vec!["mcp__github__search".into(), "read".into()])
@@ -2166,18 +2106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_extension_tools_is_a_no_op_with_no_host() {
-        assert!(connect_extension_tools(None).await.is_empty());
+    async fn connect_wasm_tools_is_a_no_op_with_no_host() {
+        assert!(connect_wasm_tools(None).await.is_empty());
     }
-
-    // NOTE: `connect_extension_tools_wraps_a_running_provides_tools_extension_and_executes_it`
-    // was deleted here: it proved `connect_extension_tools` wraps and can
-    // dispatch a tool discovered through a `CorePlugin.extension`-driven
-    // `ExtensionHost::spawn_all` sweep (a `FakeExtFactory` wired via
-    // `extension: Some(...)`). `CorePlugin.extension` no longer exists (the
-    // v2 SDK manifest has no `[[extension]]` surface), `spawn_all` is now a
-    // permanent no-op, and no plugin can ever be discovered this way — that
-    // whole integration is categorically impossible pending Task 3's full
-    // deletion of Track D subprocess extensions.
-    // `connect_extension_tools_is_a_no_op_with_no_host` above still holds.
 }
