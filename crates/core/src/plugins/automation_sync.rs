@@ -137,6 +137,14 @@ fn build_action(action: &str, config: &toml::Value) -> anyhow::Result<HookAction
     serde_json::from_value(wire).context("hook config does not match its action's schema")
 }
 
+/// An `agent.run` action with no project selected — the state
+/// `automation::toggle_hook` refuses to enable ("pick a project first").
+/// A plugin cannot declare a target, so this is how every freshly-synced
+/// `agent.run` hook starts out.
+fn is_targetless_agent_run(action: &HookActionInput) -> bool {
+    matches!(action, HookActionInput::AgentRun(cfg) if cfg.project_id.trim().is_empty())
+}
+
 /// Preserve a user-filled `agent.run` target across a re-sync: any of
 /// `project_id`/`branch`/`gateway_id`/`agent_id` the STORED row has non-empty
 /// wins over whatever the fresh manifest-derived action carries (ordinarily
@@ -214,12 +222,14 @@ async fn sync_one_hook(
     let (id, enabled, action, created_at) = match &existing {
         Some(existing) => {
             let action = preserve_agent_run_target(action, &existing.action);
-            (
-                existing.id.clone(),
-                existing.enabled,
-                action,
-                existing.created_at,
-            )
+            // Carrying `enabled` forward is what preserves the user's choice
+            // across a plugin update — but a plugin can also CHANGE a hook's
+            // action kind. Flipping `webhook.outbound` (which may ship
+            // enabled) to `agent.run` would then persist an enabled hook with
+            // no project, the exact state `toggle_hook`'s guard refuses, via
+            // a write path that bypasses it. Re-apply the first-sync rule.
+            let enabled = existing.enabled && !is_targetless_agent_run(&action);
+            (existing.id.clone(), enabled, action, existing.created_at)
         }
         None => {
             // First sync: only webhook.outbound may ship enabled — agent.run
@@ -396,6 +406,78 @@ schedule = "every day at 2am"
 prompt = "Run the nightly audit"
 "#
         );
+        let manifest = PluginManifest::from_toml(&toml).expect("valid manifest");
+        declarative::declarative_plugin(manifest, PluginSource::Builtin)
+            .expect("declarative plugin")
+    }
+
+    /// A plugin update may CHANGE a hook's action kind. Flipping an enabled
+    /// `webhook.outbound` hook to `agent.run` must not persist an enabled
+    /// hook with no project — `toggle_hook` refuses exactly that state, and
+    /// the sync path writes rows without going through it.
+    #[tokio::test]
+    async fn resync_that_changes_an_enabled_hook_to_agent_run_disables_it() {
+        let store = mem_store().await;
+
+        // v1 of the plugin: a webhook.outbound hook, which may ship enabled.
+        let webhook_only = plugin_with_one_hook(
+            "acme",
+            r#"
+[[hooks]]
+name = "notify"
+trigger = "tool.before"
+action = "webhook.outbound"
+
+[hooks.config]
+url = "https://example.com/notify"
+method = "POST"
+"#,
+        );
+        sync_plugin_automations(&store, &webhook_only)
+            .await
+            .unwrap();
+        let hook = automation::find_hook_by_name(&store, "acme/notify")
+            .await
+            .unwrap()
+            .expect("hook synced");
+        assert!(hook.enabled, "a webhook.outbound preset may ship enabled");
+
+        // v2 of the plugin: same hook name, now an agent.run with no target.
+        let agent_run = plugin_with_one_hook(
+            "acme",
+            r#"
+[[hooks]]
+name = "notify"
+trigger = "tool.before"
+action = "agent.run"
+
+[hooks.config]
+projectId = ""
+branch = ""
+gatewayId = ""
+prompt = "Do the thing"
+subtask = false
+"#,
+        );
+        sync_plugin_automations(&store, &agent_run).await.unwrap();
+
+        let hook = automation::find_hook_by_name(&store, "acme/notify")
+            .await
+            .unwrap()
+            .expect("hook still present");
+        assert!(
+            matches!(hook.action, HookActionInput::AgentRun(_)),
+            "the action must be updated to the plugin's new declaration"
+        );
+        assert!(
+            !hook.enabled,
+            "an agent.run hook with no project must not stay enabled across a re-sync"
+        );
+    }
+
+    /// A plugin declaring exactly the hook block given.
+    fn plugin_with_one_hook(id: &str, hook_toml: &str) -> CorePlugin {
+        let toml = format!("contract = 2\nid = \"{id}\"\nname = \"{id}\"\n{hook_toml}");
         let manifest = PluginManifest::from_toml(&toml).expect("valid manifest");
         declarative::declarative_plugin(manifest, PluginSource::Builtin)
             .expect("declarative plugin")
