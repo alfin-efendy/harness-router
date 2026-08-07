@@ -90,7 +90,15 @@ pub fn plugin_fields_all() -> Vec<(String, SettingField)> {
 ///   `validate_setting("plugin.<id>.enabled", ...)` accept every installed
 ///   plugin, not just connector-capable ones (harmless for the others: they
 ///   just never read the key back via `is_enabled`)
-fn register_plugin_fields(manifest: &PluginManifest) {
+/// - `plugin.<id>.trusted`, always, as a `Bool` field — Task 11's tiered
+///   trust flag (see [`component_surfaces_trusted_for`]). Called directly by
+///   [`crate::plugins::install_sources::confirm_plugin_install`] on its
+///   freshly-parsed manifest (not yet added to any `PluginHost`) so
+///   `SettingsStore::set(qualified_setting_key(id, "trusted"), ...)` is
+///   already schema-known the moment confirm needs to write it — waiting for
+///   a later `Registries::add_plugin` (e.g. after a daemon restart) would be
+///   too late.
+pub(crate) fn register_plugin_fields(manifest: &PluginManifest) {
     let mut fields = plugin_fields()
         .write()
         .expect("PLUGIN_FIELDS lock poisoned");
@@ -136,6 +144,23 @@ fn register_plugin_fields(manifest: &PluginManifest) {
             },
         ),
     );
+    let trusted_key = qualified_setting_key(&manifest.id, "trusted");
+    fields.insert(
+        trusted_key.clone(),
+        (
+            manifest.id.clone(),
+            SettingField {
+                key: trusted_key,
+                label: format!("{} trust acceptance", manifest.name),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Bool,
+                options: Vec::new(),
+                default: None,
+            },
+        ),
+    );
 }
 
 /// Where a plugin's manifest/behavior came from.
@@ -152,7 +177,8 @@ pub enum PluginSource {
 }
 
 /// How an [`PluginSource::Installed`] plugin arrived on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum InstallProvenance {
     /// Came through the signed catalog feed (first-party verified).
     Catalog,
@@ -160,6 +186,55 @@ pub enum InstallProvenance {
     LocalPath,
     /// Unsigned git-clone install (records the source URL).
     GitUrl(String),
+}
+
+/// The single trust gate for every unsigned-installable surface with real
+/// blast radius — `[[mcp]]` (an arbitrary stdio process) and `[component]`
+/// (a WASM component, sandboxed but still executable code) — Task 11's
+/// tiered-trust model. `true` when `provenance` is
+/// [`InstallProvenance::Catalog`] (a hash-verified, signed install — trusted
+/// by construction, first-party embedded builtins never carry any other
+/// provenance) OR the user has explicitly accepted the trust prompt for
+/// `plugin_id` (`plugin.<id>.trusted == "true"`, written ONLY by
+/// [`crate::plugins::install_sources::confirm_plugin_install`]'s confirm
+/// step, and only when the user accepted).
+///
+/// This is the single source of truth every call site gates on:
+/// `crate::plugins::mcp_sync::sync_plugin_mcp` (via
+/// [`component_surfaces_trusted`], which has a live [`CorePlugin`] and reads
+/// `plugin.source` directly) and the three WASM bundle-discovery sites —
+/// `control::lifecycle::ControlPlane::build_component_mcp_servers`,
+/// `crate::plugins::wasm_provider::discover_provider_components`,
+/// `crate::plugins::wasm_gateway::discover_gateway_components` — which only
+/// have an [`crate::plugins::bundle::InstalledBundle`] (no live `CorePlugin`)
+/// and so re-derive `provenance` straight off the on-disk `install.json`
+/// stamp via [`crate::plugins::install_sources::read_install_provenance`]
+/// (defaulting to `Catalog` when absent — every pre-Task-11 install path,
+/// first-party embedded or signed-catalog, never writes that stamp).
+pub async fn component_surfaces_trusted_for(
+    settings: &SettingsStore,
+    plugin_id: &str,
+    provenance: &InstallProvenance,
+) -> bool {
+    match provenance {
+        InstallProvenance::Catalog => true,
+        InstallProvenance::LocalPath | InstallProvenance::GitUrl(_) => {
+            let key = qualified_setting_key(plugin_id, "trusted");
+            matches!(settings.get(&key).await, Ok(Some(value)) if value == "true")
+        }
+    }
+}
+
+/// [`component_surfaces_trusted_for`], keyed off a registered [`CorePlugin`]'s
+/// own [`PluginSource`] — `Builtin` (first-party, native or embedded catalog)
+/// is trusted unconditionally; `Installed` delegates to its `provenance`.
+pub async fn component_surfaces_trusted(settings: &SettingsStore, plugin: &CorePlugin) -> bool {
+    match &plugin.source {
+        PluginSource::Builtin => true,
+        PluginSource::Installed { provenance, .. } => {
+            component_surfaces_trusted_for(settings, &plugin.manifest.id, provenance).await
+        }
+    }
 }
 
 /// The one namespacing site for a bare v2 settings key: v2 manifests keep
@@ -1138,5 +1213,63 @@ mod tests {
             field.required,
             "the declared field's required flag must survive, not the synthetic's always-false"
         );
+    }
+
+    // ---------- Task 11: component_surfaces_trusted{,_for} ----------
+
+    #[tokio::test]
+    async fn catalog_and_builtin_provenance_are_always_trusted() {
+        let (_store, settings, _tmp) = open_settings().await;
+        assert!(
+            component_surfaces_trusted_for(&settings, "acme", &InstallProvenance::Catalog).await
+        );
+
+        let mut plugin = manifest_only("acme-builtin");
+        plugin.source = PluginSource::Builtin;
+        assert!(component_surfaces_trusted(&settings, &plugin).await);
+    }
+
+    #[tokio::test]
+    async fn unsigned_provenance_requires_the_explicit_trust_setting() {
+        let (store, settings, _tmp) = open_settings().await;
+        for provenance in [
+            InstallProvenance::LocalPath,
+            InstallProvenance::GitUrl("https://example.com/acme.git".to_string()),
+        ] {
+            assert!(
+                !component_surfaces_trusted_for(&settings, "acme-unsigned", &provenance).await,
+                "no trust setting written yet: {provenance:?}"
+            );
+        }
+
+        store
+            .set_setting_raw("plugin.acme-unsigned.trusted", "true")
+            .await
+            .unwrap();
+        assert!(
+            component_surfaces_trusted_for(
+                &settings,
+                "acme-unsigned",
+                &InstallProvenance::LocalPath
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn component_surfaces_trusted_reads_provenance_off_the_core_plugin_source() {
+        let (store, settings, _tmp) = open_settings().await;
+        let mut plugin = manifest_only("acme-installed");
+        plugin.source = PluginSource::Installed {
+            dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+            provenance: InstallProvenance::LocalPath,
+        };
+        assert!(!component_surfaces_trusted(&settings, &plugin).await);
+
+        store
+            .set_setting_raw("plugin.acme-installed.trusted", "true")
+            .await
+            .unwrap();
+        assert!(component_surfaces_trusted(&settings, &plugin).await);
     }
 }
