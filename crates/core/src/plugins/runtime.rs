@@ -1597,6 +1597,23 @@ mod tests {
             "a non-first-party key must NOT grant self-auth"
         );
 
+        // The gateway export is gated on the SAME verified-provenance signal.
+        // Asserted here, at the derivation, because the export-loop test flips
+        // `allow_gateway` by hand and so would not catch a regression that
+        // granted it unconditionally.
+        assert!(
+            first_party.allow_gateway,
+            "the first-party key must grant the gateway export"
+        );
+        assert!(
+            !third_party.allow_gateway,
+            "a non-first-party key must NOT grant the gateway export"
+        );
+        assert!(
+            !HostPolicy::deny_all().allow_gateway,
+            "deny_all must not grant the gateway export"
+        );
+
         // The rest of the derivation is manifest-driven and independent of the
         // self-auth gate: settings/storage always on, network only with a
         // declared host — and a network grant never implies self-auth.
