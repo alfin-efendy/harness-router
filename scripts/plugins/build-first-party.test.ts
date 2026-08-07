@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { artifactNames, COMPONENTS } from "./build-first-party.ts";
+import { artifactNames, COMPONENTS, readManifest } from "./build-first-party.ts";
 
 // Repo root relative to this file (scripts/plugins/), so the test is
 // cwd-independent — it resolves plugins/ the same way regardless of where
@@ -67,6 +67,20 @@ test("each COMPONENTS entry's crateWasmStem matches its crate's [package] name",
     const crateName = parsed.package?.name;
     expect(typeof crateName).toBe("string");
     expect(spec.crateWasmStem).toBe((crateName as string).replaceAll("-", "_"));
+  }
+});
+
+// Every shipped bundle manifest must be manifest-v2 (`contract = 2`, wasm
+// filename under `[component].file`) — `readManifest` is the release
+// pipeline's own reader, so a passing call here means the same manifest will
+// parse when `build-first-party.ts` actually signs a release. Catches a
+// manifest left on v1 (top-level `contract`/`component` string) before it
+// reaches CI's signing step.
+test("readManifest accepts every shipped plugins/<id>/ryuzi-plugin.toml as contract 2", async () => {
+  for (const spec of COMPONENTS) {
+    const manifest = await readManifest(join(REPO_ROOT, spec.dir));
+    expect(manifest.id).toBe(spec.id);
+    expect(manifest.component.length).toBeGreaterThan(0);
   }
 });
 

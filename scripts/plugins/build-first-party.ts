@@ -208,10 +208,15 @@ export async function readManifest(dir: string): Promise<ManifestFields> {
   const parsed = Bun.TOML.parse(await Bun.file(path).text()) as Record<string, unknown>;
   const id = parsed.id;
   const version = parsed.version;
-  const component = parsed.component;
+  // v2 manifests nest the wasm filename under `[component].file` (the top-level
+  // `component = "<name>.wasm"` string was a v1-only field — see Task 2/17's
+  // manifest-v2 conversion).
+  const component = (parsed.component as Record<string, unknown> | undefined)?.file;
+  const contract = parsed.contract;
   if (typeof id !== "string" || id.length === 0) throw new Error(`${path}: missing 'id'`);
   if (typeof version !== "string" || version.length === 0) throw new Error(`${path}: missing 'version'`);
-  if (typeof component !== "string" || component.length === 0) throw new Error(`${path}: missing 'component'`);
+  if (contract !== 2) throw new Error(`${path}: 'contract' must be 2`);
+  if (typeof component !== "string" || component.length === 0) throw new Error(`${path}: missing '[component].file'`);
   return { id, version, component };
 }
 
