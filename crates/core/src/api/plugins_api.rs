@@ -36,7 +36,7 @@ use crate::plugins::oauth::{
     register_oauth_client, OauthServerMetadata, PluginOauthToken,
 };
 use crate::plugins::providers;
-use crate::plugins::{CorePlugin, PluginSource};
+use crate::plugins::{CorePlugin, InstallProvenance, PluginSource};
 use crate::serve::ApiState;
 use crate::settings::SettingsStore;
 use crate::store::{PluginOauthClient, RemoteCatalogRow, Store};
@@ -429,8 +429,11 @@ async fn update_all_plugins(cp: &ControlPlane) -> anyhow::Result<Vec<UpdateOutco
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
-        PluginSource::Component => "component",
-        PluginSource::SkillPack(_) => "skill-pack",
+        PluginSource::Installed { provenance, .. } => match provenance {
+            InstallProvenance::Catalog => "catalog",
+            InstallProvenance::LocalPath => "local-path",
+            InstallProvenance::GitUrl(_) => "git-url",
+        },
     }
 }
 
@@ -1087,8 +1090,7 @@ async fn plugin_auth_configured(
         return Ok(false);
     };
     if auth.kind == AuthKind::Oauth {
-        if let Some(bundle) = crate::plugins::component_catalog::declared_bundle_manifest(plugin_id)
-        {
+        if let Some(bundle) = crate::plugins::component_catalog::declared_manifest(plugin_id) {
             if !bundle.oauth.is_empty() {
                 for profile in &bundle.oauth {
                     let live = store
@@ -1773,8 +1775,13 @@ async fn plugin_tools(cp: &ControlPlane, id: &str) -> Result<PluginToolsResult, 
         .get(id)
         .ok_or_else(|| ApiError::not_found(format!("unknown plugin: {id}")))?;
 
-    // 1. Live extension tools.
-    if plugin.extension.is_some() {
+    // 1. Live extension tools. `CorePlugin.extension` no longer exists — the
+    // v2 SDK manifest has no `[[extension]]` surface, so no plugin can ever
+    // be extension-capable anymore. This branch never fires (see
+    // `api::extension_status_api`'s identical note) pending Task 3's full
+    // deletion of Track D subprocess extensions.
+    if false {
+        let _ = &plugin;
         let snapshots = cp.extension_host().get(id).await;
         let running: Vec<_> = snapshots
             .iter()
@@ -2219,7 +2226,7 @@ async fn begin_plugin_install(
         .plugins()
         .get(&plugin_id)
         .ok_or_else(|| ApiError::not_found(format!("unknown plugin: {plugin_id}")))?;
-    if plugin.source == PluginSource::Component {
+    if plugin.manifest.component.is_some() {
         return Err(ApiError::bad_request(
             "component plugins connect via their oauth profiles, not the declarative install flow"
                 .to_string(),
@@ -2343,7 +2350,7 @@ async fn plugin_release_detail(
         None => None,
     };
     let declared_manifest =
-        match crate::plugins::component_catalog::declared_bundle_manifest(plugin_id)
+        match crate::plugins::component_catalog::declared_manifest(plugin_id)
             .map(ComponentManifestInfo::from)
         {
             Some(mut manifest) => {
@@ -2397,10 +2404,8 @@ async fn enrich_oauth_profile_status(
         if !profile.client_id_configured {
             // A client-id-setting with a stored non-empty value also counts
             // (PR-3: user-supplied client id until first-party ids are baked).
-            let setting_key = crate::plugins::component_catalog::declared_bundle_manifest(
-                plugin_id,
-            )
-            .and_then(|bundle| {
+            let setting_key = crate::plugins::component_catalog::declared_manifest(plugin_id)
+                .and_then(|bundle| {
                 bundle
                     .oauth
                     .into_iter()
@@ -2627,7 +2632,7 @@ async fn profile_capability_context(
 ) -> Result<
     (
         crate::plugins::capabilities::PluginCapabilityContext,
-        ryuzi_plugin_sdk::PluginBundleManifest,
+        ryuzi_plugin_sdk::PluginManifest,
     ),
     ApiError,
 > {
@@ -2661,7 +2666,7 @@ async fn profile_capability_context(
 }
 
 fn find_oauth_profile(
-    manifest: &ryuzi_plugin_sdk::PluginBundleManifest,
+    manifest: &ryuzi_plugin_sdk::PluginManifest,
     profile_id: &str,
 ) -> Result<ryuzi_plugin_sdk::OAuthProfile, ApiError> {
     manifest
@@ -2780,7 +2785,9 @@ mod tests {
     use crate::gateway::{Gateway, GatewayFactory};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
     use crate::Registries;
-    use ryuzi_plugin_sdk::{AuthSpec, ModelDef, PluginManifest, ProviderMeta};
+    use ryuzi_plugin_sdk::{
+        AuthSpec, ComponentSpec, ModelDef, PluginLifecycle, PluginManifest, ProviderSpec,
+    };
     use serde_json::json;
     use serial_test::serial;
     use std::collections::BTreeMap;
@@ -2881,7 +2888,7 @@ mod tests {
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Plugin {id}"),
             version: String::new(),
@@ -2895,10 +2902,15 @@ mod tests {
             experimental: false,
             auth: None,
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         }
     }
 
@@ -2908,7 +2920,6 @@ mod tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -2916,13 +2927,23 @@ mod tests {
 
     fn gateway_only(id: &str) -> CorePlugin {
         CorePlugin {
-            manifest: manifest(id),
+            manifest: PluginManifest {
+                component: Some(ComponentSpec {
+                    file: format!("{id}.wasm"),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: PluginLifecycle::Singleton,
+                }),
+                ..manifest(id)
+            },
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
-            extension: None,
             provider: None,
-            source: PluginSource::Component,
+            // Real component-catalog plugins are `PluginSource::Builtin`-
+            // registered too (see `component_catalog.rs`) — "component-ness"
+            // is a manifest property (`manifest.component.is_some()`) now,
+            // not a `PluginSource` variant.
+            source: PluginSource::Builtin,
         }
     }
 
@@ -2932,17 +2953,20 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            extension: None,
             provider: None,
-            source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
+            source: PluginSource::Installed {
+                dir: std::path::PathBuf::from("/tmp/whatever"),
+                provenance: InstallProvenance::LocalPath,
+            },
         }
     }
 
     fn provider_only(id: &str) -> CorePlugin {
         CorePlugin {
             manifest: PluginManifest {
-                provider: Some(ProviderMeta {
-                    format: "openai".to_string(),
+                provider: Some(ProviderSpec {
+                    ids: vec![],
+                    format: Some("openai".to_string()),
                     base_url: None,
                     models: vec![ModelDef {
                         id: "m1".to_string(),
@@ -2955,7 +2979,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -2990,7 +3013,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -3003,10 +3025,26 @@ mod tests {
     #[test]
     fn source_label_maps_every_variant() {
         assert_eq!(source_label(&PluginSource::Builtin), "builtin");
-        assert_eq!(source_label(&PluginSource::Component), "component");
         assert_eq!(
-            source_label(&PluginSource::SkillPack(std::path::PathBuf::from("/x"))),
-            "skill-pack"
+            source_label(&PluginSource::Installed {
+                dir: std::path::PathBuf::from("/x"),
+                provenance: InstallProvenance::Catalog,
+            }),
+            "catalog"
+        );
+        assert_eq!(
+            source_label(&PluginSource::Installed {
+                dir: std::path::PathBuf::from("/x"),
+                provenance: InstallProvenance::LocalPath,
+            }),
+            "local-path"
+        );
+        assert_eq!(
+            source_label(&PluginSource::Installed {
+                dir: std::path::PathBuf::from("/x"),
+                provenance: InstallProvenance::GitUrl("https://example.com/repo.git".to_string()),
+            }),
+            "git-url"
         );
     }
 
@@ -3016,22 +3054,8 @@ mod tests {
     fn derive_kind_classifies_each_capability_shape() {
         assert_eq!(derive_kind(&provider_only("anthropic")), Some("provider"));
         assert_eq!(derive_kind(&gateway_only("discord")), Some("gateway"));
-        assert_eq!(derive_kind(&connector_only("slack")), Some("skill-pack"));
+        assert_eq!(derive_kind(&connector_only("slack")), Some("integration"));
         assert_eq!(derive_kind(&harness_only("native")), None);
-    }
-
-    #[test]
-    fn derive_kind_integration_for_connector_without_skill_pack_source() {
-        let mut plugin = connector_only("acme-conn");
-        plugin.source = PluginSource::Component;
-        assert_eq!(derive_kind(&plugin), Some("integration"));
-    }
-
-    #[test]
-    fn derive_kind_skill_pack_from_source() {
-        let mut plugin = connector_only("acme-pack");
-        plugin.source = PluginSource::SkillPack(std::path::PathBuf::from("/tmp/p"));
-        assert_eq!(derive_kind(&plugin), Some("skill-pack"));
     }
 
     // ---------- installed_flag ----------
@@ -3397,8 +3421,8 @@ mod tests {
 
     #[test]
     fn plugin_info_status_not_installed_for_not_installed_catalog_row() {
-        // `gateway_only` is `PluginSource::Component`-sourced — a
-        // component-catalog row not yet installed.
+        // `gateway_only` declares `manifest.component` — a component-catalog
+        // row not yet installed.
         let plugin = gateway_only("acme-catalog");
         let info = plugin_info(&plugin, false, false, "gateway", false, no_ctx(false));
         assert_eq!(info.status, "not-installed");
@@ -3428,7 +3452,14 @@ mod tests {
     #[test]
     fn plugin_info_tool_count_reads_embedded_manifest_for_component_backed_rows() {
         let mut plugin = connector_only("github");
-        plugin.source = PluginSource::Component;
+        // `component_backed`/`tool_count` are keyed off the real embedded
+        // component catalog by id (`is_component_bundle("github")`), not
+        // `plugin.source` — this just documents the fixture's intent.
+        plugin.manifest.component = Some(ComponentSpec {
+            file: "github.wasm".to_string(),
+            wit_api: "^0.1.0".to_string(),
+            lifecycle: PluginLifecycle::Singleton,
+        });
         let info = plugin_info(&plugin, true, true, "integration", true, no_ctx(false));
         assert!(info.component_backed);
         assert_eq!(info.tool_count, Some(12));
@@ -3442,7 +3473,7 @@ mod tests {
 
     #[test]
     fn plugin_info_skill_count_only_applies_to_skill_pack_kind() {
-        // Already `PluginSource::SkillPack(_)`-sourced by default.
+        // `kind` is passed explicitly below — `plugin.source` plays no part.
         let plugin = connector_only("acme-pack");
         let ctx = PluginInfoContext {
             skill_count: Some(7),
@@ -3463,7 +3494,11 @@ mod tests {
     #[test]
     fn plugin_info_update_available_only_for_component_backed_rows_with_newer_catalog_version() {
         let mut plugin = connector_only("github");
-        plugin.source = PluginSource::Component;
+        plugin.manifest.component = Some(ComponentSpec {
+            file: "github.wasm".to_string(),
+            wit_api: "^0.1.0".to_string(),
+            lifecycle: PluginLifecycle::Singleton,
+        });
         let remote = RemoteCatalogRow {
             id: "github".to_string(),
             manifest_toml: String::new(),
@@ -3504,8 +3539,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
-        let mut plugin = gateway_only("acme-remote");
-        plugin.source = PluginSource::Component;
+        let plugin = gateway_only("acme-remote");
         regs.add_plugin(plugin);
         let cp = {
             let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
@@ -4030,9 +4064,8 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            extension: None,
             provider: None,
-            source: PluginSource::Component,
+            source: PluginSource::Builtin,
         }
     }
 
@@ -4129,8 +4162,7 @@ mod tests {
     /// `RYUZI_TEST_CONFIG_ROOT`'s `plugins/` dir (only `install_builtins`
     /// registers plugins for them), so this can never accidentally register
     /// "superpowers" as a real plugin — `curated_pack_row`'s synthesized-row
-    /// path keeps applying, only now with `installed: true`. Mirrors
-    /// `SkillPackFixture` above, minus the plugin-manifest write.
+    /// path keeps applying, only now with `installed: true`.
     struct InstalledCuratedPackFixture {
         _temp_dir: tempfile::TempDir,
         _config_root: crate::api::tests_support::TestConfigRootGuard,
@@ -4152,7 +4184,8 @@ mod tests {
             )
             .unwrap();
             // Set the env var AFTER the fixture is fully written to disk —
-            // see `SkillPackFixture`'s matching comment for why.
+            // avoids a window where a concurrently-running test could read a
+            // half-written directory through the same process-wide env var.
             let config_root = crate::api::tests_support::TestConfigRootGuard::set(temp_dir.path());
             Self {
                 _temp_dir: temp_dir,
@@ -5262,14 +5295,17 @@ mod tests {
     // `connected` false (it cannot see the store).
     #[test]
     fn component_manifest_from_carries_profile_urls_and_baked_client_id() {
-        let manifest = ryuzi_plugin_sdk::PluginBundleManifest::from_toml(
+        let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(
             r#"
+contract = 2
 id = "github"
 name = "GitHub"
 version = "0.1.0"
+
+[component]
+file = "github.wasm"
 wit-api = "^0.1.0"
 lifecycle = "per-call"
-component = "github.wasm"
 
 [[oauth]]
 id = "github"
@@ -5300,14 +5336,17 @@ client-id = "Iv1.public"
     // declared tools (name, description, writes) from the bundle manifest.
     #[test]
     fn component_manifest_info_carries_tools() {
-        let manifest = ryuzi_plugin_sdk::PluginBundleManifest::from_toml(
+        let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(
             r#"
+contract = 2
 id = "github"
 name = "GitHub"
 version = "0.1.0"
+
+[component]
+file = "github.wasm"
 wit-api = "^0.1.0"
 lifecycle = "per-call"
-component = "github.wasm"
 
 [[tools]]
 name = "create_issue"
@@ -5402,7 +5441,7 @@ writes = true
     // embedded `github` bundle bakes a first-party client id instead (no
     // `client-id-setting`), so this profile must stay unconfigured rather
     // than the new lookup panicking or false-positiving on a plugin id that
-    // resolves via `component_catalog::declared_bundle_manifest`.
+    // resolves via `component_catalog::declared_manifest`.
     #[tokio::test]
     async fn enrich_client_id_setting_fallback_leaves_unconfigured_when_none_declared() {
         let cp = test_cp().await;
@@ -5435,7 +5474,7 @@ writes = true
     // (see `component_catalog`'s `atlassian_profile_carries_pkce_extras_and_client_id_setting`).
     // A non-empty stored value at that key must flip `client_id_configured`
     // through `plugin_release_detail`/`enrich_oauth_profile_status`'s
-    // `declared_bundle_manifest` fallback — the mirror image of
+    // `declared_manifest` fallback — the mirror image of
     // `enrich_client_id_setting_fallback_leaves_unconfigured_when_none_declared`.
     #[tokio::test]
     async fn enrich_client_id_setting_fallback_flips_configured_when_value_is_stored() {
@@ -6054,103 +6093,14 @@ writes = true
             .all(|e| { e.get("name").is_some() && e.get("kind") == Some(&json!("tool")) }));
     }
 
-    /// Test-only guard: stamps a `plugins/<pack_id>` manifest directory (so
-    /// `load_skill_pack_plugins_from` registers it as a `CorePlugin`) plus
-    /// N materialized skill directories sharing that `plugin_id` under a
-    /// tempdir `skills/` (so `skills_install::get_installed_skill_pack` finds
-    /// them via `RYUZI_TEST_CONFIG_ROOT`) — mirrors both
-    /// `plugins::load_skill_pack_plugins_tests`' manifest/stamp fixture and
-    /// `agent_api::tests::InstalledSkillGuard`'s env-var isolation, combined
-    /// since `plugin_tools`' skill-pack branch needs both halves to line up.
-    /// Uses the crate-shared [`crate::api::tests_support::TestConfigRootGuard`]
-    /// so this can never race `agent_api`'s own installed-skill fixture (or
-    /// any other test) over the same process-wide env var.
-    struct SkillPackFixture {
-        temp_dir: tempfile::TempDir,
-        _config_root: crate::api::tests_support::TestConfigRootGuard,
-    }
-
-    impl SkillPackFixture {
-        fn install(pack_id: &str, skill_names: &[&str]) -> Self {
-            let temp_dir = tempfile::tempdir().unwrap();
-            let plugin_dir = temp_dir.path().join("plugins").join(pack_id);
-            std::fs::create_dir_all(&plugin_dir).unwrap();
-            std::fs::write(
-                plugin_dir.join("ryuzi-plugin.toml"),
-                format!("contract = 1\nid = \"{pack_id}\"\nname = \"{pack_id}\"\n"),
-            )
-            .unwrap();
-            std::fs::write(
-                plugin_dir.join(".ryuzi-skill.json"),
-                format!(
-                    r#"{{"source":"https://example.test/{pack_id}","plugin_id":"{pack_id}","installed_at":"2026-01-01T00:00:00.000Z"}}"#
-                ),
-            )
-            .unwrap();
-            for name in skill_names {
-                let skill_dir = temp_dir
-                    .path()
-                    .join("skills")
-                    .join(format!("{pack_id}--{name}"));
-                std::fs::create_dir_all(&skill_dir).unwrap();
-                std::fs::write(
-                    skill_dir.join("SKILL.md"),
-                    format!("---\nname: {name}\ndescription: test skill\n---\nbody"),
-                )
-                .unwrap();
-                std::fs::write(
-                    skill_dir.join(".ryuzi-skill.json"),
-                    format!(
-                        r#"{{"source":"https://example.test/{pack_id}","plugin_id":"{pack_id}","installed_at":"2026-01-01T00:00:00.000Z"}}"#
-                    ),
-                )
-                .unwrap();
-            }
-            // Set the env var AFTER the fixture is fully written to disk —
-            // see `InstalledSkillGuard`'s matching comment for why.
-            let config_root = crate::api::tests_support::TestConfigRootGuard::set(temp_dir.path());
-            Self {
-                temp_dir,
-                _config_root: config_root,
-            }
-        }
-
-        fn plugins_root(&self) -> std::path::PathBuf {
-            self.temp_dir.path().join("plugins")
-        }
-
-        fn skills_root(&self) -> std::path::PathBuf {
-            self.temp_dir.path().join("skills")
-        }
-    }
-
-    #[tokio::test]
-    async fn plugin_tools_skill_pack_lists_skills() {
-        let fixture = SkillPackFixture::install("acme-pack", &["triage", "review"]);
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
-        let mut regs = Registries::new();
-        regs.add_plugin(crate::harness::native::native_plugin());
-        crate::plugins::install_builtins(&mut regs);
-        crate::plugins::load_skill_pack_plugins_from(
-            &mut regs,
-            &fixture.plugins_root(),
-            &fixture.skills_root(),
-        );
-        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
-            .await
-            .unwrap();
-        let cp = ControlPlane::new(store, regs, persistence).await;
-
-        let res = plugin_tools(&cp, "acme-pack").await.unwrap();
-        assert_eq!(res.entries.len(), 2);
-        assert!(!res.live);
-        assert!(res.entries.iter().all(|e| e.kind == "skill"));
-        assert!(res.entries.iter().all(|e| e.writes.is_none()));
-        assert!(res.entries.iter().all(|e| e.description.is_empty()));
-        let names: Vec<&str> = res.entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"triage"));
-        assert!(names.contains(&"review"));
-    }
+    // `SkillPackFixture` and its `plugin_tools_skill_pack_lists_skills` test
+    // were deleted here: both exercised `plugins::load_skill_pack_plugins_from`
+    // registering a disk-sourced `CorePlugin` (`PluginSource::SkillPack`) for
+    // `plugin_tools`' step-3 skill-pack branch. That loader was deleted in
+    // this same v2 manifest migration — full plugin-folder installs are
+    // deferred to a later task ("Task 11") — so the scenario is categorically
+    // impossible for now. `plugin_tools`' step 3
+    // (`skills_install::get_installed_skill_pack`) itself is untouched and
+    // still covered elsewhere (e.g. `InstalledCuratedPackFixture`-backed
+    // tests), since that ledger is independent of the deleted loader.
 }

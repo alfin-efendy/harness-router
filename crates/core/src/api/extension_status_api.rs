@@ -46,7 +46,12 @@ async fn extension_status(cp: &ControlPlane) -> anyhow::Result<Vec<ExtensionStat
     }
     let settings = SettingsStore::new(cp.store().clone());
     for plugin in cp.plugins().list() {
-        if plugin.extension.is_none() {
+        // `CorePlugin.extension` no longer exists — the v2 SDK manifest has
+        // no `[[extension]]` surface, so no plugin can ever be
+        // extension-capable anymore. This always skips every plugin (the RPC
+        // always returns an empty list) pending Task 3's full deletion of
+        // Track D subprocess extensions.
+        if true {
             continue;
         }
         let id = &plugin.manifest.id;
@@ -99,15 +104,9 @@ async fn extension_status(cp: &ControlPlane) -> anyhow::Result<Vec<ExtensionStat
 #[cfg(test)]
 mod tests {
     use crate::api::{dispatch, ApiState};
-    use crate::plugins::extension::proc::SupervisedExtension;
-    use crate::plugins::extension::{
-        ExtensionCtx, ExtensionFactory, ExtensionSpec, ExtensionStatus,
-    };
     use crate::plugins::Registries;
-    use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Arc;
-    use std::time::Duration;
 
     /// Like `api::tests_support::state`, but seeded with `plugins` at
     /// `ControlPlane::new` time (that function doesn't take a `Registries`
@@ -143,167 +142,21 @@ mod tests {
         }
     }
 
-    struct NoopExtensionFactory;
-    #[async_trait]
-    impl ExtensionFactory for NoopExtensionFactory {
-        async fn extensions(&self, _ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
-            Ok(vec![])
-        }
-    }
-
-    fn extension_plugin(id: &str) -> crate::plugins::CorePlugin {
-        crate::plugins::CorePlugin {
-            manifest: ryuzi_plugin_sdk::PluginManifest {
-                contract: 1,
-                id: id.to_string(),
-                name: id.to_string(),
-                version: String::new(),
-                publisher: String::new(),
-                description: String::new(),
-                homepage: None,
-                icon: None,
-                categories: vec![],
-                slot: None,
-                verified: false,
-                experimental: false,
-                auth: None,
-                settings: vec![],
-                mcp: vec![],
-                extensions: vec![],
-                skills: vec![],
-                provider: None,
-            },
-            harness: None,
-            gateway: None,
-            connector: None,
-            extension: Some(std::sync::Arc::new(NoopExtensionFactory)),
-            provider: None,
-            source: crate::plugins::PluginSource::Builtin,
-        }
-    }
-
-    fn fake_spec(name: &str) -> ExtensionSpec {
-        ExtensionSpec {
-            name: name.to_string(),
-            command: "unused-in-these-tests".to_string(),
-            args: vec![],
-            events: vec![],
-            provides_tools: false,
-            timeout: Duration::from_millis(500),
-            env: vec![],
-        }
-    }
+    // NOTE: `NoopExtensionFactory`/`extension_plugin`/`fake_spec` and the 3
+    // tests that used them (`reports_a_running_entry_with_confirmed_events_and_tool_count`,
+    // `a_failed_entrys_last_error_is_the_sanitized_reason_never_a_raw_secret`,
+    // `an_enabled_extension_plugin_with_nothing_spawned_reports_not_running_when_the_host_is_otherwise_active`)
+    // were deleted here: each proved an extension-capable plugin (built via
+    // `extension_plugin`'s `extension: Some(...)`) shows up in this RPC's
+    // results. `CorePlugin.extension` no longer exists (the v2 SDK manifest
+    // has no `[[extension]]` surface), the handler above now always skips
+    // every plugin, and that behavior is categorically impossible now —
+    // pending Task 3's full deletion of Track D subprocess extensions.
 
     #[tokio::test]
     async fn empty_host_reports_an_empty_list() {
         let s = state_with_plugins(vec![]).await;
         let out = dispatch(&s, "extension_status", json!({})).await.unwrap();
         assert_eq!(out, json!([]));
-    }
-
-    #[tokio::test]
-    async fn reports_a_running_entry_with_confirmed_events_and_tool_count() {
-        let s = state_with_plugins(vec![extension_plugin("acme-ext")]).await;
-        s.cp.store()
-            .set_setting_raw("plugin.acme-ext.enabled", "true")
-            .await
-            .unwrap();
-        s.cp.extension_host()
-            .insert_for_test(
-                "acme-ext",
-                SupervisedExtension::fixed_for_test(
-                    fake_spec("linter"),
-                    ExtensionStatus::Running,
-                    vec!["tool.before".to_string()],
-                    0,
-                ),
-            )
-            .await;
-
-        let out = dispatch(&s, "extension_status", json!({})).await.unwrap();
-        let entries = out.as_array().unwrap();
-        assert_eq!(entries.len(), 1, "got: {entries:?}");
-        assert_eq!(entries[0]["pluginId"], json!("acme-ext"));
-        assert_eq!(entries[0]["name"], json!("linter"));
-        assert_eq!(entries[0]["status"], json!("running"));
-        assert_eq!(entries[0]["restartCount"], json!(0));
-        assert_eq!(entries[0]["lastError"], json!(null));
-        assert_eq!(entries[0]["confirmedEvents"], json!(["tool.before"]));
-        assert_eq!(entries[0]["toolCount"], json!(0));
-    }
-
-    #[tokio::test]
-    async fn a_failed_entrys_last_error_is_the_sanitized_reason_never_a_raw_secret() {
-        let s = state_with_plugins(vec![extension_plugin("secret-ext")]).await;
-        s.cp.store()
-            .set_setting_raw("plugin.secret-ext.enabled", "true")
-            .await
-            .unwrap();
-        s.cp.extension_host()
-            .insert_for_test(
-                "secret-ext",
-                SupervisedExtension::fixed_for_test(
-                    fake_spec("linter"),
-                    ExtensionStatus::Failed(
-                        "linter: initialize protocol version mismatch".to_string(),
-                    ),
-                    vec![],
-                    3,
-                ),
-            )
-            .await;
-
-        let out = dispatch(&s, "extension_status", json!({})).await.unwrap();
-        let entries = out.as_array().unwrap();
-        assert_eq!(entries.len(), 1, "got: {entries:?}");
-        assert_eq!(entries[0]["status"], json!("failed"));
-        assert_eq!(entries[0]["restartCount"], json!(3));
-        let last_error = entries[0]["lastError"].as_str().unwrap();
-        assert!(last_error.contains("linter"));
-        // `sanitize_init_error` (proc.rs) collapses every handshake failure
-        // to a canned per-stage message — it never echoes extension-supplied
-        // text, so nothing token/secret-shaped can appear here regardless of
-        // what a hostile extension's own JSON-RPC error body contained.
-        assert!(!last_error.to_lowercase().contains("token"));
-        assert!(!last_error.to_lowercase().contains("secret"));
-    }
-
-    #[tokio::test]
-    async fn an_enabled_extension_plugin_with_nothing_spawned_reports_not_running_when_the_host_is_otherwise_active(
-    ) {
-        let s = state_with_plugins(vec![
-            extension_plugin("unspawned-ext"),
-            extension_plugin("sibling-ext"),
-        ])
-        .await;
-        s.cp.store()
-            .set_setting_raw("plugin.unspawned-ext.enabled", "true")
-            .await
-            .unwrap();
-        s.cp.store()
-            .set_setting_raw("plugin.sibling-ext.enabled", "true")
-            .await
-            .unwrap();
-        s.cp.extension_host()
-            .insert_for_test(
-                "sibling-ext",
-                SupervisedExtension::fixed_for_test(
-                    fake_spec("linter"),
-                    ExtensionStatus::Running,
-                    vec![],
-                    0,
-                ),
-            )
-            .await;
-
-        let out = dispatch(&s, "extension_status", json!({})).await.unwrap();
-        let entries = out.as_array().unwrap();
-        let unspawned = entries
-            .iter()
-            .find(|e| e["pluginId"] == json!("unspawned-ext"))
-            .expect("unspawned-ext must have a synthetic not-running entry");
-        assert_eq!(unspawned["status"], json!("not-running"));
-        assert_eq!(unspawned["restartCount"], json!(0));
-        assert_eq!(unspawned["lastError"], json!(null));
     }
 }

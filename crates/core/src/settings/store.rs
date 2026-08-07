@@ -239,7 +239,7 @@ mod tests {
         use ryuzi_plugin_sdk::{AuthKind, AuthSpec, FieldKind, PluginManifest, SettingField};
 
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Test Plugin {id}"),
             version: String::new(),
@@ -266,10 +266,15 @@ mod tests {
                 options: Vec::new(),
                 default: None,
             }],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -277,7 +282,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });
@@ -335,7 +339,7 @@ mod tests {
         use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Test Enum Plugin {id}"),
             version: String::new(),
@@ -358,10 +362,15 @@ mod tests {
                 options: vec!["free".to_string(), "pro".to_string()],
                 default: None,
             }],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -369,7 +378,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });
@@ -437,7 +445,7 @@ mod tests {
         use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Test Default Plugin {id}"),
             version: String::new(),
@@ -472,10 +480,15 @@ mod tests {
                     default: None,
                 },
             ],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -483,7 +496,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });

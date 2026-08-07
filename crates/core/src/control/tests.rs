@@ -5828,7 +5828,7 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
     use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, PluginManifest};
 
     let manifest = PluginManifest {
-        contract: 1,
+        contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
         id: id.to_string(),
         name: format!("Test Plugin {id}"),
         version: String::new(),
@@ -5846,6 +5846,11 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
             ..Default::default()
         }),
         settings: vec![],
+        component: None,
+        permissions: Default::default(),
+        oauth: vec![],
+        provider: None,
+        tools: vec![],
         mcp: vec![McpServerDef {
             name: server_name.to_string(),
             transport: McpTransportDef::Stdio,
@@ -5855,9 +5860,9 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
             url: None,
             headers: std::collections::BTreeMap::new(),
         }],
-        extensions: vec![],
-        skills: vec![],
-        provider: None,
+        hooks: vec![],
+        jobs: vec![],
+        gateway: false,
     };
     crate::plugins::declarative::declarative_plugin(manifest, crate::plugins::PluginSource::Builtin)
         .expect("test manifest must validate")

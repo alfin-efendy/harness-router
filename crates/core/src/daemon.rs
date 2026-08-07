@@ -522,7 +522,6 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     for plugin in crate::plugins::component_catalog::component_catalog_plugins() {
         registries.add_plugin(plugin);
     }
-    crate::plugins::load_skill_pack_plugins(&mut registries);
     if let Some(factory) = opts.harness_factory {
         registries.harness = factory;
     }
@@ -2093,94 +2092,6 @@ mod tests {
                 "component bundle `{id}` must be registered by build_daemon: {ids:?}"
             );
         }
-    }
-
-    /// Track D hermeticity: `build_daemon` must never spawn a real extension
-    /// subprocess, even when an enabled extension-capable plugin is present
-    /// in the composed `Registries` — extension spawning happens ONLY from
-    /// the daemon's real entry point (`crates/runner/src/daemon_cmd.rs`, via
-    /// `ControlPlane::spawn_extensions`), mirroring
-    /// `run_startup_maintenance`'s own hermeticity discipline (see that
-    /// method's doc). `cargo test`'s `build_daemon` calls must stay safe to
-    /// run in parallel without ever touching a real process tree.
-    ///
-    /// Proven two ways: (1) a marker file the fake extension's shell command
-    /// would touch on spawn must remain absent; (2) the constructed
-    /// `ExtensionHost` itself must report no spawned entry for the plugin.
-    /// `#[serial]` because this test overrides `$HOME` (the only way to feed
-    /// an extension-capable plugin into `build_daemon`'s real
-    /// `load_skill_pack_plugins` composition step, since `BuildDaemonOpts`
-    /// has no plugin-injection seam) — see `plugins::extension::proc`'s own
-    /// `#[serial]` env-var test for the same reasoning.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn build_daemon_never_spawns_extension_subprocesses() {
-        let (_guard, db_path) = temp_db_path();
-        let fake_home = tempfile::tempdir().unwrap();
-        let plugin_dir = fake_home.path().join(".config/ryuzi/plugins/marker-ext");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        let marker = fake_home.path().join("spawned.marker");
-        let manifest_toml = format!(
-            "contract = 1\nid = \"marker-ext\"\nname = \"Marker Extension\"\n\n\
-             [[extension]]\nname = \"marker\"\ncommand = \"sh\"\n\
-             args = [\"-c\", \"touch '{}'\"]\nevents = [\"tool.before\"]\n",
-            marker.display()
-        );
-        std::fs::write(plugin_dir.join("ryuzi-plugin.toml"), manifest_toml).unwrap();
-        std::fs::write(
-            plugin_dir.join(".ryuzi-skill.json"),
-            r#"{"source":"https://example.test/marker","plugin_id":"marker-ext","installed_at":"2026-07-11T00:00:00.000Z"}"#,
-        )
-        .unwrap();
-
-        {
-            let store = Store::open(&db_path).await.unwrap();
-            // `set_setting_raw` (not `SettingsStore::set`, which validates
-            // the key against `PLUGIN_FIELDS` — not yet populated for
-            // "marker-ext" this early) — mirrors
-            // `plugins::extension::proc`'s own tests seeding a plugin's
-            // enable flag.
-            store
-                .set_setting_raw("plugin.marker-ext.enabled", "true")
-                .await
-                .unwrap();
-        }
-
-        let previous_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", fake_home.path());
-        let result = build_daemon(BuildDaemonOpts {
-            db_path: db_path.clone(),
-            config_root: tempfile::tempdir().unwrap().keep(),
-            telemetry: Some(Arc::new(NoopTelemetry)),
-            extra_gateway_factories: vec![],
-            harness_factory: None,
-            component_bootstrap: None,
-        })
-        .await;
-        match previous_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-
-        let daemon = result
-            .expect("build_daemon must succeed even with an extension-capable plugin present");
-        assert!(
-            daemon.cp.plugins().get("marker-ext").is_some(),
-            "sanity: the extension-capable skill-pack plugin must have registered"
-        );
-
-        // Give any hypothetical stray spawn a moment to touch the marker
-        // before asserting its absence.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            !marker.exists(),
-            "build_daemon must stay hermetic: it must never spawn a real extension subprocess"
-        );
-        assert!(
-            daemon.cp.extension_host().get("marker-ext").await.is_empty(),
-            "the constructed ExtensionHost must have no spawned entry until spawn_extensions() runs"
-        );
     }
 
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------

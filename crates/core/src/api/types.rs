@@ -1101,15 +1101,10 @@ pub struct TrustPromptDto {
     pub skills: Vec<String>,
     pub hook_scripts: Vec<String>,
     pub total_bytes: u64,
-    /// Mirrors `TrustPrompt::runs_code`: true when the staged manifest
-    /// declares `[[extension]]` (code execution, Track D) — the wizard must
-    /// show a distinct warning for this, not just fold it into the
-    /// hook-script list.
-    pub runs_code: bool,
     /// Mirrors `TrustPrompt::curated`: true when the source is one of the
-    /// curated skill packs, so this prompt only exists because `runs_code`
-    /// is true — the wizard uses this to avoid the misleading "this source
-    /// isn't curated" framing for a curated-but-code-running install.
+    /// curated skill packs — surfaced so the wizard can distinguish "this
+    /// prompt exists because the source is arbitrary/unvetted" from a
+    /// curated source that still stops here for some other reason.
     pub curated: bool,
 }
 
@@ -1123,7 +1118,6 @@ impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
             skills: p.skills,
             hook_scripts: p.hook_scripts,
             total_bytes: p.total_bytes,
-            runs_code: p.runs_code,
             curated: p.curated,
         }
     }
@@ -1359,12 +1353,18 @@ fn lifecycle_label(l: ryuzi_plugin_sdk::PluginLifecycle) -> &'static str {
     }
 }
 
-impl From<ryuzi_plugin_sdk::PluginBundleManifest> for ComponentManifestInfo {
-    fn from(m: ryuzi_plugin_sdk::PluginBundleManifest) -> Self {
+impl From<ryuzi_plugin_sdk::PluginManifest> for ComponentManifestInfo {
+    fn from(m: ryuzi_plugin_sdk::PluginManifest) -> Self {
+        let lifecycle = m
+            .component
+            .as_ref()
+            .map(|c| lifecycle_label(c.lifecycle))
+            .unwrap_or("singleton")
+            .to_string();
         ComponentManifestInfo {
             publisher: m.publisher,
             description: m.description,
-            lifecycle: lifecycle_label(m.lifecycle).to_string(),
+            lifecycle,
             domains: m.permissions.network.into_iter().map(|n| n.0).collect(),
             oauth_profiles: m
                 .oauth

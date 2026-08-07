@@ -66,7 +66,7 @@ mod tests {
         // test's plugin in the same test binary.
         let id = "task7-catalogtest-plugin";
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: "Catalog Test Plugin".to_string(),
             version: String::new(),
@@ -84,10 +84,15 @@ mod tests {
                 ..Default::default()
             }),
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -95,7 +100,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });

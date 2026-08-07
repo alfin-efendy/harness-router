@@ -63,14 +63,10 @@ impl HookEvent {
 impl std::str::FromStr for HookEvent {
     type Err = String;
 
-    /// The inverse of [`HookEvent::as_str`] — used by Track D's declarative
-    /// extension binding (`plugins::extension`) to turn a manifest's
-    /// already-`validate()`d `events: Vec<String>` into typed `HookEvent`s.
-    /// `PluginManifest::validate` already rejects any string outside
-    /// `ryuzi_plugin_sdk::KNOWN_HOOK_EVENTS` (kept in sync with `as_str` by
-    /// `hook_event_vocabulary_matches_the_sdk_known_events`, below), so this
-    /// only errors on a value that bypassed validation (e.g. a hand-built
-    /// `ExtensionDef` in a test).
+    /// The inverse of [`HookEvent::as_str`]. The v2 `PluginManifest` no
+    /// longer has an `[[extension]]` events surface to validate against this
+    /// vocabulary (Track D's SDK-side declaration was removed), so this now
+    /// only ever sees strings this module itself produces.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         HookEvent::ALL
             .iter()
@@ -302,22 +298,6 @@ mod tests {
         assert_eq!(HookEvent::ToolBefore.as_str(), "tool.before");
         assert_eq!(HookEvent::ToolAfter.as_str(), "tool.after");
         assert_eq!(HookEvent::SessionEnd.as_str(), "session.end");
-    }
-
-    // Guards the cross-crate contract: the SDK validates `[[extension]]`
-    // `events` against `ryuzi_plugin_sdk::KNOWN_HOOK_EVENTS`, but the events
-    // are actually fired here by `HookEvent`. If the two drift (a renamed
-    // variant, a new event on one side only), a manifest's subscription is
-    // accepted at parse time but never delivered at runtime — a silent break.
-    // This test fails to compile-or-assert the moment they diverge.
-    #[test]
-    fn hook_event_vocabulary_matches_the_sdk_known_events() {
-        let core: Vec<&str> = HookEvent::ALL.iter().map(|e| e.as_str()).collect();
-        assert_eq!(
-            core,
-            ryuzi_plugin_sdk::KNOWN_HOOK_EVENTS,
-            "core HookEvent vocabulary must stay in sync with the SDK's KNOWN_HOOK_EVENTS"
-        );
     }
 
     #[test]

@@ -101,12 +101,21 @@ struct SkillDescriptor {
     source_dir: PathBuf,
 }
 
+/// A repo that installs as multiple skills sharing one plugin id, discovered
+/// either from `.codex-plugin/plugin.json` or a bare `skills/*/SKILL.md`
+/// layout. Unlike the pre-v2 shape, this carries no `PluginManifest` at all —
+/// the v2 SDK manifest dropped `skills`/`extensions` entirely, so there is
+/// nothing left to synthesize, write, or read back for a skill pack; a full
+/// plugin-folder install (a real, possibly-manifest-bearing `PluginSource`)
+/// is deferred to a later task. `skills` are already resolved
+/// `SkillDescriptor`s, each carrying its own absolute `source_dir` into the
+/// temp clone.
 #[derive(Debug, Clone)]
 struct PackDescriptor {
     plugin_id: String,
-    repo_dir: PathBuf,
-    manifest: ryuzi_plugin_sdk::PluginManifest,
-    manifest_to_write: Option<String>,
+    /// Display name for the pack, shown as `InstalledSkillPack::name`.
+    name: String,
+    skills: Vec<SkillDescriptor>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,8 +366,7 @@ async fn refresh_installed_skill_recorded_with(
 ) -> Result<InstalledSkillPack> {
     let prior = store.get_plugin_install(id).await?;
     let refreshed = refresh_installed_skill_with(id, roots, cloner).await?;
-    let dir = installed_pack_dir(roots, &refreshed);
-    let fingerprint = fingerprint_dir(&dir)?;
+    let fingerprint = pack_fingerprint(roots, &refreshed)?;
     let now = crate::paths::now_ms();
     let kind = if refreshed.plugin_id.is_some() {
         "plugin_pack"
@@ -469,7 +477,7 @@ async fn install_skill_source_with_recorded(
     store: &crate::store::Store,
 ) -> Result<InstalledSkillPack> {
     let (pack, commit) = install_skill_source_with_commit(source, roots, cloner).await?;
-    let fingerprint = fingerprint_dir(&installed_pack_dir(roots, &pack))?;
+    let fingerprint = pack_fingerprint(roots, &pack)?;
     let now = crate::paths::now_ms();
     let trust_tier = if is_curated_source(&pack.source) {
         "curated"
@@ -503,13 +511,48 @@ async fn install_skill_source_with_recorded(
     Ok(pack)
 }
 
-/// The on-disk directory whose fingerprint identifies a pack: the plugin dir
-/// for packs, the single-skill dir otherwise.
+/// The on-disk directory that holds a standalone (non-pack) installed
+/// skill's content — the single-skill dir under `skills_root`. Only
+/// meaningful for `pack.plugin_id == None`; a plugin-pack install's content
+/// lives across several sibling directories instead (one per member skill,
+/// see `fingerprint_pack`), so there is no longer a single directory that
+/// represents "the pack" on disk.
 fn installed_pack_dir(roots: &InstallRoots, pack: &InstalledSkillPack) -> PathBuf {
+    roots.skills_root.join(&pack.id)
+}
+
+/// The ledger fingerprint for an installed pack, covering whichever
+/// directories actually hold its content: the single-skill dir for a
+/// standalone skill, or the combined content of every materialized member
+/// skill directory (`{plugin_id}--{skill}` under `skills_root`) for a
+/// plugin pack — `install_plugin_pack` no longer writes anything under
+/// `plugins_root`, so there is no single directory left to fingerprint for a
+/// pack.
+fn pack_fingerprint(roots: &InstallRoots, pack: &InstalledSkillPack) -> Result<String> {
     match &pack.plugin_id {
-        Some(pid) => roots.plugins_root.join(pid),
-        None => roots.skills_root.join(&pack.id),
+        Some(plugin_id) => fingerprint_pack(roots, plugin_id),
+        None => fingerprint_dir(&installed_pack_dir(roots, pack)),
     }
+}
+
+/// Combined fingerprint of every materialized skill directory belonging to
+/// `plugin_id` under `skills_root`, hashed in a stable (sorted-by-id) order
+/// so the same on-disk content always yields the same digest. See
+/// `pack_fingerprint`'s doc comment for why a plugin pack needs this instead
+/// of `fingerprint_dir` on a single directory.
+fn fingerprint_pack(roots: &InstallRoots, plugin_id: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut ids = materialized_skill_ids_for_plugin(roots, plugin_id)?;
+    ids.sort();
+    let mut hasher = Sha256::new();
+    for id in ids {
+        let dir_fingerprint = fingerprint_dir(&roots.skills_root.join(&id))?;
+        hasher.update(id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(dir_fingerprint.as_bytes());
+        hasher.update([0u8]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 /// Whether `canonical_repo` (already resolved by `parse_skill_source`) names
@@ -589,23 +632,10 @@ pub struct TrustPrompt {
     pub skills: Vec<String>,
     pub hook_scripts: Vec<String>,
     pub total_bytes: u64,
-    /// Whether the staged manifest declares `[[extension]]` — i.e. installing
-    /// it means running code in a supervised subprocess (Track D), not just
-    /// materializing skill/hook data. Derived from
-    /// `!manifest.extensions.is_empty()` (see `discovery_runs_code`). The
-    /// caller (Cockpit's trust step) must surface this distinctly from the
-    /// hook-script warning below: an extension is long-lived, event-driven
-    /// code, not a one-shot script. `begin_install_with` also uses this
-    /// signal to force even a curated source through this prompt instead of
-    /// installing immediately — see its doc comment.
-    pub runs_code: bool,
     /// Whether the source is one of `CURATED_SKILL_SOURCES` (see
-    /// `is_curated_source`) — i.e. this prompt exists ONLY because
-    /// `runs_code` is true (a curated-but-code-running install), not because
-    /// the source itself is unvetted. The caller uses this to avoid the
-    /// misleading "this source isn't a curated pack" framing when the source
-    /// actually is curated and the real reason for the prompt is the
-    /// elevated code-execution risk.
+    /// `is_curated_source`) — surfaced so the caller can distinguish "this
+    /// prompt exists because the source is arbitrary/unvetted" from a
+    /// curated source that still stops here for some other reason.
     pub curated: bool,
 }
 
@@ -620,21 +650,12 @@ pub enum BeginInstall {
 
 /// Phase 1 of the two-phase tiered trust gate. Clones `source` into a temp
 /// dir, classifies its trust tier, and either installs it immediately
-/// (curated, and not code-running) or stages the clone and returns a
-/// `TrustPrompt` for the caller to show the user before `confirm_install` can
-/// proceed (arbitrary, or curated-but-runs-code).
+/// (curated) or stages the clone and returns a `TrustPrompt` for the caller
+/// to show the user before `confirm_install` can proceed (arbitrary).
 pub async fn begin_install(source: &str, store: &crate::store::Store) -> Result<BeginInstall> {
     let roots = InstallRoots::for_user()?;
     let cloner = GitRepoCloner;
     begin_install_with(source, &roots, &cloner, store).await
-}
-
-/// Whether a `Discovery`'s manifest declares `[[extension]]` — i.e. whether
-/// installing it means running code in a supervised subprocess (Track D).
-/// Only `Discovery::Pack` ever carries a manifest; a single skill install has
-/// none and can never declare an extension.
-fn discovery_runs_code(discovered: &Discovery) -> bool {
-    matches!(discovered, Discovery::Pack(pack) if !pack.manifest.extensions.is_empty())
 }
 
 async fn begin_install_with(
@@ -646,28 +667,21 @@ async fn begin_install_with(
     roots.ensure_exists()?;
     let parsed = parse_skill_source(source)?;
 
-    // Clone into a temp dir up front — even for a curated source — so the
-    // manifest can be inspected for `[[extension]]` before deciding
-    // curated-immediate vs. trust-prompt. An extension plugin (code
-    // execution) is never curated-immediate: the Track A trust gate treats
-    // it as higher-risk and always routes it through the two-phase
-    // `confirm_install` acknowledgment below, curated source or not (see the
-    // Track D design doc's "Trust integration" section).
     let temp = tempfile::tempdir()?;
     let repo_dir = temp.path().join("repo");
     let commit = cloner.clone_repo(&parsed, &repo_dir).await?;
     let discovered = discover_install_target(&repo_dir, &parsed)?;
 
-    // Curated AND no code execution → frictionless, install immediately.
-    // This mirrors `install_skill_source_with_recorded`'s curated branch,
-    // just reusing the clone/discovery already done above instead of
-    // re-cloning the repo a second time.
-    if is_curated_source(&parsed.repo) && !discovery_runs_code(&discovered) {
+    // Curated → frictionless, install immediately. This mirrors
+    // `install_skill_source_with_recorded`'s curated branch, just reusing the
+    // clone/discovery already done above instead of re-cloning the repo a
+    // second time.
+    if is_curated_source(&parsed.repo) {
         let pack = match discovered {
             Discovery::Single(skill) => install_single_skill(roots, &parsed, skill)?,
             Discovery::Pack(pack) => install_plugin_pack(roots, &parsed, *pack)?,
         };
-        let fingerprint = fingerprint_dir(&installed_pack_dir(roots, &pack))?;
+        let fingerprint = pack_fingerprint(roots, &pack)?;
         let now = crate::paths::now_ms();
         store
             .upsert_plugin_install(&crate::store::PluginInstallRecord {
@@ -692,11 +706,10 @@ async fn begin_install_with(
         return Ok(BeginInstall::Completed(pack));
     }
 
-    // Arbitrary source, or a curated source whose manifest runs code →
-    // stage into a temp dir, build the prompt, hold for confirm.
-    // `stage_for_trust_prompt` re-derives `Discovery` from the same on-disk
-    // clone (cheap relative to the network clone above) so it can also set
-    // `TrustPrompt::skills`/`runs_code` from the same manifest.
+    // Arbitrary source → stage into a temp dir, build the prompt, hold for
+    // confirm. `stage_for_trust_prompt` re-derives `Discovery` from the same
+    // on-disk clone (cheap relative to the network clone above) so it can
+    // also set `TrustPrompt::skills` from it.
     let prompt = stage_for_trust_prompt(source, parsed, roots, temp, repo_dir, commit, None)?;
     Ok(BeginInstall::NeedsConfirmation(prompt))
 }
@@ -708,10 +721,9 @@ async fn begin_install_with(
 /// so it must never complete an install that `begin_install`'s
 /// curated-immediate branch wouldn't also complete immediately: reuses
 /// `begin_install_with`'s classification and only ever returns `Ok` for the
-/// same "curated AND doesn't run code" condition. Anything else — an
-/// arbitrary source, or a curated source whose manifest declares
-/// `[[extension]]` — is refused with an error naming the two-phase flow
-/// instead; nothing is installed and no ledger row is written.
+/// same "curated" condition. Anything else — an arbitrary source — is
+/// refused with an error naming the two-phase flow instead; nothing is
+/// installed and no ledger row is written.
 pub async fn install_skill_source_gated(
     source: &str,
     store: &crate::store::Store,
@@ -737,10 +749,9 @@ async fn install_skill_source_gated_with(
             // comment on why an abandoned entry otherwise just sits there).
             discard_staged_install(&prompt.token);
             bail!(
-                "source `{source}` needs review before it can install — it is either not a \
-                 curated pack or its manifest runs code. Use the two-phase begin_install/\
-                 confirm_install flow (`begin_skill_install`/`confirm_skill_install`) to \
-                 review and confirm it first."
+                "source `{source}` needs review before it can install — it is not a curated \
+                 pack. Use the two-phase begin_install/confirm_install flow \
+                 (`begin_skill_install`/`confirm_skill_install`) to review and confirm it first."
             );
         }
     }
@@ -797,7 +808,7 @@ pub async fn confirm_install(
             store.delete_plugin_install(old).await?;
         }
     }
-    let dir = installed_pack_dir(roots, &pack);
+    let fingerprint = pack_fingerprint(roots, &pack)?;
     let now = crate::paths::now_ms();
     store
         .upsert_plugin_install(&crate::store::PluginInstallRecord {
@@ -809,7 +820,7 @@ pub async fn confirm_install(
             },
             source_spec: staged.source_spec.clone(),
             resolved_commit: staged.commit.clone(),
-            fingerprint: fingerprint_dir(&dir)?,
+            fingerprint,
             installed_at: now,
             updated_at: now,
             pinned: false,
@@ -841,7 +852,6 @@ fn stage_for_trust_prompt(
 ) -> Result<TrustPrompt> {
     let discovered = discover_install_target(&repo_dir, &parsed)?;
     let skills = discovered_skill_names(&discovered);
-    let runs_code = discovery_runs_code(&discovered);
     let curated = is_curated_source(&parsed.repo);
     let hook_scripts = list_pack_hook_scripts(&repo_dir);
     let total_bytes = dir_size(&repo_dir);
@@ -881,7 +891,6 @@ fn stage_for_trust_prompt(
         skills,
         hook_scripts,
         total_bytes,
-        runs_code,
         curated,
     })
 }
@@ -889,9 +898,7 @@ fn stage_for_trust_prompt(
 fn discovered_skill_names(d: &Discovery) -> Vec<String> {
     match d {
         Discovery::Single(s) => vec![s.display_name.clone()],
-        Discovery::Pack(p) => materialized_skills_from_manifest(&p.repo_dir, &p.manifest)
-            .map(|v| v.into_iter().map(|s| s.display_name).collect())
-            .unwrap_or_default(),
+        Discovery::Pack(p) => p.skills.iter().map(|s| s.display_name.clone()).collect(),
     }
 }
 
@@ -971,8 +978,8 @@ async fn backfill_install_records_in(
         if store.get_plugin_install(&pack.id).await?.is_some() {
             continue;
         }
-        let fingerprint = fingerprint_dir(&installed_pack_dir(roots, &pack))
-            .unwrap_or_else(|_| "sha256:unknown".into());
+        let fingerprint =
+            pack_fingerprint(roots, &pack).unwrap_or_else(|_| "sha256:unknown".into());
         let now = crate::paths::now_ms();
         let trust_tier = if is_curated_source(&pack.source) {
             "curated"
@@ -1092,25 +1099,13 @@ pub async fn update_installed_pack(
 /// `LocalEdits` (unless `force`); re-clone resolves to the same commit
 /// already recorded → `AlreadyCurrent` (unless `force`); the re-clone
 /// contains a hook script not already covered by the recorded
-/// `trust_ack_summary`, OR its manifest runs code (`discovery_runs_code`,
-/// i.e. declares `[[extension]]`) → `NeedsReack` (stages the clone into
-/// `staging_map()` and routes back through `confirm_install` — checked
-/// regardless of `force`, since both hook scripts and extensions execute
-/// code and re-acknowledging that isn't something `force` should be able to
-/// skip); otherwise reinstall (staged), clean up stale refresh artifacts,
-/// and rewrite the ledger row with the new commit/fingerprint/`updated_at`,
-/// preserving `installed_at`/pin/trust fields from the old row.
-///
-/// The code-execution check fires on EVERY update whose manifest runs code,
-/// not just a newly-introduced one — unlike hook scripts, the ledger row
-/// carries no explicit "this pack was already acknowledged as code-running"
-/// signal (`trust_ack_summary` is a free-form JSON blob that predates the
-/// `runs_code` concept), so there's no reliable way to distinguish "still
-/// running the same acknowledged code" from "running changed/different code"
-/// from the ledger alone. Re-prompting on every code-running update is the
-/// deliberate, safe default: it costs an extra confirm on later updates of
-/// an already-acknowledged extension plugin, but it can never let a new or
-/// changed code-running version land silently.
+/// `trust_ack_summary` → `NeedsReack` (stages the clone into `staging_map()`
+/// and routes back through `confirm_install` — checked regardless of
+/// `force`, since a hook script executes code and re-acknowledging that
+/// isn't something `force` should be able to skip); otherwise reinstall
+/// (staged), clean up stale refresh artifacts, and rewrite the ledger row
+/// with the new commit/fingerprint/`updated_at`, preserving
+/// `installed_at`/pin/trust fields from the old row.
 async fn update_installed_pack_with(
     id: &str,
     force: bool,
@@ -1129,9 +1124,8 @@ async fn update_installed_pack_with(
     // recorded at the last install/update, or an update would silently
     // overwrite whatever the user changed by hand.
     let installed = read_installed_pack(roots, id)?;
-    let dir = installed_pack_dir(roots, &installed);
     if !force {
-        let current_fp = fingerprint_dir(&dir).unwrap_or_default();
+        let current_fp = pack_fingerprint(roots, &installed).unwrap_or_default();
         if current_fp != rec.fingerprint {
             return Ok(UpdateOutcome::LocalEdits);
         }
@@ -1156,14 +1150,9 @@ async fn update_installed_pack_with(
     let acked = acked_hook_scripts(rec.trust_ack_summary.as_deref());
     let new_hook_script = hook_scripts_in_update.iter().any(|h| !acked.contains(h));
 
-    // Re-ack-on-code: the updated manifest itself is the source of truth for
-    // whether this update runs code (`discovery_runs_code`) — see the
-    // function doc comment above for why this fires unconditionally on every
-    // code-running update rather than only a newly-introduced one.
     let discovered = discover_install_target(&repo_dir, &parsed)?;
-    let update_runs_code = discovery_runs_code(&discovered);
 
-    if new_hook_script || update_runs_code {
+    if new_hook_script {
         let prompt = stage_for_trust_prompt(
             &rec.source_spec,
             parsed,
@@ -1184,7 +1173,7 @@ async fn update_installed_pack_with(
     };
     remove_stale_refresh_artifacts(roots, &installed, &refreshed)?;
 
-    let new_dir = installed_pack_dir(roots, &refreshed);
+    let fingerprint = pack_fingerprint(roots, &refreshed)?;
     let now = crate::paths::now_ms();
     let updated = crate::store::PluginInstallRecord {
         plugin_id: refreshed.id.clone(),
@@ -1195,7 +1184,7 @@ async fn update_installed_pack_with(
         },
         source_spec: rec.source_spec.clone(),
         resolved_commit: new_commit,
-        fingerprint: fingerprint_dir(&new_dir)?,
+        fingerprint,
         installed_at: rec.installed_at,
         updated_at: now,
         pinned: rec.pinned,
@@ -1380,60 +1369,34 @@ fn install_single_skill(
     ))
 }
 
+/// Materializes every skill discovered in a "plugin pack" repo into
+/// `~/.config/ryuzi/skills/{plugin_id}--{skill}` — the multi-skill analogue
+/// of `install_single_skill`. Unlike the pre-v2 behavior, this no longer
+/// writes anything under `plugins_root`: there is no `PluginManifest` to
+/// synthesize or preserve (the v2 SDK manifest dropped `skills` entirely),
+/// and the loader that used to read a `ryuzi-plugin.toml`/provenance stamp
+/// back out of `plugins_root/<plugin_id>` to register a `CorePlugin` has
+/// been removed — full plugin-folder installs are a later task. The pack's
+/// member skills are still grouped together for listing/removal purposes via
+/// their shared `plugin_id` in each skill's own provenance stamp (see
+/// `collect_installed_packs`).
 fn install_plugin_pack(
     roots: &InstallRoots,
     source: &ParsedSkillSource,
     pack: PackDescriptor,
 ) -> Result<InstalledSkillPack> {
-    let plugin_target = checked_child(&roots.plugins_root, &pack.plugin_id)?;
-
-    // Write the (possibly regenerated) manifest into the temp clone BEFORE
-    // staging, so the DirSwap copy of the plugin dir captures it. The live
-    // plugin dir is untouched until `swap.commit()` below.
-    if let Some(text) = &pack.manifest_to_write {
-        std::fs::write(pack.repo_dir.join("ryuzi-plugin.toml"), text)?;
-    }
-
     let existing = materialized_skill_ids_for_plugin(roots, &pack.plugin_id)?;
-    // Resolve materialized skills against the temp clone (`pack.repo_dir`),
-    // not the live plugin dir: nothing has been written to the live target
-    // yet, and `repo_dir` is the same base the manifest's skill paths were
-    // already resolved against at discovery time.
-    let materialized = materialized_skills_from_manifest(&pack.repo_dir, &pack.manifest)?;
-    let desired = materialized
+    let desired = pack
+        .skills
         .iter()
         .map(|skill| format!("{}--{}", pack.plugin_id, skill.normalized_name))
         .collect::<HashSet<_>>();
     let installed_at = now_rfc3339();
 
-    // Skill-pack provenance in the plugin directory itself: the loader
-    // (`crate::plugins::load_skill_pack_plugins_from`) only registers
-    // directories carrying this stamp (or heals legacy installs from the
-    // materialized skills' provenance below the skills root). Stamped into
-    // the temp clone (before staging) so the DirSwap copy captures it.
-    write_provenance(
-        &pack.repo_dir.join(PROVENANCE_FILE),
-        &SkillInstallProvenance {
-            source: source.repo.clone(),
-            plugin_id: Some(pack.plugin_id.clone()),
-            installed_at: installed_at.clone(),
-        },
-    )?;
-
-    // Stage the plugin dir FIRST, from the still-clean tree — only the
-    // top-level `ryuzi-plugin.toml` + plugin-dir stamp have been written into
-    // `pack.repo_dir` so far. Per-skill stamps are written AFTER this so they
-    // don't get copied into the plugin dir's own skill subtrees (the plugin
-    // dir carries only its single top-level stamp, matching the pre-DirSwap
-    // on-disk shape).
+    // Stamp each materialized skill's own copy (still inside the temp clone)
+    // and stage it into the skills root.
     let mut swap = DirSwap::new();
-    swap.stage(&pack.repo_dir, &plugin_target)?;
-
-    // Now stamp each materialized skill's own copy (still inside the temp
-    // clone) and stage it into the skills root. The plugin-dir stage above
-    // already captured a clean tree, so these nested stamps never leak into
-    // the plugin dir.
-    for skill in &materialized {
+    for skill in &pack.skills {
         write_provenance(
             &skill.source_dir.join(PROVENANCE_FILE),
             &SkillInstallProvenance {
@@ -1462,12 +1425,7 @@ fn install_plugin_pack(
 
     remove_stale_single_skill_artifact_for_plugin_install(roots, &pack.plugin_id)?;
 
-    Ok(installed_plugin_pack(
-        &pack,
-        &source.repo,
-        &materialized,
-        installed_at,
-    ))
+    Ok(installed_plugin_pack(&pack, &source.repo, installed_at))
 }
 
 fn installed_single_skill_pack(
@@ -1491,10 +1449,10 @@ fn installed_single_skill_pack(
 fn installed_plugin_pack(
     pack: &PackDescriptor,
     source: &str,
-    materialized: &[SkillDescriptor],
     installed_at: String,
 ) -> InstalledSkillPack {
-    let mut skills = materialized
+    let mut skills = pack
+        .skills
         .iter()
         .map(|skill| InstalledSkillEntry {
             id: format!("{}--{}", pack.plugin_id, skill.normalized_name),
@@ -1504,7 +1462,7 @@ fn installed_plugin_pack(
     skills.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     InstalledSkillPack {
         id: pack.plugin_id.clone(),
-        name: pack.manifest.name.clone(),
+        name: pack.name.clone(),
         source: source.to_string(),
         plugin_id: Some(pack.plugin_id.clone()),
         installed_at,
@@ -1604,13 +1562,21 @@ fn discover_install_target(repo_dir: &Path, source: &ParsedSkillSource) -> Resul
     let skills = scan_skill_root(&repo_dir.join("skills"))?;
     if !skills.is_empty() {
         return Ok(Discovery::Pack(Box::new(discover_bare_plugin_pack(
-            repo_dir, source, skills,
+            source, skills,
         )?)));
     }
 
     bail!("no installable skill found in repo — checked .codex-plugin/plugin.json, SKILL.md, and skills/*/SKILL.md")
 }
 
+/// Discover a "plugin pack" repo advertised via `.codex-plugin/plugin.json`
+/// (the Codex/Claude-style plugin manifest, unrelated to `ryuzi-plugin.toml`)
+/// — resolves the skills it declares (`plugin_json.skills`, defaulting to
+/// `./skills/`) and derives a plugin id/display name from its metadata. No
+/// `PluginManifest` is read or constructed here: the v2 SDK manifest dropped
+/// `skills` entirely, so even a repo that happens to also ship a
+/// `ryuzi-plugin.toml` is out of scope for this installer — a real
+/// plugin-folder install is a later task.
 fn discover_plugin_pack_from_plugin_json(
     repo_dir: &Path,
     source: &ParsedSkillSource,
@@ -1620,46 +1586,8 @@ fn discover_plugin_pack_from_plugin_json(
         serde_json::from_str(&std::fs::read_to_string(plugin_json_path)?)
             .with_context(|| format!("invalid plugin.json at {}", plugin_json_path.display()))?;
 
-    let existing_manifest_path = repo_dir.join("ryuzi-plugin.toml");
-    if existing_manifest_path.is_file() {
-        let text = std::fs::read_to_string(&existing_manifest_path)?;
-        let manifest_dir = existing_manifest_path.parent().unwrap_or(repo_dir);
-        let mut manifest =
-            ryuzi_plugin_sdk::PluginManifest::from_toml(&text).with_context(|| {
-                format!(
-                    "invalid preserved plugin manifest at {}",
-                    existing_manifest_path.display()
-                )
-            })?;
-        if manifest.skills.is_empty() {
-            let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
-            let default_skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
-            manifest.skills = manifest_skill_defs(repo_dir, &default_skills)?;
-            let manifest_text = toml::to_string_pretty(&manifest)?;
-            return Ok(PackDescriptor {
-                plugin_id: manifest.id.clone(),
-                repo_dir: repo_dir.to_path_buf(),
-                manifest,
-                manifest_to_write: Some(manifest_text),
-            });
-        }
-        let materialized = materialized_skills_from_manifest(manifest_dir, &manifest)?;
-        if materialized.is_empty() {
-            bail!(
-                "plugin manifest at {} does not resolve any installable skills",
-                existing_manifest_path.display()
-            );
-        }
-        return Ok(PackDescriptor {
-            plugin_id: manifest.id.clone(),
-            repo_dir: repo_dir.to_path_buf(),
-            manifest,
-            manifest_to_write: None,
-        });
-    }
-
     let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
-    let default_skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
+    let skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
 
     let plugin_id = normalize_name(
         plugin_json
@@ -1673,144 +1601,26 @@ fn discover_plugin_pack_from_plugin_json(
         .and_then(|value| value.display_name.clone())
         .or_else(|| plugin_json.name.clone())
         .unwrap_or_else(|| source.repo_name.clone());
-    let description = plugin_json
-        .description
-        .clone()
-        .or_else(|| {
-            plugin_json
-                .interface
-                .as_ref()
-                .and_then(|value| value.short_description.clone())
-        })
-        .unwrap_or_default();
-    let publisher = plugin_json
-        .interface
-        .as_ref()
-        .and_then(|value| value.developer_name.clone())
-        .or_else(|| {
-            plugin_json
-                .author
-                .as_ref()
-                .and_then(|author| author.name.clone())
-        })
-        .unwrap_or_default();
-    let homepage = plugin_json.homepage.clone().or_else(|| {
-        plugin_json
-            .interface
-            .as_ref()
-            .and_then(|value| value.website_url.clone())
-    });
-    let manifest = generated_plugin_manifest(
-        &plugin_id,
-        &name,
-        plugin_json.version.as_deref().unwrap_or_default(),
-        &description,
-        &publisher,
-        homepage,
-        manifest_skill_defs(repo_dir, &default_skills)?,
-    )?;
     Ok(PackDescriptor {
         plugin_id,
-        repo_dir: repo_dir.to_path_buf(),
-        manifest_to_write: Some(toml::to_string_pretty(&manifest)?),
-        manifest,
+        name,
+        skills,
     })
 }
 
+/// Discover a "bare" plugin pack: a repo with no `.codex-plugin/plugin.json`
+/// and no top-level `SKILL.md`, but multiple skills under `skills/*/SKILL.md`
+/// — the plugin id/name are derived purely from the repo name.
 fn discover_bare_plugin_pack(
-    repo_dir: &Path,
     source: &ParsedSkillSource,
     skills: Vec<SkillDescriptor>,
 ) -> Result<PackDescriptor> {
     let plugin_id = normalize_name(&source.repo_name);
-    let manifest = generated_plugin_manifest(
-        &plugin_id,
-        &source.repo_name,
-        "",
-        "",
-        "",
-        None,
-        manifest_skill_defs(repo_dir, &skills)?,
-    )?;
     Ok(PackDescriptor {
-        plugin_id: plugin_id.clone(),
-        repo_dir: repo_dir.to_path_buf(),
-        manifest_to_write: Some(toml::to_string_pretty(&manifest)?),
-        manifest,
-    })
-}
-
-fn generated_plugin_manifest(
-    plugin_id: &str,
-    name: &str,
-    version: &str,
-    description: &str,
-    publisher: &str,
-    homepage: Option<String>,
-    skills: Vec<ryuzi_plugin_sdk::SkillDef>,
-) -> Result<ryuzi_plugin_sdk::PluginManifest> {
-    let manifest = ryuzi_plugin_sdk::PluginManifest {
-        contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
-        id: plugin_id.to_string(),
-        name: name.to_string(),
-        version: version.to_string(),
-        publisher: publisher.to_string(),
-        description: description.to_string(),
-        homepage,
-        icon: None,
-        categories: vec![],
-        slot: None,
-        verified: false,
-        experimental: false,
-        auth: None,
-        settings: vec![],
-        mcp: vec![],
-        extensions: vec![],
+        plugin_id,
+        name: source.repo_name.clone(),
         skills,
-        provider: None,
-    };
-    manifest.validate()?;
-    Ok(manifest)
-}
-
-fn manifest_skill_defs(
-    repo_dir: &Path,
-    skills: &[SkillDescriptor],
-) -> Result<Vec<ryuzi_plugin_sdk::SkillDef>> {
-    let mut out = Vec::with_capacity(skills.len());
-    for skill in skills {
-        out.push(ryuzi_plugin_sdk::SkillDef {
-            name: skill.display_name.clone(),
-            description: String::new(),
-            path: relative_path_string(repo_dir, &skill.source_dir)?,
-        });
-    }
-    Ok(out)
-}
-
-fn materialized_skills_from_manifest(
-    base_dir: &Path,
-    manifest: &ryuzi_plugin_sdk::PluginManifest,
-) -> Result<Vec<SkillDescriptor>> {
-    let mut out = Vec::new();
-    for skill in &manifest.skills {
-        let skill_dir = resolve_within(base_dir, &skill.path)?;
-        if !skill_dir.join("SKILL.md").is_file() {
-            bail!("plugin skill path {} does not contain SKILL.md", skill.path);
-        }
-        let mut descriptor = read_skill_descriptor(&skill_dir)?;
-        if descriptor.display_name.is_empty() {
-            descriptor.display_name = skill.name.clone();
-        }
-        if descriptor.normalized_name.is_empty() {
-            descriptor.normalized_name = normalize_name(&skill.name);
-        }
-        out.push(descriptor);
-    }
-    if out.is_empty() {
-        bail!("plugin manifest declares no installable skills");
-    }
-    Ok(out)
+    })
 }
 
 fn discover_skill_descriptors(repo_dir: &Path, rel: &str) -> Result<Vec<SkillDescriptor>> {
@@ -1983,53 +1793,6 @@ fn plugin_display_name(roots: &InstallRoots, plugin_id: &str) -> Option<String> 
         .map(|manifest| manifest.name)
 }
 
-/// Legacy skill packs installed before `install_plugin_pack` stamped
-/// `.ryuzi-skill.json` into the plugin directory carry provenance only in
-/// their materialized skill dirs under the skills root. When one of those
-/// names `plugin_id`, copy that provenance into `plugin_dir` (one-time
-/// heal) and return `true`; return `false` when nothing names the plugin
-/// (hand-authored manifests — the loader skips them).
-pub(crate) fn stamp_legacy_skill_pack_provenance(
-    skills_root: &Path,
-    plugin_dir: &Path,
-    plugin_id: &str,
-) -> bool {
-    // `install_plugin_pack` always writes packs at `plugins_root/<plugin_id>`
-    // (see `checked_child(&roots.plugins_root, &pack.plugin_id)` above), so a
-    // legitimate legacy pack's directory name always equals its plugin id.
-    // Without this guard, a hand-authored directory under any other name
-    // could claim an installed pack's id in its manifest and ride that
-    // pack's materialized skills-root provenance to get itself healed and
-    // permanently trusted — same-id spoofing. Reject anything whose
-    // directory name doesn't match before even looking at the skills root.
-    if plugin_dir.file_name().and_then(|n| n.to_str()) != Some(plugin_id) {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(skills_root) else {
-        return false;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let provenance_path = entry.path().join(PROVENANCE_FILE);
-        let Ok(text) = std::fs::read_to_string(&provenance_path) else {
-            continue;
-        };
-        let Ok(provenance) = serde_json::from_str::<SkillInstallProvenance>(&text) else {
-            continue;
-        };
-        if provenance.plugin_id.as_deref() != Some(plugin_id) {
-            continue;
-        }
-        if let Err(e) = write_provenance(&plugin_dir.join(PROVENANCE_FILE), &provenance) {
-            tracing::warn!(
-                "failed to stamp skill-pack provenance into {}: {e}",
-                plugin_dir.display()
-            );
-        }
-        return true; // provenance exists — the pack is legit even if the stamp write failed
-    }
-    false
-}
-
 fn resolve_within(base_dir: &Path, rel: &str) -> Result<PathBuf> {
     let base_dir = base_dir
         .canonicalize()
@@ -2042,19 +1805,6 @@ fn resolve_within(base_dir: &Path, rel: &str) -> Result<PathBuf> {
         bail!("path escapes install root: {rel}");
     }
     Ok(target)
-}
-
-fn relative_path_string(base_dir: &Path, target: &Path) -> Result<String> {
-    let base_dir = base_dir
-        .canonicalize()
-        .unwrap_or_else(|_| base_dir.to_path_buf());
-    let target = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
-    Ok(target
-        .strip_prefix(&base_dir)?
-        .to_string_lossy()
-        .replace('\\', "/"))
 }
 
 fn replace_dir_from(source: &Path, target: &Path) -> Result<()> {
@@ -2306,21 +2056,6 @@ mod tests {
         .unwrap();
     }
 
-    /// Recursively count files named `file_name` anywhere under `dir`.
-    fn count_files_named(dir: &std::path::Path, file_name: &str) -> usize {
-        let mut count = 0;
-        for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
-            let path = entry.path();
-            let ty = entry.file_type().unwrap();
-            if ty.is_dir() {
-                count += count_files_named(&path, file_name);
-            } else if entry.file_name().to_string_lossy() == file_name {
-                count += 1;
-            }
-        }
-        count
-    }
-
     fn write_installed_skill(
         roots: &InstallRoots,
         id: &str,
@@ -2349,7 +2084,7 @@ mod tests {
                 .plugins_root
                 .join("superpack")
                 .join("ryuzi-plugin.toml"),
-            "contract = 1\nid = \"superpack\"\nname = \"Superpack\"\n",
+            "contract = 2\nid = \"superpack\"\nname = \"Superpack\"\n",
         )
         .unwrap();
         let provenance = SkillInstallProvenance {
@@ -2445,87 +2180,13 @@ mod tests {
         assert_eq!(listed[0].skill_count, 1);
     }
 
-    #[test]
-    fn stamp_legacy_skill_pack_provenance_heals_from_materialized_skills() {
-        let config = tempfile::tempdir().unwrap();
-        let roots = InstallRoots::new(config.path().to_path_buf());
-        roots.ensure_exists().unwrap();
-        let plugin_dir = roots.plugins_root.join("legacy-pack");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        write_installed_skill(
-            &roots,
-            "legacy-pack--triage",
-            "triage",
-            "Old pack skill.",
-            SkillInstallProvenance {
-                source: "https://github.com/acme/legacy-pack".to_string(),
-                plugin_id: Some("legacy-pack".to_string()),
-                installed_at: "2026-01-01T00:00:00.000Z".to_string(),
-            },
-        );
-
-        assert!(stamp_legacy_skill_pack_provenance(
-            &roots.skills_root,
-            &plugin_dir,
-            "legacy-pack"
-        ));
-        let stamped: SkillInstallProvenance = serde_json::from_str(
-            &std::fs::read_to_string(plugin_dir.join(PROVENANCE_FILE)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(stamped.plugin_id.as_deref(), Some("legacy-pack"));
-        assert_eq!(stamped.source, "https://github.com/acme/legacy-pack");
-    }
-
-    #[test]
-    fn stamp_legacy_skill_pack_provenance_rejects_plugin_without_materialized_provenance() {
-        let config = tempfile::tempdir().unwrap();
-        let roots = InstallRoots::new(config.path().to_path_buf());
-        roots.ensure_exists().unwrap();
-        let plugin_dir = roots.plugins_root.join("hand-authored");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-
-        assert!(!stamp_legacy_skill_pack_provenance(
-            &roots.skills_root,
-            &plugin_dir,
-            "hand-authored"
-        ));
-        assert!(!plugin_dir.join(PROVENANCE_FILE).exists());
-    }
-
-    #[test]
-    fn stamp_legacy_skill_pack_provenance_rejects_dir_name_spoofing_an_installed_id() {
-        // `install_plugin_pack` always writes packs at `plugins_root/<plugin_id>`,
-        // so a directory named anything else claiming a real pack's id via its
-        // manifest — even when that id's materialized skills-root provenance is
-        // genuine — must not be healed or trusted.
-        let config = tempfile::tempdir().unwrap();
-        let roots = InstallRoots::new(config.path().to_path_buf());
-        roots.ensure_exists().unwrap();
-        let plugin_dir = roots.plugins_root.join("impostor");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        write_installed_skill(
-            &roots,
-            "acme-user--triage",
-            "triage",
-            "Real pack skill.",
-            SkillInstallProvenance {
-                source: "https://github.com/acme/acme-user".to_string(),
-                plugin_id: Some("acme-user".to_string()),
-                installed_at: "2026-01-01T00:00:00.000Z".to_string(),
-            },
-        );
-
-        assert!(!stamp_legacy_skill_pack_provenance(
-            &roots.skills_root,
-            &plugin_dir,
-            "acme-user"
-        ));
-        assert!(!plugin_dir.join(PROVENANCE_FILE).exists());
-    }
-
+    /// `.codex-plugin/plugin.json` discovery materializes each declared
+    /// skill under `skills_root` as `{plugin_id}--{skill}`, and writes
+    /// nothing under `plugins_root` — no `PluginManifest` is synthesized or
+    /// preserved for a skill pack (the v2 SDK manifest dropped `skills`
+    /// entirely; a real plugin-folder install is a later task).
     #[tokio::test]
-    async fn install_plugin_pack_copies_repo_writes_manifest_and_materializes_skills() {
+    async fn install_plugin_pack_materializes_skills_without_a_plugin_row() {
         let config = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
@@ -2533,15 +2194,9 @@ mod tests {
             repo.path().join(".codex-plugin/plugin.json"),
             serde_json::json!({
                 "name": "superpowers",
-                "description": "Curated skill pack",
-                "homepage": "https://github.com/obra/superpowers",
-                "repository": "https://github.com/obra/superpowers",
-                "author": { "name": "OpenAI" },
                 "skills": "./skills/",
                 "interface": {
-                    "displayName": "Superpowers",
-                    "developerName": "OpenAI",
-                    "shortDescription": "Curated skills"
+                    "displayName": "Superpowers"
                 }
             })
             .to_string(),
@@ -2579,46 +2234,9 @@ mod tests {
         assert_eq!(pack.name, "Superpowers");
         assert_eq!(pack.skills.len(), 2);
 
-        let plugin_dir = roots.plugins_root.join("superpowers");
-        assert!(plugin_dir.join(".codex-plugin/plugin.json").is_file());
-        assert!(plugin_dir.join("ryuzi-plugin.toml").is_file());
-
-        let pack_provenance: SkillInstallProvenance = serde_json::from_str(
-            &std::fs::read_to_string(plugin_dir.join(PROVENANCE_FILE)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            pack_provenance.source,
-            "https://github.com/obra/superpowers"
-        );
-        assert_eq!(pack_provenance.plugin_id.as_deref(), Some("superpowers"));
-
-        // Regression: the installed plugin dir must carry ONLY its single
-        // top-level provenance stamp — none nested inside its skill subtrees.
-        // (The atomic DirSwap stages the plugin dir from the clean clone
-        // BEFORE the per-skill stamps are written, so those stamps land only
-        // in the materialized skill dirs under the skills root, never in the
-        // plugin dir's own copy of the skill tree.)
-        assert!(!plugin_dir
-            .join("skills/brainstorming")
-            .join(PROVENANCE_FILE)
-            .exists());
-        assert!(!plugin_dir
-            .join("skills/test-driven-development")
-            .join(PROVENANCE_FILE)
-            .exists());
-        assert_eq!(
-            count_files_named(&plugin_dir, PROVENANCE_FILE),
-            1,
-            "plugin dir should contain exactly one (top-level) provenance stamp"
-        );
-
-        let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(
-            &std::fs::read_to_string(plugin_dir.join("ryuzi-plugin.toml")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest.id, "superpowers");
-        assert_eq!(manifest.skills.len(), 2);
+        // No plugin row is fabricated: `plugins_root` is never touched by a
+        // skill-pack install.
+        assert!(!roots.plugins_root.join("superpowers").exists());
 
         let brainstorming = roots.skills_root.join("superpowers--brainstorming");
         let tdd = roots
@@ -2626,6 +2244,15 @@ mod tests {
             .join("superpowers--test-driven-development");
         assert!(brainstorming.join("SKILL.md").is_file());
         assert!(tdd.join("SKILL.md").is_file());
+        let pack_provenance: SkillInstallProvenance = serde_json::from_str(
+            &std::fs::read_to_string(brainstorming.join(PROVENANCE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pack_provenance.source,
+            "https://github.com/obra/superpowers"
+        );
+        assert_eq!(pack_provenance.plugin_id.as_deref(), Some("superpowers"));
 
         let listed = list_installed_skills_in(&roots).unwrap();
         assert_eq!(listed.len(), 1);
@@ -2784,7 +2411,9 @@ path = "skills/brainstorming"
             }]
         );
         assert!(!roots.skills_root.join("superpowers").exists());
-        assert!(roots.plugins_root.join("superpowers").exists());
+        // No plugin row is fabricated: `plugins_root` is never touched by a
+        // skill-pack install.
+        assert!(!roots.plugins_root.join("superpowers").exists());
         assert!(roots
             .skills_root
             .join("superpowers--brainstorming")
@@ -2796,148 +2425,6 @@ path = "skills/brainstorming"
         assert_eq!(listed[0].id, "superpowers");
         assert_eq!(listed[0].plugin_id.as_deref(), Some("superpowers"));
         assert_eq!(listed[0].skill_count, 1);
-    }
-
-    #[tokio::test]
-    async fn install_plugin_pack_preserves_existing_manifest_with_custom_skill_paths() {
-        let config = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
-        std::fs::write(
-            repo.path().join(".codex-plugin/plugin.json"),
-            serde_json::json!({
-                "name": "superpowers",
-                "skills": "./skills/",
-                "interface": { "displayName": "Superpowers" }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        write_skill(
-            &repo.path().join("bundled/brainstorming"),
-            "brainstorming",
-            "Explore ideas",
-            "Custom layout.",
-        );
-        let preserved_manifest = r#"
-contract = 1
-id = "superpowers"
-name = "Superpowers"
-
-[[skills]]
-name = "brainstorming"
-description = "Explore ideas"
-path = "bundled/brainstorming"
-"#
-        .trim_start();
-        std::fs::write(repo.path().join("ryuzi-plugin.toml"), preserved_manifest).unwrap();
-
-        let mut repos = BTreeMap::new();
-        repos.insert(
-            "https://github.com/obra/superpowers".to_string(),
-            repo.path().to_path_buf(),
-        );
-        let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner {
-            repos,
-            commit: None,
-        };
-
-        let pack = install_skill_source_with("superpowers", &roots, &cloner)
-            .await
-            .unwrap();
-
-        assert_eq!(pack.id, "superpowers");
-        assert_eq!(pack.skills.len(), 1);
-        assert_eq!(pack.skills[0].id, "superpowers--brainstorming");
-
-        let plugin_dir = roots.plugins_root.join("superpowers");
-        assert_eq!(
-            std::fs::read_to_string(plugin_dir.join("ryuzi-plugin.toml")).unwrap(),
-            preserved_manifest
-        );
-        assert!(plugin_dir.join("bundled/brainstorming/SKILL.md").is_file());
-        assert!(roots
-            .skills_root
-            .join("superpowers--brainstorming")
-            .join("SKILL.md")
-            .is_file());
-    }
-
-    #[tokio::test]
-    async fn invalid_preserved_manifest_blocks_plugin_json_fallback_install() {
-        let config = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
-        std::fs::write(
-            repo.path().join(".codex-plugin/plugin.json"),
-            serde_json::json!({
-                "name": "superpowers",
-                "skills": "./skills/",
-                "interface": { "displayName": "Superpowers" }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        write_skill(
-            &repo.path().join("skills/brainstorming"),
-            "brainstorming",
-            "Explore ideas",
-            "Default layout.",
-        );
-        write_skill(
-            &repo.path().join("bundled/test-driven-development"),
-            "test-driven-development",
-            "Write tests first",
-            "Custom layout.",
-        );
-        std::fs::write(
-            repo.path().join("ryuzi-plugin.toml"),
-            r#"
-contract = 1
-id = "superpowers"
-name = "Superpowers"
-
-[[skills]]
-name = "test-driven-development"
-description = "Write tests first"
-path = 123
-"#
-            .trim_start(),
-        )
-        .unwrap();
-
-        let source = parse_skill_source("superpowers").unwrap();
-        let discovery_err = discover_plugin_pack_from_plugin_json(
-            repo.path(),
-            &source,
-            &repo.path().join(".codex-plugin/plugin.json"),
-        )
-        .expect_err("invalid preserved manifest should be authoritative");
-        assert!(discovery_err.to_string().contains("ryuzi-plugin.toml"));
-
-        let mut repos = BTreeMap::new();
-        repos.insert(source.repo.clone(), repo.path().to_path_buf());
-        let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner {
-            repos,
-            commit: None,
-        };
-
-        let install_err = install_skill_source_with("superpowers", &roots, &cloner)
-            .await
-            .expect_err("install should fail when preserved manifest is invalid");
-        assert!(install_err.to_string().contains("ryuzi-plugin.toml"));
-        assert!(list_installed_skills_in(&roots).unwrap().is_empty());
-        assert!(!roots.plugins_root.join("superpowers").exists());
-        assert!(!roots
-            .skills_root
-            .join("superpowers--brainstorming")
-            .exists());
-        assert!(!roots
-            .skills_root
-            .join("superpowers--test-driven-development")
-            .exists());
     }
 
     #[tokio::test]
@@ -2974,10 +2461,7 @@ path = 123
 
         assert_eq!(pack.id, "toolbox");
         assert_eq!(pack.skills.len(), 2);
-        assert!(roots
-            .plugins_root
-            .join("toolbox/ryuzi-plugin.toml")
-            .is_file());
+        assert!(!roots.plugins_root.join("toolbox").exists());
         assert!(roots
             .skills_root
             .join("toolbox--alpha")
@@ -3089,7 +2573,6 @@ path = 123
             .await
             .unwrap();
         assert_eq!(installed.id, "superpowers");
-        assert!(roots.plugins_root.join("superpowers").exists());
         assert!(roots
             .skills_root
             .join("superpowers--brainstorming")
@@ -3119,12 +2602,13 @@ path = 123
 
         assert_eq!(refreshed.id, "mindpowers");
         assert_eq!(refreshed.plugin_id.as_deref(), Some("mindpowers"));
-        assert!(!roots.plugins_root.join("superpowers").exists());
         assert!(!roots
             .skills_root
             .join("superpowers--brainstorming")
             .exists());
-        assert!(roots.plugins_root.join("mindpowers").exists());
+        // No plugin row is ever fabricated for either identity.
+        assert!(!roots.plugins_root.join("superpowers").exists());
+        assert!(!roots.plugins_root.join("mindpowers").exists());
         assert!(roots.skills_root.join("mindpowers--focus").exists());
 
         let listed = list_installed_skills_in(&roots).unwrap();
@@ -3269,7 +2753,6 @@ path = 123
             .unwrap();
         assert_eq!(installed.id, "superpowers");
         assert_eq!(installed.plugin_id.as_deref(), Some("superpowers"));
-        assert!(roots.plugins_root.join("superpowers").exists());
         assert!(roots
             .skills_root
             .join("superpowers--brainstorming")
@@ -3354,7 +2837,7 @@ path = 123
         assert_eq!(refreshed.id, "superpowers");
         assert_eq!(refreshed.plugin_id.as_deref(), Some("superpowers"));
         assert!(!roots.skills_root.join("superpowers").exists());
-        assert!(roots.plugins_root.join("superpowers").exists());
+        assert!(!roots.plugins_root.join("superpowers").exists());
         assert!(roots
             .skills_root
             .join("superpowers--brainstorming")
@@ -3564,7 +3047,8 @@ path = "skills/focus"
             .join("superpowers--brainstorming")
             .exists());
         assert!(!roots.skills_root.join("superpowers--focus").exists());
-        assert!(roots.plugins_root.join("mindpowers").exists());
+        // No plugin row is fabricated for the new identity either.
+        assert!(!roots.plugins_root.join("mindpowers").exists());
         assert!(roots.skills_root.join("mindpowers--focus").exists());
     }
 
@@ -3651,7 +3135,8 @@ path = "skills/focus"
         assert!(!roots.plugins_root.join("superpowers").exists());
         assert!(!roots.skills_root.join("superpowers").exists());
         assert!(!roots.skills_root.join("superpowers--focus").exists());
-        assert!(roots.plugins_root.join("mindpowers").exists());
+        // No plugin row is fabricated for the new identity either.
+        assert!(!roots.plugins_root.join("mindpowers").exists());
         assert!(roots
             .skills_root
             .join("mindpowers--focus")
@@ -4181,9 +3666,6 @@ path = "skills/focus"
             prompt.hook_scripts,
             vec!["tool.before/guard.sh".to_string()]
         );
-        // No `[[extension]]` in this fixture — the new field must default to
-        // false and the flow must stay exactly as before DT7.
-        assert!(!prompt.runs_code);
         assert!(store.get_plugin_install("s").await.unwrap().is_none()); // not installed yet
 
         let pack = confirm_install(&prompt.token, &store).await.unwrap();
@@ -4195,154 +3677,6 @@ path = "skills/focus"
         // the identity/skills/hooks fields.
         let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
         assert_eq!(summary["totalBytes"], serde_json::json!(prompt.total_bytes));
-    }
-
-    /// Writes a plugin pack repo (`.codex-plugin/plugin.json` +
-    /// `ryuzi-plugin.toml`) declaring one skill and one `[[extension]]`, so
-    /// `discover_install_target` parses a real manifest with
-    /// `extensions.is_empty() == false` — the DT7 trust-gate tests need this
-    /// to exercise `discovery_runs_code` through the real manifest parser
-    /// rather than asserting against a hand-built `Discovery`.
-    fn write_extension_plugin_repo(dir: &std::path::Path, plugin_id: &str) {
-        std::fs::create_dir_all(dir.join(".codex-plugin")).unwrap();
-        std::fs::write(
-            dir.join(".codex-plugin/plugin.json"),
-            serde_json::json!({ "name": plugin_id }).to_string(),
-        )
-        .unwrap();
-        write_skill(
-            &dir.join("bundled/brainstorming"),
-            "brainstorming",
-            "Explore ideas",
-            "body",
-        );
-        let manifest = format!(
-            r#"
-contract = 1
-id = "{plugin_id}"
-name = "{plugin_id}"
-
-[[skills]]
-name = "brainstorming"
-description = "Explore ideas"
-path = "bundled/brainstorming"
-
-[[extension]]
-name = "my-ext"
-command = "my-ext-binary"
-events = ["tool.before"]
-"#
-        );
-        std::fs::write(dir.join("ryuzi-plugin.toml"), manifest.trim_start()).unwrap();
-    }
-
-    #[tokio::test]
-    async fn begin_curated_source_with_extension_forces_confirmation_not_immediate() {
-        // The key new DT7 rule: a curated source whose manifest declares
-        // `[[extension]]` must NOT take the curated-immediate shortcut —
-        // it has to stop at the trust prompt just like an arbitrary source,
-        // with `runs_code: true` so the wizard can name the elevated risk.
-        let repo = tempfile::tempdir().unwrap();
-        write_extension_plugin_repo(repo.path(), "superpowers");
-        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
-        let cloner = FakeRepoCloner {
-            repos: BTreeMap::from([(
-                "https://github.com/obra/superpowers".into(),
-                repo.path().to_path_buf(),
-            )]),
-            commit: Some("c1".into()),
-        };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-
-        let prompt = match begin_install_with("superpowers", &roots, &cloner, &store)
-            .await
-            .unwrap()
-        {
-            BeginInstall::NeedsConfirmation(p) => p,
-            BeginInstall::Completed(_) => {
-                panic!("a curated source that runs code must not install immediately")
-            }
-        };
-        assert!(prompt.runs_code);
-        // Nothing installed yet, and no ledger row written — the
-        // curated-immediate branch never ran.
-        assert!(store
-            .get_plugin_install("superpowers")
-            .await
-            .unwrap()
-            .is_none());
-
-        // confirm_install completes the staged install and records
-        // "acknowledged" — NOT "curated" — because this plugin runs code and
-        // therefore always requires the explicit two-phase acknowledgment.
-        let pack = confirm_install(&prompt.token, &store).await.unwrap();
-        let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
-        assert_eq!(rec.trust_tier, "acknowledged");
-        assert!(rec.trust_ack_at.is_some());
-        assert!(rec.trust_ack_summary.is_some());
-    }
-
-    #[tokio::test]
-    async fn begin_curated_source_without_extension_still_installs_immediately() {
-        // Unchanged-behavior guard alongside the new rule above: a curated
-        // pack with NO `[[extension]]` must still take the frictionless
-        // curated-immediate path.
-        let repo = tempfile::tempdir().unwrap();
-        write_skill(repo.path(), "S", "d", "b");
-        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
-        let cloner = FakeRepoCloner {
-            repos: BTreeMap::from([(
-                "https://github.com/obra/superpowers".into(),
-                repo.path().to_path_buf(),
-            )]),
-            commit: Some("c1".into()),
-        };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-
-        match begin_install_with("superpowers", &roots, &cloner, &store)
-            .await
-            .unwrap()
-        {
-            BeginInstall::Completed(p) => {
-                let rec = store.get_plugin_install(&p.id).await.unwrap().unwrap();
-                assert_eq!(rec.trust_tier, "curated");
-                assert!(rec.trust_ack_at.is_none());
-            }
-            BeginInstall::NeedsConfirmation(_) => {
-                panic!("curated, non-extension install must stay immediate")
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn begin_arbitrary_source_with_extension_sets_runs_code() {
-        let repo = tempfile::tempdir().unwrap();
-        write_extension_plugin_repo(repo.path(), "acme-ext");
-        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
-        let cloner = FakeRepoCloner {
-            repos: BTreeMap::from([(
-                "https://github.com/acme/ext-plugin".into(),
-                repo.path().to_path_buf(),
-            )]),
-            commit: Some("c1".into()),
-        };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-
-        let prompt = match begin_install_with("acme/ext-plugin", &roots, &cloner, &store)
-            .await
-            .unwrap()
-        {
-            BeginInstall::NeedsConfirmation(p) => p,
-            BeginInstall::Completed(_) => panic!("arbitrary source must always prompt"),
-        };
-        assert!(prompt.runs_code);
-
-        let pack = confirm_install(&prompt.token, &store).await.unwrap();
-        let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
-        assert_eq!(rec.trust_tier, "acknowledged");
     }
 
     #[tokio::test]
@@ -4570,110 +3904,6 @@ events = ["tool.before"]
     // raw `install_skill`) — see task-dt7-report.md's "Fix wave" section. ---
 
     #[tokio::test]
-    async fn update_needs_reack_when_update_adds_an_extension_without_hooks() {
-        // A plain, non-code plugin pack (no `[[extension]]`, no
-        // `ryuzi-plugin.toml` at all — the plugin.json-only discovery path).
-        let config_root = tempfile::tempdir().unwrap().keep();
-        let roots = InstallRoots::new(config_root);
-        let repo_dir = roots_repo(&roots);
-        std::fs::create_dir_all(repo_dir.join(".codex-plugin")).unwrap();
-        std::fs::write(
-            repo_dir.join(".codex-plugin/plugin.json"),
-            serde_json::json!({ "name": "acme-pack", "skills": "./skills/" }).to_string(),
-        )
-        .unwrap();
-        write_skill(
-            &repo_dir.join("skills/brainstorming"),
-            "brainstorming",
-            "Explore ideas",
-            "body",
-        );
-
-        let db_path = tempfile::NamedTempFile::new()
-            .unwrap()
-            .into_temp_path()
-            .keep()
-            .unwrap();
-        let store = crate::store::Store::open(&db_path).await.unwrap();
-        let cloner_c1 = fake_cloner("https://github.com/acme/pack", &repo_dir, "c1");
-        let pack = install_skill_source_with_recorded(
-            "https://github.com/acme/pack",
-            &roots,
-            &cloner_c1,
-            &store,
-        )
-        .await
-        .unwrap();
-        assert_eq!(pack.plugin_id.as_deref(), Some("acme-pack"));
-        let rec = store
-            .get_plugin_install("acme-pack")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rec.trust_tier, "acknowledged"); // not curated, no ack summary
-        assert!(rec.trust_ack_summary.is_none());
-
-        // Upstream now ships a `ryuzi-plugin.toml` declaring the SAME skill
-        // plus an `[[extension]]` — no hook scripts anywhere in this update.
-        // Before the fix-wave, `update_installed_pack_with` only consulted
-        // `list_pack_hook_scripts`, so this landed as a silent `Updated`
-        // with no trust prompt at all (CRITICAL #1).
-        std::fs::write(
-            repo_dir.join("ryuzi-plugin.toml"),
-            r#"
-contract = 1
-id = "acme-pack"
-name = "acme-pack"
-
-[[skills]]
-name = "brainstorming"
-description = "Explore ideas"
-path = "skills/brainstorming"
-
-[[extension]]
-name = "my-ext"
-command = "my-ext-binary"
-events = ["tool.before"]
-"#
-            .trim_start(),
-        )
-        .unwrap();
-        let cloner_c2 = fake_cloner("https://github.com/acme/pack", &repo_dir, "c2");
-
-        let outcome = update_installed_pack_with("acme-pack", false, &roots, &cloner_c2, &store)
-            .await
-            .unwrap();
-        let prompt = match outcome {
-            UpdateOutcome::NeedsReack(p) => p,
-            other => panic!(
-                "an update that newly declares [[extension]] must NeedsReack, not silently \
-                 install — got {other:?}"
-            ),
-        };
-        assert!(prompt.runs_code);
-        assert!(prompt.hook_scripts.is_empty());
-
-        // The live install must be untouched — no swap happened yet, still on c1.
-        let rec = store
-            .get_plugin_install("acme-pack")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rec.resolved_commit.as_deref(), Some("c1"));
-
-        // Confirming completes the update and records the acknowledgment.
-        let confirmed = confirm_install(&prompt.token, &store).await.unwrap();
-        assert_eq!(confirmed.id, "acme-pack");
-        let rec = store
-            .get_plugin_install("acme-pack")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rec.resolved_commit.as_deref(), Some("c2"));
-        assert_eq!(rec.trust_tier, "acknowledged");
-    }
-
-    #[tokio::test]
     async fn update_returns_updated_when_no_hooks_or_extensions_are_involved() {
         let (roots, cloner_c1, store) = recorded_setup("https://github.com/acme/p", "c1").await;
         install_skill_source_with_recorded("https://github.com/acme/p", &roots, &cloner_c1, &store)
@@ -4691,65 +3921,6 @@ events = ["tool.before"]
             .unwrap();
         assert_eq!(outcome, UpdateOutcome::Updated);
         let rec = store.get_plugin_install("p").await.unwrap().unwrap();
-        assert_eq!(rec.resolved_commit.as_deref(), Some("c2"));
-    }
-
-    #[tokio::test]
-    async fn update_needs_reack_again_for_an_already_code_running_pack() {
-        // Chosen semantics for "already acknowledged as code" (see
-        // `update_installed_pack_with`'s doc comment): the ledger carries no
-        // reliable "already ack'd as code" signal distinct from
-        // `trust_ack_summary`'s free-form JSON, so re-ack-on-code fires on
-        // EVERY code-running update, not just a newly-introduced one — even
-        // for a pack that was already installed and acknowledged as code.
-        let repo = tempfile::tempdir().unwrap();
-        write_extension_plugin_repo(repo.path(), "acme-ext");
-        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
-        let cloner_c1 = FakeRepoCloner {
-            repos: BTreeMap::from([(
-                "https://github.com/acme/ext-plugin".into(),
-                repo.path().to_path_buf(),
-            )]),
-            commit: Some("c1".into()),
-        };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-
-        let prompt = match begin_install_with("acme/ext-plugin", &roots, &cloner_c1, &store)
-            .await
-            .unwrap()
-        {
-            BeginInstall::NeedsConfirmation(p) => p,
-            BeginInstall::Completed(_) => panic!("extension source must always prompt"),
-        };
-        confirm_install(&prompt.token, &store).await.unwrap();
-        let rec = store.get_plugin_install("acme-ext").await.unwrap().unwrap();
-        assert_eq!(rec.trust_tier, "acknowledged");
-
-        // Upstream ships a new commit of the SAME extension-declaring
-        // manifest (still `[[extension]]`, no new hook scripts).
-        let cloner_c2 = FakeRepoCloner {
-            repos: BTreeMap::from([(
-                "https://github.com/acme/ext-plugin".into(),
-                repo.path().to_path_buf(),
-            )]),
-            commit: Some("c2".into()),
-        };
-        let outcome = update_installed_pack_with("acme-ext", false, &roots, &cloner_c2, &store)
-            .await
-            .unwrap();
-        let prompt2 = match outcome {
-            UpdateOutcome::NeedsReack(p) => p,
-            other => panic!(
-                "expected NeedsReack again for an already-code pack (chosen safe-default: \
-                 re-ack on every code-running update), got {other:?}"
-            ),
-        };
-        assert!(prompt2.runs_code);
-
-        let confirmed = confirm_install(&prompt2.token, &store).await.unwrap();
-        assert_eq!(confirmed.id, "acme-ext");
-        let rec = store.get_plugin_install("acme-ext").await.unwrap().unwrap();
         assert_eq!(rec.resolved_commit.as_deref(), Some("c2"));
     }
 
@@ -4797,33 +3968,6 @@ events = ["tool.before"]
         assert!(err.to_string().contains("begin_install"));
         assert!(list_installed_skills_in(&roots).unwrap().is_empty());
         assert!(store.get_plugin_install("p").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn install_skill_source_gated_refuses_a_curated_source_that_runs_code() {
-        let repo = tempfile::tempdir().unwrap();
-        write_extension_plugin_repo(repo.path(), "superpowers");
-        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
-        let cloner = FakeRepoCloner {
-            repos: BTreeMap::from([(
-                "https://github.com/obra/superpowers".into(),
-                repo.path().to_path_buf(),
-            )]),
-            commit: Some("c1".into()),
-        };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-
-        let err = install_skill_source_gated_with("superpowers", &roots, &cloner, &store)
-            .await
-            .expect_err("a code-running manifest must be refused even for a curated source");
-        assert!(err.to_string().contains("begin_install"));
-        assert!(list_installed_skills_in(&roots).unwrap().is_empty());
-        assert!(store
-            .get_plugin_install("superpowers")
-            .await
-            .unwrap()
-            .is_none());
     }
 
     /// `install_skill_source_gated_with` discards a refused
