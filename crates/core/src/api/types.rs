@@ -625,6 +625,7 @@ pub enum CommandOriginInfo {
     Builtin,
     Global,
     Project,
+    Plugin,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]

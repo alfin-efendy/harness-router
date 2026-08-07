@@ -237,6 +237,7 @@ fn slash_entry_info(entry: crate::harness::native::slash_catalog::SlashEntry) ->
             CommandOrigin::Builtin => CommandOriginInfo::Builtin,
             CommandOrigin::Global => CommandOriginInfo::Global,
             CommandOrigin::Project => CommandOriginInfo::Project,
+            CommandOrigin::Plugin => CommandOriginInfo::Plugin,
         },
         home: entry.surfaces.home,
         session: entry.surfaces.session,

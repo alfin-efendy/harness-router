@@ -63,6 +63,10 @@ pub enum CommandOrigin {
     Builtin,
     Global,
     Project,
+    /// Shipped inside an installed plugin's `commands/` directory (Task 8).
+    /// Lowest precedence of all four origins — a same-name builtin,
+    /// project, or global command always wins.
+    Plugin,
 }
 
 impl CommandOrigin {
@@ -71,6 +75,7 @@ impl CommandOrigin {
             Self::Builtin => "builtin",
             Self::Global => "global",
             Self::Project => "project",
+            Self::Plugin => "plugin",
         }
     }
 }
@@ -180,6 +185,11 @@ pub struct RegisteredCommand {
     pub effective: bool,
     /// Whether a project source has a global source with the same name.
     pub shadows_global: bool,
+    /// Whether a `CommandOrigin::Plugin` entry lost its bare name to a
+    /// higher-precedence source and was re-registered as
+    /// `<plugin-id>/<name>` (Task 8) — surfaced for UI labeling. Always
+    /// `false` for non-plugin origins.
+    pub namespaced: bool,
 }
 
 /// The set of available slash commands.
@@ -196,6 +206,20 @@ impl CommandRegistry {
         Self::load_from_dirs(Some(work_dir), &global)
     }
 
+    /// Like [`Self::load`], plus every ENABLED, installed plugin's
+    /// `commands/` directory (Task 8) — `plugin_roots` is `(plugin_id,
+    /// <install_dir>/commands)` for each, provided by the control plane
+    /// (`crate::control::ControlPlane::enabled_plugin_content_roots`).
+    pub fn load_with_plugins(
+        work_dir: &Path,
+        plugin_roots: &[(String, PathBuf)],
+    ) -> CommandRegistry {
+        let global = dirs::home_dir()
+            .map(|home| home.join(".config/ryuzi/commands"))
+            .unwrap_or_default();
+        Self::load_from_dirs_with_plugins(Some(work_dir), &global, plugin_roots)
+    }
+
     /// Global + builtin commands only — the no-project catalog path.
     pub fn load_without_project() -> CommandRegistry {
         let global = dirs::home_dir()
@@ -204,18 +228,69 @@ impl CommandRegistry {
         Self::load_from_dirs(None, &global)
     }
 
+    /// Like [`Self::load_without_project`], plus every enabled plugin's
+    /// `commands/` directory (Task 8) — the no-project catalog path.
+    pub fn load_without_project_with_plugins(
+        plugin_roots: &[(String, PathBuf)],
+    ) -> CommandRegistry {
+        let global = dirs::home_dir()
+            .map(|home| home.join(".config/ryuzi/commands"))
+            .unwrap_or_default();
+        Self::load_from_dirs_with_plugins(None, &global, plugin_roots)
+    }
+
     pub(crate) fn load_from_dirs(work_dir: Option<&Path>, global_dir: &Path) -> CommandRegistry {
+        Self::load_from_dirs_with_plugins(work_dir, global_dir, &[])
+    }
+
+    /// Like [`Self::load_from_dirs`], plus every enabled plugin's
+    /// `commands/` directory (Task 8).
+    ///
+    /// Precedence: builtin > project > global > plugin. Plugin commands are
+    /// read first and inserted into the collapse map before every other
+    /// origin, so a same-name project, global, or builtin command always
+    /// overrides one — but a displaced plugin command is never silently
+    /// dropped: a second pass re-registers it as `<plugin-id>/<name>` (the
+    /// existing nested-name grammar already renders these correctly, e.g.
+    /// `/github/review`). The same rule applies if two different plugins
+    /// ship a same-named command: only one keeps the bare name, the other
+    /// falls back to its namespaced form.
+    pub(crate) fn load_from_dirs_with_plugins(
+        work_dir: Option<&Path>,
+        global_dir: &Path,
+        plugin_roots: &[(String, PathBuf)],
+    ) -> CommandRegistry {
         let global_commands = read_command_dir(global_dir);
         let project_commands = work_dir.map(read_project_command_dir).unwrap_or_default();
         let builtin_commands = builtin_commands();
+        let plugin_commands: Vec<(String, Command)> = plugin_roots
+            .iter()
+            .flat_map(|(plugin_id, root)| {
+                read_command_dir(root)
+                    .into_iter()
+                    .map(|command| (plugin_id.clone(), command))
+            })
+            .collect();
         let mut catalog = Vec::new();
 
+        // Plugin commands are inserted FIRST so every other origin overrides
+        // a same-name plugin command in the collapse below.
+        for (_, command) in &plugin_commands {
+            catalog.push(RegisteredCommand {
+                command: command.clone(),
+                origin: CommandOrigin::Plugin,
+                effective: false,
+                shadows_global: false,
+                namespaced: false,
+            });
+        }
         for command in global_commands {
             catalog.push(RegisteredCommand {
                 command,
                 origin: CommandOrigin::Global,
                 effective: false,
                 shadows_global: false,
+                namespaced: false,
             });
         }
         for command in project_commands {
@@ -227,6 +302,7 @@ impl CommandRegistry {
                 origin: CommandOrigin::Project,
                 effective: false,
                 shadows_global,
+                namespaced: false,
             });
         }
         for command in builtin_commands {
@@ -235,13 +311,45 @@ impl CommandRegistry {
                 origin: CommandOrigin::Builtin,
                 effective: false,
                 shadows_global: false,
+                namespaced: false,
             });
         }
-        let commands = catalog
+        let mut commands = catalog
             .iter()
             .cloned()
             .map(|entry| (entry.command.name.clone(), entry))
             .collect::<BTreeMap<_, _>>();
+
+        // Which plugin, if any, won a contested bare name among plugins
+        // themselves — mirrors the collapse map's own last-insert-wins rule
+        // applied only to the plugin-origin subset.
+        let mut plugin_bare_winner: BTreeMap<String, String> = BTreeMap::new();
+        for (plugin_id, command) in &plugin_commands {
+            plugin_bare_winner.insert(command.name.clone(), plugin_id.clone());
+        }
+        for (plugin_id, command) in &plugin_commands {
+            let is_bare_winner = plugin_bare_winner.get(&command.name) == Some(plugin_id)
+                && commands
+                    .get(&command.name)
+                    .is_some_and(|winner| winner.origin == CommandOrigin::Plugin);
+            if is_bare_winner {
+                continue;
+            }
+            let namespaced_name = format!("{plugin_id}/{}", command.name);
+            let entry = RegisteredCommand {
+                command: Command {
+                    name: namespaced_name.clone(),
+                    ..command.clone()
+                },
+                origin: CommandOrigin::Plugin,
+                effective: false,
+                shadows_global: false,
+                namespaced: true,
+            };
+            catalog.push(entry.clone());
+            commands.insert(namespaced_name, entry);
+        }
+
         for entry in &mut catalog {
             entry.effective = commands
                 .get(&entry.command.name)
@@ -272,6 +380,7 @@ impl CommandRegistry {
                 origin: CommandOrigin::Builtin,
                 effective: true,
                 shadows_global: false,
+                namespaced: false,
             })
             .collect::<Vec<_>>();
         let commands = catalog
@@ -1160,5 +1269,166 @@ mod tests {
         assert_eq!(resolved.agent.as_deref(), Some("plan"));
         assert_eq!(resolved.model.as_deref(), Some("openai/gpt-4.1"));
         assert!(resolved.subtask);
+    }
+
+    // ---------- Task 8: plugin-shipped commands ----------
+
+    /// The EFFECTIVE catalog entry's origin for `name` (`None` if `name`
+    /// resolves to nothing). `CommandRegistry::get` returns a bare `Command`
+    /// with no provenance, so tests that need to assert *which source won*
+    /// go through the full catalog instead.
+    fn origin_of(reg: &CommandRegistry, name: &str) -> Option<CommandOrigin> {
+        reg.catalog()
+            .into_iter()
+            .find(|entry| entry.command.name == name && entry.effective)
+            .map(|entry| entry.origin)
+    }
+
+    #[test]
+    fn plugin_commands_load_with_lowest_precedence_and_namespace_on_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_cmds = tmp.path().join("github/commands");
+        std::fs::create_dir_all(&plugin_cmds).unwrap();
+        std::fs::write(
+            plugin_cmds.join("sync.md"),
+            "---\ndescription: Sync repo\n---\nSync $ARGUMENTS",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_cmds.join("review.md"),
+            "---\ndescription: Plugin review\n---\nX",
+        )
+        .unwrap(); // collides with builtin
+
+        let reg = CommandRegistry::load_from_dirs_with_plugins(
+            None,
+            &tmp.path().join("nope-global"),
+            &[("github".to_string(), plugin_cmds.clone())],
+        );
+        reg.get("sync")
+            .expect("non-colliding plugin command keeps its bare name");
+        assert_eq!(origin_of(&reg, "sync"), Some(CommandOrigin::Plugin));
+        assert_eq!(
+            origin_of(&reg, "review"),
+            Some(CommandOrigin::Builtin),
+            "builtin wins"
+        );
+        assert!(
+            reg.get("github/review").is_some(),
+            "colliding plugin command is auto-namespaced"
+        );
+        assert_eq!(
+            origin_of(&reg, "github/review"),
+            Some(CommandOrigin::Plugin)
+        );
+    }
+
+    #[test]
+    fn plugin_command_colliding_with_project_is_also_namespaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_cmds = tmp.path().join("acme/commands");
+        std::fs::create_dir_all(&plugin_cmds).unwrap();
+        std::fs::write(
+            plugin_cmds.join("ship.md"),
+            "---\ndescription: Plugin ship\n---\nX",
+        )
+        .unwrap();
+
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project_dir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            project_dir.path().join(".ryuzi/commands/ship.md"),
+            "---\ndescription: Project ship\n---\nProject",
+        )
+        .unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            global_dir.path().join("deploy.md"),
+            "---\ndescription: Global deploy\n---\nDeploy",
+        )
+        .unwrap();
+
+        let reg = CommandRegistry::load_from_dirs_with_plugins(
+            Some(project_dir.path()),
+            global_dir.path(),
+            &[("acme".to_string(), plugin_cmds)],
+        );
+        // Project wins the bare "ship" name; the plugin command is reachable
+        // only under its namespaced form.
+        assert_eq!(origin_of(&reg, "ship"), Some(CommandOrigin::Project));
+        reg.get("acme/ship")
+            .expect("colliding plugin command is namespaced under project too");
+        assert_eq!(origin_of(&reg, "acme/ship"), Some(CommandOrigin::Plugin));
+        let namespaced_entry = reg
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.command.name == "acme/ship")
+            .unwrap();
+        assert!(
+            namespaced_entry.namespaced,
+            "the re-registered entry must be flagged for UI labeling"
+        );
+        let bare_plugin_entry = reg
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.command.name == "ship" && entry.origin == CommandOrigin::Plugin)
+            .unwrap();
+        assert!(
+            !bare_plugin_entry.namespaced,
+            "the shadowed bare-name catalog entry itself isn't the namespaced one"
+        );
+        assert!(!bare_plugin_entry.effective);
+        // A global-only command is untouched by plugin precedence.
+        assert_eq!(origin_of(&reg, "deploy"), Some(CommandOrigin::Global));
+    }
+
+    #[test]
+    fn two_plugins_shipping_the_same_command_name_both_stay_reachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a_cmds = tmp.path().join("a/commands");
+        let b_cmds = tmp.path().join("b/commands");
+        std::fs::create_dir_all(&a_cmds).unwrap();
+        std::fs::create_dir_all(&b_cmds).unwrap();
+        std::fs::write(
+            a_cmds.join("deploy.md"),
+            "---\ndescription: A deploy\n---\nA",
+        )
+        .unwrap();
+        std::fs::write(
+            b_cmds.join("deploy.md"),
+            "---\ndescription: B deploy\n---\nB",
+        )
+        .unwrap();
+
+        let reg = CommandRegistry::load_from_dirs_with_plugins(
+            None,
+            &tmp.path().join("nope-global"),
+            &[("a".to_string(), a_cmds), ("b".to_string(), b_cmds)],
+        );
+        // Exactly one of the two keeps the bare name (last-insert-wins, "b"
+        // since it was listed second); the other is reachable namespaced.
+        assert_eq!(origin_of(&reg, "deploy"), Some(CommandOrigin::Plugin));
+        assert!(
+            reg.get("a/deploy").is_some(),
+            "the losing plugin command must still be reachable namespaced"
+        );
+        assert!(reg.get("deploy").is_some());
+    }
+
+    #[test]
+    fn load_with_plugins_threads_plugin_roots_through_the_convenience_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_cmds = dir.path().join("plugin-commands");
+        std::fs::create_dir_all(&plugin_cmds).unwrap();
+        std::fs::write(
+            plugin_cmds.join("triage.md"),
+            "---\ndescription: Triage\n---\nTriage $ARGUMENTS",
+        )
+        .unwrap();
+
+        let reg =
+            CommandRegistry::load_with_plugins(dir.path(), &[("triager".to_string(), plugin_cmds)]);
+        reg.get("triage").unwrap();
+        assert_eq!(origin_of(&reg, "triage"), Some(CommandOrigin::Plugin));
     }
 }
