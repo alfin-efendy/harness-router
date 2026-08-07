@@ -3,6 +3,14 @@
 //! owns parsing (TOML) and structural validation only — it has no opinion
 //! on how a manifest becomes a running harness, gateway, or connector; that
 //! binding lives in `ryuzi-core`'s `PluginHost`.
+//!
+//! Contract 2 unifies the old declarative manifest (`ryuzi-plugin.toml`,
+//! contract 1) and the WASM component bundle (`ryuzi-plugin-bundle.toml`)
+//! into ONE schema: every plugin — first-party built-in, embedded catalog,
+//! user-authored declarative, or WASM-component-backed — is described by a
+//! single [`PluginManifest`]. This is a big-bang migration: `validate()`
+//! rejects any manifest that does not declare `contract = 2` outright,
+//! there is no compat loader for contract 1.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -11,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use crate::categories;
 
 /// The manifest contract version this SDK understands. `validate()` rejects
-/// manifests declaring a newer `contract` so an old loader fails loudly
-/// instead of silently misinterpreting fields it doesn't know about.
-pub const CONTRACT_VERSION: u32 = 1;
+/// any manifest that does not declare exactly this contract — big-bang
+/// migration, no compat loader for older contracts.
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// One plugin, one manifest. Rust built-ins construct this in code; catalog
 /// and user plugins author it as TOML (`ryuzi-plugin.toml`).
@@ -34,16 +42,6 @@ pub struct PluginManifest {
     pub icon: Option<String>,
     #[serde(default)]
     pub categories: Vec<String>,
-    /// Optional exclusive capability claim: "I am THE provider of the
-    /// `<slot>` capability" (e.g. `slot = "memory"` for a Hermes memory
-    /// backend). Distinct from `categories` — a category is a free-form
-    /// cosmetic tag any number of plugins may share; a slot is arbitrated
-    /// by `ryuzi_core`'s `PluginHost` (first registration wins, see
-    /// `PluginHost::slot_owner`), and a losing claim is surfaced as a
-    /// `plugin_doctor` `"slot-conflict"` finding rather than silently
-    /// dropped. An unknown slot name is a non-fatal `warnings()` entry,
-    /// matching `categories`' warn-not-reject discipline — it is never a
-    /// `validate()` error.
     #[serde(default)]
     pub slot: Option<String>,
     #[serde(default)]
@@ -54,25 +52,37 @@ pub struct PluginManifest {
     pub auth: Option<AuthSpec>,
     #[serde(default)]
     pub settings: Vec<SettingField>,
+    /// The WASM component this plugin ships, when any component-backed
+    /// surface (`[provider]`, `[[tools]]`, `[gateway]`) is used.
+    #[serde(default)]
+    pub component: Option<ComponentSpec>,
+    #[serde(default)]
+    pub permissions: PluginPermissions,
+    #[serde(default)]
+    pub oauth: Vec<OAuthProfile>,
+    /// Surface: provider. `ids` = the llm-router provider ids served
+    /// (absorbs v1-bundle `provider-ids`); `format`/`base_url`/`models`
+    /// carry the old `ProviderMeta` fields used by builtin catalog rows.
+    #[serde(default)]
+    pub provider: Option<ProviderSpec>,
+    /// Surface: MCP tools backed by the component (statically declared so
+    /// Cockpit shows "what you'll get" pre-install).
+    #[serde(default)]
+    pub tools: Vec<DeclaredTool>,
+    /// Surface: MCP tools via external servers.
     #[serde(default)]
     pub mcp: Vec<McpServerDef>,
-    /// Supervised subprocess "code plugin" extensions (Track D). The TOML
-    /// table is the singular `[[extension]]` (matching the design doc and
-    /// the `[[mcp]]`/`[auth]` singular-noun convention), hence the
-    /// `rename`; the Rust field stays plural per `Vec` naming convention.
-    /// Extension names are validated for uniqueness in their own
-    /// namespace, deliberately separate from `mcp` server names: an
-    /// extension and an MCP server are different capability axes wired
-    /// independently by `ryuzi-core`'s `PluginHost`, so a name collision
-    /// between them is not ambiguous and not rejected (mirrors how
-    /// `settings` keys already live in a namespace separate from `mcp`
-    /// names).
-    #[serde(default, rename = "extension")]
-    pub extensions: Vec<ExtensionDef>,
+    /// Surface: declarative automation hooks.
     #[serde(default)]
-    pub skills: Vec<SkillDef>,
+    pub hooks: Vec<HookDef>,
+    /// Automation: scheduled-job presets.
     #[serde(default)]
-    pub provider: Option<ProviderMeta>,
+    pub jobs: Vec<JobDef>,
+    /// INTERNAL surface — first-party only, enforced at install/link time
+    /// (not here; validation only requires a component). Never documented
+    /// in the public standard.
+    #[serde(default)]
+    pub gateway: bool,
 }
 
 /// How a plugin authenticates. `none` needs no credential; `api-key` and
@@ -167,64 +177,34 @@ pub enum McpTransportDef {
     Http,
 }
 
-/// The hook events an `[[extension]]` may name in its `events[]` list —
-/// the SDK's own copy of Track C's hook-event vocabulary. The SDK cannot
-/// depend on `ryuzi-core` (see module docs), so this is a hand-kept
-/// duplicate of `ryuzi_core::harness::native::hooks::HookEvent::as_str()`.
-/// **Keep these two lists in sync**: if `HookEvent` gains, renames, or
-/// removes a variant, update this constant in the same change, or
-/// extension manifests will wrongly reject a real event (or silently
-/// accept a dead one that never fires).
-pub const KNOWN_HOOK_EVENTS: &[&str] =
-    &["session.start", "tool.before", "tool.after", "session.end"];
-
-/// Ceiling for `ExtensionDef::timeout_ms`. A gating extension (subscribed
-/// to `tool.before`) blocks the agent for up to this long before the host's
-/// fail-open policy kicks in (Track D runtime, not this slice); anything
-/// larger is almost certainly a manifest typo, not an intentional budget.
-/// Keep in sync with the number in `ManifestError::ExtensionTimeoutOutOfRange`'s
-/// message.
-pub const MAX_EXTENSION_TIMEOUT_MS: u64 = 60_000;
-
-/// One supervised subprocess "code plugin" extension (Track D). Declarative
-/// only in this slice — DT1 adds manifest parsing and validation; the
-/// `ExtensionHost` that actually spawns, supervises, and dispatches
-/// `events[]` to this command is a later Track D slice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExtensionDef {
-    /// Unique within the manifest's `extensions` list (see the field doc on
-    /// `PluginManifest::extensions` for why this namespace is separate from
-    /// `mcp` server names).
-    pub name: String,
-    /// The stdio binary to spawn, or a `${...}` placeholder (`${auth}`,
-    /// `${setting:KEY}`) resolved the same way `McpServerDef::command` is.
-    /// Required and must be non-empty.
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Hook events this extension subscribes to. Every entry must be a
-    /// member of [`KNOWN_HOOK_EVENTS`] — unlike unknown `categories`/`slot`
-    /// values (which only warn), an unknown event is a hard `validate()`
-    /// error, because a typo'd event silently never fires rather than
-    /// merely showing an odd label.
-    #[serde(default)]
-    pub events: Vec<String>,
-    /// If true, the host queries this extension for tool definitions at
-    /// init and wires them into the session's tool registry.
-    #[serde(default)]
-    pub provides_tools: bool,
-    /// Per-event response budget in milliseconds. When present, must be
-    /// `> 0` and `<= MAX_EXTENSION_TIMEOUT_MS`.
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
+#[serde(rename_all = "kebab-case")]
+pub struct ComponentSpec {
+    pub file: String,
+    /// Cargo-style semver RANGE the component targets (e.g. `^0.1.0`).
+    pub wit_api: String,
+    pub lifecycle: PluginLifecycle,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SkillDef {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    pub path: String,
+/// How the host instances a bundle's component: one shared instance for
+/// the whole process, one instance per session, or a fresh instance per
+/// call. Purely declarative here — the instancing policy itself is
+/// enforced by the (not-yet-implemented) Wasmtime host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginLifecycle {
+    Singleton,
+    PerSession,
+    PerCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ProviderSpec {
+    pub ids: Vec<String>,
+    pub format: Option<String>,
+    pub base_url: Option<String>,
+    pub models: Vec<ModelDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,24 +216,110 @@ pub struct ModelDef {
     pub default: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProviderMeta {
-    pub format: String,
-    #[serde(default)]
-    pub base_url: Option<String>,
-    #[serde(default)]
-    pub models: Vec<ModelDef>,
+/// A bundle's permission contract. Currently just the outbound network
+/// allowlist; more permission axes (filesystem, env, secrets) can be added
+/// as new fields without breaking existing bundles (`#[serde(default)]`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginPermissions {
+    pub network: Vec<NetworkPermission>,
 }
+
+/// One outbound-network allowlist entry: a bare lowercase hostname
+/// (`api.github.com`) or a `*.`-prefixed wildcard hostname
+/// (`*.github.com`). No scheme, path, port, IP literal, bare `*`, or
+/// uppercase — see the host-validation logic exercised by
+/// [`PluginManifest::validate`] for the exact grammar enforced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NetworkPermission(pub String);
+
+/// One OAuth profile a plugin's component may use to authenticate. A
+/// plugin may declare more than one (e.g. a connector that talks to two
+/// different OAuth-protected APIs); `id` must be unique within the
+/// manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct OAuthProfile {
+    pub id: String,
+    pub authorize_url: Option<String>,
+    pub token_url: Option<String>,
+    /// The RFC 8628 device-authorization endpoint (e.g. GitHub's
+    /// `https://github.com/login/device/code`). `OAuthProfile` has no other
+    /// place to record it, and the host's `begin_device_flow` needs it
+    /// explicitly; a component that supports the device grant declares it here.
+    /// `None` for a profile that does not offer device flow.
+    pub device_authorization_url: Option<String>,
+    pub scopes: Vec<String>,
+    /// A first-party PUBLIC OAuth client id baked into the (signed) manifest —
+    /// the `gh` CLI model: the component ships its own app's client id so an
+    /// end-user connects with zero configuration. Public, not a secret (device
+    /// flow uses a public client, no client secret). A user-set
+    /// [`Self::client_id_setting`] or a stored per-install client id still wins
+    /// over this default (see the host's `resolve_client_id`).
+    pub client_id: Option<String>,
+    pub client_id_setting: Option<String>,
+    pub client_secret_setting: Option<String>,
+    pub resource: Option<String>,
+    pub dynamic_registration: bool,
+    /// Extra query parameters the provider's authorize URL requires beyond
+    /// the standard PKCE set (e.g. Atlassian's mandatory
+    /// `audience=api.atlassian.com`). Mirrors the declarative
+    /// `AuthSpec.extra_authorize_params`. Forwarded verbatim by the host's
+    /// `begin_pkce`.
+    #[serde(default)]
+    pub extra_authorize_params: BTreeMap<String, String>,
+}
+
+/// A tool the component exposes to agents, declared statically so Cockpit can
+/// show "what you'll get" before the plugin is ever installed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct DeclaredTool {
+    pub name: String,
+    pub description: String,
+    pub writes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookDef {
+    pub name: String,
+    /// Canonical or Claude-alias spelling; `validate()` requires a known
+    /// spelling, `canonical_trigger()` gives the stored form.
+    pub trigger: String,
+    /// One of `KNOWN_HOOK_ACTIONS`.
+    pub action: String,
+    /// Action config, shape-checked by ryuzi-core against the matching
+    /// `HookActionInput` variant at sync time (the SDK stays
+    /// runtime-independent and does not duplicate that schema).
+    #[serde(default = "empty_toml_table")]
+    pub config: toml::Value,
+}
+
+fn empty_toml_table() -> toml::Value {
+    toml::Value::Table(toml::map::Map::new())
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobDef {
+    pub name: String,
+    /// Natural-language ("every day at 9am") or cron. Parsed by
+    /// ryuzi-core's scheduler at sync time.
+    pub schedule: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub model_override: Option<String>,
+}
+
+pub const KNOWN_HOOK_ACTIONS: &[&str] = &["agent.run", "webhook.outbound"];
 
 /// Errors from parsing or validating a `PluginManifest`.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("invalid plugin manifest toml: {0}")]
     Toml(#[from] toml::de::Error),
-    #[error(
-        "manifest declares contract {found}, but this build only supports up to {CONTRACT_VERSION}"
-    )]
-    ContractTooNew { found: u32 },
+    #[error("manifest declares contract {found}, but this build only supports contract 2")]
+    ContractUnsupported { found: u32 },
     #[error("invalid plugin id: {0}")]
     InvalidId(String),
     #[error("plugin name must not be empty")]
@@ -272,16 +338,49 @@ pub enum ManifestError {
     SettingOptionsRequireStringKind(String),
     #[error("settings field \"{0}\"'s `default` is not a member of its `options`")]
     SettingDefaultNotInOptions(String),
-    #[error("duplicate extension name: {0}")]
-    DuplicateExtensionName(String),
-    #[error("extension \"{0}\" has an empty command")]
-    ExtensionEmptyCommand(String),
-    #[error("extension \"{0}\" subscribes to unknown hook event \"{1}\"")]
-    ExtensionUnknownEvent(String, String),
-    #[error("extension \"{0}\"'s timeout_ms must be > 0 and <= 60000 (got {1})")]
-    ExtensionTimeoutOutOfRange(String, u64),
-    #[error("extension \"{0}\" references ${{auth}} but the manifest has no [auth] block")]
-    ExtensionAuthPlaceholderWithoutAuth(String),
+    #[error("invalid version {0:?}: {1}")]
+    InvalidVersion(String, String),
+    #[error("invalid wit-api version {0:?}: {1}")]
+    InvalidWitApi(String, String),
+    #[error("component filename must not be empty")]
+    EmptyComponent,
+    #[error("invalid network allowlist entry: {0:?}")]
+    InvalidNetworkHost(String),
+    #[error("oauth profile id must not be empty")]
+    EmptyOAuthProfileId,
+    #[error("duplicate oauth profile id: {0}")]
+    DuplicateOAuthProfile(String),
+    #[error("oauth profile {profile:?} field {field:?} must be a non-empty https:// url")]
+    InsecureOauthUrl {
+        profile: String,
+        field: &'static str,
+    },
+    #[error("invalid provider id: {0:?}")]
+    InvalidProviderId(String),
+    #[error("tool name must not be empty")]
+    EmptyToolName,
+    #[error("duplicate tool name: {0}")]
+    DuplicateTool(String),
+    #[error("settings key must not start with \"plugin.\": {0}")]
+    SettingKeyPrefixForbidden(String),
+    #[error("{0} requires a [component] block")]
+    SurfaceRequiresComponent(&'static str),
+    #[error("hook name must not be empty")]
+    EmptyHookName,
+    #[error("duplicate hook name: {0}")]
+    DuplicateHookName(String),
+    #[error("hook \"{0}\" has unknown trigger \"{1}\"")]
+    UnknownTrigger(String, String),
+    #[error("hook \"{0}\" has unknown action \"{1}\"")]
+    UnknownAction(String, String),
+    #[error("job name must not be empty")]
+    EmptyJobName,
+    #[error("duplicate job name: {0}")]
+    DuplicateJobName(String),
+    #[error("job \"{0}\" has an empty schedule")]
+    EmptyJobSchedule(String),
+    #[error("job \"{0}\" has an empty prompt")]
+    EmptyJobPrompt(String),
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -304,10 +403,42 @@ fn contains_auth_placeholder(server: &McpServerDef) -> bool {
             .is_some_and(|u| u.contains(PLACEHOLDER))
 }
 
-fn extension_contains_auth_placeholder(extension: &ExtensionDef) -> bool {
-    const PLACEHOLDER: &str = "${auth}";
-    extension.command.contains(PLACEHOLDER)
-        || extension.args.iter().any(|a| a.contains(PLACEHOLDER))
+/// `true` if `host` is a bare lowercase hostname (`api.github.com`) or a
+/// `*.`-prefixed wildcard hostname (`*.github.com`). Rejects a scheme
+/// (`://`), a path or port (`/`, `:`), whitespace, an IP literal, a bare
+/// `*`, a wildcard anywhere but the leading `*.`, uppercase characters, and
+/// blank input.
+fn is_valid_network_host(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host.contains("://") {
+        return false;
+    }
+
+    let body = match host.strip_prefix("*.") {
+        Some(rest) if !rest.is_empty() => rest,
+        Some(_) => return false, // "*." with nothing after it
+        None => host,
+    };
+
+    if body.contains('*') || body.contains('/') || body.contains(':') || body.contains(' ') {
+        return false;
+    }
+    if body.chars().any(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    if body.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+
+    let labels: Vec<&str> = body.split('.').collect();
+    labels.iter().all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 impl PluginManifest {
@@ -318,12 +449,16 @@ impl PluginManifest {
         Ok(manifest)
     }
 
-    /// Structural validation: contract version, id shape, required fields,
-    /// unique MCP server names, transport-specific requirements, and the
-    /// `${auth}` placeholder requiring an `[auth]` block.
+    /// Structural validation: contract version (exact match — big-bang
+    /// migration, no compat loader for contract 1), id shape, required
+    /// fields, unique MCP server names, transport-specific requirements,
+    /// the `${auth}` placeholder requiring an `[auth]` block, the network
+    /// allowlist grammar, OAuth profile shape, declared-tool uniqueness,
+    /// bare settings keys, component-backed surface requirements, provider
+    /// id shape, and hook/job shape.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.contract > CONTRACT_VERSION {
-            return Err(ManifestError::ContractTooNew {
+        if self.contract != CONTRACT_VERSION {
+            return Err(ManifestError::ContractUnsupported {
                 found: self.contract,
             });
         }
@@ -374,36 +509,125 @@ impl PluginManifest {
             }
         }
 
-        let mut seen_extension_names: HashSet<&str> = HashSet::new();
-        for extension in &self.extensions {
-            if !seen_extension_names.insert(extension.name.as_str()) {
-                return Err(ManifestError::DuplicateExtensionName(
-                    extension.name.clone(),
-                ));
+        // ---- moved in from bundle.rs's validate() ----
+
+        for entry in &self.permissions.network {
+            if !is_valid_network_host(&entry.0) {
+                return Err(ManifestError::InvalidNetworkHost(entry.0.clone()));
             }
-            if extension.command.trim().is_empty() {
-                return Err(ManifestError::ExtensionEmptyCommand(extension.name.clone()));
+        }
+
+        let mut seen_oauth_ids: HashSet<&str> = HashSet::new();
+        for profile in &self.oauth {
+            if profile.id.is_empty() {
+                return Err(ManifestError::EmptyOAuthProfileId);
             }
-            for event in &extension.events {
-                if !KNOWN_HOOK_EVENTS.contains(&event.as_str()) {
-                    return Err(ManifestError::ExtensionUnknownEvent(
-                        extension.name.clone(),
-                        event.clone(),
-                    ));
+            if !seen_oauth_ids.insert(profile.id.as_str()) {
+                return Err(ManifestError::DuplicateOAuthProfile(profile.id.clone()));
+            }
+            for (field, url) in [
+                ("authorize-url", &profile.authorize_url),
+                ("token-url", &profile.token_url),
+                (
+                    "device-authorization-url",
+                    &profile.device_authorization_url,
+                ),
+            ] {
+                if let Some(url) = url {
+                    if !url.starts_with("https://") {
+                        return Err(ManifestError::InsecureOauthUrl {
+                            profile: profile.id.clone(),
+                            field,
+                        });
+                    }
                 }
             }
-            if let Some(timeout_ms) = extension.timeout_ms {
-                if timeout_ms == 0 || timeout_ms > MAX_EXTENSION_TIMEOUT_MS {
-                    return Err(ManifestError::ExtensionTimeoutOutOfRange(
-                        extension.name.clone(),
-                        timeout_ms,
-                    ));
+        }
+
+        let mut seen_tool_names: HashSet<&str> = HashSet::new();
+        for tool in &self.tools {
+            if tool.name.is_empty() {
+                return Err(ManifestError::EmptyToolName);
+            }
+            if !seen_tool_names.insert(tool.name.as_str()) {
+                return Err(ManifestError::DuplicateTool(tool.name.clone()));
+            }
+        }
+
+        for setting in &self.settings {
+            if setting.key.starts_with("plugin.") {
+                return Err(ManifestError::SettingKeyPrefixForbidden(
+                    setting.key.clone(),
+                ));
+            }
+        }
+
+        // ---- new v2 rules ----
+
+        // Component-backed surfaces require a [component].
+        if self.component.is_none() {
+            if self.provider.as_ref().is_some_and(|p| !p.ids.is_empty()) {
+                return Err(ManifestError::SurfaceRequiresComponent("provider.ids"));
+            }
+            if !self.tools.is_empty() {
+                return Err(ManifestError::SurfaceRequiresComponent("tools"));
+            }
+            if self.gateway {
+                return Err(ManifestError::SurfaceRequiresComponent("gateway"));
+            }
+        }
+        if let Some(component) = &self.component {
+            if component.file.is_empty() {
+                return Err(ManifestError::EmptyComponent);
+            }
+            semver::VersionReq::parse(&component.wit_api).map_err(|e| {
+                ManifestError::InvalidWitApi(component.wit_api.clone(), e.to_string())
+            })?;
+            // A component-backed plugin must version itself.
+            semver::Version::parse(&self.version)
+                .map_err(|e| ManifestError::InvalidVersion(self.version.clone(), e.to_string()))?;
+        }
+        if let Some(provider) = &self.provider {
+            for provider_id in &provider.ids {
+                if !is_valid_id(provider_id) {
+                    return Err(ManifestError::InvalidProviderId(provider_id.clone()));
                 }
             }
-            if extension_contains_auth_placeholder(extension) && self.auth.is_none() {
-                return Err(ManifestError::ExtensionAuthPlaceholderWithoutAuth(
-                    extension.name.clone(),
+        }
+        let mut seen_hook_names: HashSet<&str> = HashSet::new();
+        for hook in &self.hooks {
+            if hook.name.is_empty() {
+                return Err(ManifestError::EmptyHookName);
+            }
+            if !seen_hook_names.insert(hook.name.as_str()) {
+                return Err(ManifestError::DuplicateHookName(hook.name.clone()));
+            }
+            if crate::triggers::canonical_trigger(&hook.trigger).is_none() {
+                return Err(ManifestError::UnknownTrigger(
+                    hook.name.clone(),
+                    hook.trigger.clone(),
                 ));
+            }
+            if !KNOWN_HOOK_ACTIONS.contains(&hook.action.as_str()) {
+                return Err(ManifestError::UnknownAction(
+                    hook.name.clone(),
+                    hook.action.clone(),
+                ));
+            }
+        }
+        let mut seen_job_names: HashSet<&str> = HashSet::new();
+        for job in &self.jobs {
+            if job.name.is_empty() {
+                return Err(ManifestError::EmptyJobName);
+            }
+            if !seen_job_names.insert(job.name.as_str()) {
+                return Err(ManifestError::DuplicateJobName(job.name.clone()));
+            }
+            if job.schedule.is_empty() {
+                return Err(ManifestError::EmptyJobSchedule(job.name.clone()));
+            }
+            if job.prompt.is_empty() {
+                return Err(ManifestError::EmptyJobPrompt(job.name.clone()));
             }
         }
 
@@ -429,6 +653,17 @@ impl PluginManifest {
         }
         warnings
     }
+
+    /// The llm-router provider id(s) this plugin serves: `provider.ids`
+    /// when non-empty, else `[self.id]` when a `[provider]` block exists at
+    /// all, else empty (not a provider plugin).
+    pub fn resolved_provider_ids(&self) -> Vec<String> {
+        match &self.provider {
+            None => vec![],
+            Some(p) if p.ids.is_empty() => vec![self.id.clone()],
+            Some(p) => p.ids.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -436,7 +671,7 @@ mod tests {
     use super::*;
 
     const GITHUB_MANIFEST: &str = r#"
-contract = 1
+contract = 2
 id = "github"
 name = "GitHub"
 version = "0.1.0"
@@ -454,7 +689,7 @@ env = "GITHUB_PERSONAL_ACCESS_TOKEN"
 help_url = "https://github.com/settings/tokens"
 
 [[settings]]
-key = "plugin.github.host"
+key = "github.host"
 label = "GitHub host"
 help = "Set for GitHub Enterprise."
 required = false
@@ -465,11 +700,6 @@ transport = "stdio"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
 env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${auth}" }
-
-[[skills]]
-name = "github-triage"
-description = "Triage issues into labeled buckets"
-path = "skills/github-triage"
 "#;
 
     #[test]
@@ -477,7 +707,7 @@ path = "skills/github-triage"
         let manifest =
             PluginManifest::from_toml(GITHUB_MANIFEST).expect("should parse and validate");
 
-        assert_eq!(manifest.contract, 1);
+        assert_eq!(manifest.contract, 2);
         assert_eq!(manifest.id, "github");
         assert_eq!(manifest.name, "GitHub");
         assert_eq!(manifest.version, "0.1.0");
@@ -499,7 +729,7 @@ path = "skills/github-triage"
 
         assert_eq!(manifest.settings.len(), 1);
         let setting = &manifest.settings[0];
-        assert_eq!(setting.key, "plugin.github.host");
+        assert_eq!(setting.key, "github.host");
         assert_eq!(setting.label, "GitHub host");
         assert_eq!(setting.help, "Set for GitHub Enterprise.");
         assert!(!setting.required);
@@ -526,30 +756,25 @@ path = "skills/github-triage"
                 .map(String::as_str),
             Some("${auth}")
         );
-
-        assert_eq!(manifest.skills.len(), 1);
-        let skill = &manifest.skills[0];
-        assert_eq!(skill.name, "github-triage");
-        assert_eq!(skill.description, "Triage issues into labeled buckets");
-        assert_eq!(skill.path, "skills/github-triage");
     }
 
     #[test]
     fn round_trips_the_provider_block() {
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "anthropic"
 name = "Anthropic"
 
 [provider]
 format = "anthropic"
-base_url = "https://api.anthropic.com"
+base-url = "https://api.anthropic.com"
 models = [ { id = "claude-opus-4-5", label = "Opus 4.5", default = true } ]
 "#;
         let manifest = PluginManifest::from_toml(toml_str).expect("should parse and validate");
 
         let provider = manifest.provider.expect("provider block");
-        assert_eq!(provider.format, "anthropic");
+        assert!(provider.ids.is_empty());
+        assert_eq!(provider.format.as_deref(), Some("anthropic"));
         assert_eq!(
             provider.base_url.as_deref(),
             Some("https://api.anthropic.com")
@@ -563,7 +788,7 @@ models = [ { id = "claude-opus-4-5", label = "Opus 4.5", default = true } ]
     #[test]
     fn parses_oauth_auth_metadata() {
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "acme-oauth"
 name = "Acme OAuth"
 
@@ -639,7 +864,7 @@ extra-token-params = { audience = "acme", tenant = "engineering" }
     #[test]
     fn parses_canonical_help_url_key() {
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "acme-oauth-help-url"
 name = "Acme OAuth Help URL"
 
@@ -658,7 +883,7 @@ help-url = "https://acme.example.com/help"
     #[test]
     fn parses_oauth_with_only_kind_for_backwards_compatibility() {
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "acme-oauth-legacy"
 name = "Acme OAuth Legacy"
 
@@ -686,7 +911,7 @@ kind = "oauth"
     fn minimal_manifest(extra: &str) -> String {
         format!(
             r#"
-contract = 1
+contract = 2
 id = "acme"
 name = "Acme"
 {extra}
@@ -694,10 +919,40 @@ name = "Acme"
         )
     }
 
+    fn manifest_with_component(extra: &str) -> String {
+        format!(
+            r#"
+contract = 2
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[component]
+file = "test.wasm"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+{extra}
+"#
+        )
+    }
+
+    fn manifest_with_network(host: &str) -> String {
+        format!(
+            r#"
+contract = 2
+id = "acme"
+name = "Acme"
+
+[permissions]
+network = ["{host}"]
+"#
+        )
+    }
+
     #[test]
     fn rejects_missing_id() {
         let toml_str = r#"
-contract = 1
+contract = 2
 name = "Acme"
 "#;
         let err = PluginManifest::from_toml(toml_str).expect_err("missing id should fail to parse");
@@ -707,7 +962,7 @@ name = "Acme"
     #[test]
     fn rejects_uppercase_id() {
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "Acme"
 name = "Acme"
 "#;
@@ -719,13 +974,16 @@ name = "Acme"
     #[test]
     fn rejects_contract_newer_than_supported() {
         let toml_str = r#"
-contract = 2
+contract = 3
 id = "acme"
 name = "Acme"
 "#;
         let err =
-            PluginManifest::from_toml(toml_str).expect_err("contract 2 should fail validation");
-        assert!(matches!(err, ManifestError::ContractTooNew { found: 2 }));
+            PluginManifest::from_toml(toml_str).expect_err("contract 3 should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::ContractUnsupported { found: 3 }
+        ));
     }
 
     #[test]
@@ -807,14 +1065,14 @@ transport = "http"
         assert!(manifest.warnings().is_empty());
     }
 
-    // ---------- SettingField: options/default (Feature C3) ----------
+    // ---------- SettingField: options/default ----------
 
     #[test]
     fn settings_field_with_valid_enum_options_and_default_parses() {
         let toml_str = minimal_manifest(
             r#"
 [[settings]]
-key = "plugin.acme.tier"
+key = "tier"
 label = "Tier"
 kind = "string"
 options = ["free", "pro", "enterprise"]
@@ -841,17 +1099,17 @@ default = "free"
         let toml_str = minimal_manifest(
             r#"
 [[settings]]
-key = "plugin.acme.dup"
+key = "dup"
 label = "Dup One"
 
 [[settings]]
-key = "plugin.acme.dup"
+key = "dup"
 label = "Dup Two"
 "#,
         );
         let err = PluginManifest::from_toml(&toml_str)
             .expect_err("duplicate settings field keys should fail validation");
-        assert!(matches!(err, ManifestError::DuplicateSettingKey(key) if key == "plugin.acme.dup"));
+        assert!(matches!(err, ManifestError::DuplicateSettingKey(key) if key == "dup"));
     }
 
     #[test]
@@ -859,7 +1117,7 @@ label = "Dup Two"
         let toml_str = minimal_manifest(
             r#"
 [[settings]]
-key = "plugin.acme.tier"
+key = "tier"
 label = "Tier"
 kind = "string"
 options = ["free", "pro"]
@@ -868,9 +1126,7 @@ default = "enterprise"
         );
         let err = PluginManifest::from_toml(&toml_str)
             .expect_err("default outside options should fail validation");
-        assert!(
-            matches!(err, ManifestError::SettingDefaultNotInOptions(key) if key == "plugin.acme.tier")
-        );
+        assert!(matches!(err, ManifestError::SettingDefaultNotInOptions(key) if key == "tier"));
     }
 
     #[test]
@@ -878,7 +1134,7 @@ default = "enterprise"
         let toml_str = minimal_manifest(
             r#"
 [[settings]]
-key = "plugin.acme.retries"
+key = "retries"
 label = "Retries"
 kind = "int"
 options = ["1", "2", "3"]
@@ -887,11 +1143,29 @@ options = ["1", "2", "3"]
         let err = PluginManifest::from_toml(&toml_str)
             .expect_err("options with a non-string kind should fail validation");
         assert!(
-            matches!(err, ManifestError::SettingOptionsRequireStringKind(key) if key == "plugin.acme.retries")
+            matches!(err, ManifestError::SettingOptionsRequireStringKind(key) if key == "retries")
         );
     }
 
-    // ---------- slot (Feature C2) ----------
+    #[test]
+    fn bundle_settings_keys_must_be_bare() {
+        // validate() rejects a fully-qualified key — v2 settings are bare;
+        // the host prefixes `plugin.<id>.` when bridging to the plugin list.
+        let toml_str = minimal_manifest(
+            r#"
+[[settings]]
+key = "plugin.acme.token"
+label = "Bot token"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("settings key starting with plugin. should fail validation");
+        assert!(
+            matches!(err, ManifestError::SettingKeyPrefixForbidden(key) if key == "plugin.acme.token")
+        );
+    }
+
+    // ---------- slot ----------
 
     #[test]
     fn slot_defaults_to_none_when_omitted() {
@@ -938,221 +1212,705 @@ slot = "not-a-real-slot"
         );
     }
 
-    // ---------- extension (Track D, Slice DT1) ----------
+    // ---------- network allowlist grammar (moved from bundle.rs) ----------
 
     #[test]
-    fn parses_a_valid_extension_declaration() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "my-linter"
-command = "my-linter-ext"
-args = ["--serve"]
-events = ["tool.before", "tool.after"]
-provides_tools = true
-timeout_ms = 5000
-"#,
-        );
-        let manifest = PluginManifest::from_toml(&toml_str).expect("valid extension should parse");
-
-        assert_eq!(manifest.extensions.len(), 1);
-        let extension = &manifest.extensions[0];
-        assert_eq!(extension.name, "my-linter");
-        assert_eq!(extension.command, "my-linter-ext");
-        assert_eq!(extension.args, vec!["--serve".to_string()]);
-        assert_eq!(
-            extension.events,
-            vec!["tool.before".to_string(), "tool.after".to_string()]
-        );
-        assert!(extension.provides_tools);
-        assert_eq!(extension.timeout_ms, Some(5000));
+    fn accepts_a_bare_hostname() {
+        let toml_str = manifest_with_network("api.github.com");
+        let manifest = PluginManifest::from_toml(&toml_str).expect("bare hostname should validate");
+        assert_eq!(manifest.permissions.network[0].0, "api.github.com");
     }
 
     #[test]
-    fn extension_optional_fields_default_when_omitted() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "bare"
-command = "bare-ext"
-"#,
-        );
+    fn accepts_a_wildcard_hostname() {
+        let toml_str = manifest_with_network("*.github.com");
         let manifest =
-            PluginManifest::from_toml(&toml_str).expect("minimal extension should parse");
-
-        let extension = &manifest.extensions[0];
-        assert!(extension.args.is_empty());
-        assert!(extension.events.is_empty());
-        assert!(!extension.provides_tools);
-        assert_eq!(extension.timeout_ms, None);
+            PluginManifest::from_toml(&toml_str).expect("wildcard hostname should validate");
+        assert_eq!(manifest.permissions.network[0].0, "*.github.com");
     }
 
     #[test]
-    fn manifest_without_extensions_still_validates() {
-        let toml_str = minimal_manifest("");
-        let manifest =
-            PluginManifest::from_toml(&toml_str).expect("no extensions should still validate");
-        assert!(manifest.extensions.is_empty());
-    }
-
-    #[test]
-    fn rejects_duplicate_extension_names() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "dup"
-command = "one"
-
-[[extension]]
-name = "dup"
-command = "two"
-"#,
-        );
+    fn rejects_network_host_with_scheme() {
+        let toml_str = manifest_with_network("https://api.github.com");
         let err = PluginManifest::from_toml(&toml_str)
-            .expect_err("duplicate extension names should fail validation");
-        assert!(matches!(err, ManifestError::DuplicateExtensionName(name) if name == "dup"));
-    }
-
-    #[test]
-    fn extension_name_may_collide_with_an_mcp_server_name() {
-        // Extensions and MCP servers are separate capability axes wired
-        // independently by ryuzi-core's PluginHost, so they occupy separate
-        // name namespaces within one manifest.
-        let toml_str = minimal_manifest(
-            r#"
-[[mcp]]
-name = "shared"
-transport = "stdio"
-command = "npx"
-
-[[extension]]
-name = "shared"
-command = "shared-ext"
-"#,
-        );
-        let manifest = PluginManifest::from_toml(&toml_str)
-            .expect("extension and mcp server may share a name");
-        assert_eq!(manifest.mcp[0].name, "shared");
-        assert_eq!(manifest.extensions[0].name, "shared");
-    }
-
-    #[test]
-    fn rejects_extension_with_empty_command() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "no-command"
-command = ""
-"#,
-        );
-        let err =
-            PluginManifest::from_toml(&toml_str).expect_err("empty command should fail validation");
-        assert!(matches!(err, ManifestError::ExtensionEmptyCommand(name) if name == "no-command"));
-    }
-
-    #[test]
-    fn rejects_extension_with_unknown_event() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "typo-event"
-command = "ext"
-events = ["tool.before", "tool.beforee"]
-"#,
-        );
-        let err = PluginManifest::from_toml(&toml_str)
-            .expect_err("unknown hook event should fail validation");
-        assert!(matches!(
-            err,
-            ManifestError::ExtensionUnknownEvent(name, event)
-                if name == "typo-event" && event == "tool.beforee"
-        ));
-    }
-
-    #[test]
-    fn rejects_extension_timeout_ms_of_zero() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "zero-timeout"
-command = "ext"
-timeout_ms = 0
-"#,
-        );
-        let err = PluginManifest::from_toml(&toml_str)
-            .expect_err("zero timeout_ms should fail validation");
-        assert!(matches!(
-            err,
-            ManifestError::ExtensionTimeoutOutOfRange(name, timeout_ms)
-                if name == "zero-timeout" && timeout_ms == 0
-        ));
-    }
-
-    #[test]
-    fn rejects_extension_timeout_ms_above_cap() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "huge-timeout"
-command = "ext"
-timeout_ms = 60001
-"#,
-        );
-        let err = PluginManifest::from_toml(&toml_str)
-            .expect_err("timeout_ms above the cap should fail validation");
-        assert!(matches!(
-            err,
-            ManifestError::ExtensionTimeoutOutOfRange(name, timeout_ms)
-                if name == "huge-timeout" && timeout_ms == 60001
-        ));
-    }
-
-    #[test]
-    fn extension_timeout_ms_at_cap_is_allowed() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "at-cap"
-command = "ext"
-timeout_ms = 60000
-"#,
-        );
-        let manifest = PluginManifest::from_toml(&toml_str)
-            .expect("timeout_ms exactly at the cap should validate");
-        assert_eq!(manifest.extensions[0].timeout_ms, Some(60000));
-    }
-
-    #[test]
-    fn rejects_extension_auth_placeholder_without_auth_block() {
-        let toml_str = minimal_manifest(
-            r#"
-[[extension]]
-name = "needs-auth"
-command = "ext"
-args = ["${auth}"]
-"#,
-        );
-        let err = PluginManifest::from_toml(&toml_str)
-            .expect_err("${auth} without [auth] should fail validation");
+            .expect_err("scheme in network host should fail validation");
         assert!(
-            matches!(err, ManifestError::ExtensionAuthPlaceholderWithoutAuth(name) if name == "needs-auth")
+            matches!(err, ManifestError::InvalidNetworkHost(h) if h == "https://api.github.com")
         );
     }
 
     #[test]
-    fn extension_auth_placeholder_with_auth_block_parses() {
+    fn rejects_network_host_with_scheme_and_path() {
+        let toml_str = manifest_with_network("https://api.github.com/v3");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("scheme + path in network host should fail validation");
+        assert!(
+            matches!(err, ManifestError::InvalidNetworkHost(h) if h == "https://api.github.com/v3")
+        );
+    }
+
+    #[test]
+    fn rejects_network_host_with_bare_path() {
+        let toml_str = manifest_with_network("api.github.com/v3");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("path in network host should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "api.github.com/v3"));
+    }
+
+    #[test]
+    fn rejects_network_host_with_port() {
+        let toml_str = manifest_with_network("api.github.com:443");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("port in network host should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "api.github.com:443"));
+    }
+
+    #[test]
+    fn rejects_network_host_that_is_an_ip_literal() {
+        let toml_str = manifest_with_network("192.168.1.1");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("IP literal network host should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "192.168.1.1"));
+    }
+
+    #[test]
+    fn rejects_network_host_that_is_an_ipv6_literal() {
+        let toml_str = manifest_with_network("::1");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("IPv6 literal network host should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "::1"));
+    }
+
+    #[test]
+    fn rejects_bare_wildcard_network_host() {
+        let toml_str = manifest_with_network("*");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("bare wildcard network host should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "*"));
+    }
+
+    #[test]
+    fn rejects_wildcard_with_nothing_after_the_dot() {
+        let toml_str = manifest_with_network("*.");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("dangling wildcard suffix should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "*."));
+    }
+
+    #[test]
+    fn rejects_wildcard_not_at_the_leading_position() {
+        let toml_str = manifest_with_network("api.*.github.com");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("mid-string wildcard should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "api.*.github.com"));
+    }
+
+    #[test]
+    fn rejects_wildcard_without_a_dot_separator() {
+        let toml_str = manifest_with_network("*github.com");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("wildcard without a dot separator should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "*github.com"));
+    }
+
+    #[test]
+    fn rejects_uppercase_network_host() {
+        let toml_str = manifest_with_network("API.github.com");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("uppercase network host should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h == "API.github.com"));
+    }
+
+    #[test]
+    fn rejects_blank_network_host() {
+        let toml_str = manifest_with_network("");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("blank network host should fail validation");
+        assert!(matches!(err, ManifestError::InvalidNetworkHost(h) if h.is_empty()));
+    }
+
+    // ---------- oauth profiles (moved from bundle.rs) ----------
+
+    #[test]
+    fn rejects_non_https_authorize_url() {
         let toml_str = minimal_manifest(
             r#"
-[auth]
-kind = "token"
-
-[[extension]]
-name = "has-auth"
-command = "${auth}"
+[[oauth]]
+id = "acme-cloud"
+authorize-url = "http://example.com/authorize"
 "#,
         );
-        let manifest = PluginManifest::from_toml(&toml_str)
-            .expect("${auth} with an [auth] block should validate");
-        assert_eq!(manifest.extensions[0].command, "${auth}");
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("non-https authorize-url should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "authorize-url"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_https_token_url() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = "acme-cloud"
+token-url = "http://relay.example.com/token/acme"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("non-https token-url should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "token-url"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_https_device_authorization_url() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = "acme-cloud"
+device-authorization-url = "http://example.com/device/code"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("non-https device-authorization-url should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "device-authorization-url"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_string_token_url() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = "acme-cloud"
+token-url = ""
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("empty token-url should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::InsecureOauthUrl { ref profile, field }
+                if profile == "acme-cloud" && field == "token-url"
+        ));
+    }
+
+    #[test]
+    fn https_oauth_urls_validate() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = "acme-cloud"
+authorize-url = "https://example.com/authorize"
+token-url = "https://relay.example.com/token/acme"
+device-authorization-url = "https://example.com/device/code"
+"#,
+        );
+        PluginManifest::from_toml(&toml_str).expect("https oauth urls should validate");
+    }
+
+    #[test]
+    fn oauth_profile_without_any_urls_still_validates() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = "acme-cloud"
+"#,
+        );
+        PluginManifest::from_toml(&toml_str)
+            .expect("an oauth profile declaring no urls should still validate");
+    }
+
+    #[test]
+    fn rejects_duplicate_oauth_profile_ids() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = "github"
+
+[[oauth]]
+id = "github"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("duplicate oauth profile id should fail validation");
+        assert!(matches!(err, ManifestError::DuplicateOAuthProfile(id) if id == "github"));
+    }
+
+    #[test]
+    fn rejects_empty_oauth_profile_id() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = ""
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("empty oauth profile id should fail validation");
+        assert!(matches!(err, ManifestError::EmptyOAuthProfileId));
+    }
+
+    #[test]
+    fn oauth_profile_parses_extra_authorize_params() {
+        let toml_str = minimal_manifest(
+            r#"
+[[oauth]]
+id = "acme-cloud"
+authorize-url = "https://auth.acme.test/authorize"
+
+[oauth.extra-authorize-params]
+audience = "api.acme.test"
+prompt = "consent"
+"#,
+        );
+        let manifest =
+            PluginManifest::from_toml(&toml_str).expect("extra-authorize-params should parse");
+        assert_eq!(
+            manifest.oauth[0]
+                .extra_authorize_params
+                .get("audience")
+                .map(String::as_str),
+            Some("api.acme.test")
+        );
+        assert_eq!(
+            manifest.oauth[0]
+                .extra_authorize_params
+                .get("prompt")
+                .map(String::as_str),
+            Some("consent")
+        );
+    }
+
+    // ---------- declared tools (moved from bundle.rs; now component-gated) ----------
+
+    #[test]
+    fn manifest_parses_declared_tools() {
+        let toml_str = manifest_with_component(
+            r#"
+[[tools]]
+name = "create_issue"
+description = "Open an issue in a repository"
+writes = true
+
+[[tools]]
+name = "list_issues"
+description = "List issues"
+"#,
+        );
+        let m = PluginManifest::from_toml(&toml_str).unwrap();
+        assert_eq!(m.tools.len(), 2);
+        assert_eq!(m.tools[0].name, "create_issue");
+        assert!(m.tools[0].writes);
+        assert!(!m.tools[1].writes); // default false
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn manifest_without_tools_defaults_empty() {
+        let toml_str = minimal_manifest("");
+        let m = PluginManifest::from_toml(&toml_str).unwrap();
+        assert!(m.tools.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_tool_names() {
+        let toml_str = manifest_with_component(
+            r#"
+[[tools]]
+name = "create_issue"
+description = "Open an issue in a repository"
+writes = true
+
+[[tools]]
+name = "create_issue"
+description = "Duplicate tool name"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("duplicate tool name should fail validation");
+        assert!(matches!(err, ManifestError::DuplicateTool(name) if name == "create_issue"));
+    }
+
+    #[test]
+    fn rejects_empty_tool_name() {
+        let toml_str = manifest_with_component(
+            r#"
+[[tools]]
+name = ""
+description = "Nameless tool"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("empty tool name should fail validation");
+        assert!(matches!(err, ManifestError::EmptyToolName));
+    }
+
+    // ---------- v2: component-backed surfaces ----------
+
+    fn v2_component_fixture() -> String {
+        r#"
+contract = 2
+id = "github"
+name = "GitHub"
+version = "0.2.0"
+publisher = "Ryuzi"
+
+[component]
+file = "github.wasm"
+wit-api = "^0.1.0"
+lifecycle = "per-session"
+
+[permissions]
+network = ["api.github.com"]
+
+[[oauth]]
+id = "github"
+device-authorization-url = "https://github.com/login/device/code"
+client-id = "Iv1.public-app-id"
+
+[[tools]]
+name = "create_pr"
+description = "Open a pull request"
+writes = true
+
+[[hooks]]
+name = "notify-on-fail"
+trigger = "PreToolUse"
+action = "webhook.outbound"
+
+[[jobs]]
+name = "daily-triage"
+schedule = "every day at 9am"
+prompt = "Triage new issues."
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn parses_the_full_v2_fixture() {
+        let m = PluginManifest::from_toml(&v2_component_fixture()).unwrap();
+        assert_eq!(m.contract, 2);
+        assert_eq!(m.component.as_ref().unwrap().file, "github.wasm");
+        assert_eq!(m.tools.len(), 1);
+        assert_eq!(m.hooks[0].trigger, "PreToolUse");
+        assert_eq!(m.jobs[0].schedule, "every day at 9am");
+        assert!(!m.gateway);
+    }
+
+    #[test]
+    fn rejects_contract_1() {
+        let toml_str = "contract = 1\nid = \"a\"\nname = \"A\"\n";
+        let err = PluginManifest::from_toml(toml_str).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::ContractUnsupported { found: 1 }
+        ));
+    }
+
+    #[test]
+    fn tools_without_component_are_rejected() {
+        let toml_str = r#"
+contract = 2
+id = "a"
+name = "A"
+
+[[tools]]
+name = "t"
+description = "d"
+"#;
+        let err = PluginManifest::from_toml(toml_str).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::SurfaceRequiresComponent("tools")
+        ));
+    }
+
+    #[test]
+    fn gateway_without_component_is_rejected() {
+        let toml_str = "contract = 2\nid = \"a\"\nname = \"A\"\ngateway = true\n";
+        let err = PluginManifest::from_toml(toml_str).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::SurfaceRequiresComponent("gateway")
+        ));
+    }
+
+    #[test]
+    fn provider_ids_without_component_are_rejected_but_metadata_only_provider_is_fine() {
+        // Builtin catalog rows declare [provider] with format/models and NO ids
+        // and NO component — that must stay valid.
+        let ok = r#"
+contract = 2
+id = "openai"
+name = "OpenAI"
+
+[provider]
+format = "openai"
+"#;
+        PluginManifest::from_toml(ok).unwrap();
+
+        let bad = r#"
+contract = 2
+id = "mimo"
+name = "MiMo"
+
+[provider]
+ids = ["mimo-free"]
+"#;
+        let err = PluginManifest::from_toml(bad).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::SurfaceRequiresComponent("provider.ids")
+        ));
+    }
+
+    #[test]
+    fn hook_with_unknown_trigger_or_action_is_rejected() {
+        let bad_trigger = r#"
+contract = 2
+id = "a"
+name = "A"
+
+[[hooks]]
+name = "h"
+trigger = "UserPromptSubmit"
+action = "webhook.outbound"
+"#;
+        let err = PluginManifest::from_toml(bad_trigger).unwrap_err();
+        assert!(matches!(err, ManifestError::UnknownTrigger(_, _)));
+
+        let bad_action = r#"
+contract = 2
+id = "a"
+name = "A"
+
+[[hooks]]
+name = "h"
+trigger = "tool.before"
+action = "shell.exec"
+"#;
+        let err = PluginManifest::from_toml(bad_action).unwrap_err();
+        assert!(matches!(err, ManifestError::UnknownAction(_, _)));
+    }
+
+    #[test]
+    fn resolved_provider_ids_semantics() {
+        let none = PluginManifest::from_toml("contract = 2\nid = \"a\"\nname = \"A\"\n").unwrap();
+        assert!(none.resolved_provider_ids().is_empty());
+
+        let meta_only = PluginManifest::from_toml(
+            "contract = 2\nid = \"openai\"\nname = \"OpenAI\"\n\n[provider]\nformat = \"openai\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            meta_only.resolved_provider_ids(),
+            vec!["openai".to_string()]
+        );
+    }
+
+    #[test]
+    fn component_requires_semver_version() {
+        let toml_str = r#"
+contract = 2
+id = "a"
+name = "A"
+version = "not-semver"
+
+[component]
+file = "a.wasm"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+"#;
+        let err = PluginManifest::from_toml(toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidVersion(v, _) if v == "not-semver"));
+    }
+
+    #[test]
+    fn rejects_empty_component_file() {
+        let toml_str = r#"
+contract = 2
+id = "a"
+name = "A"
+version = "0.1.0"
+
+[component]
+file = ""
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+"#;
+        let err = PluginManifest::from_toml(toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::EmptyComponent));
+    }
+
+    #[test]
+    fn rejects_invalid_wit_api_range() {
+        let toml_str = r#"
+contract = 2
+id = "a"
+name = "A"
+version = "0.1.0"
+
+[component]
+file = "a.wasm"
+wit-api = "not-a-range"
+lifecycle = "singleton"
+"#;
+        let err = PluginManifest::from_toml(toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidWitApi(v, _) if v == "not-a-range"));
+    }
+
+    #[test]
+    fn rejects_invalid_provider_id() {
+        let toml_str = manifest_with_component(
+            r#"
+[provider]
+ids = ["Mimo Free"]
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidProviderId(id) if id == "Mimo Free"));
+    }
+
+    // ---------- v2: hooks ----------
+
+    #[test]
+    fn rejects_empty_hook_name() {
+        let toml_str = minimal_manifest(
+            r#"
+[[hooks]]
+name = ""
+trigger = "tool.before"
+action = "webhook.outbound"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::EmptyHookName));
+    }
+
+    #[test]
+    fn rejects_duplicate_hook_names() {
+        let toml_str = minimal_manifest(
+            r#"
+[[hooks]]
+name = "dup"
+trigger = "tool.before"
+action = "webhook.outbound"
+
+[[hooks]]
+name = "dup"
+trigger = "tool.after"
+action = "agent.run"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::DuplicateHookName(name) if name == "dup"));
+    }
+
+    #[test]
+    fn hook_config_round_trips_arbitrary_toml_table() {
+        let toml_str = minimal_manifest(
+            r#"
+[[hooks]]
+name = "h"
+trigger = "tool.before"
+action = "agent.run"
+
+[hooks.config]
+agent = "triage-bot"
+retries = 3
+"#,
+        );
+        let m = PluginManifest::from_toml(&toml_str).expect("hook config table should parse");
+        let config = &m.hooks[0].config;
+        assert_eq!(
+            config.get("agent").and_then(|v| v.as_str()),
+            Some("triage-bot")
+        );
+        assert_eq!(config.get("retries").and_then(|v| v.as_integer()), Some(3));
+    }
+
+    #[test]
+    fn hook_config_defaults_to_empty_table_when_omitted() {
+        let toml_str = minimal_manifest(
+            r#"
+[[hooks]]
+name = "h"
+trigger = "tool.before"
+action = "agent.run"
+"#,
+        );
+        let m = PluginManifest::from_toml(&toml_str).expect("hook without config should parse");
+        assert_eq!(m.hooks[0].config, toml::Value::Table(toml::map::Map::new()));
+    }
+
+    // ---------- v2: jobs ----------
+
+    #[test]
+    fn rejects_empty_job_name() {
+        let toml_str = minimal_manifest(
+            r#"
+[[jobs]]
+name = ""
+schedule = "every day at 9am"
+prompt = "Triage."
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::EmptyJobName));
+    }
+
+    #[test]
+    fn rejects_duplicate_job_names() {
+        let toml_str = minimal_manifest(
+            r#"
+[[jobs]]
+name = "dup"
+schedule = "every day at 9am"
+prompt = "Triage."
+
+[[jobs]]
+name = "dup"
+schedule = "every day at 5pm"
+prompt = "Triage again."
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::DuplicateJobName(name) if name == "dup"));
+    }
+
+    #[test]
+    fn rejects_empty_job_schedule() {
+        let toml_str = minimal_manifest(
+            r#"
+[[jobs]]
+name = "j"
+schedule = ""
+prompt = "Triage."
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::EmptyJobSchedule(name) if name == "j"));
+    }
+
+    #[test]
+    fn rejects_empty_job_prompt() {
+        let toml_str = minimal_manifest(
+            r#"
+[[jobs]]
+name = "j"
+schedule = "every day at 9am"
+prompt = ""
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str).unwrap_err();
+        assert!(matches!(err, ManifestError::EmptyJobPrompt(name) if name == "j"));
     }
 }
