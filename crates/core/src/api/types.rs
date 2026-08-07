@@ -587,6 +587,11 @@ pub struct AppInfo {
     pub auth_detail: Option<String>,
     pub tools: Vec<ToolInfo>,
     pub agent_access: Vec<AgentAccessInfo>,
+    /// The plugin that owns this server, when it was synced from a plugin's
+    /// `[[mcp]]` declaration rather than added by the user. Cockpit uses it
+    /// to badge the row and to warn before removing a plugin-managed app —
+    /// deleting one only makes it reappear on the plugin's next sync.
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]

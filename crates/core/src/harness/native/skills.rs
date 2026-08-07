@@ -190,7 +190,21 @@ fn merge_skill_root(skills: &mut BTreeMap<String, Skill>, base: &Path, origin: S
     } else {
         // This is a root: scan for subdirectories containing SKILL.md.
         for skill in read_skills(base, origin) {
-            skills.entry(skill.name.clone()).or_insert(skill);
+            let name = skill.name.clone();
+            if let Some(kept) = skills.get(&name) {
+                // First-wins, but never silently: two plugins shipping the
+                // same skill name is invisible otherwise, and unlike commands
+                // (which stay reachable at `<plugin-id>/<name>`) the loser
+                // here has no fallback route.
+                if kept.origin == SkillOrigin::Plugin && origin == SkillOrigin::Plugin {
+                    tracing::warn!(
+                        skill = %name,
+                        "skills: two plugins ship a skill with the same name; keeping the first"
+                    );
+                }
+                continue;
+            }
+            skills.insert(name, skill);
         }
     }
 }

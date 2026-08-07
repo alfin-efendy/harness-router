@@ -1938,6 +1938,11 @@ impl ControlPlane {
                 id,
             });
         }
+        // `read_dir` order is filesystem-dependent, and both collision rules
+        // downstream (commands: last plugin wins the bare name; skills:
+        // first-listed plugin wins) would otherwise resolve differently on
+        // different machines. Sort by plugin id so the winner is deterministic.
+        roots.sort_by(|a, b| a.id.cmp(&b.id));
         roots
     }
 

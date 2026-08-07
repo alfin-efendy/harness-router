@@ -167,6 +167,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
             auth_detail: row.auth_detail,
             tools,
             agent_access,
+            plugin_id: row.plugin_id,
         });
     }
     Ok(out)
