@@ -7,9 +7,9 @@ import {
   filterHubItems,
   fixTargetTab,
   type HubItem,
-  kindCounts,
   railCounts,
   statusPresentation,
+  surfaceCounts,
 } from "./plugin-hub";
 
 function mkPlugin(overrides: Partial<PluginInfo> = {}): PluginInfo {
@@ -44,6 +44,9 @@ function mkPlugin(overrides: Partial<PluginInfo> = {}): PluginInfo {
     authKind: "none",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
     ...overrides,
   };
 }
@@ -70,6 +73,7 @@ function mkApp(overrides: Partial<AppInfo> = {}): AppInfo {
     authDetail: null,
     tools: [],
     agentAccess: [],
+    pluginId: null,
     ...overrides,
   };
 }
@@ -91,12 +95,18 @@ function mkSkill(overrides: Partial<InstalledSkillInfo> = {}): InstalledSkillInf
 // ---------------------------------------------------------------------------
 
 describe("buildHubItems: plugin mapping", () => {
-  test("maps a plugin 1:1: kind/status passthrough, rowKey/nav/icon", () => {
-    const plugin = mkPlugin({ id: "github", kind: "integration", status: "needs-setup", statusDetail: "no token" });
+  test("maps a plugin 1:1: surfaces/status passthrough, rowKey/nav/icon", () => {
+    const plugin = mkPlugin({
+      id: "github",
+      kind: "integration",
+      status: "needs-setup",
+      statusDetail: "no token",
+      surfaces: ["tools", "mcp"],
+    });
     const [item] = buildHubItems({ plugins: [plugin], apps: [], skills: [] });
     expect(item.rowKey).toBe("plugin:github");
     expect(item.id).toBe("github");
-    expect(item.kind).toBe("integration");
+    expect(item.surfaces).toEqual(["tools", "mcp"]);
     expect(item.status).toBe("needs-setup");
     expect(item.statusDetail).toBe("no token");
     expect(item.icon).toBe("cpu");
@@ -256,10 +266,10 @@ describe("buildHubItems: app mapping", () => {
     expect(item.status).toBe("unchecked");
   });
 
-  test("kind is mcp-server, installed true, nav appDetail, icon null, uses initial/color", () => {
+  test("surfaces is ['mcp'], installed true, nav appDetail, icon null, uses initial/color", () => {
     const app = mkApp({ id: "slack", initial: "S", color: "#ff00ff" });
     const [item] = buildHubItems({ plugins: [], apps: [app], skills: [] });
-    expect(item.kind).toBe("mcp-server");
+    expect(item.surfaces).toEqual(["mcp"]);
     expect(item.installed).toBe(true);
     expect(item.nav).toEqual({ kind: "appDetail", id: "slack" });
     expect(item.icon).toBeNull();
@@ -319,7 +329,7 @@ describe("buildHubItems: skill mapping", () => {
     const skill = mkSkill({ id: "my-skills", name: "My Skills", source: "https://github.com/me/skills", skillCount: 5, pluginId: null });
     const [item] = buildHubItems({ plugins: [], apps: [], skills: [skill] });
     expect(item.rowKey).toBe("skill:my-skills");
-    expect(item.kind).toBe("skill-pack");
+    expect(item.surfaces).toEqual(["skills"]);
     expect(item.status).toBe("ok");
     expect(item.countsLabel).toBe("5 skills");
     expect(item.installed).toBe(true);
@@ -337,21 +347,21 @@ describe("buildHubItems: skill mapping", () => {
     const plugin = mkPlugin({ id: "superpowers" });
     const skill = mkSkill({ id: "superpowers", pluginId: null });
     const items = buildHubItems({ plugins: [plugin], apps: [], skills: [skill] });
-    expect(items.filter((i) => i.kind === "skill-pack")).toHaveLength(0);
+    expect(items.filter((i) => i.surfaces.includes("skills"))).toHaveLength(0);
   });
 
   test("excludes a skill whose pluginId matches an existing plugin id", () => {
     const plugin = mkPlugin({ id: "superpowers" });
     const skill = mkSkill({ id: "some-other-id", pluginId: "superpowers" });
     const items = buildHubItems({ plugins: [plugin], apps: [], skills: [skill] });
-    expect(items.filter((i) => i.kind === "skill-pack")).toHaveLength(0);
+    expect(items.filter((i) => i.surfaces.includes("skills"))).toHaveLength(0);
   });
 
   test("includes a skill unrelated to any plugin id", () => {
     const plugin = mkPlugin({ id: "superpowers" });
     const skill = mkSkill({ id: "manual-skill", pluginId: null });
     const items = buildHubItems({ plugins: [plugin], apps: [], skills: [skill] });
-    expect(items.filter((i) => i.kind === "skill-pack")).toHaveLength(1);
+    expect(items.filter((i) => i.surfaces.includes("skills"))).toHaveLength(1);
   });
 });
 
@@ -378,8 +388,24 @@ test("rowKey stays unique even when a plugin/app/skill share the same bare id", 
 function items(): HubItem[] {
   return buildHubItems({
     plugins: [
-      mkPlugin({ id: "github", name: "GitHub", description: "Repos and issues", kind: "integration", installed: true, status: "ok" }),
-      mkPlugin({ id: "discord", name: "Discord", description: "Chat gateway", kind: "gateway", installed: true, status: "needs-setup" }),
+      mkPlugin({
+        id: "github",
+        name: "GitHub",
+        description: "Repos and issues",
+        kind: "integration",
+        installed: true,
+        status: "ok",
+        surfaces: ["mcp"],
+      }),
+      mkPlugin({
+        id: "discord",
+        name: "Discord",
+        description: "Chat gateway",
+        kind: "gateway",
+        installed: true,
+        status: "needs-setup",
+        surfaces: ["jobs"],
+      }),
       mkPlugin({
         id: "anthropic",
         name: "Anthropic",
@@ -387,6 +413,7 @@ function items(): HubItem[] {
         kind: "provider",
         installed: true,
         status: "attach-failed",
+        surfaces: ["provider"],
       }),
       mkPlugin({
         id: "notion",
@@ -396,6 +423,7 @@ function items(): HubItem[] {
         installed: false,
         status: "not-installed",
         verified: true,
+        surfaces: ["commands"],
       }),
       mkPlugin({
         id: "jira",
@@ -404,6 +432,7 @@ function items(): HubItem[] {
         kind: "integration",
         installed: true,
         status: "update-available",
+        surfaces: ["tools", "mcp"],
       }),
     ],
     apps: [mkApp({ id: "slack", name: "Slack", desc: "Team chat", tools: [{ name: "post-message", desc: "Post", perm: "ask" }] })],
@@ -413,7 +442,7 @@ function items(): HubItem[] {
 
 describe("filterHubItems: state", () => {
   test("installed = installed rows only", () => {
-    const result = filterHubItems(items(), { state: "installed", kind: null, category: null }, "");
+    const result = filterHubItems(items(), { state: "installed", surface: null, category: null }, "");
     expect(result.every((i) => i.installed)).toBe(true);
     expect(result.some((i) => i.id === "notion")).toBe(false);
   });
@@ -427,12 +456,12 @@ describe("filterHubItems: state", () => {
       apps: [],
       skills: [],
     });
-    const result = filterHubItems(withTwoDiscover, { state: "discover", kind: null, category: null }, "");
+    const result = filterHubItems(withTwoDiscover, { state: "discover", surface: null, category: null }, "");
     expect(result.map((i) => i.id)).toEqual(["zeta", "alpha"]); // input order preserved, NOT alphabetical
   });
 
   test("attention = needs-setup | attach-failed", () => {
-    const result = filterHubItems(items(), { state: "attention", kind: null, category: null }, "");
+    const result = filterHubItems(items(), { state: "attention", surface: null, category: null }, "");
     expect(result.map((i) => i.id).sort()).toEqual(["discord", "anthropic"].sort());
   });
 
@@ -442,35 +471,40 @@ describe("filterHubItems: state", () => {
       apps: [],
       skills: [],
     });
-    const result = filterHubItems(withBlocked, { state: "attention", kind: null, category: null }, "");
+    const result = filterHubItems(withBlocked, { state: "attention", surface: null, category: null }, "");
     expect(result.map((i) => i.id)).toEqual(["blocked-one"]);
   });
 
   test("updates = update-available only", () => {
-    const result = filterHubItems(items(), { state: "updates", kind: null, category: null }, "");
+    const result = filterHubItems(items(), { state: "updates", surface: null, category: null }, "");
     expect(result.map((i) => i.id)).toEqual(["jira"]);
   });
 
   test("all = every row", () => {
-    const result = filterHubItems(items(), { state: "all", kind: null, category: null }, "");
+    const result = filterHubItems(items(), { state: "all", surface: null, category: null }, "");
     expect(result).toHaveLength(items().length);
   });
 });
 
-describe("filterHubItems: kind", () => {
-  test("'integrations' matches integration|gateway", () => {
-    const result = filterHubItems(items(), { state: "all", kind: "integrations", category: null }, "");
-    expect(result.map((i) => i.id).sort()).toEqual(["discord", "github", "jira", "notion"].sort());
+describe("filterHubItems: surface", () => {
+  test("'mcp' matches every row carrying the mcp surface, plugin or app alike", () => {
+    const result = filterHubItems(items(), { state: "all", surface: "mcp", category: null }, "");
+    expect(result.map((i) => i.id).sort()).toEqual(["github", "jira", "slack"].sort());
   });
 
-  test("exact kind matches only that kind", () => {
-    const result = filterHubItems(items(), { state: "all", kind: "provider", category: null }, "");
+  test("'provider' matches only the provider-surfaced row", () => {
+    const result = filterHubItems(items(), { state: "all", surface: "provider", category: null }, "");
     expect(result.map((i) => i.id)).toEqual(["anthropic"]);
   });
 
-  test("mcp-server kind matches app rows", () => {
-    const result = filterHubItems(items(), { state: "all", kind: "mcp-server", category: null }, "");
-    expect(result.map((i) => i.id)).toEqual(["slack"]);
+  test("'skills' matches a standalone skill source row", () => {
+    const result = filterHubItems(items(), { state: "all", surface: "skills", category: null }, "");
+    expect(result.map((i) => i.id)).toEqual(["docs-skill"]);
+  });
+
+  test("null surface matches every row (no filter applied)", () => {
+    const result = filterHubItems(items(), { state: "all", surface: null, category: null }, "");
+    expect(result).toHaveLength(items().length);
   });
 });
 
@@ -481,29 +515,29 @@ describe("filterHubItems: category", () => {
       apps: [],
       skills: [],
     });
-    const result = filterHubItems(withCategory, { state: "all", kind: null, category: "vcs" }, "");
+    const result = filterHubItems(withCategory, { state: "all", surface: null, category: "vcs" }, "");
     expect(result.map((i) => i.id)).toEqual(["a"]);
   });
 });
 
 describe("filterHubItems: search query", () => {
   test("matches on name case-insensitively", () => {
-    const result = filterHubItems(items(), { state: "all", kind: null, category: null }, "GITHUB");
+    const result = filterHubItems(items(), { state: "all", surface: null, category: null }, "GITHUB");
     expect(result.map((i) => i.id)).toEqual(["github"]);
   });
 
   test("matches on description case-insensitively", () => {
-    const result = filterHubItems(items(), { state: "all", kind: null, category: null }, "issue tracker");
+    const result = filterHubItems(items(), { state: "all", surface: null, category: null }, "issue tracker");
     expect(result.map((i) => i.id)).toEqual(["jira"]);
   });
 
   test("matches on a tool name (toolNames corpus) case-insensitively", () => {
-    const result = filterHubItems(items(), { state: "all", kind: null, category: null }, "POST-MESSAGE");
+    const result = filterHubItems(items(), { state: "all", surface: null, category: null }, "POST-MESSAGE");
     expect(result.map((i) => i.id)).toEqual(["slack"]);
   });
 
   test("no match returns empty", () => {
-    const result = filterHubItems(items(), { state: "all", kind: null, category: null }, "zzz-nothing-matches");
+    const result = filterHubItems(items(), { state: "all", surface: null, category: null }, "zzz-nothing-matches");
     expect(result).toEqual([]);
   });
 });
@@ -520,7 +554,7 @@ describe("filterHubItems: sort", () => {
       apps: [],
       skills: [],
     });
-    const result = filterHubItems(data, { state: "all", kind: null, category: null }, "");
+    const result = filterHubItems(data, { state: "all", surface: null, category: null }, "");
     expect(result.map((i) => i.name)).toEqual(["Alpha", "Yak", "Mango", "Zebra"]);
   });
 
@@ -533,7 +567,7 @@ describe("filterHubItems: sort", () => {
       apps: [],
       skills: [],
     });
-    const result = filterHubItems(data, { state: "installed", kind: null, category: null }, "");
+    const result = filterHubItems(data, { state: "installed", surface: null, category: null }, "");
     expect(result.map((i) => i.name)).toEqual(["Alpha", "Zebra"]);
   });
 
@@ -546,7 +580,7 @@ describe("filterHubItems: sort", () => {
       apps: [],
       skills: [],
     });
-    const result = filterHubItems(data, { state: "updates", kind: null, category: null }, "");
+    const result = filterHubItems(data, { state: "updates", surface: null, category: null }, "");
     expect(result.map((i) => i.name)).toEqual(["Alpha", "Zebra"]);
   });
 });
@@ -559,33 +593,39 @@ test("railCounts totals match filterHubItems for each state", () => {
   const data = items();
   const counts = railCounts(data);
   expect(counts.all).toBe(data.length);
-  expect(counts.installed).toBe(filterHubItems(data, { state: "installed", kind: null, category: null }, "").length);
-  expect(counts.discover).toBe(filterHubItems(data, { state: "discover", kind: null, category: null }, "").length);
-  expect(counts.attention).toBe(filterHubItems(data, { state: "attention", kind: null, category: null }, "").length);
-  expect(counts.updates).toBe(filterHubItems(data, { state: "updates", kind: null, category: null }, "").length);
+  expect(counts.installed).toBe(filterHubItems(data, { state: "installed", surface: null, category: null }, "").length);
+  expect(counts.discover).toBe(filterHubItems(data, { state: "discover", surface: null, category: null }, "").length);
+  expect(counts.attention).toBe(filterHubItems(data, { state: "attention", surface: null, category: null }, "").length);
+  expect(counts.updates).toBe(filterHubItems(data, { state: "updates", surface: null, category: null }, "").length);
 });
 
-test("kindCounts totals: per-kind counts sum to the full item count, integrations aggregates integration+gateway", () => {
+test("surfaceCounts: an item with multiple surfaces counts once per surface it carries", () => {
   const data = items();
-  const counts = kindCounts(data);
-  const perKindSum = counts.integration + counts.gateway + counts.provider + counts["skill-pack"] + counts["mcp-server"];
-  expect(perKindSum).toBe(data.length);
-  expect(counts.integrations).toBe(counts.integration + counts.gateway);
+  const counts = surfaceCounts(data);
+  // jira carries both "tools" and "mcp" — it contributes to both buckets.
+  expect(counts.tools).toBe(1);
+  expect(counts.mcp).toBe(3); // github + jira + the slack app row
+  expect(counts.provider).toBe(1); // anthropic
+  expect(counts.jobs).toBe(1); // discord
+  expect(counts.commands).toBe(1); // notion
+  expect(counts.skills).toBe(1); // docs-skill
+  expect(counts.hooks).toBe(0);
 });
 
-test("kindCounts pre-seeds all kinds and aggregates to zero even when absent from fixtures", () => {
+test("surfaceCounts pre-seeds every SurfaceBadge to zero even when absent from fixtures", () => {
   const data = buildHubItems({
-    plugins: [mkPlugin({ id: "github", kind: "integration" })],
+    plugins: [mkPlugin({ id: "github", surfaces: ["mcp"] })],
     apps: [],
     skills: [],
   });
-  const counts = kindCounts(data);
-  expect(counts.integration).toBe(1);
-  expect(counts.gateway).toBe(0);
+  const counts = surfaceCounts(data);
+  expect(counts.mcp).toBe(1);
   expect(counts.provider).toBe(0);
-  expect(counts["skill-pack"]).toBe(0);
-  expect(counts["mcp-server"]).toBe(0);
-  expect(counts.integrations).toBe(1);
+  expect(counts.tools).toBe(0);
+  expect(counts.skills).toBe(0);
+  expect(counts.commands).toBe(0);
+  expect(counts.hooks).toBe(0);
+  expect(counts.jobs).toBe(0);
 });
 
 // ---------------------------------------------------------------------------

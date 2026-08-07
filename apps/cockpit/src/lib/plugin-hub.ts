@@ -8,7 +8,13 @@ import type { AppInfo, ComponentManifestInfo, InstalledSkillInfo, PluginInfo, Pl
 // `connected|error|unknown` vocabulary onto the same `HubStatus` union so
 // every row — plugin, app, or skill — speaks one status language.
 
-export type HubItemKind = "integration" | "gateway" | "provider" | "skill-pack" | "mcp-server";
+/** The v2 surface taxonomy (task-12 report): exactly what a plugin's
+ *  manifest can declare, always emitted by the backend in this order.
+ *  `"gateway"` is deliberately never a member — it is internal-only and must
+ *  never be shown as a plugin surface anywhere in the UI. */
+export type SurfaceBadge = "provider" | "tools" | "mcp" | "skills" | "commands" | "hooks" | "jobs";
+
+export const ALL_SURFACES: readonly SurfaceBadge[] = ["provider", "tools", "mcp", "skills", "commands", "hooks", "jobs"];
 
 export type HubStatus =
   | "ok"
@@ -28,7 +34,11 @@ export type HubNav =
 export type HubItem = {
   rowKey: string; // unique across sources: "plugin:<id>" | "app:<id>" | "skill:<id>"
   id: string;
-  kind: HubItemKind;
+  /** Task 13: replaces the old `kind` taxonomy — which v2 surfaces this row
+   *  carries (badges, filtering). Apps map to `["mcp"]`; standalone skill
+   *  rows to `["skills"]`. A row's chip (initial/color vs. plugin icon)
+   *  discriminates on `appInitial` presence instead of a kind field now. */
+  surfaces: SurfaceBadge[];
   name: string;
   description: string;
   icon: string | null; // pluginIcon() key; apps use initial/color instead
@@ -54,7 +64,7 @@ export type HubItem = {
 };
 
 export type RailState = "all" | "installed" | "discover" | "attention" | "updates";
-export type RailFilter = { state: RailState; kind: HubItemKind | "integrations" | null; category: string | null };
+export type RailFilter = { state: RailState; surface: SurfaceBadge | null; category: string | null };
 
 function pluginNav(plugin: PluginInfo): HubNav {
   // Providers navigate to the shared Models `providerDetail` surface keyed by
@@ -74,7 +84,7 @@ function pluginToHubItem(plugin: PluginInfo): HubItem {
   return {
     rowKey: `plugin:${plugin.id}`,
     id: plugin.id,
-    kind: plugin.kind as HubItemKind,
+    surfaces: plugin.surfaces as SurfaceBadge[],
     name: plugin.name,
     description: plugin.description,
     icon: plugin.icon,
@@ -111,7 +121,7 @@ function appToHubItem(app: AppInfo): HubItem {
   return {
     rowKey: `app:${app.id}`,
     id: app.id,
-    kind: "mcp-server",
+    surfaces: ["mcp"],
     name: app.name,
     description: app.desc,
     icon: null,
@@ -136,7 +146,7 @@ function skillToHubItem(skill: InstalledSkillInfo): HubItem {
   return {
     rowKey: `skill:${skill.id}`,
     id: skill.id,
-    kind: "skill-pack",
+    surfaces: ["skills"],
     name: skill.name,
     description: skill.source,
     icon: null,
@@ -232,10 +242,9 @@ function matchesState(item: HubItem, state: RailState): boolean {
   }
 }
 
-function matchesKind(item: HubItem, kind: HubItemKind | "integrations" | null): boolean {
-  if (kind == null) return true;
-  if (kind === "integrations") return item.kind === "integration" || item.kind === "gateway";
-  return item.kind === kind;
+function matchesSurface(item: HubItem, surface: SurfaceBadge | null): boolean {
+  if (surface == null) return true;
+  return item.surfaces.includes(surface);
 }
 
 /** Pure filter + sort for the hub list. `discover` preserves catalog (input)
@@ -245,7 +254,7 @@ export function filterHubItems(items: HubItem[], filter: RailFilter, query: stri
   const q = query.trim().toLowerCase();
   const filtered = items.filter((item) => {
     if (!matchesState(item, filter.state)) return false;
-    if (!matchesKind(item, filter.kind)) return false;
+    if (!matchesSurface(item, filter.surface)) return false;
     if (filter.category && !item.categories.includes(filter.category)) return false;
     if (q) {
       const haystack = [item.name, item.description, ...item.toolNames].join("\n").toLowerCase();
@@ -273,21 +282,16 @@ export function railCounts(items: HubItem[]): Record<RailState, number> {
   };
 }
 
-/** Per-kind totals plus an "integrations" aggregate (integration + gateway)
- *  matching the `RailFilter.kind` vocabulary's collapsed option. */
-export function kindCounts(items: HubItem[]): Record<string, number> {
-  const counts: Record<string, number> = {
-    integration: 0,
-    gateway: 0,
-    provider: 0,
-    "skill-pack": 0,
-    "mcp-server": 0,
-    integrations: 0,
-  };
+/** Per-surface totals over the full (unfiltered by surface/category/query)
+ *  item set — an item counts once per surface it carries (unlike the old
+ *  per-kind counts, where each item had exactly one kind). Pre-seeds every
+ *  `SurfaceBadge` to 0 so a surface absent from the fixtures still renders a
+ *  zero count rather than `undefined`. */
+export function surfaceCounts(items: HubItem[]): Record<SurfaceBadge, number> {
+  const counts = Object.fromEntries(ALL_SURFACES.map((s) => [s, 0])) as Record<SurfaceBadge, number>;
   for (const item of items) {
-    counts[item.kind] = (counts[item.kind] ?? 0) + 1;
+    for (const s of item.surfaces) counts[s] = (counts[s] ?? 0) + 1;
   }
-  counts.integrations = counts.integration + counts.gateway;
   return counts;
 }
 

@@ -10,6 +10,7 @@ const hook: AutomationHookInfo = {
   inboundPath: null,
   createdAt: 1,
   updatedAt: 1,
+  pluginId: null,
 };
 
 const detail: AutomationHookDetail = {

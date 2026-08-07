@@ -33,6 +33,7 @@ const inbound: AutomationHookInfo = {
   inboundPath: "wh_x",
   createdAt: 1,
   updatedAt: 1,
+  pluginId: null,
 };
 const outbound: AutomationHookInfo = {
   id: "outbound-1",
@@ -43,6 +44,7 @@ const outbound: AutomationHookInfo = {
   inboundPath: null,
   createdAt: 1,
   updatedAt: 1,
+  pluginId: null,
 };
 
 const inboundDetail: AutomationHookDetail = {

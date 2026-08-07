@@ -76,6 +76,9 @@ const builtin: PluginInfo = {
   authKind: "none",
   toolCount: null,
   skillCount: null,
+  surfaces: [],
+  provenance: null,
+  trusted: true,
 };
 
 const github: PluginInfo = {
@@ -109,6 +112,9 @@ const github: PluginInfo = {
   authKind: "none",
   toolCount: null,
   skillCount: null,
+  surfaces: ["mcp"],
+  provenance: "catalog",
+  trusted: true,
 };
 
 const skillPack: PluginInfo = {
@@ -709,6 +715,72 @@ test("retryComponentBootstrap installs every known first-party id, then reloads 
   installSpy.mockRestore();
   detailSpy.mockRestore();
   statusSpy.mockRestore();
+});
+
+// ---------- Install from source (Task 13) ----------
+
+test("beginSourceInstall forwards to the command and returns the trust prompt", async () => {
+  reset();
+  const begin = {
+    token: "tok-1",
+    id: "acme",
+    name: "Acme",
+    publisher: "Acme Inc.",
+    surfaces: { commands: 0, skills: 0, hooks: 0, jobs: 0 },
+    mcpServers: [],
+    component: null,
+    trustRequired: false,
+  };
+  const spy = spyOn(commands, "beginPluginSourceInstall").mockResolvedValue({ status: "ok", data: begin });
+
+  const result = await usePlugins.getState().beginSourceInstall("/path/to/acme");
+
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "/path/to/acme");
+  expect(result).toEqual(begin);
+  spy.mockRestore();
+});
+
+test("beginSourceInstall toasts and returns null on error", async () => {
+  reset();
+  const spy = spyOn(commands, "beginPluginSourceInstall").mockResolvedValue({ status: "error", error: { message: "not a plugin" } });
+
+  const result = await usePlugins.getState().beginSourceInstall("/nowhere");
+
+  expect(result).toBeNull();
+  spy.mockRestore();
+});
+
+test("confirmSourceInstall forwards acceptTrust, reloads the plugin list on success, and returns the installed PluginInfo", async () => {
+  reset();
+  const installed = { ...github, id: "acme", name: "Acme" };
+  const confirmSpy = spyOn(commands, "confirmPluginSourceInstall").mockResolvedValue({ status: "ok", data: installed });
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [installed] });
+  const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
+
+  const result = await usePlugins.getState().confirmSourceInstall("tok-1", true);
+
+  expect(confirmSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "tok-1", true);
+  expect(result).toEqual(installed);
+  expect(listSpy).toHaveBeenCalled();
+  expect(usePlugins.getState().plugins.map((p) => p.id)).toEqual(["acme"]);
+  confirmSpy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+  catalogSpy.mockRestore();
+});
+
+test("confirmSourceInstall toasts and returns null on error, without reloading", async () => {
+  reset();
+  const confirmSpy = spyOn(commands, "confirmPluginSourceInstall").mockResolvedValue({ status: "error", error: { message: "boom" } });
+  const listSpy = spyOn(commands, "listPlugins");
+
+  const result = await usePlugins.getState().confirmSourceInstall("tok-1", false);
+
+  expect(result).toBeNull();
+  expect(listSpy).not.toHaveBeenCalled();
+  confirmSpy.mockRestore();
+  listSpy.mockRestore();
 });
 
 test("retryComponentBootstrap tolerates a per-id install failure and still refreshes the pending status", async () => {

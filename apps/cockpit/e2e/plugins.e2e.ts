@@ -75,6 +75,41 @@ test("installing a component plugin walks Overview → Permissions → Install �
   await expect(dialog.getByRole("button", { name: "Open plugin page" })).toBeVisible();
 });
 
+// ---------- Task 13: surface badges + surface rail filter ----------
+
+test("hub rows render surface badges, and the surface rail narrows the list", async ({ page }) => {
+  const main = page.getByRole("main");
+
+  // github carries tools+mcp, linear carries mcp, slack carries tools —
+  // both badges live inside the row's own "Open GitHub" button (see
+  // `HubRow.tsx`), so no ancestor traversal is needed to scope the query.
+  const githubRow = main.getByRole("button", { name: "Open GitHub" });
+  await expect(githubRow.getByText("Tools", { exact: true })).toBeVisible();
+  await expect(githubRow.getByText("MCP", { exact: true })).toBeVisible();
+
+  const rail = page.getByRole("complementary");
+  await rail.getByText("MCP", { exact: true }).click();
+  await expect(main.getByRole("button", { name: "Open GitHub" })).toBeVisible();
+  await expect(main.getByRole("button", { name: "Open Linear" })).toBeVisible();
+  await expect(main.getByRole("button", { name: "Open Slack" })).toHaveCount(0);
+});
+
+// ---------- Task 13: install from source ----------
+
+test("install from source walks begin → trust review → confirm, and closes on accept", async ({ page }) => {
+  const main = page.getByRole("main");
+  await main.getByRole("button", { name: "Install from source…" }).click();
+
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Plugin source").fill("https://github.com/acme/plugin");
+  await dialog.getByRole("button", { name: "Continue" }).click();
+
+  await expect(dialog.getByText("acme-mcp")).toBeVisible();
+  await dialog.getByRole("button", { name: "Trust & Install" }).click();
+
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
 test("detail tabs switch and the Tools tab lists the mocked tool", async ({ page }) => {
   const main = page.getByRole("main");
   await main.getByRole("button", { name: "Open GitHub" }).click();

@@ -929,6 +929,9 @@ const HUB_GITHUB_PLUGIN: PluginInfo = {
   authKind: "oauth",
   toolCount: 12,
   skillCount: null,
+  surfaces: ["tools", "mcp"],
+  provenance: "catalog",
+  trusted: true,
 };
 
 const HUB_LINEAR_PLUGIN: PluginInfo = {
@@ -962,6 +965,9 @@ const HUB_LINEAR_PLUGIN: PluginInfo = {
   authKind: "token",
   toolCount: null,
   skillCount: null,
+  surfaces: ["mcp"],
+  provenance: null,
+  trusted: false,
 };
 
 const HUB_SLACK_PLUGIN: PluginInfo = {
@@ -995,6 +1001,9 @@ const HUB_SLACK_PLUGIN: PluginInfo = {
   authKind: "none",
   toolCount: 5,
   skillCount: null,
+  surfaces: ["tools"],
+  provenance: null,
+  trusted: false,
 };
 
 export const PLUGIN_HUB_ROWS: PluginInfo[] = [HUB_GITHUB_PLUGIN, HUB_LINEAR_PLUGIN, HUB_SLACK_PLUGIN];
@@ -1023,6 +1032,10 @@ const PLUGIN_DETAILS: Record<string, PluginDetail> = {
     models: [],
     homepage: "https://github.com/github/github-mcp-server",
     publisher: "GitHub (official)",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   },
   linear: {
     info: HUB_LINEAR_PLUGIN,
@@ -1042,6 +1055,10 @@ const PLUGIN_DETAILS: Record<string, PluginDetail> = {
     models: [],
     homepage: null,
     publisher: "Linear",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   },
   slack: {
     info: HUB_SLACK_PLUGIN,
@@ -1054,6 +1071,10 @@ const PLUGIN_DETAILS: Record<string, PluginDetail> = {
     models: [],
     homepage: null,
     publisher: "Slack",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   },
 };
 
@@ -1632,6 +1653,64 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
             const detail = details[id];
             if (!detail) return Promise.reject({ message: `unknown plugin: ${id}` });
             return Promise.resolve(detail);
+          }
+          // Task 13: "Install from source…" — a fixed trust-required prompt for
+          // any source string (the modal's own "no trust needed" path is
+          // exercised in the unit tests, not e2e); `confirm` echoes back a
+          // freshly-"installed" `PluginInfo` derived off the same id/name.
+          if (cmd === "begin_plugin_source_install") {
+            const { source } = args as { source: string };
+            return Promise.resolve({
+              token: "e2e-source-token",
+              id: "acme-source",
+              name: "Acme Source",
+              publisher: "Acme",
+              surfaces: { commands: 0, skills: 0, hooks: 0, jobs: 0 },
+              mcpServers: [{ name: "acme-mcp", transport: "stdio", detail: `npx acme-mcp-server ${source}` }],
+              component: null,
+              trustRequired: true,
+            });
+          }
+          if (cmd === "confirm_plugin_source_install") {
+            // Built inline (not a reference to a module-level fixture) — this
+            // callback is re-evaluated via `.toString()` in the page, so it
+            // only ever sees its own `fixtures` parameter (see the
+            // `plugin_details`/`component_releases` doc above).
+            return Promise.resolve({
+              id: "acme-source",
+              name: "Acme Source",
+              description: "Installed from a local path or git URL.",
+              icon: null,
+              categories: [],
+              slot: null,
+              ownsSlot: false,
+              verified: false,
+              experimental: false,
+              enabled: true,
+              configured: false,
+              source: "catalog",
+              capabilities: ["connector"],
+              kind: "integration",
+              installed: true,
+              family: null,
+              pinned: false,
+              sourceSpec: null,
+              resolvedCommit: null,
+              installedAt: Date.now(),
+              updatedAt: Date.now(),
+              trustTier: null,
+              componentBacked: false,
+              catalogVersion: null,
+              blockedReason: null,
+              status: "ok",
+              statusDetail: null,
+              authKind: "none",
+              toolCount: null,
+              skillCount: null,
+              surfaces: ["mcp"],
+              provenance: "git",
+              trusted: true,
+            });
           }
           // Task 16: `plugin_tools` — echoes a single declared tool for any id,
           // mirroring a component's declared-tools manifest response (`live:

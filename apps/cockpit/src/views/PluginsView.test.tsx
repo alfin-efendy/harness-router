@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type {
   AddAppInput,
   AppInfo,
@@ -60,6 +60,9 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     authKind: "none",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
     ...over,
   };
 }
@@ -74,12 +77,14 @@ const anthropicPlugin = plugin("anthropic", ["model-provider"], {
   family: "anthropic",
   source: "builtin",
   status: "not-installed",
+  surfaces: ["provider"],
 });
 const superpowersPlugin = plugin("superpowers", ["skills"], {
   name: "Superpowers",
   kind: "skill-pack",
   source: "skill-pack",
   status: "not-installed",
+  surfaces: ["skills"],
 });
 
 const slackApp: AppInfo = {
@@ -103,6 +108,7 @@ const slackApp: AppInfo = {
   authDetail: null,
   tools: [],
   agentAccess: [],
+  pluginId: null,
 };
 
 const docsSkill: InstalledSkillInfo = {
@@ -145,6 +151,37 @@ const updateAllPlugins = mock(async (_runnerId: string) => ({
 const setPluginPin = mock(async (_runnerId: string, _id: string, _pinned: boolean, _reason: string | null) => ({
   status: "ok" as const,
   data: null,
+}));
+
+// Task 13: "Install from source…" — begin/confirm fixtures. `sourceTrustFixture`
+// lets a test opt into the trust-required path; the default (`null`) mirrors a
+// signed/no-risky-surface source that confirms immediately.
+let sourceTrustFixture: {
+  token: string;
+  id: string;
+  name: string;
+  publisher: string;
+  surfaces: { commands: number; skills: number; hooks: number; jobs: number };
+  mcpServers: { name: string; transport: string; detail: string }[];
+  component: { networkHosts: string[]; tools: { name: string; writes: boolean }[] } | null;
+  trustRequired: boolean;
+} = {
+  token: "src-token-1",
+  id: "acme-source",
+  name: "Acme Source",
+  publisher: "Acme",
+  surfaces: { commands: 0, skills: 0, hooks: 0, jobs: 0 },
+  mcpServers: [],
+  component: null,
+  trustRequired: false,
+};
+const beginPluginSourceInstall = mock(async (_runnerId: string, _source: string) => ({
+  status: "ok" as const,
+  data: sourceTrustFixture,
+}));
+const confirmPluginSourceInstall = mock(async (_runnerId: string, _token: string, _acceptTrust: boolean) => ({
+  status: "ok" as const,
+  data: plugin(sourceTrustFixture.id, [], { name: sourceTrustFixture.name, installed: true, status: "ok" as const }),
 }));
 
 const beginSkillInstall = mock(async (_runnerId: string, _source: string) => ({
@@ -199,6 +236,10 @@ const wizardDetail: PluginDetail = {
   models: [],
   homepage: null,
   publisher: "GitHub",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
 const wizardBegin: PluginInstallBeginResult = {
   authKind: "none",
@@ -291,6 +332,8 @@ mock.module("@/bindings", () => ({
     updatePlugin,
     updateAllPlugins,
     setPluginPin,
+    beginPluginSourceInstall,
+    confirmPluginSourceInstall,
     beginSkillInstall,
     confirmSkillInstall,
     listSkills,
@@ -371,6 +414,18 @@ beforeEach(() => {
   updatePlugin.mockClear();
   updateAllPlugins.mockClear();
   setPluginPin.mockClear();
+  beginPluginSourceInstall.mockClear();
+  confirmPluginSourceInstall.mockClear();
+  sourceTrustFixture = {
+    token: "src-token-1",
+    id: "acme-source",
+    name: "Acme Source",
+    publisher: "Acme",
+    surfaces: { commands: 0, skills: 0, hooks: 0, jobs: 0 },
+    mcpServers: [],
+    component: null,
+    trustRequired: false,
+  };
   beginSkillInstall.mockClear();
   confirmSkillInstall.mockClear();
   listSkills.mockClear();
@@ -487,12 +542,15 @@ test("clicking the Installed rail entry hides not-installed rows", async () => {
   expect(screen.getByText("Notion")).toBeTruthy();
 });
 
-test("clicking the Providers kind rail entry narrows the list to provider rows", async () => {
+test("clicking the Provider surface rail entry narrows the list to provider-surfaced rows", async () => {
   pluginsFixture = [githubPlugin, notionPlugin, { ...anthropicPlugin, installed: true, status: "ok" as const }];
   await renderView();
   await screen.findByText("Anthropic");
 
-  fireEvent.click(screen.getByText("Providers"));
+  // Scoped to the rail (`aside`, role="complementary") since an installed
+  // provider row's own surface badge also reads "Provider".
+  const rail = screen.getByRole("complementary");
+  fireEvent.click(within(rail).getByText("Provider"));
 
   expect(screen.getByText("Anthropic")).toBeTruthy();
   expect(screen.queryByText("GitHub")).toBeNull();
@@ -769,6 +827,60 @@ test("the bootstrap banner's Retry button reinstalls every known first-party id 
   await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "opencode", null));
   await waitFor(() => expect(screen.queryByText("Component plugins need attention")).toBeNull());
   expect(toastSuccess).toHaveBeenCalled();
+});
+
+// ---------- Install from source (Task 13) ----------
+
+test("Install from source opens the modal and, for a source needing no trust review, installs immediately", async () => {
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Install from source…" }));
+  fireEvent.change(screen.getByLabelText("Plugin source"), { target: { value: "/path/to/plugin" } });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(beginPluginSourceInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "/path/to/plugin"));
+  await waitFor(() => expect(confirmPluginSourceInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "src-token-1", false));
+  await waitFor(() => expect(screen.queryByLabelText("Plugin source")).toBeNull());
+});
+
+test("Install from source shows the trust summary and requires an explicit accept before confirming", async () => {
+  sourceTrustFixture = {
+    ...sourceTrustFixture,
+    trustRequired: true,
+    mcpServers: [{ name: "acme-mcp", transport: "stdio", detail: "npx acme-mcp-server" }],
+    component: { networkHosts: ["api.acme.example.com"], tools: [{ name: "delete_all", writes: true }] },
+  };
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Install from source…" }));
+  fireEvent.change(screen.getByLabelText("Plugin source"), { target: { value: "https://github.com/acme/plugin" } });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(beginPluginSourceInstall).toHaveBeenCalled());
+  expect(await screen.findByText("acme-mcp")).toBeTruthy();
+  expect(screen.getByText("npx acme-mcp-server")).toBeTruthy();
+  expect(screen.getByText("api.acme.example.com")).toBeTruthy();
+  expect(screen.getByText("delete_all")).toBeTruthy();
+  expect(screen.getByText("writes")).toBeTruthy();
+  expect(confirmPluginSourceInstall).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Trust & Install" }));
+  await waitFor(() => expect(confirmPluginSourceInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "src-token-1", true));
+});
+
+test("Install from source's Decline closes the modal without confirming", async () => {
+  sourceTrustFixture = { ...sourceTrustFixture, trustRequired: true };
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Install from source…" }));
+  fireEvent.change(screen.getByLabelText("Plugin source"), { target: { value: "https://github.com/acme/plugin" } });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(beginPluginSourceInstall).toHaveBeenCalled());
+  fireEvent.click(await screen.findByRole("button", { name: "Decline" }));
+
+  expect(confirmPluginSourceInstall).not.toHaveBeenCalled();
+  expect(screen.queryByText("Decline")).toBeNull();
 });
 
 // ---------- Empty state ----------
