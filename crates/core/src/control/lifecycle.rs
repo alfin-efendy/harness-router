@@ -1769,7 +1769,7 @@ impl ControlPlane {
     /// either. An empty vec when nothing enabled+configured is installed, so
     /// the common case constructs no component runtime at all. Declarative
     /// connectors are untouched (this migration phase keeps both paths live).
-    async fn build_component_mcp_servers(
+    pub(crate) async fn build_component_mcp_servers(
         &self,
         settings: &SettingsStore,
     ) -> Vec<Arc<crate::plugins::mcp_component::ComponentMcpServer>> {
@@ -1828,6 +1828,24 @@ impl ControlPlane {
                     tracing::warn!(plugin = %id, "wasm: configured-settings check failed: {error}");
                     continue;
                 }
+            }
+            // Task 11 tiered trust: a `[component]` (WASM, sandboxed but
+            // still executable code) installed from an unsigned source
+            // (local folder / git URL) must not attach until the user has
+            // explicitly accepted the trust prompt. Belt-and-braces over the
+            // Task 4 signing gate — `HostPolicy::for_installed_bundle`
+            // already keeps `allow_self_auth`/`allow_gateway` false for a
+            // non-first-party signing key, but that alone doesn't stop the
+            // component from attaching and exposing its tools at all.
+            let provenance = crate::plugins::install_sources::read_install_provenance(&bundle.root);
+            if !crate::plugins::host::component_surfaces_trusted_for(settings, &id, &provenance)
+                .await
+            {
+                tracing::info!(
+                    plugin = %id,
+                    "wasm: skipping {id}: unsigned component requires explicit trust acceptance"
+                );
+                continue;
             }
             // Capabilities are granted from the bundle's own manifest
             // declarations + verified install provenance — the single source of
@@ -1903,28 +1921,73 @@ impl ControlPlane {
     /// treat a missing directory as "no commands"/"no skills" (matching
     /// `read_command_dir`/`read_skills`'s existing not-found handling), so
     /// this never checks for their presence itself.
+    ///
+    /// # Union, not swap (Task 11 fix)
+    ///
+    /// [`crate::plugins::bundle::load_active_bundles`] hard-rejects any
+    /// manifest without `[component]` — it exists to discover WASM component
+    /// bundles, not every installed plugin. A DECLARATIVE-ONLY plugin
+    /// installed via `plugins::install_sources` (commands/skills, no wasm)
+    /// would therefore never appear in that walk, and its commands/skills
+    /// would be silently invisible in every session and in "/" autocomplete.
+    ///
+    /// Fixed by UNION rather than by swapping to `PluginHost::list()`
+    /// outright: a pure `PluginHost::list()` walk would break
+    /// github/atlassian/bitbucket/discord, whose `CorePlugin.source ==
+    /// Builtin` and whose real on-disk root is only knowable via the active
+    /// bundle pointer (`bundle.root`) — `PluginSource::Builtin` carries no
+    /// directory at all. So: keep the bundle walk for every component-backed
+    /// plugin (covers first-party embedded AND signed-catalog component
+    /// installs), and additionally fall back to `PluginHost::list()`'s
+    /// `Installed { dir, .. }` entries for any id the bundle walk didn't
+    /// already cover — using `dir` (the resolved version directory,
+    /// `install_sources::confirm_plugin_install`'s exact `bundle.root`
+    /// equivalent) as the commands/skills root. A component-backed id is
+    /// never double-added: it's always covered by the bundle walk first.
     pub(crate) async fn enabled_plugin_content_roots(&self) -> Vec<PluginContentRoots> {
-        let root = crate::plugins::bundle::installed_bundle_root();
-        if !root.exists() {
-            return Vec::new();
-        }
-        let bundles = match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
-            Ok(bundles) => bundles,
-            Err(error) => {
-                tracing::warn!(
-                    "plugins: discovering installed bundles for content roots failed: {error}"
-                );
-                return Vec::new();
-            }
-        };
-        if bundles.is_empty() {
-            return Vec::new();
-        }
         let settings = SettingsStore::new(self.store.clone());
-        let mut roots = Vec::with_capacity(bundles.len());
-        for bundle in bundles {
-            let id = bundle.manifest.id.clone();
-            match crate::plugins::host::component_plugin_enabled(&settings, &id).await {
+        let mut roots = Vec::new();
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let root = crate::plugins::bundle::installed_bundle_root();
+        if root.exists() {
+            match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
+                Ok(bundles) => {
+                    for bundle in bundles {
+                        let id = bundle.manifest.id.clone();
+                        covered.insert(id.clone());
+                        match crate::plugins::host::component_plugin_enabled(&settings, &id).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => {
+                                tracing::warn!(plugin = %id, "plugins: enablement check for content roots failed: {error}");
+                                continue;
+                            }
+                        }
+                        roots.push(PluginContentRoots {
+                            commands: bundle.root.join("commands"),
+                            skills: bundle.root.join("skills"),
+                            id,
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "plugins: discovering installed bundles for content roots failed: {error}"
+                    );
+                }
+            }
+        }
+
+        for plugin in self.registries.plugins.list() {
+            let id = plugin.manifest.id.clone();
+            if covered.contains(&id) {
+                continue;
+            }
+            let crate::plugins::PluginSource::Installed { dir, .. } = &plugin.source else {
+                continue;
+            };
+            match self.registries.plugins.is_enabled(&settings, &id).await {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => {
@@ -1933,11 +1996,12 @@ impl ControlPlane {
                 }
             }
             roots.push(PluginContentRoots {
-                commands: bundle.root.join("commands"),
-                skills: bundle.root.join("skills"),
+                commands: dir.join("commands"),
+                skills: dir.join("skills"),
                 id,
             });
         }
+
         // `read_dir` order is filesystem-dependent, and both collision rules
         // downstream (commands: last plugin wins the bare name; skills:
         // first-listed plugin wins) would otherwise resolve differently on

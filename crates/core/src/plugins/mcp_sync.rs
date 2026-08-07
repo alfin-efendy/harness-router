@@ -90,6 +90,20 @@ pub async fn sync_plugin_mcp(
     let Some(connector) = &plugin.connector else {
         return Ok(());
     };
+    // Task 11 tiered trust: an `[[mcp]]` entry is an arbitrary stdio process
+    // (or an HTTP endpoint) — for an unsigned (local-folder/git-URL) install,
+    // it must not sync into the Apps domain until the user has explicitly
+    // accepted the trust prompt (`plugin.<id>.trusted`, written only by
+    // `install_sources::confirm_plugin_install`'s confirm step). Signed
+    // catalog/first-party installs are trusted by construction and skip this
+    // check entirely.
+    if !crate::plugins::host::component_surfaces_trusted(settings, plugin).await {
+        tracing::info!(
+            plugin = %plugin.manifest.id,
+            "mcp sync: skipping — unsigned mcp surfaces require explicit trust acceptance"
+        );
+        return Ok(());
+    }
     let id = plugin.manifest.id.clone();
     let ctx = ConnectorCtx {
         project_id: id.clone(),
@@ -500,6 +514,98 @@ env = { TOKEN = "${auth}" }
         let mcp = safe_attach_reason("acme", AttachStage::McpServers, &err);
         assert!(!mcp.contains("abc123"));
         assert!(mcp.starts_with("acme:"));
+    }
+
+    /// Build the same shape [`plugin_with_mcp`] does, but with an
+    /// `Installed { .. }` source instead of `Builtin` — the shape
+    /// `install_sources::confirm_plugin_install` actually passes.
+    fn installed_plugin_with_mcp(
+        id: &str,
+        defs: &[(&str, &str, &str)],
+        provenance: crate::plugins::host::InstallProvenance,
+    ) -> CorePlugin {
+        let mut toml = format!("contract = 2\nid = \"{id}\"\nname = \"{id}\"\n\n");
+        for (name, transport, command) in defs {
+            toml.push_str(&format!(
+                "[[mcp]]\nname = \"{name}\"\ntransport = \"{transport}\"\ncommand = \"{command}\"\n\n"
+            ));
+        }
+        let manifest = PluginManifest::from_toml(&toml).expect("valid manifest");
+        declarative::declarative_plugin(
+            manifest,
+            PluginSource::Installed {
+                dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+                provenance,
+            },
+        )
+        .expect("declarative plugin")
+    }
+
+    // ---------- Task 11: tiered trust gate ----------
+
+    #[tokio::test]
+    async fn untrusted_unsigned_plugin_syncs_no_mcp_rows() {
+        let (store, settings) = mem_store().await;
+        let plugin = installed_plugin_with_mcp(
+            "acme-untrusted",
+            &[("main", "stdio", "acme-mcp")],
+            crate::plugins::host::InstallProvenance::LocalPath,
+        );
+
+        sync_plugin_mcp(&store, &settings, &plugin).await.unwrap();
+        assert!(
+            mcp::list_servers(&store).await.unwrap().is_empty(),
+            "an unsigned, untrusted plugin must sync no mcp rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_unsigned_plugin_syncs_its_mcp_rows() {
+        let (store, settings) = mem_store().await;
+        let plugin = installed_plugin_with_mcp(
+            "acme-trusted",
+            &[("main", "stdio", "acme-mcp")],
+            crate::plugins::host::InstallProvenance::LocalPath,
+        );
+        store
+            .set_setting_raw("plugin.acme-trusted.trusted", "true")
+            .await
+            .unwrap();
+
+        sync_plugin_mcp(&store, &settings, &plugin).await.unwrap();
+        let rows = mcp::list_servers(&store).await.unwrap();
+        assert_eq!(rows.len(), 1, "a trusted plugin's mcp entry must sync");
+        assert_eq!(rows[0].plugin_id.as_deref(), Some("acme-trusted"));
+    }
+
+    #[tokio::test]
+    async fn a_git_url_install_needs_trust_the_same_as_a_local_path_install() {
+        let (store, settings) = mem_store().await;
+        let plugin = installed_plugin_with_mcp(
+            "acme-git",
+            &[("main", "stdio", "acme-mcp")],
+            crate::plugins::host::InstallProvenance::GitUrl("https://example.com/acme.git".into()),
+        );
+
+        sync_plugin_mcp(&store, &settings, &plugin).await.unwrap();
+        assert!(mcp::list_servers(&store).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_provenance_is_trusted_by_construction() {
+        let (store, settings) = mem_store().await;
+        let plugin = installed_plugin_with_mcp(
+            "acme-catalog",
+            &[("main", "stdio", "acme-mcp")],
+            crate::plugins::host::InstallProvenance::Catalog,
+        );
+
+        sync_plugin_mcp(&store, &settings, &plugin).await.unwrap();
+        assert_eq!(
+            mcp::list_servers(&store).await.unwrap().len(),
+            1,
+            "a signed-catalog install must sync without any trust setting"
+        );
     }
 
     #[tokio::test]

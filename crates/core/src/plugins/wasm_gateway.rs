@@ -704,6 +704,19 @@ pub(crate) async fn discover_gateway_components(
                 continue;
             }
         }
+        // Task 11 tiered trust: belt-and-braces over the Task 4 signing gate
+        // — a gateway export is already first-party-only structurally
+        // (`HostPolicy::for_installed_bundle`'s `allow_gateway`, enforced at
+        // instantiation by `ComponentRuntime::compile`), but an untrusted
+        // unsigned bundle must not even reach compilation.
+        let provenance = crate::plugins::install_sources::read_install_provenance(&bundle.root);
+        if !crate::plugins::host::component_surfaces_trusted_for(settings, &id, &provenance).await {
+            tracing::info!(
+                plugin = %id,
+                "wasm gateway: skipping {id}: unsigned component requires explicit trust acceptance"
+            );
+            continue;
+        }
         // Single source of truth for the installed-bundle capability policy
         // (incl. the first-party-only `allow_self_auth` gate) — see
         // `HostPolicy::for_installed_bundle`.

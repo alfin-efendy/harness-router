@@ -565,6 +565,14 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     for plugin in crate::plugins::component_catalog::component_catalog_plugins() {
         registries.add_plugin(plugin);
     }
+    // Task 11: every plugin installed from a local folder or git URL
+    // (`plugins::install_sources`) — scanned last so first-registration-wins
+    // keeps every embedded first-party row above authoritative for its id;
+    // this call is purely additive for ids nothing else already claimed.
+    crate::plugins::install_installed_plugins(
+        &mut registries,
+        &crate::plugins::bundle::installed_bundle_root(),
+    );
     if let Some(factory) = opts.harness_factory {
         registries.harness = factory;
     }

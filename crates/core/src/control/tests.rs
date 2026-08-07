@@ -6406,3 +6406,48 @@ async fn stop_revoked_running_gateways_is_a_noop_with_no_registered_gateways() {
         "revoking an id with no registered gateway must be a clean no-op"
     );
 }
+
+/// Task 11 union fix: `enabled_plugin_content_roots` must not rely SOLELY on
+/// `bundle::load_active_bundles` (which hard-rejects any manifest without
+/// `[component]`) — a declarative-only installed plugin's commands/skills
+/// must still be discovered via the `PluginHost::list()` fallback. Registers
+/// a manifest-only `Installed` plugin pointing at a hermetic temp directory
+/// (never the real `~/.config/ryuzi/plugins`) carrying `commands/` and
+/// `skills/`, and asserts the returned roots include it.
+#[tokio::test]
+async fn enabled_plugin_content_roots_discovers_a_declarative_only_installed_plugin() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let commands = plugin_dir.path().join("commands");
+    let skills = plugin_dir.path().join("skills");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(commands.join("hello.md"), "# hi").unwrap();
+
+    let toml = "contract = 2\nid = \"acme-declarative\"\nname = \"Acme Declarative\"\n";
+    let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(toml).unwrap();
+    let mut regs = registries_with(false, Counters::default());
+    regs.add_plugin(crate::plugins::CorePlugin {
+        manifest,
+        harness: None,
+        gateway: None,
+        connector: None,
+        provider: None,
+        source: crate::plugins::PluginSource::Installed {
+            dir: plugin_dir.path().to_path_buf(),
+            provenance: crate::plugins::InstallProvenance::LocalPath,
+        },
+    });
+
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let cp = test_control_plane(store, regs).await;
+
+    let roots = cp.enabled_plugin_content_roots().await;
+    let mine = roots
+        .iter()
+        .find(|r| r.id == "acme-declarative")
+        .expect("the declarative-only installed plugin must be discovered");
+    assert_eq!(mine.commands, commands);
+    assert_eq!(mine.skills, skills);
+    drop(db_guard);
+}

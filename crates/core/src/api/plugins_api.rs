@@ -65,6 +65,11 @@ pub(crate) const HANDLES: &[&str] = &[
     "cancel_plugin_install",
     "begin_skill_install",
     "confirm_skill_install",
+    // Task 11: install a plugin from a local folder or a git URL, with a
+    // tiered-trust confirm step — mirrors the begin/confirm skill-install
+    // pair above.
+    "begin_plugin_source_install",
+    "confirm_plugin_source_install",
     "update_plugin",
     "update_all_plugins",
     "set_plugin_pin",
@@ -148,6 +153,11 @@ struct SourceP {
 #[derive(Deserialize)]
 struct TokenP {
     token: String,
+}
+#[derive(Deserialize)]
+struct ConfirmPluginSourceInstallP {
+    token: String,
+    accept_trust: bool,
 }
 #[derive(Deserialize)]
 struct UpdatePluginP {
@@ -273,6 +283,17 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: TokenP = params(p)?;
             ok(confirm_skill_install(cp, &a.token).await?)
         }
+        "begin_plugin_source_install" => {
+            let a: SourceP = params(p)?;
+            ok(
+                crate::plugins::install_sources::begin_plugin_install_from_source(&a.source)
+                    .await?,
+            )
+        }
+        "confirm_plugin_source_install" => {
+            let a: ConfirmPluginSourceInstallP = params(p)?;
+            ok(confirm_plugin_source_install(cp, &a.token, a.accept_trust).await?)
+        }
         "update_plugin" => {
             let a: UpdatePluginP = params(p)?;
             ok(update_plugin(cp, &a.id, a.force).await?)
@@ -387,6 +408,31 @@ async fn confirm_skill_install(
     cp.mark_plugins_restart_required();
     cp.emit(CoreEvent::PluginsChanged);
     Ok(pack)
+}
+
+/// Task 11 phase 2: complete a staged local-folder/git-URL plugin install
+/// after the caller has reviewed [`crate::plugins::install_sources::PluginTrustPrompt`].
+/// The token is single-use. Always marks `plugins_restart_required` and
+/// broadcasts `PluginsChanged`: reaching this point always means an install
+/// just completed (mcp/component surfaces may still be inert if
+/// `accept_trust` was withheld while `trust_required` — the install itself
+/// always succeeds).
+async fn confirm_plugin_source_install(
+    cp: &ControlPlane,
+    token: &str,
+    accept_trust: bool,
+) -> anyhow::Result<crate::plugins::install_sources::InstalledPluginInfo> {
+    let settings = SettingsStore::new(cp.store().clone());
+    let info = crate::plugins::install_sources::confirm_plugin_install(
+        token,
+        accept_trust,
+        cp.store(),
+        &settings,
+    )
+    .await?;
+    cp.mark_plugins_restart_required();
+    cp.emit(CoreEvent::PluginsChanged);
+    Ok(info)
 }
 
 /// Update one installed pack. `force` overrides the local-edits guard but

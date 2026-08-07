@@ -30,6 +30,7 @@ pub mod declarative;
 pub mod doctor;
 pub mod first_party_key;
 pub mod host;
+pub mod install_sources;
 pub mod mcp_component;
 pub mod mcp_sync;
 pub mod migrate_v2;
@@ -288,6 +289,101 @@ pub(crate) fn build_provider_component_once(plugin_dir: &str) {
 pub fn install_providers(regs: &mut Registries) {
     for plugin in providers::provider_plugins() {
         regs.add_plugin(plugin);
+    }
+}
+
+/// Boot-time registration (Task 11) for every plugin installed under
+/// `root/<id>/current` — the local-folder/git-URL install pipeline's
+/// counterpart to [`install_builtins`]. Scans `root`, and for each `<id>`
+/// directory whose `current` pointer resolves to a readable, parseable v2
+/// manifest, registers a MANIFEST-ONLY `CorePlugin { source: Installed { dir,
+/// provenance } }` — `dir` is the resolved version directory (the same path
+/// `bundle::InstalledBundle::root` would use for a component-backed
+/// sibling), and `provenance` comes from that version dir's `install.json`
+/// stamp (defaulting to `Catalog` when absent, e.g. a bundle installed
+/// through the signed-catalog pipeline rather than this one).
+///
+/// First-registration-wins (`PluginHost::add`/`Registries::add_plugin`) keeps
+/// an embedded first-party row (added by [`install_builtins`], called
+/// BEFORE this) authoritative for its id even if the same id also happens to
+/// exist on disk — this function is purely additive for ids nothing else
+/// already claimed.
+///
+/// Registered manifest-only (no live harness/gateway/connector/provider): the
+/// real behavioral capabilities are built transiently by
+/// `install_sources::confirm_plugin_install` when it runs the post-install
+/// syncs, and any `[component]` surface goes through the WASM
+/// bundle-discovery path (`bundle::load_active_bundles`) instead. This
+/// registration exists purely for identity/enablement bookkeeping
+/// (`PluginHost::is_enabled`'s manifest-only "always true" branch is what
+/// keeps an installed plugin's commands/skills/hooks/jobs active without a
+/// separate enable step) and as the fallback source
+/// `control::lifecycle::ControlPlane::enabled_plugin_content_roots`'s union
+/// reads for a declarative-only install (no `[component]`, so
+/// `bundle::load_active_bundles` — which hard-requires one — never sees it).
+///
+/// Warn-and-skip per plugin directory: an unreadable/unparseable manifest, a
+/// dangling `current` pointer, or a missing version directory must not blind
+/// the rest of the scan (mirrors `bundle::load_active_bundles`'s discipline).
+/// A missing `root` itself is a silent no-op (nothing installed yet).
+pub fn install_installed_plugins(regs: &mut Registries, root: &std::path::Path) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let plugin_dir = entry.path();
+        if !plugin_dir.is_dir() {
+            continue;
+        }
+        let pointer = plugin_dir.join("current");
+        let version = match std::fs::read_to_string(&pointer) {
+            Ok(v) => v.trim().to_string(),
+            Err(_) => continue,
+        };
+        if version.is_empty() || version.contains(['/', '\\']) || version == "." || version == ".."
+        {
+            tracing::warn!(
+                dir = %plugin_dir.display(),
+                "installed-plugin scan: malformed active pointer, skipping"
+            );
+            continue;
+        }
+        let version_dir = plugin_dir.join(&version);
+        let manifest_path = version_dir.join("ryuzi-plugin.toml");
+        let manifest_toml = match std::fs::read_to_string(&manifest_path) {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!(
+                    dir = %plugin_dir.display(),
+                    "installed-plugin scan: no readable manifest at the active version, skipping"
+                );
+                continue;
+            }
+        };
+        let manifest = match ryuzi_plugin_sdk::PluginManifest::from_toml(&manifest_toml) {
+            Ok(m) => m,
+            Err(error) => {
+                tracing::warn!(
+                    dir = %plugin_dir.display(),
+                    "installed-plugin scan: unparseable manifest: {error}"
+                );
+                continue;
+            }
+        };
+        let provenance = install_sources::read_install_provenance(&version_dir);
+        regs.add_plugin(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            provider: None,
+            source: PluginSource::Installed {
+                dir: version_dir,
+                provenance,
+            },
+        });
     }
 }
 
@@ -1346,5 +1442,91 @@ mod install_builtins_tests {
                 component.manifest.id
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod install_installed_plugins_tests {
+    use super::*;
+
+    fn write_plugin_dir(root: &std::path::Path, id: &str, version: &str, toml: &str) {
+        let version_dir = root.join(id).join(version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("ryuzi-plugin.toml"), toml).unwrap();
+        std::fs::write(root.join(id).join("current"), version).unwrap();
+    }
+
+    fn manifest_toml(id: &str) -> String {
+        format!("contract = 2\nid = \"{id}\"\nname = \"{id}\"\n")
+    }
+
+    #[test]
+    fn registers_a_manifest_only_installed_plugin() {
+        let root = tempfile::tempdir().unwrap();
+        write_plugin_dir(
+            root.path(),
+            "acme-scan",
+            "0.0.0",
+            &manifest_toml("acme-scan"),
+        );
+
+        let mut regs = Registries::new();
+        install_installed_plugins(&mut regs, root.path());
+
+        let plugin = regs.plugins.get("acme-scan").expect("must register");
+        assert!(plugin.harness.is_none());
+        assert!(plugin.gateway.is_none());
+        assert!(plugin.connector.is_none());
+        match &plugin.source {
+            PluginSource::Installed { dir, provenance } => {
+                assert_eq!(dir, &root.path().join("acme-scan").join("0.0.0"));
+                // No install.json stamp was written for this fixture — the
+                // safe default is Catalog (pre-Task-11 install paths never
+                // wrote one either).
+                assert_eq!(provenance, &InstallProvenance::Catalog);
+            }
+            other => panic!("expected Installed source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_registration_wins_over_a_same_id_disk_entry() {
+        let root = tempfile::tempdir().unwrap();
+        write_plugin_dir(root.path(), "github", "0.0.0", &manifest_toml("github"));
+
+        let mut regs = Registries::new();
+        install_builtins(&mut regs); // embedded "github" component registers first
+        install_installed_plugins(&mut regs, root.path());
+
+        let plugin = regs.plugins.get("github").unwrap();
+        assert_eq!(
+            plugin.source,
+            PluginSource::Builtin,
+            "the embedded first-party row must stay authoritative"
+        );
+    }
+
+    #[test]
+    fn a_malformed_entry_is_skipped_without_blinding_a_healthy_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        // Malformed: current pointer names a version directory that doesn't exist.
+        std::fs::create_dir_all(root.path().join("broken")).unwrap();
+        std::fs::write(root.path().join("broken").join("current"), "0.0.0").unwrap();
+        write_plugin_dir(root.path(), "healthy", "0.0.0", &manifest_toml("healthy"));
+
+        let mut regs = Registries::new();
+        install_installed_plugins(&mut regs, root.path());
+
+        assert!(regs.plugins.get("broken").is_none());
+        assert!(regs.plugins.get("healthy").is_some());
+    }
+
+    #[test]
+    fn a_missing_root_is_a_silent_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("does-not-exist");
+        let mut regs = Registries::new();
+        install_installed_plugins(&mut regs, &missing);
+        assert!(regs.plugins.list().is_empty());
     }
 }
