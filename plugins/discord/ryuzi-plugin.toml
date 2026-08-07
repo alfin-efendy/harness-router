@@ -1,11 +1,15 @@
+contract = 2
 id = "discord"
 name = "Discord"
 version = "0.1.0"
-wit-api = ">=0.1.0, <0.2.0"
-lifecycle = "singleton"
-component = "discord.wasm"
 publisher = "Ryuzi"
 description = "Discord gateway: connects the Discord gateway (wss) over the host-managed ryuzi:websocket transport and Discord REST over ryuzi:http, bridging Discord channels/threads to Cockpit projects/sessions (mentions, thread replies, DMs, the four slash commands, and tool-approval buttons)."
+gateway = true
+
+[component]
+file = "discord.wasm"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "singleton"
 
 # Every host the component may reach — enforced by the host on the websocket
 # `connect` url (and re-checked on every component-driven reconnect) and on every
