@@ -251,6 +251,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_automation_hook_accepts_a_claude_alias_trigger_spelling() {
+        // The JSON RPC payload layer must accept `"Stop"` (Claude Code's
+        // alias for `session.end`), not just the canonical dotted spelling —
+        // closes the gap between `TriggerKind::from_str` (which already
+        // resolved aliases) and the derived `Deserialize` that used to reject
+        // them.
+        let state = state_with_project().await;
+        let mut input = valid_agent_hook_input();
+        input["triggerKind"] = json!("Stop");
+        let created = dispatch(&state, "create_automation_hook", json!({ "input": input }))
+            .await
+            .unwrap();
+        assert_eq!(created["triggerKind"], "session.end");
+    }
+
+    #[tokio::test]
     async fn test_automation_hook_delivers_a_successful_outbound_test_run() {
         let state = state().await;
         let (url, payload, shutdown) = loopback_payload_server().await;

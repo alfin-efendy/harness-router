@@ -459,7 +459,7 @@ impl Default for Dispatcher {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 pub enum TriggerKind {
     #[serde(rename = "session.start")]
     SessionStart,
@@ -477,6 +477,24 @@ pub enum TriggerKind {
     GatewayStatusChanged,
     #[serde(rename = "webhook.inbound")]
     WebhookInbound,
+}
+
+/// Hand-written rather than `#[derive(Deserialize)]` so JSON API payloads
+/// accept a Claude Code alias spelling (`"Stop"`, `"PreToolUse"`, ...) on
+/// input, not just the canonical dotted form — `AutomationHookInput.trigger_kind`
+/// (and therefore `create_automation_hook`/`update_automation_hook`'s RPC
+/// bodies) deserializes through here. Routes through `FromStr`, which already
+/// resolves aliases via `ryuzi_plugin_sdk::canonical_trigger` before falling
+/// back to an error; canonical spellings still match on the first attempt, so
+/// this is purely additive over the old derive's exact-match behavior.
+impl<'de> Deserialize<'de> for TriggerKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        TriggerKind::from_str(&raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl TriggerKind {
@@ -2951,6 +2969,26 @@ mod tests {
             TriggerKind::ToolBefore
         );
         assert!(TriggerKind::from_str("NotARealAlias").is_err());
+    }
+
+    #[test]
+    fn trigger_kind_deserializes_claude_aliases_and_canonical_spellings() {
+        // The JSON payload layer (`serde_json::from_value` on
+        // `AutomationHookInput.trigger_kind`) must accept both spellings,
+        // matching `FromStr` — this is what closes the gap between the two.
+        assert_eq!(
+            serde_json::from_value::<TriggerKind>(json!("Stop")).unwrap(),
+            TriggerKind::SessionEnd
+        );
+        assert_eq!(
+            serde_json::from_value::<TriggerKind>(json!("PreToolUse")).unwrap(),
+            TriggerKind::ToolBefore
+        );
+        assert_eq!(
+            serde_json::from_value::<TriggerKind>(json!("session.end")).unwrap(),
+            TriggerKind::SessionEnd
+        );
+        assert!(serde_json::from_value::<TriggerKind>(json!("NotARealAlias")).is_err());
     }
 
     #[test]
