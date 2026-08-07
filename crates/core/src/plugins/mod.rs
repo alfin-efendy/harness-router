@@ -30,6 +30,7 @@ pub mod doctor;
 pub mod first_party_key;
 pub mod host;
 pub mod mcp_component;
+pub mod mcp_sync;
 pub mod migrate_v2;
 pub mod oauth;
 pub mod providers;
@@ -457,7 +458,18 @@ pub async fn toggle_enabled(
             &qualified_setting_key(id, "enabled"),
             if enable { "true" } else { "false" },
         )
-        .await
+        .await?;
+    // Task 7: a connector-only plugin's `[[mcp]]` entries sync into the Apps
+    // domain right here, on enable — the only place this axis flips from
+    // disabled (where `mcp_sync::sync_plugin_mcp` is never called) to
+    // enabled. Disable deliberately does NOT call `remove_plugin_mcp` — the
+    // row (and any perm a user set on it) survives a disable/enable cycle;
+    // `mcp::servers_for_session`'s own enabled-plugin gate is what keeps a
+    // disabled plugin's servers out of new sessions.
+    if enable {
+        mcp_sync::sync_plugin_mcp(&settings.store(), settings, &plugin).await?;
+    }
+    Ok(())
 }
 
 /// Whether the remote catalog's signed feed has blocked `id`, per the cached

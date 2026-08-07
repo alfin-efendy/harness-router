@@ -5817,13 +5817,24 @@ async fn drain_waits_for_an_in_flight_turn_up_to_the_timeout() {
     assert_eq!(cp.running_count(), 0);
 }
 
-// ---------- plugin connector MCP servers attach to sessions ----------
+// ---------- Task 7: plugin-synced MCP servers attach to sessions ----------
+//
+// The old transient path (`ControlPlane::attach_plugin_mcp_servers`) scanned
+// every enabled connector plugin at every session start. Task 7 replaced it:
+// a plugin's `[[mcp]]` entries sync into `mcp_servers`
+// (`crate::plugins::mcp_sync::sync_plugin_mcp`) once, at enable/install-
+// complete time, and `start_harness_session` now just reads whatever's in
+// that table via `crate::mcp::servers_for_session` — identically to a
+// user-added Apps card. These tests drive `sync_plugin_mcp` directly (the
+// same call `toggle_enabled`'s enable branch makes) rather than merely
+// writing the raw `plugin.<id>.enabled` setting, since that setting alone no
+// longer causes anything to attach.
 
 /// A connector-capable declarative plugin: one `[[mcp]]` stdio server named
 /// `server_name`, whose only env var is `${auth}` — so `connector.mcp_servers()`
 /// succeeds when `plugin.<id>.token` is set and fails (unresolved
-/// placeholder) when it isn't. Exercises `attach_plugin_mcp_servers`'s
-/// "broken connector" path with a real, not a fake, `Connector`.
+/// placeholder) when it isn't. Exercises `sync_plugin_mcp`'s "broken
+/// connector" path with a real, not a fake, `Connector`.
 fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CorePlugin {
     use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, PluginManifest};
 
@@ -5892,16 +5903,24 @@ async fn fake_control_plane_with_plugin(
 
 #[tokio::test]
 #[serial]
-async fn enabled_declarative_plugins_mcp_server_attaches_to_the_session() {
+async fn synced_declarative_plugins_mcp_server_attaches_to_the_session() {
     let _guard = StateDirGuard::new();
-    let (cp, store, counters, _db_guard) =
-        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-attach", "acme")).await;
+    let plugin = declarative_test_plugin("task7-lc-attach", "acme");
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_plugin(plugin).await;
+    let plugin = cp.plugins().get("task7-lc-attach").unwrap();
     store
         .set_setting_raw("plugin.task7-lc-attach.token", "sekret")
         .await
         .unwrap();
+    // `servers_for_session` excludes a plugin-owned row unless its plugin is
+    // marked enabled — the real `toggle_enabled` sets this key itself before
+    // calling `sync_plugin_mcp`.
     store
         .set_setting_raw("plugin.task7-lc-attach.enabled", "true")
+        .await
+        .unwrap();
+    let settings = SettingsStore::new(store.clone());
+    crate::plugins::mcp_sync::sync_plugin_mcp(&store, &settings, &plugin)
         .await
         .unwrap();
 
@@ -5914,23 +5933,23 @@ async fn enabled_declarative_plugins_mcp_server_attaches_to_the_session() {
 
     let servers = wait_for_session_ctx(&counters).await;
     assert!(
-        servers.iter().any(|s| s.name == "acme"),
-        "expected the enabled plugin's mcp server to attach, got: {servers:?}"
+        servers.iter().any(|s| s.name == "task7-lc-attach-acme"),
+        "expected the synced plugin mcp server to attach, got: {servers:?}"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn enabled_declarative_plugins_mcp_server_resolves_its_principal_from_the_binding() {
-    // The principal must come from the mcp_server_name → plugin binding built
-    // in `attach_plugin_mcp_servers` — not from parsing the server/tool name
-    // string (which happens to also contain "acme" here, precisely so a
-    // string-parsing implementation would still get lucky and pass; the
-    // manifest id/name below are deliberately different from the server name
-    // to catch that).
+async fn synced_declarative_plugins_mcp_server_resolves_its_principal_from_the_row() {
+    // The principal must come from the row's own `plugin_id` column — not
+    // from parsing the server/tool name string (which happens to also
+    // contain "acme" here, precisely so a string-parsing implementation
+    // would still get lucky and pass; the manifest id/name below are
+    // deliberately different from the server name to catch that).
     let _guard = StateDirGuard::new();
-    let (cp, store, counters, _db_guard) =
-        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-principal", "acme")).await;
+    let plugin = declarative_test_plugin("task7-lc-principal", "acme");
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_plugin(plugin).await;
+    let plugin = cp.plugins().get("task7-lc-principal").unwrap();
     store
         .set_setting_raw("plugin.task7-lc-principal.token", "sekret")
         .await
@@ -5939,6 +5958,10 @@ async fn enabled_declarative_plugins_mcp_server_resolves_its_principal_from_the_
         .set_setting_raw("plugin.task7-lc-principal.enabled", "true")
         .await
         .unwrap();
+    let settings = SettingsStore::new(store.clone());
+    crate::plugins::mcp_sync::sync_plugin_mcp(&store, &settings, &plugin)
+        .await
+        .unwrap();
 
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -5949,26 +5972,41 @@ async fn enabled_declarative_plugins_mcp_server_resolves_its_principal_from_the_
 
     let principals = wait_for_session_ctx_principals(&counters).await;
     assert_eq!(
-        principals.get("acme"),
+        principals.get("task7-lc-principal-acme"),
         Some(&crate::domain::Principal {
             plugin_id: "task7-lc-principal".to_string(),
             plugin_name: "Test Plugin task7-lc-principal".to_string(),
         }),
-        "expected the \"acme\" server to resolve to its owning plugin's identity, got: {principals:?}"
+        "expected the synced server to resolve to its owning plugin's identity, got: {principals:?}"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn disabled_declarative_plugins_mcp_server_does_not_attach() {
+async fn disabled_declarative_plugins_synced_mcp_server_does_not_attach() {
     let _guard = StateDirGuard::new();
-    let (cp, store, counters, _db_guard) =
-        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-disabled", "acme")).await;
-    // Configured, but never enabled — `plugin.<id>.enabled` defaults to false.
+    let plugin = declarative_test_plugin("task7-lc-disabled", "acme");
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_plugin(plugin).await;
+    let plugin = cp.plugins().get("task7-lc-disabled").unwrap();
     store
         .set_setting_raw("plugin.task7-lc-disabled.token", "sekret")
         .await
         .unwrap();
+    let settings = SettingsStore::new(store.clone());
+    // The row is synced (as `toggle_enabled`'s enable branch would leave it)
+    // but the plugin itself is never marked enabled — `plugin.<id>.enabled`
+    // defaults to false for a connector-only plugin, and disable leaves the
+    // row in place rather than deleting it.
+    crate::plugins::mcp_sync::sync_plugin_mcp(&store, &settings, &plugin)
+        .await
+        .unwrap();
+    assert!(
+        crate::mcp::get_server(&store, "task7-lc-disabled-acme")
+            .await
+            .unwrap()
+            .is_some(),
+        "the row must exist even though the plugin isn't enabled"
+    );
 
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -5979,112 +6017,43 @@ async fn disabled_declarative_plugins_mcp_server_does_not_attach() {
 
     let servers = wait_for_session_ctx(&counters).await;
     assert!(
-        !servers.iter().any(|s| s.name == "acme"),
-        "a disabled plugin's mcp server must not attach, got: {servers:?}"
+        !servers.iter().any(|s| s.name == "task7-lc-disabled-acme"),
+        "a disabled plugin's synced row must not attach, got: {servers:?}"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn broken_plugin_connector_is_skipped_and_never_fails_session_start() {
+async fn broken_plugin_connector_sync_leaves_no_row_and_never_fails_session_start() {
     let _guard = StateDirGuard::new();
-    let (cp, store, counters, _db_guard) =
-        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-broken", "acme")).await;
-    // Enabled, but never configured — `${auth}` has nothing to resolve from,
-    // so `connector.mcp_servers()` returns `Err`.
-    store
-        .set_setting_raw("plugin.task7-lc-broken.enabled", "true")
+    let plugin = declarative_test_plugin("task7-lc-broken", "acme");
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_plugin(plugin).await;
+    let plugin = cp.plugins().get("task7-lc-broken").unwrap();
+    // Never configured — `${auth}` has nothing to resolve from, so
+    // `sync_plugin_mcp` skips (no row written) rather than erroring.
+    let settings = SettingsStore::new(store.clone());
+    crate::plugins::mcp_sync::sync_plugin_mcp(&store, &settings, &plugin)
         .await
         .unwrap();
+    assert!(
+        crate::mcp::list_servers(&store).await.unwrap().is_empty(),
+        "a broken connector's sync must not leave a row behind"
+    );
 
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-    // The whole point: a broken connector must never prevent session start.
+    // The whole point: nothing here — sync's own resilience, and the fact
+    // that session start no longer touches connectors at all — can fail
+    // session start.
     cp.start_session(&project.project_id, "go", "test", &[])
         .await
         .expect("a broken plugin connector must not fail session start");
 
     let servers = wait_for_session_ctx(&counters).await;
     assert!(
-        !servers.iter().any(|s| s.name == "acme"),
-        "a connector that failed to resolve must not contribute a server, got: {servers:?}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn db_configured_server_wins_over_a_same_named_plugin_server() {
-    let _guard = StateDirGuard::new();
-    let (cp, store, counters, _db_guard) =
-        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-collide", "acme")).await;
-    store
-        .set_setting_raw("plugin.task7-lc-collide.token", "sekret")
-        .await
-        .unwrap();
-    store
-        .set_setting_raw("plugin.task7-lc-collide.enabled", "true")
-        .await
-        .unwrap();
-
-    // A DB-configured server sharing the plugin's server name ("acme").
-    crate::mcp::upsert_server(
-        &store,
-        crate::mcp::McpServerRow {
-            id: "acme".into(),
-            name: "Acme (DB)".into(),
-            kind: "MCP server".into(),
-            color: "#000000".into(),
-            description: String::new(),
-            transport: "stdio".into(),
-            command: Some("db-acme-mcp".into()),
-            args: vec![],
-            env: vec![],
-            url: None,
-            scope: "global".into(),
-            scope_gateways: vec![],
-            version: None,
-            publisher: None,
-            status: "unknown".into(),
-            status_detail: None,
-            auth_kind: "none".into(),
-            auth_detail: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
-    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-    cp.start_session(&project.project_id, "go", "test", &[])
-        .await
-        .unwrap();
-
-    let servers = wait_for_session_ctx(&counters).await;
-    let acme: Vec<_> = servers.iter().filter(|s| s.name == "acme").collect();
-    assert_eq!(
-        acme.len(),
-        1,
-        "exactly one \"acme\" server must attach, got: {servers:?}"
-    );
-    match &acme[0].transport {
-        crate::domain::McpTransport::Stdio { command, .. } => {
-            assert_eq!(
-                command, "db-acme-mcp",
-                "the DB-configured server must win over the plugin's same-named one"
-            );
-        }
-        other => panic!("expected a stdio transport, got: {other:?}"),
-    }
-
-    // The plugin's losing entry must not leave a stray principal binding for
-    // "acme" — a DB-configured server (no plugin) resolves to `principal =
-    // None` for every one of its tools.
-    let principals = wait_for_session_ctx_principals(&counters).await;
-    assert!(
-        !principals.contains_key("acme"),
-        "the DB-configured server must not resolve to a plugin principal, got: {principals:?}"
+        servers.is_empty(),
+        "no server should have attached, got: {servers:?}"
     );
 }
 

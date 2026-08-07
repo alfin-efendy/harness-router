@@ -1977,6 +1977,13 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
         // stale trust/pin/attach metadata into the reappeared Browse card).
         return crate::skills_install::remove_installed_skill_recorded(&pack.id, cp.store()).await;
     };
+    // Task 7: an uninstalled plugin's synced `[[mcp]]` rows (and their
+    // tools/agent-access/perms) must not survive — unlike disable, which
+    // deliberately leaves them so a user's perms outlast a disable/enable
+    // cycle. A no-op for a plugin that never synced any row (every kind
+    // below, not just connector-only, since nothing stops a manifest of any
+    // kind from also declaring `[[mcp]]`).
+    crate::plugins::mcp_sync::remove_plugin_mcp(cp.store(), id).await?;
     match derive_kind(&plugin) {
         Some("provider") => {
             let family = provider_family(id);
@@ -2152,6 +2159,16 @@ async fn complete_plugin_oauth(
             }
         };
     cp.store().upsert_plugin_oauth_token(&token).await?;
+    // Task 7: "install completion" for an OAuth-authed connector plugin is
+    // exactly this moment — the credential `Connector::ensure_auth` needs
+    // often doesn't exist yet at enable time (a connector-only plugin's
+    // `[[mcp]]` sync already ran then and skipped for lack of it), so sync
+    // again now that a fresh token is stored. A no-op for a plugin with no
+    // `[[mcp]]` entries.
+    if let Some(plugin) = cp.plugins().get(&plugin_id) {
+        let settings = SettingsStore::new(cp.store().clone());
+        crate::plugins::mcp_sync::sync_plugin_mcp(cp.store(), &settings, &plugin).await?;
+    }
     Ok(build_auth_info(cp.store(), &plugin_id, &auth).await?)
 }
 

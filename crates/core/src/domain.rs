@@ -514,8 +514,10 @@ impl QueuedSessionPrompt {
 /// of guessing from a substring match between the MCP server name and a
 /// manifest id. `None` (everywhere this is optional) means the action is the
 /// core agent itself (a built-in tool), not a plugin. Resolved at the
-/// mcp-server→plugin binding (`ControlPlane::attach_plugin_mcp_servers`),
-/// never by parsing the tool/server name string.
+/// mcp-server→plugin binding — `mcp_servers.plugin_id` (Task 7's
+/// `crate::plugins::mcp_sync::sync_plugin_mcp`), re-derived per session by
+/// `ControlPlane::mcp_principals_for` — never by parsing the tool/server
+/// name string.
 ///
 /// Carries no gating semantics: this is visibility/attribution metadata for
 /// the approval prompt, not an input to the permission DECISION.

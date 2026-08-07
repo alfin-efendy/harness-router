@@ -55,13 +55,14 @@ pub struct SessionCtx {
     pub resume: Option<String>,
     /// MCP servers to attach (from the connector axis).
     pub mcp_servers: Vec<McpServerSpec>,
-    /// `McpServerSpec.name` → the plugin that attached that server, for
-    /// every server in `mcp_servers` sourced from a connector plugin (built
-    /// in `ControlPlane::attach_plugin_mcp_servers`, keyed at the same
-    /// binding site the servers themselves are resolved). A DB-configured
-    /// server (no plugin) simply has no entry here. The native runtime looks
-    /// this up per `mcp__<server>__<tool>` tool so approvals can attribute
-    /// the call to its plugin (see [`crate::domain::Principal`]).
+    /// `McpServerSpec.name` → the plugin that owns that server, for every
+    /// server in `mcp_servers` whose `mcp_servers.plugin_id` is set (Task
+    /// 7's `crate::plugins::mcp_sync::sync_plugin_mcp` writes it; built here
+    /// by `ControlPlane::mcp_principals_for`, re-reading that column per
+    /// session). A user-added server (no plugin) simply has no entry here.
+    /// The native runtime looks this up per `mcp__<server>__<tool>` tool so
+    /// approvals can attribute the call to its plugin (see
+    /// [`crate::domain::Principal`]).
     pub mcp_principals: HashMap<String, Principal>,
     /// Extra skill directories folded in beside the native runtime's usual
     /// project/global skill dirs. The daemon no longer feeds plugin-bundled

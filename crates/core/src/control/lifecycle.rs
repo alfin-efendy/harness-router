@@ -2,7 +2,6 @@
 //! harness-session wiring and the background prompt driver.
 
 use super::{ControlPlane, WorkerBinding, RESUME_NUDGE};
-use crate::connector::ConnectorCtx;
 use crate::domain::{
     AgentRunKind, AttachmentRef, CoreEvent, NewAgentRun, PermMode, Project, QueuedSessionPrompt,
     Session, SessionGitOptions, SessionKind, SessionStatus,
@@ -1594,19 +1593,21 @@ impl ControlPlane {
         // override the selected primary agent's model, effort, or permissions.
         let harness = self.registries.harness.create()?;
 
-        // Attach the Apps screen's enabled MCP servers to the session. The MCP
-        // per-agent allowlist has a single agent id: "native".
-        let mut mcp_servers =
+        // Attach every enabled Apps-domain MCP server to the session — both
+        // user-added ones and Task 7's plugin-synced rows (a disabled
+        // plugin's rows are already excluded by `servers_for_session`
+        // itself). The MCP per-agent allowlist has a single agent id:
+        // "native". Plugin `[[mcp]]` servers no longer attach transiently
+        // here (the deleted `attach_plugin_mcp_servers` used to scan every
+        // enabled connector plugin on every session start) — they sync into
+        // `mcp_servers` once, at enable/install-complete time
+        // (`crate::plugins::mcp_sync::sync_plugin_mcp`), and ride the exact
+        // same path a user-added server does from here on.
+        let mcp_servers =
             crate::mcp::servers_for_session(&self.store, crate::harness::native::NATIVE_ID)
                 .await
                 .unwrap_or_default();
-        // A chat session has no project to scope plugin connectors by —
-        // `ConnectorCtx.project_id` isn't read by any connector today, so the
-        // session id is a harmless, uniquely-scoped stand-in.
-        let scope_id = project.map(|p| p.project_id.as_str()).unwrap_or(session_pk);
-        let mcp_principals = self
-            .attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
-            .await;
+        let mcp_principals = self.mcp_principals_for(&mcp_servers).await;
         // Plugin-bundled live skill dirs are no longer discovery sources —
         // installed skill packs are materialized into ~/.config/ryuzi/skills
         // by skills_install and reach sessions via the global root.
@@ -1861,113 +1862,55 @@ impl ControlPlane {
         servers
     }
 
-    /// Extend `mcp_servers` with the MCP servers of every enabled,
-    /// connector-capable plugin (`registries.plugins`). A DB-configured
-    /// server (already in `mcp_servers`) wins over a plugin server with the
-    /// same name — the plugin's entry is dropped rather than overriding it.
-    /// A connector that fails to enable, fails `ensure_auth` (e.g. missing
-    /// credential — logged with its friendly, secret-free message), or
-    /// fails to resolve its servers is logged via `tracing::warn!` and
-    /// skipped: a broken plugin integration must never prevent a session
-    /// from starting.
+    /// The `McpServerSpec.name` → owning-plugin [`Principal`] binding for
+    /// every server in `mcp_servers` that Task 7's plugin-mcp sync
+    /// (`crate::plugins::mcp_sync::sync_plugin_mcp`) created — i.e. every row
+    /// with a non-null `mcp_servers.plugin_id`. Attribution now flows
+    /// straight from that column (re-read here via a fresh
+    /// `crate::mcp::list_servers`, since `McpServerSpec` itself carries no
+    /// plugin identity) rather than from a connector-scan loop resolving it
+    /// at discovery time — the deleted `attach_plugin_mcp_servers` used to do
+    /// that at every session start; the sync/session split means the fact
+    /// only needs to be written once, at sync time.
     ///
-    /// Each plugin's outcome (`"ok"`/`"failed"`, plus a secret-free reason on
-    /// failure) is also recorded via [`Self::record_attach`] for
-    /// `plugin_doctor` to surface later — recording is best-effort and never
-    /// changes this loop's control flow or its warn-and-continue discipline.
-    ///
-    /// Returns the `McpServerSpec.name` → owning-plugin [`Principal`] binding
-    /// for every server this call actually attached — resolved HERE, at the
-    /// only place a server name is definitively known to belong to a given
-    /// `CorePlugin`, rather than reconstructed later from a substring match
-    /// on the server/tool name. A server that lost the `names.insert` race
-    /// (a DB-configured or earlier plugin's same-named server won) gets no
-    /// entry, mirroring its exclusion from `mcp_servers` itself.
+    /// A row whose `plugin_id` the host doesn't currently know (an
+    /// uninstalled or renamed plugin, or a stale row) still gets a
+    /// `Principal` — the tool-card attribution should degrade to the raw id,
+    /// not vanish, since the row's own existence already proves *some*
+    /// plugin owns it; only the human-friendly `plugin_name` is best-effort.
     ///
     /// [`Principal`]: crate::domain::Principal
-    async fn attach_plugin_mcp_servers(
+    async fn mcp_principals_for(
         &self,
-        project_id: &str,
-        work_dir: &Path,
-        settings: &SettingsStore,
-        mcp_servers: &mut Vec<crate::domain::McpServerSpec>,
+        mcp_servers: &[crate::domain::McpServerSpec],
     ) -> std::collections::HashMap<String, crate::domain::Principal> {
-        let mut names: std::collections::HashSet<String> =
-            mcp_servers.iter().map(|s| s.name.clone()).collect();
-        let mut principals: std::collections::HashMap<String, crate::domain::Principal> =
-            std::collections::HashMap::new();
-        for plugin in self.registries.plugins.list() {
-            let Some(connector) = &plugin.connector else {
+        let rows = crate::mcp::list_servers(&self.store)
+            .await
+            .unwrap_or_default();
+        let plugin_id_by_row: std::collections::HashMap<&str, &str> = rows
+            .iter()
+            .filter_map(|r| r.plugin_id.as_deref().map(|pid| (r.id.as_str(), pid)))
+            .collect();
+        let mut principals = std::collections::HashMap::new();
+        for spec in mcp_servers {
+            let Some(plugin_id) = plugin_id_by_row.get(spec.name.as_str()) else {
                 continue;
             };
-            let id = &plugin.manifest.id;
-            match self.registries.plugins.is_enabled(settings, id).await {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!(plugin = %id, "plugin connector failed: {e}");
-                    let reason = safe_attach_reason(id, AttachStage::Enable, &e);
-                    self.record_attach(id, "failed", Some(&reason)).await;
-                    continue;
-                }
-            }
-            let ctx = ConnectorCtx {
-                project_id: project_id.to_string(),
-                work_dir: work_dir.to_path_buf(),
-                settings: settings.clone(),
-            };
-            if let Err(e) = connector.ensure_auth(&ctx).await {
-                tracing::warn!(plugin = %id, "plugin connector not ready: {e}");
-                let reason = safe_attach_reason(id, AttachStage::Auth, &e);
-                self.record_attach(id, "failed", Some(&reason)).await;
-                continue;
-            }
-            match connector.mcp_servers(&ctx).await {
-                Ok(specs) => {
-                    for spec in specs {
-                        if !names.insert(spec.name.clone()) {
-                            continue; // a DB-configured (or earlier plugin's) server wins
-                        }
-                        principals.insert(
-                            spec.name.clone(),
-                            crate::domain::Principal {
-                                plugin_id: id.clone(),
-                                plugin_name: plugin.manifest.name.clone(),
-                            },
-                        );
-                        mcp_servers.push(spec);
-                    }
-                    self.record_attach(id, "ok", None).await;
-                }
-                Err(e) => {
-                    tracing::warn!(plugin = %id, "plugin connector failed: {e}");
-                    let reason = safe_attach_reason(id, AttachStage::McpServers, &e);
-                    self.record_attach(id, "failed", Some(&reason)).await;
-                }
-            }
+            let plugin_name = self
+                .registries
+                .plugins
+                .get(plugin_id)
+                .map(|p| p.manifest.name.clone())
+                .unwrap_or_else(|| plugin_id.to_string());
+            principals.insert(
+                spec.name.clone(),
+                crate::domain::Principal {
+                    plugin_id: plugin_id.to_string(),
+                    plugin_name,
+                },
+            );
         }
         principals
-    }
-
-    /// Best-effort record of a plugin's session-attach outcome into
-    /// `plugin_attach_status`, for `plugin_doctor` to read back later. Never
-    /// surfaces its own failure — a store write failing here must not turn
-    /// into a session-start error, mirroring the warn-and-continue discipline
-    /// of the loop that calls it.
-    ///
-    /// `reason` must already be secret-free (see [`safe_attach_reason`]): the
-    /// persisted value is doctor/UI-visible, so raw connector error text must
-    /// never reach it.
-    async fn record_attach(&self, id: &str, outcome: &str, reason: Option<&str>) {
-        let _ = self
-            .store
-            .record_plugin_attach(&crate::store::PluginAttachStatus {
-                plugin_id: id.to_string(),
-                last_attach_at: crate::paths::now_ms(),
-                outcome: outcome.to_string(),
-                reason: reason.map(str::to_string),
-            })
-            .await;
     }
 
     fn dispatch_turn(
@@ -2549,86 +2492,4 @@ async fn coordinator_cancelled(
             )
         });
     root_cancelled || session_cancelled
-}
-
-/// The stage of `attach_plugin_mcp_servers` at which a connector failed —
-/// used only to pick a generic fallback message for [`safe_attach_reason`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachStage {
-    /// `PluginHost::is_enabled` itself errored (internal, secret-free).
-    Enable,
-    /// `Connector::ensure_auth` errored — the one stage whose error text can
-    /// carry a raw token-endpoint response body (HTTP-OAuth refresh path).
-    Auth,
-    /// `Connector::mcp_servers` errored while resolving specs.
-    McpServers,
-}
-
-/// Map a connector-attach failure to a secret-free reason safe to PERSIST
-/// into `plugin_attach_status` (which `plugin_doctor` reads back and later
-/// surfaces in the UI). The full error still reaches `tracing::warn!` at the
-/// call site — only the persisted reason is sanitized here.
-///
-/// Only the friendly `"configure {id}: ..."` messages that `ensure_auth`
-/// (and the HTTP-OAuth `auth_required` path) raise for a missing/expired
-/// credential are known to be secret-free: they name a setting key or a help
-/// URL, never a value. Those pass through verbatim. Every other error — in
-/// particular `refresh_http_oauth_token`'s `"{id} OAuth token refresh failed
-/// with HTTP {status}: {detail}"`, where `detail` is the raw token-endpoint
-/// response body and the refresh POST carried the real
-/// `refresh_token`/`client_secret` — is collapsed to a generic per-stage
-/// message so no connector error body is ever written to the DB.
-fn safe_attach_reason(id: &str, stage: AttachStage, err: &anyhow::Error) -> String {
-    let msg = err.to_string();
-    if msg.starts_with(&format!("configure {id}:")) {
-        return msg;
-    }
-    match stage {
-        AttachStage::Enable => format!("{id}: could not determine whether the plugin is enabled"),
-        AttachStage::Auth => format!("{id}: authentication failed"),
-        AttachStage::McpServers => format!("{id}: could not resolve MCP servers"),
-    }
-}
-
-#[cfg(test)]
-mod safe_attach_reason_tests {
-    use super::{safe_attach_reason, AttachStage};
-
-    #[test]
-    fn friendly_configure_message_passes_through_verbatim() {
-        // The secret-free `ensure_auth` missing-credential message (names a
-        // setting key / help URL, never a value) is preserved as-is.
-        let err = anyhow::anyhow!("configure acme: see https://acme.test/help");
-        assert_eq!(
-            safe_attach_reason("acme", AttachStage::Auth, &err),
-            "configure acme: see https://acme.test/help"
-        );
-    }
-
-    #[test]
-    fn oauth_refresh_body_never_reaches_the_persisted_reason() {
-        // Simulate the raw HTTP-OAuth token-refresh error whose `detail` is
-        // an untruncated response body echoing the refresh POST's form
-        // fields — the exact leak the sanitizer must stop.
-        let err = anyhow::anyhow!(
-            "acme OAuth token refresh failed with HTTP 400: \
-             {{\"echo\":\"refresh_token=leaked-secret-token&client_secret=leaked-client-secret\"}}"
-        );
-        let reason = safe_attach_reason("acme", AttachStage::Auth, &err);
-        assert_eq!(reason, "acme: authentication failed");
-        assert!(!reason.contains("leaked-secret-token"));
-        assert!(!reason.contains("leaked-client-secret"));
-        assert!(!reason.contains("refresh_token"));
-    }
-
-    #[test]
-    fn enable_and_mcp_stage_errors_are_generic_and_drop_raw_text() {
-        let err = anyhow::anyhow!("some internal detail with a token=abc123 in it");
-        let enable = safe_attach_reason("acme", AttachStage::Enable, &err);
-        let mcp = safe_attach_reason("acme", AttachStage::McpServers, &err);
-        assert!(!enable.contains("abc123"));
-        assert!(!mcp.contains("abc123"));
-        assert!(enable.starts_with("acme:"));
-        assert!(mcp.starts_with("acme:"));
-    }
 }

@@ -34,6 +34,13 @@ pub struct McpServerRow {
     pub status_detail: Option<String>,
     pub auth_kind: String,
     pub auth_detail: Option<String>,
+    /// The plugin that owns this row (Task 7's `[[mcp]]` sync), or `None` for
+    /// a user-added-via-Apps-screen server. Set once at sync time and never
+    /// user-editable; `servers_for_session` reads it to exclude a disabled
+    /// plugin's rows, and `harness::native` reads it (via a fresh
+    /// `list_servers` join, not this struct directly) to attribute a plugin
+    /// server's tools to their owning plugin in approval prompts.
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,7 +55,7 @@ pub struct McpToolRow {
 // Persistence
 // ---------------------------------------------------------------------------
 
-const SERVER_COLS: &str = "id,name,kind,color,description,transport,command,args,env,url,scope,scope_gateways,version,publisher,status,status_detail,auth_kind,auth_detail";
+const SERVER_COLS: &str = "id,name,kind,color,description,transport,command,args,env,url,scope,scope_gateways,version,publisher,status,status_detail,auth_kind,auth_detail,plugin_id";
 
 fn server_from(r: &rusqlite::Row) -> rusqlite::Result<McpServerRow> {
     let args: String = r.get(7)?;
@@ -75,6 +82,7 @@ fn server_from(r: &rusqlite::Row) -> rusqlite::Result<McpServerRow> {
         status_detail: r.get(15)?,
         auth_kind: r.get(16)?,
         auth_detail: r.get(17)?,
+        plugin_id: r.get(18)?,
     })
 }
 
@@ -117,7 +125,7 @@ pub async fn upsert_server(store: &Store, row: McpServerRow) -> anyhow::Result<(
             c.execute(
                 &format!(
                     "INSERT INTO mcp_servers({SERVER_COLS},created_at) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20) \
                      ON CONFLICT(id) DO UPDATE SET \
                        name=excluded.name, kind=excluded.kind, color=excluded.color, \
                        description=excluded.description, transport=excluded.transport, \
@@ -125,13 +133,13 @@ pub async fn upsert_server(store: &Store, row: McpServerRow) -> anyhow::Result<(
                        url=excluded.url, scope=excluded.scope, scope_gateways=excluded.scope_gateways, \
                        version=excluded.version, publisher=excluded.publisher, status=excluded.status, \
                        status_detail=excluded.status_detail, auth_kind=excluded.auth_kind, \
-                       auth_detail=excluded.auth_detail"
+                       auth_detail=excluded.auth_detail, plugin_id=excluded.plugin_id"
                 ),
                 params![
                     row.id, row.name, row.kind, row.color, row.description, row.transport,
                     row.command, args, env, row.url, row.scope, scope_gateways,
                     row.version, row.publisher, row.status, row.status_detail,
-                    row.auth_kind, row.auth_detail, now
+                    row.auth_kind, row.auth_detail, row.plugin_id, now
                 ],
             )
             .map(|_| ())
@@ -152,6 +160,24 @@ pub async fn remove_server(store: &Store, id: &str) -> anyhow::Result<()> {
                 .map(|_| ())
         })
         .await
+}
+
+/// Delete every row owned by `plugin_id` (Task 7's `[[mcp]]` sync) — the
+/// uninstall counterpart of [`crate::plugins::mcp_sync::sync_plugin_mcp`].
+/// Reuses [`remove_server`] per row so tools/agent-access rows and the server
+/// row itself all go together, identically to a user removing an Apps card
+/// by hand. A no-op (not an error) when `plugin_id` owns no rows.
+pub async fn remove_plugin_servers(store: &Store, plugin_id: &str) -> anyhow::Result<()> {
+    let ids: Vec<String> = list_servers(store)
+        .await?
+        .into_iter()
+        .filter(|r| r.plugin_id.as_deref() == Some(plugin_id))
+        .map(|r| r.id)
+        .collect();
+    for id in ids {
+        remove_server(store, &id).await?;
+    }
+    Ok(())
 }
 
 pub async fn list_tools(store: &Store, server_id: &str) -> anyhow::Result<Vec<McpToolRow>> {
@@ -273,7 +299,17 @@ pub async fn agent_allowed(store: &Store, server_id: &str, agent_id: &str) -> an
 // ---------------------------------------------------------------------------
 
 /// The MCP servers to attach to a new local session for `agent_id`: enabled
-/// scope (global or explicitly including `local`) and agent access allowed.
+/// scope (global or explicitly including `local`), agent access allowed, and
+/// — for a Task 7 plugin-synced row — its owning plugin currently enabled.
+/// Disabling a plugin never deletes its rows (perms must survive a
+/// disable/enable cycle — [`crate::plugins::mcp_sync::sync_plugin_mcp`]'s
+/// doc), so this is the single gate that keeps a disabled plugin's servers
+/// out of new sessions. A row's owning plugin is, by construction, always
+/// the "connector-only" kind (`declarative_plugin` only ever builds a
+/// connector from `manifest.mcp`), whose `PluginHost::is_enabled` default is
+/// `false` for an absent key — mirrored here directly via a raw settings
+/// read (no `PluginHost` dependency needed) so a missing/never-enabled key
+/// excludes the row, matching that default exactly.
 pub async fn servers_for_session(
     store: &Store,
     agent_id: &str,
@@ -283,6 +319,14 @@ pub async fn servers_for_session(
         let in_scope = row.scope == "global" || row.scope_gateways.iter().any(|g| g == "local");
         if !in_scope || !agent_allowed(store, &row.id, agent_id).await? {
             continue;
+        }
+        if let Some(plugin_id) = &row.plugin_id {
+            let key = crate::plugins::host::qualified_setting_key(plugin_id, "enabled");
+            let enabled =
+                store.get_setting_raw(&key).await.ok().flatten().as_deref() == Some("true");
+            if !enabled {
+                continue;
+            }
         }
         let transport = match row.transport.as_str() {
             "http" => match &row.url {
@@ -561,6 +605,7 @@ mod tests {
                 status_detail: None,
                 auth_kind: "env".into(),
                 auth_detail: Some("GITHUB_TOKEN".into()),
+                plugin_id: None,
             },
         )
         .await
@@ -571,6 +616,10 @@ mod tests {
         assert_eq!(
             rows[0].env,
             vec![("GITHUB_TOKEN".to_string(), "x".to_string())]
+        );
+        assert_eq!(
+            rows[0].plugin_id, None,
+            "user-added rows carry no plugin_id"
         );
 
         // Tool discovery keeps perms across refreshes.
@@ -636,5 +685,109 @@ mod tests {
         remove_server(&store, "github").await.unwrap();
         assert!(list_servers(&store).await.unwrap().is_empty());
         assert!(list_tools(&store, "github").await.unwrap().is_empty());
+    }
+
+    fn plugin_owned_row(id: &str, plugin_id: &str) -> McpServerRow {
+        McpServerRow {
+            id: id.into(),
+            name: id.into(),
+            kind: "MCP server".into(),
+            color: "#8B8B8B".into(),
+            description: String::new(),
+            transport: "stdio".into(),
+            command: Some("acme-mcp".into()),
+            args: vec![],
+            env: vec![],
+            url: None,
+            scope: "global".into(),
+            scope_gateways: vec![],
+            version: None,
+            publisher: None,
+            status: "unknown".into(),
+            status_detail: None,
+            auth_kind: "none".into(),
+            auth_detail: None,
+            plugin_id: Some(plugin_id.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_id_round_trips_through_upsert_and_list() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        upsert_server(&store, plugin_owned_row("acme-main", "acme"))
+            .await
+            .unwrap();
+
+        let row = get_server(&store, "acme-main").await.unwrap().unwrap();
+        assert_eq!(row.plugin_id.as_deref(), Some("acme"));
+        let rows = list_servers(&store).await.unwrap();
+        assert_eq!(rows[0].plugin_id.as_deref(), Some("acme"));
+    }
+
+    #[tokio::test]
+    async fn remove_plugin_servers_deletes_only_that_plugins_rows() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        upsert_server(&store, plugin_owned_row("acme-main", "acme"))
+            .await
+            .unwrap();
+        upsert_server(&store, plugin_owned_row("other-main", "other"))
+            .await
+            .unwrap();
+        replace_tools(&store, "acme-main", vec![("do_thing".into(), "".into())])
+            .await
+            .unwrap();
+
+        remove_plugin_servers(&store, "acme").await.unwrap();
+
+        let ids: Vec<_> = list_servers(&store)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["other-main".to_string()]);
+        assert!(list_tools(&store, "acme-main").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn servers_for_session_excludes_a_disabled_plugins_rows() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        upsert_server(&store, plugin_owned_row("acme-main", "acme"))
+            .await
+            .unwrap();
+
+        // Never enabled — connector-only plugins default to disabled.
+        let specs = servers_for_session(&store, "native").await.unwrap();
+        assert!(
+            specs.is_empty(),
+            "a never-enabled plugin's row must not attach, got: {specs:?}"
+        );
+
+        store
+            .set_setting_raw("plugin.acme.enabled", "true")
+            .await
+            .unwrap();
+        let specs = servers_for_session(&store, "native").await.unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "acme-main");
+
+        store
+            .set_setting_raw("plugin.acme.enabled", "false")
+            .await
+            .unwrap();
+        let specs = servers_for_session(&store, "native").await.unwrap();
+        assert!(
+            specs.is_empty(),
+            "an explicitly disabled plugin's row must not attach, got: {specs:?}"
+        );
+
+        // The row itself survives the disable — only session attachment is gated.
+        assert!(get_server(&store, "acme-main").await.unwrap().is_some());
     }
 }
