@@ -201,9 +201,21 @@ async fn slash_catalog_entries(
         None => None,
     };
     let allowed = agent_allowed_skills(state, agent_id).await;
-    let catalog = crate::harness::native::slash_catalog::SlashCatalog::load(
+    // Tasks 8/9: the same enabled-plugin content roots a live session builds
+    // its `CommandRegistry`/`SkillRegistry` from, so the "/" autocomplete
+    // list a not-yet-started session sees matches what actually resolves.
+    let plugin_roots = state.cp.enabled_plugin_content_roots().await;
+    let plugin_command_roots: Vec<(String, std::path::PathBuf)> = plugin_roots
+        .iter()
+        .map(|r| (r.id.clone(), r.commands.clone()))
+        .collect();
+    let plugin_skill_roots: Vec<(String, std::path::PathBuf)> =
+        plugin_roots.into_iter().map(|r| (r.id, r.skills)).collect();
+    let catalog = crate::harness::native::slash_catalog::SlashCatalog::load_with_plugins(
         workdir.as_deref().map(Path::new),
         allowed.as_deref(),
+        &plugin_command_roots,
+        &plugin_skill_roots,
     );
     Ok(catalog
         .entries()

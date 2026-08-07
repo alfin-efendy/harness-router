@@ -64,12 +64,20 @@ pub struct SessionCtx {
     /// approvals can attribute the call to its plugin (see
     /// [`crate::domain::Principal`]).
     pub mcp_principals: HashMap<String, Principal>,
-    /// Extra skill directories folded in beside the native runtime's usual
-    /// project/global skill dirs. The daemon no longer feeds plugin-bundled
-    /// dirs here — installed skill packs reach sessions via the global root
-    /// (`~/.config/ryuzi/skills`) instead — but the field remains for tests
-    /// and embedders that want to inject skill dirs directly.
-    pub extra_skill_dirs: Vec<PathBuf>,
+    /// Every ENABLED, installed plugin's `commands/` directory, paired with
+    /// its plugin id (Task 8) — `crate::control::ControlPlane::
+    /// enabled_plugin_content_roots` builds this once and shares it with
+    /// `plugin_skill_roots` below. Consumed only at session start to build
+    /// the session's `CommandRegistry` with plugin-shipped commands at the
+    /// lowest precedence (builtin > project > global > plugin).
+    pub plugin_command_roots: Vec<(String, PathBuf)>,
+    /// Every ENABLED, installed plugin's `skills/` directory, paired with
+    /// its plugin id (Task 9) — live roots, NOT copied into
+    /// `~/.config/ryuzi/skills`: disabling or uninstalling a plugin makes
+    /// its skills vanish next session. Folded into skill discovery beside
+    /// the native runtime's usual project/global skill dirs, at Plugin
+    /// precedence (below Project and Global).
+    pub plugin_skill_roots: Vec<(String, PathBuf)>,
     /// Enabled WASM component bundles, each exposed as an in-process MCP
     /// server (Task 6 — component tools flow through the SAME `mcp__<server>
     /// __<tool>` naming/permission path as an external stdio MCP server).
@@ -309,7 +317,8 @@ mod tests {
             resume: None,
             mcp_servers: vec![],
             mcp_principals: HashMap::new(),
-            extra_skill_dirs: vec![],
+            plugin_command_roots: vec![],
+            plugin_skill_roots: vec![],
             component_mcp: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),

@@ -62,7 +62,7 @@ fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
     ToolInputCtx {
         work_dir: &ctx.work_dir,
         attachments_dir: ctx.attachments_dir.as_deref(),
-        extra_skill_dirs: &ctx.extra_skill_dirs,
+        plugin_skill_roots: &ctx.plugin_skill_roots,
     }
 }
 
@@ -287,7 +287,7 @@ mod tests {
         ToolInputCtx {
             work_dir: &ctx.work_dir,
             attachments_dir: ctx.attachments_dir.as_deref(),
-            extra_skill_dirs: &ctx.extra_skill_dirs,
+            plugin_skill_roots: &ctx.plugin_skill_roots,
         }
     }
 

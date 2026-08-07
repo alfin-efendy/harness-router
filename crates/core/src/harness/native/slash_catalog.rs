@@ -8,7 +8,7 @@
 use super::commands::{Command, CommandOrigin, CommandRegistry, CommandSurfaces, ResolvedCommand};
 use super::skills::{Skill, SkillOrigin, SkillRegistry};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Maximum nesting for `/command` lines inside expanded templates.
 const NESTED_EXPANSION_DEPTH: usize = 3;
@@ -42,11 +42,30 @@ pub struct SlashCatalog {
 
 impl SlashCatalog {
     pub fn load(project_dir: Option<&Path>, allowed_skills: Option<&[String]>) -> SlashCatalog {
+        Self::load_with_plugins(project_dir, allowed_skills, &[], &[])
+    }
+
+    /// Like [`Self::load`], plus every ENABLED, installed plugin's
+    /// `commands/` and `skills/` directories (Tasks 8/9) —
+    /// `plugin_command_roots`/`plugin_skill_roots` are each `(plugin_id,
+    /// <install_dir>/{commands,skills})`, provided by the control plane
+    /// (`crate::control::ControlPlane::enabled_plugin_content_roots`). No
+    /// merge-logic change here: commands still win name clashes against
+    /// skills, exactly as [`Self::entries`]/[`Self::resolve`] already do.
+    pub fn load_with_plugins(
+        project_dir: Option<&Path>,
+        allowed_skills: Option<&[String]>,
+        plugin_command_roots: &[(String, PathBuf)],
+        plugin_skill_roots: &[(String, PathBuf)],
+    ) -> SlashCatalog {
         let (commands, skills) = match project_dir {
-            Some(dir) => (CommandRegistry::load(dir), SkillRegistry::load(dir)),
+            Some(dir) => (
+                CommandRegistry::load_with_plugins(dir, plugin_command_roots),
+                SkillRegistry::load_with_plugin_roots(dir, plugin_skill_roots),
+            ),
             None => (
-                CommandRegistry::load_without_project(),
-                SkillRegistry::load_global(),
+                CommandRegistry::load_without_project_with_plugins(plugin_command_roots),
+                SkillRegistry::load_global_with_plugin_roots(plugin_skill_roots),
             ),
         };
         SlashCatalog {
@@ -60,10 +79,15 @@ impl SlashCatalog {
         allowed.is_some_and(|list| list.iter().any(|s| s == name))
     }
 
+    /// Whether `skill` surfaces in "/" autocomplete. Project skills always
+    /// list; a Global OR Plugin-origin skill lists only when bound to the
+    /// agent (`allowed_skills`) — plugin skills behave exactly like global
+    /// ones here (Task 9): both stay reachable through the `skill` tool's
+    /// index regardless of this gate.
     fn skill_listed(&self, skill: &Skill) -> bool {
         match skill.origin {
             SkillOrigin::Project => true,
-            SkillOrigin::Global => {
+            SkillOrigin::Global | SkillOrigin::Plugin => {
                 Self::global_skill_listed(&skill.name, self.allowed_skills.as_deref())
             }
         }
@@ -109,6 +133,7 @@ impl SlashCatalog {
                 origin: match skill.origin {
                     SkillOrigin::Project => CommandOrigin::Project,
                     SkillOrigin::Global => CommandOrigin::Global,
+                    SkillOrigin::Plugin => CommandOrigin::Plugin,
                 },
                 surfaces: CommandSurfaces::default(),
                 requires_project: false,
@@ -437,5 +462,93 @@ mod tests {
             .iter()
             .filter(|e| e.origin != CommandOrigin::Builtin)
             .all(|e| e.origin == CommandOrigin::Global));
+    }
+
+    // ---------- Task 9: plugin skills gate exactly like global ones ----------
+
+    /// Mirrors [`no_project_load_binds_global_skills_and_drops_ones_colliding_with_builtins`]
+    /// but with `SkillOrigin::Plugin` sources (built via
+    /// `SkillRegistry::load_with_plugin_roots`) — asserts identical gating:
+    /// an unbound plugin skill never lists, a bound one lists (unless a
+    /// builtin command owns its name), and origin surfaces as `"plugin"`.
+    #[test]
+    fn no_project_load_binds_plugin_skills_and_drops_ones_colliding_with_builtins() {
+        let empty_project = tempfile::tempdir().unwrap();
+        let plugin_root = tempfile::tempdir().unwrap();
+        for name in ["triage", "init"] {
+            let dir = plugin_root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let plugin_roots = [("acme".to_string(), plugin_root.path().to_path_buf())];
+
+        // Unbound: neither plugin skill lists, mirroring an unbound global skill.
+        let unbound = SlashCatalog {
+            commands: CommandRegistry::load_without_project(),
+            skills: SkillRegistry::load_with_plugin_roots(empty_project.path(), &plugin_roots),
+            allowed_skills: None,
+        };
+        assert!(!unbound
+            .entries()
+            .iter()
+            .any(|e| e.name == "triage" && e.kind == SlashKind::Skill));
+
+        // Bound: "triage" lists as Plugin-origin; "init" is dropped because a
+        // builtin command owns that name, and the builtin still wins resolve.
+        let bound = SlashCatalog {
+            commands: CommandRegistry::load_without_project(),
+            skills: SkillRegistry::load_with_plugin_roots(empty_project.path(), &plugin_roots),
+            allowed_skills: Some(vec!["triage".into(), "init".into()]),
+        };
+        let entries = bound.entries();
+        assert!(entries.iter().any(|e| e.name == "triage"
+            && e.kind == SlashKind::Skill
+            && e.origin == CommandOrigin::Plugin));
+        assert_eq!(CommandOrigin::Plugin.as_str(), "plugin");
+        assert!(!entries
+            .iter()
+            .any(|e| e.name == "init" && e.kind == SlashKind::Skill));
+        let resolved = bound.resolve("/init").unwrap();
+        assert!(resolved.prompt.contains("Analyze this codebase"));
+    }
+
+    #[test]
+    fn load_with_plugins_threads_command_and_skill_roots_with_lowest_precedence() {
+        let dir = project_with(&[], &[]);
+        let plugin_root = tempfile::tempdir().unwrap();
+        let plugin_cmds = plugin_root.path().join("commands");
+        std::fs::create_dir_all(&plugin_cmds).unwrap();
+        std::fs::write(
+            plugin_cmds.join("sync.md"),
+            "---\ndescription: Sync\n---\nSync $ARGUMENTS",
+        )
+        .unwrap();
+        let plugin_skills = plugin_root.path().join("skills/triage");
+        std::fs::create_dir_all(&plugin_skills).unwrap();
+        std::fs::write(
+            plugin_skills.join("SKILL.md"),
+            "---\nname: triage\ndescription: Triage\n---\nBody",
+        )
+        .unwrap();
+
+        let catalog = SlashCatalog::load_with_plugins(
+            Some(dir.path()),
+            Some(&["triage".to_string()]),
+            &[("acme".to_string(), plugin_cmds)],
+            &[("acme".to_string(), plugin_root.path().join("skills"))],
+        );
+        let entries = catalog.entries();
+        assert!(entries.iter().any(|e| e.name == "sync"
+            && e.kind == SlashKind::Command
+            && e.origin == CommandOrigin::Plugin));
+        assert!(entries.iter().any(|e| e.name == "triage"
+            && e.kind == SlashKind::Skill
+            && e.origin == CommandOrigin::Plugin));
+        let resolved = catalog.resolve("/sync now").unwrap();
+        assert!(resolved.prompt.contains("Sync now"));
     }
 }

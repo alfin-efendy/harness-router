@@ -15,8 +15,20 @@ use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::sessions::ownership::require_executable_session_agent;
 use crate::settings::SettingsStore;
 use crate::worktree;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// One installed, ENABLED plugin's declarative-content roots — the
+/// directories `commands/` and `skills/` are discovered by directory
+/// convention (Tasks 8/9), mirroring Claude Code. Built once by
+/// [`ControlPlane::enabled_plugin_content_roots`] and shared by both
+/// surfaces so there is exactly one walk over installed plugin bundles per
+/// session start.
+pub(crate) struct PluginContentRoots {
+    pub id: String,
+    pub commands: PathBuf,
+    pub skills: PathBuf,
+}
 
 fn agent_model_parts(model: &crate::agents::types::AgentModel) -> (Option<String>, Option<String>) {
     match model {
@@ -1608,10 +1620,21 @@ impl ControlPlane {
                 .await
                 .unwrap_or_default();
         let mcp_principals = self.mcp_principals_for(&mcp_servers).await;
-        // Plugin-bundled live skill dirs are no longer discovery sources —
-        // installed skill packs are materialized into ~/.config/ryuzi/skills
-        // by skills_install and reach sessions via the global root.
-        let extra_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
+        // Tasks 8/9: every enabled, installed plugin's `commands/` and
+        // `skills/` directories, discovered by directory convention — LIVE
+        // roots, never copied into `~/.config/ryuzi/{commands,skills}`, so
+        // disabling or uninstalling a plugin makes its content vanish next
+        // session. One walk shared by both surfaces (`enabled_plugin_content_
+        // roots`), split into the two lists each registry consumes.
+        let plugin_content_roots = self.enabled_plugin_content_roots().await;
+        let plugin_command_roots: Vec<(String, std::path::PathBuf)> = plugin_content_roots
+            .iter()
+            .map(|roots| (roots.id.clone(), roots.commands.clone()))
+            .collect();
+        let plugin_skill_roots: Vec<(String, std::path::PathBuf)> = plugin_content_roots
+            .into_iter()
+            .map(|roots| (roots.id, roots.skills))
+            .collect();
         // Task 6: discover enabled WASM component bundles and expose each as
         // an in-process MCP server. Empty when no enabled component bundle is
         // installed (the common case), so no component runtime is even
@@ -1691,7 +1714,8 @@ impl ControlPlane {
             resume,
             mcp_servers,
             mcp_principals,
-            extra_skill_dirs,
+            plugin_command_roots,
+            plugin_skill_roots,
             component_mcp,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
@@ -1860,6 +1884,61 @@ impl ControlPlane {
             }
         }
         servers
+    }
+
+    /// Every installed, ENABLED plugin's declarative-content roots (Tasks
+    /// 8/9): `commands/` and `skills/`, discovered by directory convention
+    /// under each plugin's installed release directory — the exact root
+    /// [`Self::build_component_mcp_servers`] compiles components from. Built
+    /// ONCE here and shared by both the commands and skills surfaces, so a
+    /// session start walks installed plugin bundles exactly one time.
+    ///
+    /// Enablement reuses [`crate::plugins::host::component_plugin_enabled`]
+    /// — the same `plugin.<id>.enabled` convention every other capability
+    /// axis uses — rather than `PluginHost::is_enabled`, matching
+    /// `build_component_mcp_servers`'s precedent: a plugin bundle need not
+    /// have a registered `CorePlugin` (e.g. a third-party, non-catalog
+    /// install) to be discovered and attached here. `commands`/`skills`
+    /// point at directories that may not exist on disk; callers already
+    /// treat a missing directory as "no commands"/"no skills" (matching
+    /// `read_command_dir`/`read_skills`'s existing not-found handling), so
+    /// this never checks for their presence itself.
+    pub(crate) async fn enabled_plugin_content_roots(&self) -> Vec<PluginContentRoots> {
+        let root = crate::plugins::bundle::installed_bundle_root();
+        if !root.exists() {
+            return Vec::new();
+        }
+        let bundles = match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                tracing::warn!(
+                    "plugins: discovering installed bundles for content roots failed: {error}"
+                );
+                return Vec::new();
+            }
+        };
+        if bundles.is_empty() {
+            return Vec::new();
+        }
+        let settings = SettingsStore::new(self.store.clone());
+        let mut roots = Vec::with_capacity(bundles.len());
+        for bundle in bundles {
+            let id = bundle.manifest.id.clone();
+            match crate::plugins::host::component_plugin_enabled(&settings, &id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(plugin = %id, "plugins: enablement check for content roots failed: {error}");
+                    continue;
+                }
+            }
+            roots.push(PluginContentRoots {
+                commands: bundle.root.join("commands"),
+                skills: bundle.root.join("skills"),
+                id,
+            });
+        }
+        roots
     }
 
     /// The `McpServerSpec.name` → owning-plugin [`Principal`] binding for

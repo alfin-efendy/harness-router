@@ -331,7 +331,10 @@ impl Harness for NativeHarness {
         crate::llm_router::model_meta::spawn_refresh();
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
-        let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
+        let commands = Arc::new(commands::CommandRegistry::load_with_plugins(
+            &ctx.work_dir,
+            &ctx.plugin_command_roots,
+        ));
         // The durable snapshot owns this session's native persona. Legacy
         // worktree agents remain available only for slash-command/subagent
         // selection; they must never replace a durable primary by name.
@@ -436,7 +439,8 @@ impl Harness for NativeHarness {
                     .then_some(ctx.attachments_dir)
                     .flatten(),
                 artifacts: ctx.artifacts,
-                extra_skill_dirs: ctx.extra_skill_dirs,
+                plugin_command_roots: ctx.plugin_command_roots,
+                plugin_skill_roots: ctx.plugin_skill_roots,
                 model,
                 turn_effort_policy: Arc::new(effort_policy),
                 meta,
@@ -847,7 +851,8 @@ mod tests {
             resume: None,
             mcp_servers: vec![],
             mcp_principals: std::collections::HashMap::new(),
-            extra_skill_dirs: vec![],
+            plugin_command_roots: vec![],
+            plugin_skill_roots: vec![],
             component_mcp: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),

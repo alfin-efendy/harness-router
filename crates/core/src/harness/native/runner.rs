@@ -103,10 +103,15 @@ pub struct RunnerDeps {
     pub attachments_dir: Option<PathBuf>,
     /// Task-artifact service shared with the control plane.
     pub artifacts: Arc<crate::artifacts::ArtifactService>,
-    /// Extra skill directories folded in beside the worktree/global ones —
-    /// see `SessionCtx::extra_skill_dirs` for why this no longer carries
-    /// plugin-bundled dirs in production.
-    pub extra_skill_dirs: Vec<PathBuf>,
+    /// Every ENABLED, installed plugin's `commands/` directory, paired with
+    /// its plugin id (Task 8) — see `SessionCtx::plugin_command_roots`.
+    /// Cloned into a fresh `SlashCatalog::load_with_plugins` on every
+    /// `/`-prefixed prompt (`resolve_slash_command`); `deps.commands` itself
+    /// is built once, at session start, from the same list.
+    pub plugin_command_roots: Vec<(String, PathBuf)>,
+    /// Every ENABLED, installed plugin's `skills/` directory, paired with
+    /// its plugin id (Task 9) — see `SessionCtx::plugin_skill_roots`.
+    pub plugin_skill_roots: Vec<(String, PathBuf)>,
     pub model: Option<String>,
     /// Immutable effort/capability snapshot for the current turn.
     pub turn_effort_policy: Arc<TurnEffortPolicy>,
@@ -265,7 +270,7 @@ fn validate_v2_batch(
     let input_context = ToolInputCtx {
         work_dir: &deps.work_dir,
         attachments_dir: deps.attachments_dir.as_deref(),
-        extra_skill_dirs: &deps.extra_skill_dirs,
+        plugin_skill_roots: &deps.plugin_skill_roots,
     };
     tool_calls
         .into_iter()
@@ -488,8 +493,12 @@ async fn resolve_slash_command(
     input: &str,
 ) -> Option<(ResolvedCommand, Option<Agent>)> {
     let root = command_root(deps).await;
-    let catalog =
-        super::slash_catalog::SlashCatalog::load(Some(&root), deps.allowed_skills.as_deref());
+    let catalog = super::slash_catalog::SlashCatalog::load_with_plugins(
+        Some(&root),
+        deps.allowed_skills.as_deref(),
+        &deps.plugin_command_roots,
+        &deps.plugin_skill_roots,
+    );
     let agents = AgentRegistry::load(&root);
     let resolved = catalog.resolve(input)?;
     let agent = match resolved.agent.as_deref() {
@@ -1188,7 +1197,7 @@ async fn drive(
             let t0 = std::time::Instant::now();
             let sections = context::build_sections(
                 &deps.work_dir,
-                &deps.extra_skill_dirs,
+                &deps.plugin_skill_roots,
                 memory.as_deref(),
                 deps.allowed_skills.as_deref(),
             );
@@ -1929,7 +1938,8 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         work_dir: deps.work_dir.clone(),
         attachments_dir: None,
         artifacts: deps.artifacts.clone(),
-        extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        plugin_command_roots: deps.plugin_command_roots.clone(),
+        plugin_skill_roots: deps.plugin_skill_roots.clone(),
         model,
         turn_effort_policy: Arc::new(effort_policy),
         meta,
@@ -2494,7 +2504,7 @@ impl RunnerSpawner {
                     "{}{block}",
                     context::assemble_system(
                         &self.deps.work_dir,
-                        &self.deps.extra_skill_dirs,
+                        &self.deps.plugin_skill_roots,
                         None,
                         None,
                     )
@@ -2846,7 +2856,7 @@ async fn run_tool_call(
     let input_context = ToolInputCtx {
         work_dir: &deps.work_dir,
         attachments_dir: deps.attachments_dir.as_deref(),
-        extra_skill_dirs: &deps.extra_skill_dirs,
+        plugin_skill_roots: &deps.plugin_skill_roots,
     };
     let preflight = match validated
         .tool
@@ -3080,7 +3090,7 @@ async fn execute_tool_call(
         let input_context = ToolInputCtx {
             work_dir: &deps.work_dir,
             attachments_dir: deps.attachments_dir.as_deref(),
-            extra_skill_dirs: &deps.extra_skill_dirs,
+            plugin_skill_roots: &deps.plugin_skill_roots,
         };
         if let Err(error) = prepared_preflight
             .recheck_before_snapshot(&input_context)
@@ -3121,7 +3131,7 @@ async fn execute_tool_call(
         let input_context = ToolInputCtx {
             work_dir: &deps.work_dir,
             attachments_dir: deps.attachments_dir.as_deref(),
-            extra_skill_dirs: &deps.extra_skill_dirs,
+            plugin_skill_roots: &deps.plugin_skill_roots,
         };
         if let Err(error) = precondition.recheck(&input_context).await {
             let legacy_text = error.public_message();
@@ -3151,7 +3161,7 @@ async fn execute_tool_call(
         run_id: deps.run_id.clone(),
         work_dir: deps.work_dir.clone(),
         attachments_dir: deps.attachments_dir.clone(),
-        extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        plugin_skill_roots: deps.plugin_skill_roots.clone(),
         artifacts: deps.artifacts.clone(),
         pinned_file_reference,
         preflight_file_target,
@@ -5892,7 +5902,8 @@ mod tests {
                     read_max_bytes: 50_000,
                 },
             )),
-            extra_skill_dirs: vec![],
+            plugin_command_roots: vec![],
+            plugin_skill_roots: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
             turn_effort_policy: Arc::new(TurnEffortPolicy {

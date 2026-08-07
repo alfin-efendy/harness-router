@@ -873,7 +873,9 @@ impl std::error::Error for ToolError {}
 pub struct ToolInputCtx<'a> {
     pub work_dir: &'a Path,
     pub attachments_dir: Option<&'a Path>,
-    pub extra_skill_dirs: &'a [PathBuf],
+    /// Every ENABLED, installed plugin's `skills/` directory, paired with
+    /// its plugin id (Task 9) — see `SessionCtx::plugin_skill_roots`.
+    pub plugin_skill_roots: &'a [(String, PathBuf)],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
