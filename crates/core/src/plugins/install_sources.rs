@@ -504,6 +504,16 @@ async fn confirm_plugin_install_at(
         settings
             .set(&qualified_setting_key(&id, "trusted"), "true")
             .await?;
+    } else {
+        // C5: clearing is as load-bearing as setting. `trusted` outlives an
+        // uninstall/reinstall of the same id, so a user who installs id X
+        // from one source and accepts, then reinstalls X from a DIFFERENT
+        // source and DECLINES, would otherwise keep the stale "true" — and
+        // the new source's arbitrary stdio servers would sync anyway,
+        // making the declined prompt a no-op.
+        store
+            .delete_setting_raw(&qualified_setting_key(&id, "trusted"))
+            .await?;
     }
 
     // C2 fix: a freshly-installed source plugin must be usable immediately,
@@ -777,6 +787,60 @@ args = ["--flag"]
         let rows = crate::mcp::list_servers(&store).await.unwrap();
         assert_eq!(rows.len(), 1, "a trusted mcp entry must sync its row");
         assert_eq!(rows[0].plugin_id.as_deref(), Some("acme-mcp"));
+    }
+
+    /// C5: `trusted` outlives the install it was granted for, so DECLINING
+    /// must actively clear it. Otherwise a user who accepted id X from one
+    /// source, then reinstalls X from a DIFFERENT source and declines, keeps
+    /// the stale "true" — and the new source's arbitrary stdio servers sync
+    /// anyway, making the declined prompt a no-op.
+    #[tokio::test]
+    async fn declining_trust_clears_a_stale_grant_from_an_earlier_install() {
+        let (store, settings, _tmp) = open_settings().await;
+        let source_dir = tempfile::tempdir().unwrap();
+        write_manifest(source_dir.path(), MCP_MANIFEST);
+        let root = tempfile::tempdir().unwrap();
+
+        // First install: accept.
+        let prompt = begin_plugin_install_from_source(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        confirm_plugin_install_at(&prompt.token, true, &store, &settings, root.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            settings
+                .get(&qualified_setting_key("acme-mcp", "trusted"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        crate::mcp::remove_plugin_servers(&store, "acme-mcp")
+            .await
+            .unwrap();
+
+        // Reinstall the same id, this time declining.
+        let prompt = begin_plugin_install_from_source(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let info = confirm_plugin_install_at(&prompt.token, false, &store, &settings, root.path())
+            .await
+            .unwrap();
+
+        assert!(!info.trusted, "declining must not report trust");
+        assert_eq!(
+            settings
+                .get(&qualified_setting_key("acme-mcp", "trusted"))
+                .await
+                .unwrap(),
+            None,
+            "the stale grant from the earlier install must be cleared"
+        );
+        assert!(
+            crate::mcp::list_servers(&store).await.unwrap().is_empty(),
+            "an untrusted mcp entry must sync no rows"
+        );
     }
 
     #[tokio::test]

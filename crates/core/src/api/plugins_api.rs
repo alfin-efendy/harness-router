@@ -471,8 +471,18 @@ async fn plugin_info_for_freshly_installed(
                 installed.dir.display()
             )
         })?;
-    let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(&manifest_toml)
+    let mut manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(&manifest_toml)
         .context("parsing the newly-installed plugin's manifest")?;
+    // `PluginHost::add` registers this manifest's settings into the
+    // process-global field table, so this is a real registration boundary —
+    // the third one — not just a local preview. Qualify the bare manifest
+    // keys exactly as `install_installed_plugins` and
+    // `confirm_plugin_install_at` do, or a bare `token`/`region` entry gets
+    // injected alongside the qualified one and a `required` field surfaces
+    // as a phantom, unsatisfiable key in `missing_required` until restart.
+    for field in &mut manifest.settings {
+        field.key = crate::plugins::host::qualified_setting_key(&installed.id, &field.key);
+    }
     let mut host = crate::plugins::PluginHost::new();
     host.add(CorePlugin {
         manifest,
@@ -7140,6 +7150,18 @@ prompt = "Run the nightly audit"
 
         // ---------- uninstall: rows, trust key, and the install directory
         // are all gone ----------
+        // Write the setting FIRST, through the qualified key the boot-scan
+        // registration is supposed to produce. Uninstall deletes
+        // `manifest.settings[].key` verbatim, so if any registration boundary
+        // ever regresses to bare keys (C1), this row survives the uninstall
+        // and the assertion below fails. Without this write the assertion is
+        // vacuous — nothing else in either lifecycle test sets `region`.
+        let settings = SettingsStore::new(Arc::clone(&store));
+        settings
+            .set("plugin.acme-lifecycle.region", "us-east-1")
+            .await
+            .expect("the qualified key must be a registered field");
+
         uninstall(&cp, "acme-lifecycle").await.unwrap();
 
         let specs = crate::mcp::servers_for_session(&store, "native")
