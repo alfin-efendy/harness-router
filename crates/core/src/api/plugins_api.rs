@@ -1985,6 +1985,7 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
 fn plugin_hook_info(hook: automation::HookRow) -> PluginHookInfo {
     let trigger = hook.trigger_kind.as_str();
     PluginHookInfo {
+        id: hook.id,
         name: hook.name,
         trigger: trigger.to_string(),
         trigger_alias: automation::claude_alias_for(trigger).map(str::to_string),

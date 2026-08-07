@@ -86,6 +86,29 @@ test("empty entries with live:false still shows only the empty state (no hint al
   expect(screen.getByText("No tools declared.")).toBeTruthy();
 });
 
+test("formatName replaces the displayed mono name, without affecting renderTrailing's argument", () => {
+  const seen: string[] = [];
+  render(
+    <PluginToolsList
+      entries={[entry({ name: "search" })]}
+      live={true}
+      formatName={(name) => `mcp__github__${name}`}
+      renderTrailing={(name) => {
+        seen.push(name);
+        return null;
+      }}
+    />,
+  );
+  expect(screen.getByText("mcp__github__search")).toBeTruthy();
+  expect(screen.queryByText("search")).toBeNull();
+  expect(seen).toEqual(["search"]);
+});
+
+test("without formatName the short name renders as before", () => {
+  render(<PluginToolsList entries={[entry({ name: "search" })]} live={true} />);
+  expect(screen.getByText("search")).toBeTruthy();
+});
+
 test("renderTrailing renders per-row output, right-aligned", () => {
   render(
     <PluginToolsList

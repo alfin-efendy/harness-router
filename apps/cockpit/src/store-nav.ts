@@ -10,7 +10,15 @@ export type View =
   | { kind: "models" }
   | { kind: "providerDetail"; provider: string }
   | { kind: "scheduler" }
-  | { kind: "automations"; tab?: "scheduler" | "hooks" | "commands" }
+  | {
+      kind: "automations";
+      tab?: "scheduler" | "hooks" | "commands";
+      /** Task 14: the plugin detail Automations tab's "Set up…" affordance
+       *  for a `needsTarget` hook/job — deep-links here so Task 16's editor
+       *  can pre-select the row once it reads this field (out of this
+       *  task's scope; carried through unused until then). */
+      targetId?: string;
+    }
   | { kind: "jobDetail"; id: string }
   | { kind: "jobNew" }
   | { kind: "plugins" }

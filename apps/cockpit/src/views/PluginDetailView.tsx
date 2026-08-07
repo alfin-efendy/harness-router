@@ -39,8 +39,11 @@ import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { deriveSetupChecklist, SetupChecklist } from "@/components/plugins/SetupChecklist";
 import { declaredToolEntries } from "@/lib/plugin-hub";
 import { pluginIcon } from "@/lib/plugin-icons";
+import { useApps } from "@/store-apps";
+import { useAutomations } from "@/store-automations";
 import { useNav } from "@/store-nav";
 import { usePlugins } from "@/store-plugins";
+import { useScheduler } from "@/store-scheduler";
 
 const WARN = "#F59E0B";
 
@@ -141,10 +144,12 @@ export function canActivateVersion(detail: ComponentReleaseDetail, version: stri
 
 // ---------- Tabbed scaffold — Task 9 ----------
 
-/** The five sections this view can show, driven by the `Segmented` control
- *  under the hero. Every plugin always gets `overview`; the rest only appear
- *  when there's something to show in them (see `visibleTabs`). */
-export type DetailTab = "overview" | "tools" | "settings" | "versions" | "health";
+/** The sections this view can show, driven by the `Segmented` control under
+ *  the hero. Every plugin always gets `overview`; the rest only appear when
+ *  there's something to show in them (see `visibleTabs`). Task 14 adds
+ *  `contents` (a plugin's own commands/skills) and `automations` (its own
+ *  hooks/jobs). */
+export type DetailTab = "overview" | "tools" | "contents" | "automations" | "settings" | "versions" | "health";
 
 /** Pure tab-visibility gate — never touches component state so it stays
  *  unit-testable without mounting the view. `installed` is `PluginInfo.
@@ -153,10 +158,14 @@ export type DetailTab = "overview" | "tools" | "settings" | "versions" | "health
  *  is at least enabled/configured — before that, the hero's `Install` action
  *  is the only affordance (spec §4), except `versions`, whose own install
  *  gate lives on that tab for component-backed plugins regardless of
- *  `installed`. */
+ *  `installed`. `contents`/`automations` (Task 14) are likewise independent
+ *  of `installed` — a not-yet-installed plugin's declared commands/skills/
+ *  hooks/jobs are still worth previewing. */
 export function visibleTabs(input: {
   installed: boolean;
   hasTools: boolean;
+  hasContents: boolean;
+  hasAutomations: boolean;
   hasAuth: boolean;
   hasSettings: boolean;
   hasVersions: boolean;
@@ -164,6 +173,8 @@ export function visibleTabs(input: {
 }): DetailTab[] {
   const tabs: DetailTab[] = ["overview"];
   if (input.hasTools) tabs.push("tools");
+  if (input.hasContents) tabs.push("contents");
+  if (input.hasAutomations) tabs.push("automations");
   if (input.installed && (input.hasAuth || input.hasSettings)) tabs.push("settings");
   if (input.hasVersions) tabs.push("versions");
   if (input.installed && input.hasHealth) tabs.push("health");
@@ -411,6 +422,16 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     toolsLiveById,
     loadTools,
   } = usePlugins();
+  // Task 14: Tools tab per-tool perm select (installed + trusted plugins
+  // only — component-backed plugins' MCP tools live under server id
+  // `<plugin-id>` after Task 6/7, same `apps` list `set_app_tool_perm`
+  // already reads/writes for a hand-added MCP server); Automations tab's
+  // enable switches (hooks/jobs).
+  const apps = useApps((s) => s.apps);
+  const hydrateApps = useApps((s) => s.hydrate);
+  const setAppToolPerm = useApps((s) => s.setToolPerm);
+  const toggleHook = useAutomations((s) => s.toggle);
+  const toggleJob = useScheduler((s) => s.toggle);
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [authValue, setAuthValue] = useState("");
@@ -492,6 +513,14 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   useEffect(() => {
     void loadTools(id);
   }, [id, loadTools]);
+
+  // Task 14: the Tools tab's per-tool perm select reads this plugin's MCP
+  // server row (id === plugin id) from the apps list — hydrate it on mount
+  // rather than relying on PluginsView having already done so (a direct
+  // deep link into this view never went through the hub first).
+  useEffect(() => {
+    void hydrateApps();
+  }, [hydrateApps]);
 
   useEffect(() => {
     let active = true;
@@ -604,6 +633,8 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     const fallbackTabs = visibleTabs({
       installed: false,
       hasTools: false,
+      hasContents: false,
+      hasAutomations: false,
       hasAuth: false,
       hasSettings: false,
       hasVersions: true,
@@ -710,9 +741,22 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   // resolves with entries — hence the `resolvedTools.length > 0` arm below,
   // not just the two pre-load signals.
   const hasToolsTab = (info.toolCount ?? 0) > 0 || fallbackTools.length > 0 || resolvedTools.length > 0;
+  // Task 14: Contents (commands/skills) and Automations (hooks/jobs) — both
+  // gate purely on the plugin's own declared content, independent of
+  // `installed` (mirrors `hasVersions`'s reasoning: a not-yet-installed
+  // plugin's declared content is still worth previewing).
+  const hasContentsTab = detail.commands.length + detail.skills.length > 0;
+  const hasAutomationsTab = detail.hooks.length + detail.jobs.length > 0;
+  // Task 14: the Tools tab's per-tool perm select only makes sense once this
+  // plugin's MCP server is actually live in the `apps` list (installed +
+  // trusted — an unsigned/untrusted plugin's mcp surface never attaches).
+  const pluginApp = apps.find((a) => a.id === id);
+  const showToolPerms = info.installed && info.trusted && pluginApp != null;
   const tabs = visibleTabs({
     installed: info.installed,
     hasTools: hasToolsTab,
+    hasContents: hasContentsTab,
+    hasAutomations: hasAutomationsTab,
     hasAuth: hasAuthTab,
     hasSettings: hasSettingsTab,
     hasVersions: hasVersionsTab,
@@ -726,6 +770,8 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const TAB_LABEL: Record<DetailTab, string> = {
     overview: "Overview",
     tools: `Tools (${toolsTabCount})`,
+    contents: "Contents",
+    automations: "Automations",
     settings: "Settings",
     versions: "Versions",
     health: "Health",
@@ -756,6 +802,19 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const onToggleEnabled = async () => {
     if (experimental) return;
     await setEnabled(id, !info.enabled);
+    await load();
+  };
+
+  // Task 14: Automations tab enable switches. `toggleHook`/`toggleJob`
+  // (`useAutomations`/`useScheduler`) patch THEIR OWN store's row, not this
+  // view's own `detail.hooks`/`detail.jobs` — reload afterward so the
+  // Switch's `on` prop reflects the new state.
+  const onToggleHook = async (hookId: string, enabled: boolean) => {
+    await toggleHook(hookId, enabled);
+    await load();
+  };
+  const onToggleJob = async (jobId: string, enabled: boolean) => {
+    await toggleJob(jobId, enabled);
     await load();
   };
 
@@ -1057,8 +1116,125 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
             {/* Task 10: the real `plugin_tools`-backed list, grouped by kind
                 (Tools/Skills/Models) — a provider's models moved here from
                 the old Overview "Models" card, so this is now the ONE place
-                a provider's model list shows. */}
-            <PluginToolsList entries={resolvedTools} live={resolvedToolsLive} />
+                a provider's model list shows. Task 14: an installed +
+                trusted plugin's MCP tools live under server id
+                `<plugin-id>` in the apps list (Task 6/7) — when that row
+                exists, rows show their full `mcp__<id>__<tool>` name and
+                gain a per-tool allow/ask/deny select wired to the same
+                `set_app_tool_perm` RPC the Apps & MCP screen uses. */}
+            <PluginToolsList
+              entries={resolvedTools}
+              live={resolvedToolsLive}
+              formatName={showToolPerms ? (name) => `mcp__${id}__${name}` : undefined}
+              renderTrailing={
+                showToolPerms
+                  ? (name) => {
+                      const t = pluginApp?.tools.find((x) => x.name === name);
+                      if (!t) return null;
+                      return (
+                        <Segmented
+                          size="sm"
+                          options={[
+                            { id: "allow", label: "Allow" },
+                            { id: "ask", label: "Ask" },
+                            { id: "deny", label: "Deny" },
+                          ]}
+                          value={t.perm}
+                          onChange={(perm) => void setAppToolPerm(id, name, perm)}
+                        />
+                      );
+                    }
+                  : undefined
+              }
+            />
+          </div>
+        )}
+
+        {activeTab === "contents" && (
+          <div data-testid="tab-panel-contents">
+            {detail.commands.length > 0 && (
+              <Card className="mb-3">
+                <CardHeader>
+                  <CardTitle>Commands</CardTitle>
+                </CardHeader>
+                {detail.commands.map((name) => (
+                  <CardRow key={name}>
+                    <span className="min-w-0 flex-1 truncate font-mono text-xs">/{name}</span>
+                  </CardRow>
+                ))}
+              </Card>
+            )}
+            {detail.skills.length > 0 && (
+              <Card className="mb-3">
+                <CardHeader>
+                  <CardTitle>Skills</CardTitle>
+                </CardHeader>
+                {detail.skills.map((name) => (
+                  <CardRow key={name}>
+                    <span className="min-w-0 flex-1 truncate text-[13px]">{name}</span>
+                  </CardRow>
+                ))}
+              </Card>
+            )}
+          </div>
+        )}
+
+        {activeTab === "automations" && (
+          <div data-testid="tab-panel-automations">
+            {detail.hooks.length > 0 && (
+              <Card className="mb-3">
+                <CardHeader>
+                  <CardTitle>Hooks</CardTitle>
+                </CardHeader>
+                {detail.hooks.map((hook) => (
+                  <CardRow key={hook.name}>
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="text-[13px] font-medium">{hook.name}</span>
+                      <span className="text-[11.5px] text-muted-foreground">
+                        {hook.triggerAlias ? `${hook.triggerAlias} · ${hook.trigger}` : hook.trigger}
+                      </span>
+                    </div>
+                    {hook.needsTarget ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => nav.navigate({ kind: "automations", tab: "hooks", targetId: hook.id })}
+                      >
+                        Set up…
+                      </Button>
+                    ) : (
+                      <Switch on={hook.enabled} onToggle={() => void onToggleHook(hook.id, !hook.enabled)} label={`Enable ${hook.name}`} />
+                    )}
+                  </CardRow>
+                ))}
+              </Card>
+            )}
+            {detail.jobs.length > 0 && (
+              <Card className="mb-3">
+                <CardHeader>
+                  <CardTitle>Jobs</CardTitle>
+                </CardHeader>
+                {detail.jobs.map((job) => (
+                  <CardRow key={job.id}>
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="text-[13px] font-medium">{job.name}</span>
+                      <span className="text-[11.5px] text-muted-foreground">{job.schedule}</span>
+                    </div>
+                    {job.needsTarget ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => nav.navigate({ kind: "automations", tab: "scheduler", targetId: job.id })}
+                      >
+                        Set up…
+                      </Button>
+                    ) : (
+                      <Switch on={job.enabled} onToggle={() => void onToggleJob(job.id, !job.enabled)} label={`Enable ${job.name}`} />
+                    )}
+                  </CardRow>
+                ))}
+              </Card>
+            )}
           </div>
         )}
 

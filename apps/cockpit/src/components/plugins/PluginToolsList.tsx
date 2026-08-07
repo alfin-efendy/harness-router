@@ -23,15 +23,23 @@ const GROUPS: { kind: string; label: string }[] = [
  *
  * `renderTrailing` is optional (Task 12 wires per-tool permission controls
  * here) — when given, its output renders right-aligned on each row.
+ *
+ * `formatName` is optional (Task 14: the plugin detail Tools tab shows the
+ * full `mcp__<id>__<tool>` name a `renderTrailing` perm-select needs to be
+ * unambiguous about) — when given, it replaces the displayed (mono) name;
+ * `renderTrailing` always still receives the entry's own short `name`, so a
+ * perm-lookup keyed by the short name never needs to un-prefix anything.
  */
 export function PluginToolsList({
   entries,
   live,
   renderTrailing,
+  formatName,
 }: {
   entries: PluginToolEntry[];
   live: boolean;
   renderTrailing?: (name: string) => ReactNode;
+  formatName?: (name: string) => string;
 }) {
   if (entries.length === 0) {
     return <Card className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">No tools declared.</Card>;
@@ -53,7 +61,7 @@ export function PluginToolsList({
           {g.entries.map((e) => (
             <CardRow key={e.name}>
               <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                <span className="font-mono text-xs">{e.name}</span>
+                <span className="font-mono text-xs">{formatName ? formatName(e.name) : e.name}</span>
                 {e.description && <span className="text-[12.5px] text-muted-foreground">{e.description}</span>}
               </div>
               {e.writes === true && <Pill variant="warn">writes</Pill>}

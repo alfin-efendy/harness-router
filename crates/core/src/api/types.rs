@@ -1115,6 +1115,12 @@ pub struct PluginMcpInfo {
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginHookInfo {
+    /// The stored row's stable id (`automation_hooks.id`, a generated UUID —
+    /// distinct from `name`). Task 14 addition: the Automations tab's enable
+    /// switch calls `toggle_automation_hook`, which is keyed by this `id`,
+    /// not `name` — without it Cockpit had no way to toggle a plugin's own
+    /// hook row from its detail page.
+    pub id: String,
     /// The stored row name: `"<plugin-id>/<name>"`.
     pub name: String,
     /// Canonical dotted trigger (`crate::automation::TriggerKind::as_str`).

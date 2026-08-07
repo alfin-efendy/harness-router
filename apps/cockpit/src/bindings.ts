@@ -2750,6 +2750,14 @@ default: string | null }
  */
 export type PluginHookInfo = {
 /**
+ * The stored row's stable id (`automation_hooks.id`, a generated UUID —
+ * distinct from `name`). Task 14 addition: the Automations tab's enable
+ * switch calls `toggle_automation_hook`, which is keyed by this `id`,
+ * not `name` — without it Cockpit had no way to toggle a plugin's own
+ * hook row from its detail page.
+ */
+id: string;
+/**
  * The stored row name: `"<plugin-id>/<name>"`.
  */
 name: string;
