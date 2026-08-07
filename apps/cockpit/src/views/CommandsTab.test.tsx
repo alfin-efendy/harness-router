@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { CmdError, CommandFileInfo, Result, SlashEntryInfo } from "@/bindings";
+import type { CmdError, CommandFileInfo, PluginInfo, Result, SlashEntryInfo } from "@/bindings";
 
 const command: CommandFileInfo = {
   name: "audit",
@@ -64,6 +64,77 @@ const catalog: SlashEntryInfo[] = [
   },
 ];
 
+// Plugin-origin entries (Task 16): "triage" is a bare-winner name (no id
+// anywhere in the DTO — `CommandRegistry::load_from_dirs_with_plugins` only
+// namespaces a CONTESTED name), "acme/ship" is namespaced and so resolves.
+const pluginCatalog: SlashEntryInfo[] = [
+  ...catalog,
+  {
+    name: "triage",
+    description: "Triage new issues",
+    kind: "command",
+    origin: "plugin",
+    home: true,
+    session: true,
+    requiresProject: false,
+    effective: true,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
+  },
+  {
+    name: "acme/ship",
+    description: "Ship via Acme",
+    kind: "command",
+    origin: "plugin",
+    home: true,
+    session: true,
+    requiresProject: false,
+    effective: true,
+    shadowsGlobal: false,
+    agent: null,
+    model: null,
+    subtask: false,
+  },
+];
+
+const acmePlugin: PluginInfo = {
+  id: "acme",
+  name: "Acme",
+  description: "Acme integration",
+  icon: null,
+  categories: [],
+  slot: null,
+  ownsSlot: false,
+  verified: true,
+  experimental: false,
+  enabled: true,
+  source: "catalog",
+  capabilities: [],
+  configured: false,
+  kind: "integration",
+  installed: true,
+  family: null,
+  pinned: false,
+  sourceSpec: null,
+  resolvedCommit: null,
+  installedAt: null,
+  updatedAt: null,
+  trustTier: null,
+  catalogVersion: null,
+  componentBacked: false,
+  blockedReason: null,
+  status: "ok",
+  statusDetail: null,
+  authKind: "none",
+  toolCount: null,
+  skillCount: null,
+  surfaces: [],
+  provenance: "catalog",
+  trusted: true,
+};
+
 const globalCommandList = mock(async () => ({ status: "ok" as const, data: [command] }));
 const globalCommandCreate = mock(async () => ({ status: "ok" as const, data: createdCommand }));
 const globalCommandUpdate = mock(async () => ({ status: "ok" as const, data: command }));
@@ -76,14 +147,18 @@ mock.module("@/bindings", () => ({
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 
-const { CommandsTab, deriveReservedCommandNames, globalCommandNameError, globalCommandPreview } = await import("./CommandsTab");
+const { CommandsTab, deriveReservedCommandNames, globalCommandNameError, globalCommandPreview, pluginIdForCommand } = await import(
+  "./CommandsTab"
+);
 const { useNative } = await import("@/store-native");
 const { useStore } = await import("@/store");
+const { usePlugins } = await import("@/store-plugins");
 
 afterEach(() => {
   cleanup();
   useNative.setState({ globalCommands: undefined, slashCatalogByKey: {}, agentsByProject: {} });
   useStore.setState({ selectedProjectId: null });
+  usePlugins.setState({ plugins: [] });
   globalCommandList.mockClear();
   globalCommandCreate.mockClear();
   globalCommandUpdate.mockClear();
@@ -285,4 +360,30 @@ test("suggests catalog commands (excluding the one being edited) from a fresh li
 
   fireEvent.click(suggestion);
   expect(template.value).toBe(`${command.template}\n/deploy `);
+});
+
+test("resolves a plugin id from a namespaced command name, but not from a bare-winner name", () => {
+  const plugins = [{ id: "acme" }];
+  expect(pluginIdForCommand("acme/ship", plugins)).toBe("acme");
+  expect(pluginIdForCommand("triage", plugins)).toBeNull();
+  // Not just "contains a slash" — the prefix must actually match an installed plugin id.
+  expect(pluginIdForCommand("unknown/ship", plugins)).toBeNull();
+});
+
+test("plugin-origin catalog entries render with a plugin badge and no edit/delete, resolving an id only when the name is namespaced", async () => {
+  slashCatalog.mockResolvedValueOnce({ status: "ok", data: pluginCatalog });
+  usePlugins.setState({ plugins: [acmePlugin] });
+  render(<CommandsTab />);
+  await screen.findByText("/audit");
+
+  expect(await screen.findByText("/triage")).toBeTruthy();
+  expect(screen.getByText("/acme/ship")).toBeTruthy();
+  expect(screen.getByText("Plugin: Acme")).toBeTruthy();
+  // The bare-winner "triage" carries no id anywhere in the DTO — a generic
+  // badge, not a guessed one.
+  expect(screen.getByText("Plugin")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Edit /triage" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Delete /triage" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Edit /acme/ship" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Delete /acme/ship" })).toBeNull();
 });

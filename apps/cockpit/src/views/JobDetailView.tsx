@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
-import { ArrowUpRight, Check, CircleAlert, Clock, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
+import { ArrowUpRight, Check, CircleAlert, Clock, Copy, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
 import { commands } from "@/bindings";
-import { formatDuration, formatNextRun, formatStarted, jobById, toInput, useScheduler } from "@/store-scheduler";
+import { duplicateJobInput, formatDuration, formatNextRun, formatStarted, jobById, jobNeedsTarget, toInput, useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
+import { usePlugins } from "@/store-plugins";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import {
   Button,
+  Combobox,
   Input,
   Segmented,
   SettingsCard as Card,
@@ -18,7 +20,7 @@ import {
   Textarea,
 } from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { DiffStat, Pill, StatusDot } from "@/components/common/bits";
+import { DiffStat, Pill, PluginBadge, StatusDot } from "@/components/common/bits";
 
 // ---- Schedule editor (shared with JobNewView) -------------------------------
 
@@ -69,12 +71,16 @@ export function ScheduleCard({
   nextWord,
   onPatch,
   className,
+  readOnly = false,
 }: {
   value: ScheduleValue;
   next: string;
   nextWord: string;
   onPatch: (patch: Partial<ScheduleValue>) => void;
   className?: string;
+  /** Task 16: a plugin-owned job is read-only except its target — the
+   *  plugin still authors the schedule. `JobNewView` never sets this. */
+  readOnly?: boolean;
 }) {
   // Visual-builder selections live locally; only the composed cron is persisted.
   const [freq, setFreq] = useState<Freq>("daily");
@@ -122,6 +128,7 @@ export function ScheduleCard({
         <Segmented
           options={MODE_OPTIONS}
           value={value.mode}
+          disabled={readOnly}
           onChange={(m) => onPatch(m === "visual" ? { mode: m, cron: composeCron(freq, days, time) } : { mode: m })}
         />
       </CardHeader>
@@ -130,6 +137,7 @@ export function ScheduleCard({
           <>
             <Input
               value={value.natural}
+              disabled={readOnly}
               onChange={(e) => onPatch({ natural: e.target.value })}
               placeholder="e.g. “every Monday at 9am” or “every 6 hours”"
               className="h-9"
@@ -145,7 +153,7 @@ export function ScheduleCard({
         )}
         {value.mode === "visual" && (
           <div className="flex flex-wrap items-center gap-3">
-            <Segmented options={FREQ_OPTIONS} value={freq} onChange={(f) => setVisual(f, days, time)} />
+            <Segmented options={FREQ_OPTIONS} value={freq} disabled={readOnly} onChange={(f) => setVisual(f, days, time)} />
             {freq === "weekly" && (
               <div className="flex gap-1">
                 {DAY_OPTIONS.map((d) => {
@@ -155,6 +163,7 @@ export function ScheduleCard({
                       key={d.n}
                       variant={sel ? "default" : "outline"}
                       size="xs"
+                      disabled={readOnly}
                       onClick={() => setVisual(freq, sel ? days.filter((x) => x !== d.n) : [...days, d.n], time)}
                       className="h-[26px] rounded-full px-[9px]"
                     >
@@ -168,6 +177,7 @@ export function ScheduleCard({
               <Input
                 type="time"
                 value={time}
+                disabled={readOnly}
                 onChange={(e) => setVisual(freq, days, e.target.value)}
                 className="h-[30px] w-auto font-mono"
               />
@@ -175,7 +185,7 @@ export function ScheduleCard({
           </div>
         )}
         {value.mode === "cron" && (
-          <Input value={value.cron} onChange={(e) => onPatch({ cron: e.target.value })} className="h-9 w-[200px] font-mono" />
+          <Input value={value.cron} disabled={readOnly} onChange={(e) => onPatch({ cron: e.target.value })} className="h-9 w-[200px] font-mono" />
         )}
         <div className="flex items-center gap-[7px] text-xs text-muted-foreground">
           <Check aria-hidden size={12} strokeWidth={2.5} className="shrink-0" style={{ color: "#22C55E" }} />
@@ -197,11 +207,14 @@ const RUN_META: Record<string, { color: string; label: string }> = {
 };
 
 export function JobDetailView({ id }: { id: string }) {
-  const { jobs, loaded, hydrate, toggle, updateJob, remove, runNow } = useScheduler();
+  const { jobs, loaded, hydrate, toggle, updateJob, remove, runNow, createJob } = useScheduler();
   const gateways = useGateways((s) => s.gateways);
   const setFocused = useStore((s) => s.setFocused);
+  const projects = useStore((s) => s.projects);
+  const plugins = usePlugins((s) => s.plugins);
   const nav = useNav();
   const [promptDraft, setPromptDraft] = useState<string | null>(null);
+  const [duplicating, setDuplicating] = useState(false);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -216,6 +229,19 @@ export function JobDetailView({ id }: { id: string }) {
   const wsName = ws?.name ?? j.gateway;
   const failedRuns = j.history.filter((r) => r.status === "failed").length;
   const patch = (p: Partial<ReturnType<typeof toInput>>) => void updateJob(j.id, { ...toInput(j), ...p });
+  // A plugin-owned job is read-only except its enable switch and (while
+  // `needsTarget`) its project/branch — the plugin still authors the
+  // prompt/schedule/notifications. Editing the target doesn't change
+  // `pluginId` (`update_job` preserves the existing row's attribution), so
+  // this stays true even after the user fills in a project.
+  const pluginOwned = j.pluginId != null;
+  const needsTarget = jobNeedsTarget(j);
+  const duplicate = async () => {
+    setDuplicating(true);
+    const created = await createJob(duplicateJobInput(j));
+    setDuplicating(false);
+    if (created) nav.navigate({ kind: "automations", tab: "scheduler" });
+  };
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
@@ -230,9 +256,12 @@ export function JobDetailView({ id }: { id: string }) {
           }
           title={j.name}
           titleExtra={
-            <Pill variant="mono" className="shrink-0">
-              {j.cron}
-            </Pill>
+            <>
+              <Pill variant="mono" className="shrink-0">
+                {j.cron}
+              </Pill>
+              {pluginOwned && <PluginBadge pluginId={j.pluginId as string} plugins={plugins} className="shrink-0" />}
+            </>
           }
           sub={`${j.natural.trim() || j.cron} · next run ${j.enabled ? formatNextRun(j.nextRunMs) : "paused"}`}
         >
@@ -240,18 +269,25 @@ export function JobDetailView({ id }: { id: string }) {
             <Play aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
             Run now
           </Button>
-          <Button
-            variant="destructive"
-            size="icon"
-            title="Delete job"
-            onClick={() => {
-              void remove(j.id).then((removed) => {
-                if (removed) nav.navigate({ kind: "automations", tab: "scheduler" });
-              });
-            }}
-          >
-            <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-          </Button>
+          {pluginOwned ? (
+            <Button variant="outline" onClick={() => void duplicate()} disabled={duplicating}>
+              <Copy aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+              {duplicating ? "Duplicating…" : "Duplicate as mine"}
+            </Button>
+          ) : (
+            <Button
+              variant="destructive"
+              size="icon"
+              title="Delete job"
+              onClick={() => {
+                void remove(j.id).then((removed) => {
+                  if (removed) nav.navigate({ kind: "automations", tab: "scheduler" });
+                });
+              }}
+            >
+              <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+            </Button>
+          )}
           <Switch on={j.enabled} onToggle={() => void toggle(j.id, !j.enabled)} label="Enabled" />
         </DetailHeader>
 
@@ -262,6 +298,7 @@ export function JobDetailView({ id }: { id: string }) {
           <div className="px-[18px] pb-1 pt-3">
             <Textarea
               value={promptDraft ?? j.prompt}
+              disabled={pluginOwned}
               onChange={(e) => setPromptDraft(e.target.value)}
               onBlur={() => {
                 if (promptDraft !== null && promptDraft !== j.prompt) patch({ prompt: promptDraft });
@@ -272,15 +309,42 @@ export function JobDetailView({ id }: { id: string }) {
             />
           </div>
           <div className="relative flex flex-wrap items-center gap-1.5 px-[18px] pb-3.5 pt-2">
-            <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs font-medium text-muted-foreground">
-              <Folder aria-hidden size={12} strokeWidth={2} className="shrink-0" />
-              {j.projectName}
-            </span>
-            {j.branch !== "" && (
-              <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 font-mono text-[11.5px] text-muted-foreground">
-                <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
-                {j.branch}
-              </span>
+            {needsTarget ? (
+              <>
+                <Combobox
+                  aria-label="Project"
+                  options={projects.map((p) => ({ value: p.projectId, label: p.name, description: p.workdir }))}
+                  value={j.projectId || null}
+                  onValueChange={(projectId) => patch({ projectId })}
+                  placeholder="Select a project"
+                  trigger={
+                    <Button variant="outline" size="sm">
+                      <Folder aria-hidden size={12} strokeWidth={2} className="size-3" />
+                      {projects.find((p) => p.projectId === j.projectId)?.name ?? "Select a project"}
+                    </Button>
+                  }
+                />
+                <Input
+                  aria-label="Branch"
+                  value={j.branch}
+                  onChange={(e) => patch({ branch: e.target.value })}
+                  placeholder="Branch (optional)"
+                  className="h-7 w-40 font-mono text-[11.5px]"
+                />
+              </>
+            ) : (
+              <>
+                <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs font-medium text-muted-foreground">
+                  <Folder aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+                  {j.projectName}
+                </span>
+                {j.branch !== "" && (
+                  <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 font-mono text-[11.5px] text-muted-foreground">
+                    <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+                    {j.branch}
+                  </span>
+                )}
+              </>
             )}
             <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs font-medium text-muted-foreground">
               <Server aria-hidden size={12} strokeWidth={2} className="shrink-0" />
@@ -295,6 +359,7 @@ export function JobDetailView({ id }: { id: string }) {
           nextWord="next run"
           onPatch={(p) => patch(p)}
           className="mb-3"
+          readOnly={pluginOwned}
         />
 
         <Card className="mb-3">
@@ -306,14 +371,24 @@ export function JobDetailView({ id }: { id: string }) {
               <div className="text-[13px] font-medium">On success</div>
               <div className="mt-px text-[11.5px] text-muted-foreground">Toast with the run summary and diff stats.</div>
             </div>
-            <Switch on={j.notifySuccess} onToggle={() => patch({ notifySuccess: !j.notifySuccess })} label="Notify on success" />
+            <Switch
+              on={j.notifySuccess}
+              disabled={pluginOwned}
+              onToggle={() => patch({ notifySuccess: !j.notifySuccess })}
+              label="Notify on success"
+            />
           </CardRow>
           <CardRow>
             <div className="min-w-0 flex-1">
               <div className="text-[13px] font-medium">On failure</div>
               <div className="mt-px text-[11.5px] text-muted-foreground">Notify immediately with the error.</div>
             </div>
-            <Switch on={j.notifyFail} onToggle={() => patch({ notifyFail: !j.notifyFail })} label="Notify on failure" />
+            <Switch
+              on={j.notifyFail}
+              disabled={pluginOwned}
+              onToggle={() => patch({ notifyFail: !j.notifyFail })}
+              label="Notify on failure"
+            />
           </CardRow>
         </Card>
 

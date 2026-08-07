@@ -12,7 +12,16 @@ const TABS: { id: AutomationTab; label: string }[] = [
   { id: "commands", label: "Commands" },
 ];
 
-export function AutomationsView({ initialTab = "scheduler" }: { initialTab?: AutomationTab }) {
+export function AutomationsView({
+  initialTab = "scheduler",
+  targetId,
+}: {
+  initialTab?: AutomationTab;
+  /** Task 14's plugin detail Automations tab "Set up…" deep link
+   *  (`View`'s `automations.targetId`) — forwarded to whichever tab it
+   *  targets so that hook/job's editor opens once loaded (Task 16). */
+  targetId?: string;
+}) {
   const [tab, setTab] = useState<AutomationTab>(initialTab);
 
   return (
@@ -22,7 +31,13 @@ export function AutomationsView({ initialTab = "scheduler" }: { initialTab?: Aut
           <Segmented options={TABS} value={tab} onChange={setTab} />
         </div>
       </div>
-      {tab === "scheduler" ? <SchedulerView /> : tab === "commands" ? <CommandsTab /> : <HooksTab />}
+      {tab === "scheduler" ? (
+        <SchedulerView targetJobId={targetId} />
+      ) : tab === "commands" ? (
+        <CommandsTab />
+      ) : (
+        <HooksTab targetHookId={targetId} />
+      )}
     </div>
   );
 }

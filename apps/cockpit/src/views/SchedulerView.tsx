@@ -1,23 +1,35 @@
 import { ChevronRight, Clock, Folder, Plus } from "lucide-react";
 import { useEffect } from "react";
 import { NATIVE_AGENT } from "@/constants";
-import { formatNextRun, formatStarted, useScheduler } from "@/store-scheduler";
+import { formatNextRun, formatStarted, jobNeedsTarget, useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
+import { usePlugins } from "@/store-plugins";
 import { Button, SettingsCard as Card, Switch } from "@ryuzi/ui";
-import { Pill, StatusDot } from "@/components/common/bits";
+import { Pill, PluginBadge, StatusDot } from "@/components/common/bits";
 
 const RUN_COLORS: Record<string, string> = { success: "#22C55E", failed: "#EF4444", running: "#3B82F6" };
 
-export function SchedulerView() {
+export function SchedulerView({ targetJobId }: { targetJobId?: string } = {}) {
   const { jobs, loaded, hydrate, toggle } = useScheduler();
   const { gateways, loaded: gwLoaded, hydrate: hydrateGw } = useGateways();
+  const plugins = usePlugins((state) => state.plugins);
   const nav = useNav();
 
   useEffect(() => {
     void hydrate();
     if (!gwLoaded) void hydrateGw();
   }, [hydrate, gwLoaded, hydrateGw]);
+
+  // Deep-linked from the plugin detail Automations tab's "Set up…" button
+  // (Task 14) via `AutomationsView`'s `targetId` — a job has no dedicated
+  // modal editor of its own, so the "editor" `needs_target` routes into is
+  // `JobDetailView` itself (its Prompt & target card carries the Project
+  // combobox that can fill in the missing target).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only redirect keyed on targetJobId; nav is a stable store hook, and once navigated away this view unmounts anyway.
+  useEffect(() => {
+    if (targetJobId) nav.navigate({ kind: "jobDetail", id: targetJobId });
+  }, [targetJobId]);
 
   // Group real jobs under their gateway; unknown gateways group under local.
   const groups = gateways.map((w) => ({ gateway: w, jobs: jobs.filter((j) => j.gateway === w.id) })).filter((g) => g.jobs.length > 0);
@@ -46,7 +58,7 @@ export function SchedulerView() {
 
         {loaded && jobs.length === 0 && (
           <Card className="p-6 text-center text-[13px] text-muted-foreground">
-            No scheduled jobs yet. Create one — the prompt runs on a fresh session at every scheduled time.
+            No scheduled jobs yet. Plugins you install can also add job presets here.
           </Card>
         )}
 
@@ -75,6 +87,7 @@ export function SchedulerView() {
                 </div>
                 {groupJobs.map((j) => {
                   const open = () => nav.navigate({ kind: "jobDetail", id: j.id });
+                  const needsTarget = jobNeedsTarget(j);
                   return (
                     <Card key={j.id} className="flex items-center gap-3.5 px-[18px] py-[15px]">
                       <Button
@@ -91,10 +104,13 @@ export function SchedulerView() {
                             <Pill variant="mono" className="shrink-0">
                               {j.cron}
                             </Pill>
+                            {j.pluginId !== null && j.pluginId !== undefined && (
+                              <PluginBadge pluginId={j.pluginId} plugins={plugins} className="shrink-0" />
+                            )}
                           </span>
                           <span className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
                             <Folder aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-                            <span>{j.projectName}</span>
+                            <span>{needsTarget ? "No project selected" : j.projectName}</span>
                             <span className="opacity-40">·</span>
                             <span>{NATIVE_AGENT.name}</span>
                           </span>
@@ -118,7 +134,13 @@ export function SchedulerView() {
                         <div className="text-[11px] text-muted-foreground">Next run</div>
                         <div className="text-[12.5px] font-semibold">{j.enabled ? formatNextRun(j.nextRunMs) : "Paused"}</div>
                       </div>
-                      <Switch on={j.enabled} onToggle={() => void toggle(j.id, !j.enabled)} label={`Enable ${j.name}`} />
+                      {needsTarget ? (
+                        <Button variant="outline" size="sm" onClick={open}>
+                          Set up…
+                        </Button>
+                      ) : (
+                        <Switch on={j.enabled} onToggle={() => void toggle(j.id, !j.enabled)} label={`Enable ${j.name}`} />
+                      )}
                       <Button variant="ghost" size="icon-sm" title="Details" onClick={open} className="text-muted-foreground">
                         <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5" />
                       </Button>
