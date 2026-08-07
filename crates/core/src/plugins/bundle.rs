@@ -414,87 +414,111 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
         if !plugin_root.is_dir() {
             continue;
         }
-        let canonical_plugin_root = plugin_root
-            .canonicalize()
-            .with_context(|| format!("canonicalizing plugin root {}", plugin_root.display()))?;
-        if !canonical_plugin_root.starts_with(&canonical_root) {
-            bail!(
-                "plugin root escapes bundle root for {}",
-                plugin_root.display()
-            );
+        // One unreadable bundle directory must not blind the whole plugin
+        // subsystem. Every check below still rejects the bundle it applies to
+        // — the difference is that a rejection now skips THAT bundle and
+        // leaves the others loadable. This matters most right after the v2
+        // migration ships: an existing install still holding contract-1
+        // manifests on disk would otherwise take every plugin down until the
+        // first-upgrade migration has run.
+        let loaded = async {
+            let canonical_plugin_root = plugin_root
+                .canonicalize()
+                .with_context(|| format!("canonicalizing plugin root {}", plugin_root.display()))?;
+            if !canonical_plugin_root.starts_with(&canonical_root) {
+                bail!(
+                    "plugin root escapes bundle root for {}",
+                    plugin_root.display()
+                );
+            }
+            let plugin_id = plugin_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("malformed plugin directory")?;
+            let pointer = plugin_root.join("current");
+            let version =
+                std::fs::read_to_string(&pointer).context("reading active bundle pointer")?;
+            let version = version.trim();
+            if version.is_empty()
+                || version.contains(['/', '\\'])
+                || version == "."
+                || version == ".."
+            {
+                bail!("malformed active pointer for {plugin_id}");
+            }
+            let version_root = plugin_root.join(version);
+            if !version_root.is_dir() {
+                bail!("active bundle path is missing for {plugin_id}");
+            }
+            let canonical_version_root = version_root.canonicalize().with_context(|| {
+                format!(
+                    "canonicalizing active bundle path {}",
+                    version_root.display()
+                )
+            })?;
+            if !canonical_version_root.starts_with(&canonical_plugin_root)
+                || !canonical_version_root.starts_with(&canonical_root)
+            {
+                bail!("active bundle path escapes install root for {plugin_id}");
+            }
+            let record = store
+                .active_component_release(plugin_id)
+                .await?
+                .with_context(|| format!("no active release for {plugin_id}"))?;
+            if record.version != version || record.plugin_id != plugin_id || record.revoked {
+                bail!("active pointer and release ledger mismatch for {plugin_id}");
+            }
+            let manifest = PluginManifest::from_toml(&std::fs::read_to_string(
+                canonical_version_root.join("ryuzi-plugin.toml"),
+            )?)?;
+            let release = PluginRelease::from_json(&std::fs::read(
+                canonical_version_root.join("release.json"),
+            )?)?;
+            if manifest.id != plugin_id
+                || manifest.version != version
+                || release.id != plugin_id
+                || release.version != version
+                || release.component_sha256 != record.sha256
+            {
+                bail!("active bundle metadata mismatch for {plugin_id}");
+            }
+            let Some(component) = manifest.component.as_ref() else {
+                bail!("active bundle manifest for {plugin_id} declares no [component]");
+            };
+            let component_path = canonical_version_root.join(&component.file);
+            let canonical_component = component_path.canonicalize()?;
+            if !canonical_component.starts_with(&canonical_version_root) {
+                bail!("active component escapes bundle root");
+            }
+            let component_bytes = std::fs::read(&canonical_component).with_context(|| {
+                format!("reading active component {}", canonical_component.display())
+            })?;
+            let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
+            if actual_hash != release.component_sha256 {
+                bail!(
+                    "active component hash mismatch: expected {}, got {}",
+                    release.component_sha256,
+                    actual_hash
+                );
+            }
+            Ok(InstalledBundle {
+                manifest,
+                release,
+                release_record: record,
+                root: canonical_version_root,
+                component_path: canonical_component,
+            })
         }
-        let plugin_id = plugin_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("malformed plugin directory")?;
-        let pointer = plugin_root.join("current");
-        let version = std::fs::read_to_string(&pointer).context("reading active bundle pointer")?;
-        let version = version.trim();
-        if version.is_empty() || version.contains(['/', '\\']) || version == "." || version == ".."
-        {
-            bail!("malformed active pointer for {plugin_id}");
+        .await;
+        match loaded {
+            Ok(bundle) => found.push(bundle),
+            Err(error) => {
+                tracing::warn!(
+                    plugin_root = %plugin_root.display(),
+                    "skipping unloadable installed bundle: {error:#}"
+                );
+            }
         }
-        let version_root = plugin_root.join(version);
-        if !version_root.is_dir() {
-            bail!("active bundle path is missing for {plugin_id}");
-        }
-        let canonical_version_root = version_root.canonicalize().with_context(|| {
-            format!(
-                "canonicalizing active bundle path {}",
-                version_root.display()
-            )
-        })?;
-        if !canonical_version_root.starts_with(&canonical_plugin_root)
-            || !canonical_version_root.starts_with(&canonical_root)
-        {
-            bail!("active bundle path escapes install root for {plugin_id}");
-        }
-        let record = store
-            .active_component_release(plugin_id)
-            .await?
-            .with_context(|| format!("no active release for {plugin_id}"))?;
-        if record.version != version || record.plugin_id != plugin_id || record.revoked {
-            bail!("active pointer and release ledger mismatch for {plugin_id}");
-        }
-        let manifest = PluginManifest::from_toml(&std::fs::read_to_string(
-            canonical_version_root.join("ryuzi-plugin.toml"),
-        )?)?;
-        let release =
-            PluginRelease::from_json(&std::fs::read(canonical_version_root.join("release.json"))?)?;
-        if manifest.id != plugin_id
-            || manifest.version != version
-            || release.id != plugin_id
-            || release.version != version
-            || release.component_sha256 != record.sha256
-        {
-            bail!("active bundle metadata mismatch for {plugin_id}");
-        }
-        let Some(component) = manifest.component.as_ref() else {
-            bail!("active bundle manifest for {plugin_id} declares no [component]");
-        };
-        let component_path = canonical_version_root.join(&component.file);
-        let canonical_component = component_path.canonicalize()?;
-        if !canonical_component.starts_with(&canonical_version_root) {
-            bail!("active component escapes bundle root");
-        }
-        let component_bytes = std::fs::read(&canonical_component).with_context(|| {
-            format!("reading active component {}", canonical_component.display())
-        })?;
-        let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
-        if actual_hash != release.component_sha256 {
-            bail!(
-                "active component hash mismatch: expected {}, got {}",
-                release.component_sha256,
-                actual_hash
-            );
-        }
-        found.push(InstalledBundle {
-            manifest,
-            release,
-            release_record: record,
-            root: canonical_version_root,
-            component_path: canonical_component,
-        });
     }
     Ok(found)
 }
@@ -767,13 +791,16 @@ lifecycle = "singleton"
             .unwrap();
         fs::write(plugin_root.join("current"), "0.1.0").unwrap();
 
-        let err = load_active_bundles(root.path(), &store)
+        // Skip-and-warn: a bundle whose pointer disagrees with the ledger is
+        // never loaded. It is now absent from the result rather than an Err,
+        // so one bad bundle cannot blind the others.
+        let loaded = load_active_bundles(root.path(), &store)
             .await
-            .expect_err("the pointer and database must identify the same active version");
+            .expect("one rejected bundle must not fail the whole load");
         assert!(
-            err.to_string()
-                .contains("pointer and release ledger mismatch"),
-            "unexpected error: {err}"
+            loaded.is_empty(),
+            "a pointer/ledger mismatch must not load, got {:?}",
+            loaded.iter().map(|b| &b.manifest.id).collect::<Vec<_>>()
         );
     }
 
@@ -796,12 +823,15 @@ lifecycle = "singleton"
         )
         .unwrap();
 
-        let err = load_active_bundles(root.path(), &store)
+        // Skip-and-warn: the tampered bundle is refused, so it is absent from
+        // the loaded set rather than failing the whole load.
+        let loaded = load_active_bundles(root.path(), &store)
             .await
-            .expect_err("mutating an installed component must invalidate the active bundle");
+            .expect("one rejected bundle must not fail the whole load");
         assert!(
-            err.to_string().contains("hash mismatch"),
-            "unexpected error: {err}"
+            loaded.is_empty(),
+            "a mutated component must not load, got {:?}",
+            loaded.iter().map(|b| &b.manifest.id).collect::<Vec<_>>()
         );
     }
 
@@ -941,12 +971,15 @@ lifecycle = "singleton"
             return;
         }
 
-        let err = load_active_bundles(root.path(), &store)
+        // Skip-and-warn: the escaping bundle is refused, so it never appears
+        // in the loaded set (the containment guarantee is unchanged).
+        let loaded = load_active_bundles(root.path(), &store)
             .await
-            .expect_err("a version reparse point escaping the install root must be rejected");
+            .expect("one rejected bundle must not fail the whole load");
         assert!(
-            err.to_string().contains("outside") || err.to_string().contains("escapes"),
-            "unexpected error: {err}"
+            loaded.is_empty(),
+            "a version path escaping the install root must not load, got {:?}",
+            loaded.iter().map(|b| &b.manifest.id).collect::<Vec<_>>()
         );
     }
     #[tokio::test]
@@ -1028,8 +1061,16 @@ lifecycle = "singleton"
         let plugin_root = root.path().join("acme-connector/0.1.0");
         fs::create_dir_all(&plugin_root).unwrap();
         fs::write(root.path().join("acme-connector/current"), "0.1.0").unwrap();
-        let err = load_active_bundles(root.path(), &store).await.unwrap_err();
-        assert!(err.to_string().contains("no active release"));
+        // Skip-and-warn: a directory with no ledger row is not a loadable
+        // bundle, so it is simply absent from the result.
+        let loaded = load_active_bundles(root.path(), &store)
+            .await
+            .expect("one rejected bundle must not fail the whole load");
+        assert!(
+            loaded.is_empty(),
+            "a bundle with no active release row must not load, got {:?}",
+            loaded.iter().map(|b| &b.manifest.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
