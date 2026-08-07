@@ -59,7 +59,7 @@ jobs:
           CATALOG_FEED_SEQUENCE: ${{ github.run_number }}
         run: |
           if [ -z "$CATALOG_FEED_PRIVATE_KEY" ]; then
-            echo "::error::CATALOG_FEED_PRIVATE_KEY secret is not set — run the feed keygen and add it first (docs/development/plugins.md#remote-catalog)"
+            echo "::error::CATALOG_FEED_PRIVATE_KEY secret is not set — run the feed keygen and add it first (docs/development/plugins.md#remote-catalog-feed-schema-2)"
             exit 1
           fi
           bun scripts/catalog/build-feed.ts

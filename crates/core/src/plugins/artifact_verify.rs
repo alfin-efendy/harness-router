@@ -217,4 +217,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(verify_artifacts_dir(dir.path(), &trusted(&key), None).is_err());
     }
+
+    // A contract-1 manifest artifact must be rejected through this exact CI
+    // verification path, not just at the SDK layer — `PluginManifest::from_toml`
+    // (Task 2) rejects any non-`contract = 2` manifest outright, and this proves
+    // that rejection propagates as a clear, attributable `verify_artifacts_dir`
+    // error rather than some other parse failure. `[component]` here is
+    // otherwise v2-shaped (a table, not the old top-level string) so the
+    // failure is unambiguously about the contract version, not an unrelated
+    // TOML shape mismatch.
+    #[test]
+    fn contract_1_artifact_rejected() {
+        let key = test_key();
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "github";
+        let component = "github.wasm";
+        let wasm = b"\0asm test bytes".to_vec();
+        let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
+        let manifest = format!(
+            "contract = 1\nid = \"github\"\nname = \"GitHub\"\nversion = \"0.1.1\"\n\
+             publisher = \"Ryuzi\"\ndescription = \"test\"\n\n\
+             [component]\nfile = \"{component}\"\n\
+             wit-api = \">=0.1.0, <0.2.0\"\nlifecycle = \"per-call\"\n"
+        );
+        let release = format!(
+            "{{\n  \"id\": \"github\",\n  \"version\": \"0.1.1\",\n  \"wit-api\": \"0.1.0\",\n  \
+             \"component_url\": \"https://github.com/alfin-efendy/ryuzi/releases/download/v0.1.1/{component}\",\n  \
+             \"component_sha256\": \"{sha}\"\n}}\n"
+        );
+        let sig = key.sign(release.as_bytes());
+        let envelope = format!(
+            "{{\"key_id\":\"{KEY_ID}\",\"signature\":\"{}\"}}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
+        std::fs::write(
+            dir.path().join(format!("{stem}.ryuzi-plugin.toml")),
+            &manifest,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(format!("{stem}.release.json")), &release).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{stem}.release.json.sig")),
+            &envelope,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(component), &wasm).unwrap();
+
+        let err = verify_artifacts_dir(dir.path(), &trusted(&key), None).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("contract"),
+            "expected the underlying error to mention 'contract', got: {full}"
+        );
+        assert!(
+            full.contains('1') && full.contains('2'),
+            "expected the error to name both the found (1) and supported (2) contract, got: {full}"
+        );
+    }
 }

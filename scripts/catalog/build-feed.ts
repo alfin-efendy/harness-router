@@ -25,8 +25,8 @@ export const DEFAULT_SEQUENCE_PATH = "scripts/catalog/sequence.txt";
 export const DEFAULT_OUT_JSON_PATH = "catalog.json";
 export const DEFAULT_OUT_SIG_PATH = "catalog.json.sig";
 
-/** The schema version every shipped feed declares; must match `CatalogFeed::schema_version`'s accepted value (`remote_catalog.rs`, currently `1`). */
-export const SCHEMA_VERSION = 1;
+/** The schema version every shipped feed declares; must match `CatalogFeed::schema_version`'s accepted value (`remote_catalog.rs`, currently `2`). Bumped to `2` alongside the manifest-v2 rollout (Task 17) — a v1-schema feed is now rejected. */
+export const SCHEMA_VERSION = 2;
 
 export interface CatalogFeedEntry {
   id: string;

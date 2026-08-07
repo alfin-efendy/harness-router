@@ -116,7 +116,7 @@ fn parse_and_check_with(
     }
     let feed: CatalogFeed = serde_json::from_slice(feed_bytes)
         .map_err(|e| CatalogFeedError::ParseError(e.to_string()))?;
-    if feed.schema_version != 1 {
+    if feed.schema_version != 2 {
         return Err(CatalogFeedError::UnsupportedSchema(feed.schema_version));
     }
     if feed.sequence < last_sequence {
@@ -1390,7 +1390,7 @@ mod tests {
 
     fn feed_json(seq: u64) -> String {
         format!(
-            r#"{{"schemaVersion":1,"sequence":{seq},"generatedAt":0,
+            r#"{{"schemaVersion":2,"sequence":{seq},"generatedAt":0,
                 "entries":[{{"id":"acme","manifestToml":"contract=2\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}}],
                 "blocked":[]}}"#
         )
@@ -1416,6 +1416,25 @@ mod tests {
         assert!(matches!(
             parse_and_check_with(&tampered, &sig, 0, &pubkey),
             Err(CatalogFeedError::BadSignature)
+        ));
+    }
+
+    // A feed still declaring the pre-Task-17 schema (`schemaVersion: 1`) must
+    // be rejected outright — accepting it would let a stale/rolled-back feed
+    // (which could carry contract-1 manifest bodies) slip past signature
+    // verification into the store.
+    #[test]
+    fn schema_version_1_rejected() {
+        let bytes = r#"{"schemaVersion":1,"sequence":5,"generatedAt":0,
+                "entries":[{"id":"acme","manifestToml":"contract=2\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}],
+                "blocked":[]}"#
+            .as_bytes()
+            .to_vec();
+        let sig = sign(&bytes);
+        let pubkey = test_keypair().verifying_key().to_bytes();
+        assert!(matches!(
+            parse_and_check_with(&bytes, &sig, 0, &pubkey),
+            Err(CatalogFeedError::UnsupportedSchema(1))
         ));
     }
 
@@ -1741,7 +1760,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_drops_invalid_entry_but_applies_valid_ones() {
         let feed = concat!(
-            r#"{"schemaVersion":1,"sequence":8,"generatedAt":0,"#,
+            r#"{"schemaVersion":2,"sequence":8,"generatedAt":0,"#,
             r#""entries":["#,
             r#"{"id":"bad","manifestToml":"contract=2\nid=\"bad\"\nname=\"\"\nversion=\"1.0.0\""},"#,
             r#"{"id":"good","manifestToml":"contract=2\nid=\"good\"\nname=\"Good\"\nversion=\"2.0.0\""}"#,
