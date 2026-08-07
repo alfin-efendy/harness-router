@@ -442,12 +442,23 @@ impl PluginHost {
             // `experimental = false`, so this never affects them.
             return Ok(false);
         }
-        if plugin.connector.is_none() {
+        if plugin.connector.is_none() && plugin.manifest.mcp.is_empty() {
             // Manifest-only plugin (e.g. a provider metadata entry
             // with no behavioral capability of its own) — always enabled.
+            //
+            // C2 fix: a non-empty `manifest.mcp` is excluded from this
+            // fallback even when `connector` is `None` — a source-installed
+            // plugin is ALWAYS registered manifest-only by
+            // `install_installed_plugins` (its connector is only built
+            // transiently, at install time), so without this exclusion its
+            // `[[mcp]]` servers would report "always enabled" here while
+            // `crate::mcp::servers_for_session`'s literal
+            // `plugin.<id>.enabled == "true"` gate kept them from ever
+            // attaching — enabled forever in the UI, disabled forever at
+            // runtime.
             return Ok(true);
         }
-        let key = format!("plugin.{id}.enabled");
+        let key = qualified_setting_key(id, "enabled");
         Ok(settings.get(&key).await?.as_deref() == Some("true"))
     }
 }

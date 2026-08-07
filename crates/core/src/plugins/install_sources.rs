@@ -412,7 +412,24 @@ async fn confirm_plugin_install_at(
     // Register its fields (incl. `plugin.<id>.trusted`) right now so the
     // trust-acceptance write below (and any settings write a caller makes
     // before that restart) is recognized immediately.
-    crate::plugins::host::register_plugin_fields(&manifest);
+    //
+    // C1 fix: v2 manifests keep `[[settings]]` keys BARE (`token`, not
+    // `plugin.<id>.token`) — `register_plugin_fields` registers whatever key
+    // it is handed VERBATIM, so it must be handed the QUALIFIED key, exactly
+    // as `component_catalog::component_catalog_plugins` does for the
+    // embedded manifests and `install_installed_plugins` now does for the
+    // boot-scan registration. Register a throwaway qualified COPY here — the
+    // `manifest` variable itself must stay bare, since it feeds
+    // `declarative_plugin` below, whose `DeclarativeConnector` qualifies
+    // `settings[].key` a SECOND time internally (`ensure_auth`/`resolver`);
+    // qualifying `manifest` in place would double-prefix those reads.
+    {
+        let mut qualified_fields = manifest.clone();
+        for field in &mut qualified_fields.settings {
+            field.key = crate::plugins::host::qualified_setting_key(&id, &field.key);
+        }
+        crate::plugins::host::register_plugin_fields(&qualified_fields);
+    }
 
     let plugin_root = root.join(&id);
     let version_dir = plugin_root.join(&version);
@@ -488,6 +505,20 @@ async fn confirm_plugin_install_at(
             .set(&qualified_setting_key(&id, "trusted"), "true")
             .await?;
     }
+
+    // C2 fix: a freshly-installed source plugin must be usable immediately,
+    // matching every other install path's "installed == enabled by default"
+    // behavior (a component bundle already defaults to enabled through
+    // `component_plugin_enabled`'s active-release fallback). Without this
+    // explicit write, `crate::mcp::servers_for_session`'s literal
+    // `plugin.<id>.enabled == "true"` gate — the SAME key
+    // `toggle_enabled`/`PluginHost::is_enabled` read and write — never gets
+    // set for a plugin `install_installed_plugins` registers manifest-only
+    // (`connector: None`), so its `[[mcp]]` servers could never attach even
+    // though the hub showed it enabled.
+    settings
+        .set(&qualified_setting_key(&id, "enabled"), "true")
+        .await?;
 
     // Task 7/8/9/10 syncs need a fully behavioral plugin (connector +
     // hooks/jobs), not the manifest-only row boot registration keeps in
@@ -995,5 +1026,161 @@ writes = true
             parse_plugin_source("git@example.com:acme/plugin.git").unwrap(),
             ParsedPluginSource::GitUrl(_)
         ));
+    }
+
+    // ---------- C2: a source-installed plugin's [[mcp]] servers must attach ----------
+
+    const MCP_ENABLE_MANIFEST: &str = r#"
+contract = 2
+id = "acme-mcp-enable"
+name = "Acme MCP Enable"
+
+[[mcp]]
+name = "svc"
+transport = "stdio"
+command = "acme-mcp-server"
+"#;
+
+    #[tokio::test]
+    async fn a_freshly_installed_mcp_plugin_is_enabled_and_its_server_attaches() {
+        let (store, settings, _tmp) = open_settings().await;
+        let source_dir = tempfile::tempdir().unwrap();
+        write_manifest(source_dir.path(), MCP_ENABLE_MANIFEST);
+
+        let prompt = begin_plugin_install_from_source(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        // A declared `[[mcp]]` entry requires trust acceptance (Task 11
+        // tiered trust) before it syncs any row at all — accept it here so
+        // this test exercises the C2 enable-gate fix specifically, not the
+        // separate trust gate (covered by its own tests above).
+        let root = tempfile::tempdir().unwrap();
+        confirm_plugin_install_at(&prompt.token, true, &store, &settings, root.path())
+            .await
+            .unwrap();
+
+        // The install itself must flip the SAME key `servers_for_session`
+        // gates on, without any separate "enable" click.
+        assert_eq!(
+            settings
+                .get("plugin.acme-mcp-enable.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+
+        // The mcp row synced at install time must actually attach to a
+        // session now that the plugin reads as enabled.
+        let specs = crate::mcp::servers_for_session(&store, "native")
+            .await
+            .unwrap();
+        assert!(
+            specs.iter().any(|s| s.name == "acme-mcp-enable-svc"),
+            "installed mcp server must attach once enabled, got: {specs:?}"
+        );
+
+        // Simulate the next daemon boot's registration scan, mirroring what a
+        // restart would do — `PluginHost::is_enabled`/`toggle_enabled` must
+        // agree with the settings-store state written above, not bail as if
+        // this were a capability-less manifest-only plugin.
+        let mut regs = Registries::new();
+        crate::plugins::install_installed_plugins(&mut regs, root.path());
+        let host = regs.plugins;
+        assert!(host.is_enabled(&settings, "acme-mcp-enable").await.unwrap());
+
+        // A manual disable/re-enable through the UI's toggle must also work
+        // (previously bailed "always available" because the boot-registered
+        // plugin's `connector` is always `None`).
+        crate::plugins::toggle_enabled(&host, &settings, "acme-mcp-enable", false)
+            .await
+            .unwrap();
+        assert!(!host.is_enabled(&settings, "acme-mcp-enable").await.unwrap());
+        let specs = crate::mcp::servers_for_session(&store, "native")
+            .await
+            .unwrap();
+        assert!(
+            specs.iter().all(|s| s.name != "acme-mcp-enable-svc"),
+            "a disabled plugin's mcp server must not attach, got: {specs:?}"
+        );
+
+        crate::plugins::toggle_enabled(&host, &settings, "acme-mcp-enable", true)
+            .await
+            .unwrap();
+        assert!(host.is_enabled(&settings, "acme-mcp-enable").await.unwrap());
+    }
+
+    // ---------- C1: bare `[[settings]]` keys must round-trip through both
+    // the Settings-tab write path (qualified key) AND the WASM settings
+    // capability's scoped read/write (bare key, qualified internally) ----------
+
+    const SETTINGS_ROUND_TRIP_MANIFEST: &str = r#"
+contract = 2
+id = "acme-settings"
+name = "Acme Settings"
+
+[[settings]]
+key = "token"
+label = "Bot token"
+secret = true
+required = true
+"#;
+
+    #[tokio::test]
+    async fn bare_settings_key_round_trips_through_settings_and_capability_paths() {
+        let (store, settings, _tmp) = open_settings().await;
+        let source_dir = tempfile::tempdir().unwrap();
+        write_manifest(source_dir.path(), SETTINGS_ROUND_TRIP_MANIFEST);
+
+        let prompt = begin_plugin_install_from_source(source_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        confirm_plugin_install_at(&prompt.token, false, &store, &settings, root.path())
+            .await
+            .unwrap();
+
+        // Settings-tab write path: the QUALIFIED key, exactly what
+        // `set_plugin_setting`/Cockpit's Settings tab writes. Without the C1
+        // fix, `register_plugin_fields` only knew the BARE `token` key, so
+        // this write would be rejected as an unknown setting.
+        settings
+            .set("plugin.acme-settings.token", "s3cr3t")
+            .await
+            .expect("the qualified key must be recognized by the settings validator");
+
+        // Capability-path read: a WASM component only ever passes the BARE
+        // field name — `ScopedSettings` qualifies it internally.
+        let ctx = crate::plugins::capabilities::PluginCapabilityContext {
+            plugin_id: "acme-settings".to_string(),
+            version: "0.1.0".to_string(),
+            settings: settings.clone(),
+            store: store.clone(),
+            telemetry: std::sync::Arc::new(crate::telemetry::NoopTelemetry),
+            network_allowlist: vec![],
+            oauth_profile_ids: vec![],
+            provider_ids: vec![],
+        };
+        let scoped = crate::plugins::capabilities::settings::ScopedSettings::new(&ctx);
+        let (effective, value, secret) = scoped
+            .get("token")
+            .await
+            .expect("the capability path must read back the value the settings path wrote");
+        assert_eq!(effective, "plugin.acme-settings.token");
+        assert_eq!(value, "s3cr3t");
+        assert!(secret);
+
+        // And the reverse direction: a component's own write via the
+        // capability path must be visible through the qualified Settings-tab
+        // read.
+        scoped.set("token", "rotated").await.unwrap();
+        assert_eq!(
+            settings
+                .get("plugin.acme-settings.token")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("rotated")
+        );
     }
 }

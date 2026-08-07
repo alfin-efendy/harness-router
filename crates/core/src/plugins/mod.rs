@@ -362,7 +362,7 @@ pub fn install_installed_plugins(regs: &mut Registries, root: &std::path::Path) 
                 continue;
             }
         };
-        let manifest = match ryuzi_plugin_sdk::PluginManifest::from_toml(&manifest_toml) {
+        let mut manifest = match ryuzi_plugin_sdk::PluginManifest::from_toml(&manifest_toml) {
             Ok(m) => m,
             Err(error) => {
                 tracing::warn!(
@@ -372,6 +372,17 @@ pub fn install_installed_plugins(regs: &mut Registries, root: &std::path::Path) 
                 continue;
             }
         };
+        // C1 fix: v2 manifests keep `[[settings]]` keys BARE — qualify to
+        // `plugin.<id>.<key>` at THIS registration boundary too, exactly as
+        // `component_catalog::component_catalog_plugins` already does for
+        // the embedded manifests. Without this, an installed plugin's
+        // settings field registers as a GLOBAL key (`token`) while the
+        // connector and the WASM settings capability both read the
+        // qualified key (`plugin.<id>.token`) — the plugin can never be
+        // configured through the Settings tab.
+        for field in &mut manifest.settings {
+            field.key = host::qualified_setting_key(&manifest.id, &field.key);
+        }
         let provenance = install_sources::read_install_provenance(&version_dir);
         regs.add_plugin(CorePlugin {
             manifest,
@@ -471,11 +482,14 @@ pub fn register_builtin_plugin_fields() {
 ///   `plugin.<id>.enabled` write (see that method's doc) — toggling would
 ///   silently no-op
 /// - component-backed provider → set the TRANSPORT key `plugin.<id>.enabled` (display axis unchanged; see body comment)
-/// - no harness/gateway/connector capability (manifest-only, e.g. a
-///   provider metadata entry) → an error, since `is_enabled`
-///   always reports it enabled regardless of any `plugin.<id>.enabled`
-///   write — toggling would silently no-op
-/// - connector-only → set `plugin.<id>.enabled` to `"true"`/`"false"`
+/// - no harness/gateway/connector capability AND no declared `[[mcp]]`
+///   (manifest-only, e.g. a provider metadata entry) → an error, since
+///   `is_enabled` always reports it enabled regardless of any
+///   `plugin.<id>.enabled` write — toggling would silently no-op
+/// - connector-only, OR manifest-only with a non-empty `manifest.mcp` (a
+///   source-installed plugin, whose connector is only ever built
+///   transiently at install time — see C2's fix) → set
+///   `plugin.<id>.enabled` to `"true"`/`"false"`
 pub async fn toggle_enabled(
     host: &PluginHost,
     settings: &SettingsStore,
@@ -566,7 +580,14 @@ pub async fn toggle_enabled(
     if plugin.manifest.experimental {
         anyhow::bail!("{id} is experimental — nothing to enable");
     }
-    if plugin.connector.is_none() {
+    // C2 fix: a source-installed plugin's `[[mcp]]` entries are a real
+    // enableable axis even though `install_installed_plugins` always
+    // registers such a plugin manifest-only (`connector: None`) — its
+    // behavioral connector is only ever built transiently, by
+    // `install_sources::confirm_plugin_install_at`, at install time. Gate on
+    // `manifest.mcp` instead of `plugin.connector` so this key can still be
+    // flipped for it; mirrors `PluginHost::is_enabled`'s matching fix.
+    if plugin.connector.is_none() && plugin.manifest.mcp.is_empty() {
         anyhow::bail!("{id} is always available");
     }
     settings
