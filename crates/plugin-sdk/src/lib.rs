@@ -25,6 +25,7 @@ pub mod bundle;
 pub mod categories;
 pub mod manifest;
 pub mod subst;
+pub mod triggers;
 
 pub use bundle::{
     BundleError, DeclaredTool, NetworkPermission, OAuthProfile, PluginBundleManifest,
