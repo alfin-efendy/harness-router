@@ -62,12 +62,14 @@ export type ConsiderOffCandidate = { id: string; label: string };
  * the same diff as the native one below, and it's been removed rather than
  * fixed in place: catalog `pluginTools` entries are keyed by manifest id
  * (e.g. `github`), but `topTools` records the runtime tool name actually
- * invoked, which for plugin-sourced tools is namespaced by component
- * (`wasm__<component>__<tool>`, `mcp__...`). Those never literally match a
- * plugin catalog id, so the old branch flagged every bound plugin as
- * "unused" the moment the agent had any run in the trailing 30 days — a
- * false positive, not a real usage signal. Native tool ids don't have this
- * problem: they align with the recorded tool name as-is.
+ * invoked, which for plugin-sourced tools is namespaced by server
+ * (`mcp__<server>__<tool>` — one namespace for every plugin/server tool,
+ * including WASM components, since Task 6 merged the old `wasm__<component>
+ * __<tool>` path into it). Those never literally match a plugin catalog id,
+ * so the old branch flagged every bound plugin as "unused" the moment the
+ * agent had any run in the trailing 30 days — a false positive, not a real
+ * usage signal. Native tool ids don't have this problem: they align with
+ * the recorded tool name as-is.
  */
 export function considerOffCandidates(
   nativeToolDecisions: NativeToolDecisionInfo[],

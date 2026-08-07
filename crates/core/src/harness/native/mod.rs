@@ -62,13 +62,15 @@ struct AdaptedPrimary {
 /// excludes it. There is no "everything empty" shortcut to `ToolFilter::All`:
 /// an empty decision map already means every native tool is `Ask` (enabled),
 /// so an agent with no plugin/app bindings still resolves to exactly the
-/// native registry, not a blanket allow that would also sweep in
-/// `mcp__`/`wasm__` tools it never configured.
+/// native registry, not a blanket allow that would also sweep in `mcp__`
+/// tools it never configured. There is one namespace for every plugin- or
+/// server-provided tool (Task 6 merged the old `wasm__` component path into
+/// `mcp__`), so only that one prefix is special-cased below.
 fn tool_filter_for_profile(
     profile: &crate::agents::types::AgentProfile,
     available: &[String],
 ) -> agents::ToolFilter {
-    let namespaced = |name: &str| name.starts_with("mcp__") || name.starts_with("wasm__");
+    let namespaced = |name: &str| name.starts_with("mcp__");
     let mut allowed: Vec<String> = available
         .iter()
         .filter(|name| !namespaced(name))
@@ -85,22 +87,16 @@ fn tool_filter_for_profile(
             Some((provider, tool)) => allowed.extend(
                 available
                     .iter()
-                    .filter(|name| {
-                        *name == &format!("mcp__{provider}__{tool}")
-                            || *name == &format!("wasm__{provider}__{tool}")
-                    })
+                    .filter(|name| *name == &format!("mcp__{provider}__{tool}"))
                     .cloned(),
             ),
             // Bare plugin id: every tool the plugin contributes, mirroring the
             // app arm below. The old code fed ("<id>", "") through the exact
-            // arm and matched `wasm__<id>__` — i.e. nothing.
+            // arm and matched `mcp__<id>__` — i.e. nothing.
             None => allowed.extend(
                 available
                     .iter()
-                    .filter(|name| {
-                        name.starts_with(&format!("mcp__{plugin}__"))
-                            || name.starts_with(&format!("wasm__{plugin}__"))
-                    })
+                    .filter(|name| name.starts_with(&format!("mcp__{plugin}__")))
                     .cloned(),
             ),
         }
@@ -257,24 +253,30 @@ async fn connect_mcp_tools(
     extra
 }
 
-/// Gather every enabled WASM component bundle's connector tool (Task 9) and
-/// wrap each as a native `Tool` — called at the same session-start point as
-/// `connect_mcp_tools` and folded into the same registry. `None` (no enabled
-/// component bundle installed — the common case, and every bare test
-/// `SessionCtx`) is a true zero-cost no-op — no await, no extra tools.
-async fn connect_wasm_tools(
-    wasm_tools: Option<&Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
+/// Wrap every enabled WASM component's already-discovered connector tools
+/// (Task 6) as `mcp__<component>__<tool>` native `Tool`s — called at the same
+/// session-start point as `connect_mcp_tools` and folded into the SAME
+/// registry, via the SAME `McpTool` wrapper an external stdio MCP server's
+/// tools go through. An empty `component_mcp` (no enabled component bundle
+/// installed — the common case, and every bare test `SessionCtx`) is a true
+/// zero-cost no-op — no allocation, no extra tools.
+fn connect_component_mcp_tools(
+    component_mcp: &[Arc<crate::plugins::mcp_component::ComponentMcpServer>],
 ) -> Vec<Arc<dyn tools::Tool>> {
-    let Some(host) = wasm_tools else {
-        return Vec::new();
-    };
-    host.session_tools()
-        .await
-        .into_iter()
-        .map(|binding| {
-            Arc::new(tools::wasm::WasmTool::from_binding(binding)) as Arc<dyn tools::Tool>
-        })
-        .collect()
+    let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
+    for server in component_mcp {
+        for def in &server.tools {
+            extra.push(Arc::new(tools::mcp::McpTool::new(
+                &server.server_id,
+                &def.name,
+                &def.description,
+                def.input_schema.clone(),
+                server.clone() as Arc<dyn mcp_client::McpCaller>,
+                Some(server.principal.clone()),
+            )));
+        }
+    }
+    extra
 }
 
 async fn resolve_native_model(
@@ -358,11 +360,12 @@ impl Harness for NativeHarness {
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
         let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
-        // Task 9: fold in every enabled WASM component bundle's connector tool
-        // alongside the MCP ones — both flow into the SAME registry, dispatched
-        // through the identical `deps.tools.get(name)` path with no
-        // special-casing by source.
-        extra_tools.extend(connect_wasm_tools(ctx.wasm_tools.as_ref()).await);
+        // Task 6: fold in every enabled WASM component's connector tools
+        // alongside the external MCP ones — both are `McpTool`s in the SAME
+        // registry now, dispatched through the identical `deps.tools.get(name)`
+        // path with no special-casing by source, and governed by the same
+        // `mcp__*` permission path.
+        extra_tools.extend(connect_component_mcp_tools(&ctx.component_mcp));
         let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
         // The registry is complete only after MCP and WASM-tool attachment.
         // Resolve this immutable profile against that final namespace so a
@@ -845,7 +848,7 @@ mod tests {
             mcp_servers: vec![],
             mcp_principals: std::collections::HashMap::new(),
             extra_skill_dirs: vec![],
-            wasm_tools: None,
+            component_mcp: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,
@@ -1214,7 +1217,7 @@ mod tests {
     }
 
     // PR-2 fix F: a bare plugin id in tools.plugins used to demand an exact
-    // match on `wasm__<id>__` (empty tool segment) and therefore granted
+    // match on `mcp__<id>__` (empty tool segment) and therefore granted
     // NOTHING. It must grant every tool the plugin contributes, mirroring the
     // app arm's prefix match. The namespaced form stays exact.
     #[test]
@@ -1223,18 +1226,18 @@ mod tests {
         profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
         profile.tools.plugins = vec!["github".into()];
         let available = vec![
-            "wasm__github__create_issue".to_string(),
-            "wasm__github__get_repo".to_string(),
-            "wasm__discord__send".to_string(),
+            "mcp__github__create_issue".to_string(),
+            "mcp__github__get_repo".to_string(),
+            "mcp__discord__send".to_string(),
             "read_file".to_string(),
         ];
         let agents::ToolFilter::Only(allowed) = tool_filter_for_profile(&profile, &available)
         else {
             panic!("expected Only");
         };
-        assert!(allowed.contains(&"wasm__github__create_issue".to_string()));
-        assert!(allowed.contains(&"wasm__github__get_repo".to_string()));
-        assert!(!allowed.contains(&"wasm__discord__send".to_string()));
+        assert!(allowed.contains(&"mcp__github__create_issue".to_string()));
+        assert!(allowed.contains(&"mcp__github__get_repo".to_string()));
+        assert!(!allowed.contains(&"mcp__discord__send".to_string()));
     }
 
     #[test]
@@ -1243,15 +1246,15 @@ mod tests {
         profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
         profile.tools.plugins = vec!["github.create_issue".into()];
         let available = vec![
-            "wasm__github__create_issue".to_string(),
-            "wasm__github__get_repo".to_string(),
+            "mcp__github__create_issue".to_string(),
+            "mcp__github__get_repo".to_string(),
         ];
         let agents::ToolFilter::Only(allowed) = tool_filter_for_profile(&profile, &available)
         else {
             panic!("expected Only");
         };
-        assert!(allowed.contains(&"wasm__github__create_issue".to_string()));
-        assert!(!allowed.contains(&"wasm__github__get_repo".to_string()));
+        assert!(allowed.contains(&"mcp__github__create_issue".to_string()));
+        assert!(!allowed.contains(&"mcp__github__get_repo".to_string()));
     }
 
     #[test]
@@ -2105,8 +2108,8 @@ mod tests {
         assert!(tools.is_empty());
     }
 
-    #[tokio::test]
-    async fn connect_wasm_tools_is_a_no_op_with_no_host() {
-        assert!(connect_wasm_tools(None).await.is_empty());
+    #[test]
+    fn connect_component_mcp_tools_is_a_no_op_with_no_components() {
+        assert!(connect_component_mcp_tools(&[]).is_empty());
     }
 }

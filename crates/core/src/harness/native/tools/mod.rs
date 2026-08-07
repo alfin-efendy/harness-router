@@ -47,7 +47,6 @@ pub mod session_search;
 pub mod skill;
 pub mod task;
 pub mod todo;
-pub mod wasm;
 pub mod webfetch;
 pub mod websearch;
 pub mod write;

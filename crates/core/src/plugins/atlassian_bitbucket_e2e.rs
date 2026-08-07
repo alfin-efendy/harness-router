@@ -40,14 +40,18 @@ use ryuzi_plugin_sdk::PluginManifest;
 
 use crate::api::types::ComponentManifestInfo;
 use crate::domain::Principal;
+use crate::harness::native::mcp_client::McpCaller;
+use crate::harness::native::tools::mcp::McpTool;
+use crate::harness::native::tools::Tool;
 use crate::plugins::bundle::{load_active_bundles, ComponentBundleInstaller, InstalledBundle};
 use crate::plugins::capabilities::oauth::{OauthErr, ProfileOauth};
 use crate::plugins::capabilities::PluginCapabilityContext;
 use crate::plugins::first_party_key::FIRST_PARTY_KEY_ID;
+use crate::plugins::mcp_component::ComponentMcpServer;
 use crate::plugins::oauth::PluginOauthToken;
 use crate::plugins::remote_catalog::{install_component_release, CatalogHttp};
 use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
-use crate::plugins::wasm_connector::{wasm_tool_name, WasmActivation, WasmToolSet, WasmTools};
+use crate::plugins::wasm_connector::WasmActivation;
 use crate::plugins::{build_atlassian_component_once, build_bitbucket_component_once};
 use crate::settings::SettingsStore;
 use crate::store::Store;
@@ -465,6 +469,36 @@ async fn activation_for(bundle: &InstalledBundle, store: &Arc<Store>) -> Arc<Was
     ))
 }
 
+/// Discover `bundle`'s component as an in-process MCP server, then build the
+/// exact `McpTool`s the native runtime's session-tool assembly would
+/// (`harness::native::mod`'s `connect_component_mcp_tools`), so the returned
+/// names are the REAL `mcp__<id>__*` wire names a session advertises to the
+/// model (previously `wasm__<id>__*`), not a hand-formatted stand-in.
+async fn mcp_tool_names_for(bundle: &InstalledBundle, store: &Arc<Store>) -> Vec<String> {
+    let activation = activation_for(bundle, store).await;
+    let server = Arc::new(
+        ComponentMcpServer::discover(activation)
+            .await
+            .expect("the component exports connector tools"),
+    );
+    server
+        .tools
+        .iter()
+        .map(|def| {
+            McpTool::new(
+                &server.server_id,
+                &def.name,
+                &def.description,
+                def.input_schema.clone(),
+                server.clone() as Arc<dyn McpCaller>,
+                Some(server.principal.clone()),
+            )
+            .name()
+            .to_string()
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn installed_atlassian_enumerates_jira_and_confluence_tools() {
     let (store, _tmp, root) = install_atlassian_and_bitbucket().await;
@@ -474,15 +508,7 @@ async fn installed_atlassian_enumerates_jira_and_confluence_tools() {
         .into_iter()
         .find(|b| b.manifest.id == "atlassian")
         .unwrap();
-    let activation = activation_for(&bundle, &store).await;
-    let set = WasmToolSet::new(vec![activation]);
-
-    let mut names: Vec<String> = set
-        .session_tools()
-        .await
-        .into_iter()
-        .map(|b| wasm_tool_name(&b.component_id, &b.def.name))
-        .collect();
+    let mut names = mcp_tool_names_for(&bundle, &store).await;
     names.sort();
 
     let mut expected: Vec<String> = [
@@ -499,7 +525,7 @@ async fn installed_atlassian_enumerates_jira_and_confluence_tools() {
     ]
     .iter()
     .copied()
-    .map(|t| wasm_tool_name("atlassian", t))
+    .map(|t| format!("mcp__atlassian__{t}"))
     .collect();
     expected.sort();
     assert_eq!(names, expected);
@@ -514,15 +540,7 @@ async fn installed_bitbucket_enumerates_its_declared_connector_tools() {
         .into_iter()
         .find(|b| b.manifest.id == "bitbucket")
         .unwrap();
-    let activation = activation_for(&bundle, &store).await;
-    let set = WasmToolSet::new(vec![activation]);
-
-    let mut names: Vec<String> = set
-        .session_tools()
-        .await
-        .into_iter()
-        .map(|b| wasm_tool_name(&b.component_id, &b.def.name))
-        .collect();
+    let mut names = mcp_tool_names_for(&bundle, &store).await;
     names.sort();
 
     let mut expected: Vec<String> = [
@@ -538,7 +556,7 @@ async fn installed_bitbucket_enumerates_its_declared_connector_tools() {
     ]
     .iter()
     .copied()
-    .map(|t| wasm_tool_name("bitbucket", t))
+    .map(|t| format!("mcp__bitbucket__{t}"))
     .collect();
     expected.sort();
     assert_eq!(names, expected);

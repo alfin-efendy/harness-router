@@ -76,7 +76,7 @@ test("considerOffCandidates excludes tools already in top tools, an explicit off
 test("considerOffCandidates never flags a plugin catalog entry, even with a 30d run and nothing in top tools", () => {
   // Plugin catalog ids (e.g. "github") are manifest ids; topTools records
   // the namespaced runtime tool name actually invoked
-  // (wasm__github__create_issue, etc.), which never literally matches — so
+  // (mcp__github__create_issue, etc.), which never literally matches — so
   // the plugin branch is dropped entirely rather than produce this false
   // "unused" positive on every bound plugin. `catalog.pluginTools` (see the
   // fixture above) has a "github" entry, but it can never appear in the

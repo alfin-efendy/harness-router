@@ -269,7 +269,7 @@ async fn fixture_context(
             mcp_servers: Vec::new(),
             mcp_principals: Default::default(),
             extra_skill_dirs: Vec::new(),
-            wasm_tools: None,
+            component_mcp: Vec::new(),
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,

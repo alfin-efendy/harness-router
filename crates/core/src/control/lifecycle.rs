@@ -1611,11 +1611,11 @@ impl ControlPlane {
         // installed skill packs are materialized into ~/.config/ryuzi/skills
         // by skills_install and reach sessions via the global root.
         let extra_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
-        // Task 9: discover enabled WASM component bundles and expose their
-        // connector tools to this session. `None` when no enabled component
-        // bundle is installed (the common case), so no component runtime is
-        // even constructed.
-        let wasm_tools = self.build_wasm_session_providers(&settings).await;
+        // Task 6: discover enabled WASM component bundles and expose each as
+        // an in-process MCP server. Empty when no enabled component bundle is
+        // installed (the common case), so no component runtime is even
+        // constructed.
+        let component_mcp = self.build_component_mcp_servers(&settings).await;
         // `kind`/`agent` come from the session row rather than a caller
         // parameter — every caller of `start_harness_session` (fresh start,
         // cold-resume, crash-resume) has already inserted the row before
@@ -1691,7 +1691,7 @@ impl ControlPlane {
             mcp_servers,
             mcp_principals,
             extra_skill_dirs,
-            wasm_tools,
+            component_mcp,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             automation_events: Some(Arc::new(super::ControlPlaneAutomationSink(Arc::downgrade(
@@ -1730,8 +1730,10 @@ impl ControlPlane {
     /// CONFIGURED (`component_required_settings_configured` — every setting
     /// its derived auth requires, e.g. discord's bot token, is actually
     /// stored) ones, and build one shared [`WasmActivation`] per attached
-    /// bundle. Returns a [`WasmTools`] provider (its connector tools) over
-    /// those activations, to thread into the session.
+    /// bundle. Each surviving activation is wrapped as a
+    /// [`ComponentMcpServer`](crate::plugins::mcp_component::ComponentMcpServer)
+    /// (Task 6 — an in-process MCP server), to thread into the session
+    /// alongside every external stdio MCP server.
     ///
     /// Every failure mode is warn-and-skip: a missing bundle root, a discovery
     /// error, an unavailable component runtime, a per-bundle compile failure,
@@ -1739,35 +1741,36 @@ impl ControlPlane {
     /// affected bundle (or the whole set) rather than blocking the session
     /// from starting — a broken OR not-yet-configured component plugin must
     /// never brick a session, and a needs-setup one must never restart-loop
-    /// either. `None` when nothing enabled+configured is installed, so the
-    /// common case constructs no component runtime at all. Declarative
+    /// either. An empty vec when nothing enabled+configured is installed, so
+    /// the common case constructs no component runtime at all. Declarative
     /// connectors are untouched (this migration phase keeps both paths live).
-    async fn build_wasm_session_providers(
+    async fn build_component_mcp_servers(
         &self,
         settings: &SettingsStore,
-    ) -> Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>> {
+    ) -> Vec<Arc<crate::plugins::mcp_component::ComponentMcpServer>> {
+        use crate::plugins::mcp_component::ComponentMcpServer;
         use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
-        use crate::plugins::wasm_connector::{WasmActivation, WasmToolSet};
+        use crate::plugins::wasm_connector::WasmActivation;
 
         let root = crate::plugins::bundle::installed_bundle_root();
         if !root.exists() {
-            return None;
+            return Vec::new();
         }
         let bundles = match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
             Ok(bundles) => bundles,
             Err(error) => {
                 tracing::warn!("wasm: discovering component bundles failed: {error}");
-                return None;
+                return Vec::new();
             }
         };
         if bundles.is_empty() {
-            return None;
+            return Vec::new();
         }
         let runtime = match ComponentRuntime::new() {
             Ok(runtime) => runtime,
             Err(error) => {
                 tracing::warn!("wasm: component runtime unavailable: {error}");
-                return None;
+                return Vec::new();
             }
         };
         let mut activations: Vec<Arc<WasmActivation>> = Vec::new();
@@ -1841,12 +1844,21 @@ impl ControlPlane {
             };
             activations.push(Arc::new(WasmActivation::new(compiled, ctx, id, principal)));
         }
-        if activations.is_empty() {
-            return None;
+        let mut servers = Vec::with_capacity(activations.len());
+        for activation in activations {
+            let component_id = activation.component_id().to_string();
+            match ComponentMcpServer::discover(activation).await {
+                Some(server) => servers.push(Arc::new(server)),
+                // `discover` warn-logs its own specific reason (no connector
+                // export, list-tools failure, or zero surviving tool defs);
+                // this component simply contributes no MCP server.
+                None => tracing::debug!(
+                    plugin = %component_id,
+                    "wasm: component contributes no MCP tools"
+                ),
+            }
         }
-        let wasm_tools: Arc<dyn crate::plugins::wasm_connector::WasmTools> =
-            Arc::new(WasmToolSet::new(activations));
-        Some(wasm_tools)
+        servers
     }
 
     /// Extend `mcp_servers` with the MCP servers of every enabled,

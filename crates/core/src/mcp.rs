@@ -323,6 +323,18 @@ pub fn mcp_tool_parts(name: &str) -> Option<(&str, &str)> {
     Some((server, tool))
 }
 
+/// The persisted per-tool permission (`"allow"`/`"ask"`/`"deny"`) for a
+/// `mcp__<server>__<tool>` full name, if `full_name` parses as one and a
+/// `mcp_tools` row exists for it — `None` otherwise (not a namespaced name,
+/// or no row yet, e.g. a component server before Task 7's sync writes one).
+/// Thin rename-wrap of [`tool_perm_for_title`]: same lookup, but this is the
+/// name [`crate::harness::native::permission::evaluate`] calls at
+/// enforcement time, so the "title" framing (display-only, Apps-UI-era)
+/// doesn't leak into the permission gate's vocabulary.
+pub async fn stored_tool_perm(store: &Store, full_name: &str) -> Option<String> {
+    tool_perm_for_title(store, full_name).await
+}
+
 /// The persisted permission for an MCP tool title, if it is one.
 pub async fn tool_perm_for_title(store: &Store, title: &str) -> Option<String> {
     let (server, tool) = mcp_tool_parts(title)?;

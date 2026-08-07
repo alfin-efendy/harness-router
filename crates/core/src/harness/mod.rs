@@ -69,14 +69,16 @@ pub struct SessionCtx {
     /// (`~/.config/ryuzi/skills`) instead — but the field remains for tests
     /// and embedders that want to inject skill dirs directly.
     pub extra_skill_dirs: Vec<PathBuf>,
-    /// Enabled WASM component bundles' connector tools (Task 9). `None` when
-    /// no enabled component bundle is installed (the common case, and every
-    /// bare test `SessionCtx`), so a session with no component plugins builds
-    /// its tool registry with zero extra work. The native runtime's session
-    /// start calls `session_tools()` through this to enumerate each
-    /// component's `connector.list-tools` and wrap them as native `Tool`s via
-    /// `harness::native::tools::wasm::WasmTool`.
-    pub wasm_tools: Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
+    /// Enabled WASM component bundles, each exposed as an in-process MCP
+    /// server (Task 6 — component tools flow through the SAME `mcp__<server>
+    /// __<tool>` naming/permission path as an external stdio MCP server).
+    /// Empty when no enabled component bundle is installed (the common case,
+    /// and every bare test `SessionCtx`), so a session with no component
+    /// plugins builds its tool registry with zero extra work. The native
+    /// runtime's session start iterates each server's already-discovered
+    /// `tools` and wraps them as `harness::native::tools::mcp::McpTool`s,
+    /// alongside `connect_mcp_tools`'s external-server ones.
+    pub component_mcp: Vec<Arc<crate::plugins::mcp_component::ComponentMcpServer>>,
     /// Event bus for normalized session output.
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
@@ -307,7 +309,7 @@ mod tests {
             mcp_servers: vec![],
             mcp_principals: HashMap::new(),
             extra_skill_dirs: vec![],
-            wasm_tools: None,
+            component_mcp: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,

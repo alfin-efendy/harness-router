@@ -64,11 +64,12 @@ impl SessionPermOverrides {
 pub struct PermGate<'a> {
     /// Order (top wins): Plan hard-deny → profile rules (a matching scoped
     /// prefix rule always wins, even over a `Allow`/`Off` base decision) →
-    /// native per-tool decision (`Allow`/`Off` only; `Ask` falls through) →
-    /// session overrides → project `tool_policies` (allowAlways AND
-    /// rejectAlways) → mode auto-allow → prompt. Plan sits above every other
-    /// rule so no profile/session choice can punch through Plan's read-only
-    /// guarantee.
+    /// native per-tool decision (non-namespaced keys, `Allow`/`Off` only;
+    /// `Ask` falls through) OR stored `mcp_tools.perm` (namespaced `mcp__*`
+    /// keys, `allow`/`deny` only; `ask`/no row falls through) → session
+    /// overrides → project `tool_policies` (allowAlways AND rejectAlways) →
+    /// mode auto-allow → prompt. Plan sits above every other rule so no
+    /// profile/session choice can punch through Plan's read-only guarantee.
     pub permission_rules: &'a [crate::agents::types::PermissionRule],
     /// The active profile's per-tool native decision map (`AgentPermissions::
     /// native`), keyed by the tool's registry id (the same lowercase key
@@ -80,7 +81,7 @@ pub struct PermGate<'a> {
     /// `write`/`revert` both report class `"edit"`), so keying this map by
     /// `spec.key` would alias their per-tool `Off`/`Allow` entries onto each
     /// other. Consulted only for non-namespaced (native) tools;
-    /// `mcp__`/`wasm__` calls never match an entry here.
+    /// `mcp__` calls never match an entry here.
     pub native_decisions: &'a BTreeMap<String, NativeToolDecision>,
     /// The registry id of the tool actually being invoked (`Tool::name()`,
     /// e.g. `"write"`, `"grep"`, `"mcp__acme__search"`) — the ONLY key
@@ -103,13 +104,15 @@ pub struct PermGate<'a> {
     pub cancel: &'a CancellationToken,
 }
 
-/// Whether `key` names a plugin-provided tool (MCP or WASM component) rather
-/// than a native builtin — mirrors the same prefix check
+/// Whether `key` names a plugin-provided tool — an external MCP server or a
+/// WASM component, both exposed as `mcp__<server>__<tool>` since Task 6
+/// merged the component path into the MCP one (there is one namespace now) —
+/// rather than a native builtin. Mirrors the same prefix check
 /// `tool_filter_for_profile` uses to resolve the native/plugin split. A
 /// namespaced key never has a `native_decisions` entry: the decision map
 /// only governs native (registry) tool ids.
 fn is_namespaced_tool_key(key: &str) -> bool {
-    key.starts_with("mcp__") || key.starts_with("wasm__")
+    key.starts_with("mcp__")
 }
 
 /// Map a native permission key to the canonical tool name `policy` recognizes,
@@ -150,14 +153,14 @@ fn profile_rule_decision(
     })
 }
 
-/// Decide whether a native tool call may proceed.
+/// Decide whether a tool call may proceed.
 ///
 /// Order (top wins): Plan hard-deny → profile rules (a matching scoped
 /// prefix rule always wins over the tool's base decision) → native per-tool
-/// decision → session overrides → project `tool_policies` (allowAlways AND
-/// rejectAlways) → mode auto-allow → prompt. Plan sits above the session
-/// sets so "allow for this session" can never punch through Plan's
-/// read-only guarantee.
+/// decision (non-namespaced) OR stored `mcp_tools.perm` (`mcp__*`) → session
+/// overrides → project `tool_policies` (allowAlways AND rejectAlways) → mode
+/// auto-allow → prompt. Plan sits above the session sets so "allow for this
+/// session" can never punch through Plan's read-only guarantee.
 pub async fn evaluate(
     spec: &PermissionSpec,
     input: &serde_json::Value,
@@ -175,7 +178,23 @@ pub async fn evaluate(
     if let Some(decision) = profile_rule_decision(gate.permission_rules, &spec.key, input) {
         return decision;
     }
-    if !is_namespaced_tool_key(&spec.key) {
+    if is_namespaced_tool_key(&spec.key) {
+        // The Apps UI writes `mcp_tools.perm` (allow/ask/deny) per tool, but
+        // until now nothing at call time ever read it back — this is that
+        // wire. `deny`/`allow` short-circuit exactly like the native
+        // decision map below; `ask` (the explicit UI choice) or no row at
+        // all (e.g. a Task-6 component tool before Task 7's sync writes a
+        // row, or a server never configured through the Apps UI) falls
+        // through to the rest of the chain unchanged, same as native `Ask`.
+        match crate::mcp::stored_tool_perm(gate.store, &spec.key)
+            .await
+            .as_deref()
+        {
+            Some("deny") => return PermDecision::Deny,
+            Some("allow") => return PermDecision::Allow,
+            _ => {}
+        }
+    } else {
         match gate
             .native_decisions
             // Registry id, not `spec.key`: see `PermGate::tool_id`'s doc for
@@ -544,10 +563,11 @@ mod tests {
 
     #[tokio::test]
     async fn native_decision_is_only_consulted_for_non_namespaced_keys() {
-        // An `mcp__`/`wasm__` key never has a `native_decisions`
-        // entry, so an `Allow` mapped under its bare-looking key (which would
-        // never actually occur, but proves the namespace guard) must not
-        // short-circuit an MCP tool call.
+        // An `mcp__` key never has a `native_decisions` entry, so an `Allow`
+        // mapped under its bare-looking key (which would never actually
+        // occur, but proves the namespace guard) must not short-circuit an
+        // MCP tool call — with no stored `mcp_tools` row either, it falls
+        // all the way through to the prompt.
         let f = Fixture::new().await;
         let native = BTreeMap::from([("mcp__acme__search".to_string(), NativeToolDecision::Allow)]);
         let gate = PermGate {
@@ -564,6 +584,85 @@ mod tests {
         );
         f.cancel.cancel();
         assert_eq!(fut.await, PermDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn stored_deny_perm_denies_an_mcp_tool_without_prompting() {
+        let f = Fixture::new().await;
+        crate::mcp::replace_tools(&f.store, "acme", vec![("search".into(), "d".into())])
+            .await
+            .unwrap();
+        crate::mcp::set_tool_perm(&f.store, "acme", "search", "deny")
+            .await
+            .unwrap();
+        let gate = f.gate(PermMode::Default, None);
+        let d = evaluate(&spec("mcp__acme__search"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn stored_allow_perm_allows_an_mcp_tool_without_prompting() {
+        let f = Fixture::new().await;
+        crate::mcp::replace_tools(&f.store, "acme", vec![("search".into(), "d".into())])
+            .await
+            .unwrap();
+        crate::mcp::set_tool_perm(&f.store, "acme", "search", "allow")
+            .await
+            .unwrap();
+        let gate = f.gate(PermMode::Default, None);
+        let d = evaluate(&spec("mcp__acme__search"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn stored_ask_perm_and_missing_row_both_fall_through_to_the_prompt() {
+        let f = Fixture::new().await;
+        // "ask" (the explicit Apps-UI default) and a tool with NO row at all
+        // (e.g. a Task-6 component tool, before Task 7's sync writes one)
+        // must both fall through identically — neither auto-allows nor
+        // auto-denies.
+        crate::mcp::replace_tools(&f.store, "acme", vec![("search".into(), "d".into())])
+            .await
+            .unwrap();
+        let gate = f.gate(PermMode::Default, None);
+
+        let known = spec("mcp__acme__search");
+        let input = serde_json::json!({});
+        let fut = evaluate(&known, &input, &gate);
+        tokio::pin!(fut);
+        assert!(futures::poll!(fut.as_mut()).is_pending());
+        f.cancel.cancel();
+        assert_eq!(fut.await, PermDecision::Deny);
+
+        // Cancel already fired above, so this second, unrelated (no-row-at-
+        // all) namespaced key resolves the same way without needing to park.
+        let unknown = spec("mcp__nosuchserver__nosuchtool");
+        let d = evaluate(&unknown, &input, &gate).await;
+        assert_eq!(d, PermDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn stored_deny_perm_wins_over_a_project_allow_always_policy() {
+        // The stored per-tool perm sits ABOVE the project `tool_policies`
+        // fallback in the chain: a `deny` row must win even if the project
+        // separately has an `allowAlways` rule for the same canonical name.
+        let f = Fixture::new().await;
+        crate::mcp::replace_tools(&f.store, "acme", vec![("search".into(), "d".into())])
+            .await
+            .unwrap();
+        crate::mcp::set_tool_perm(&f.store, "acme", "search", "deny")
+            .await
+            .unwrap();
+        f.store
+            .set_tool_policy(WriteOrigin::User, "p1", "mcp__acme__search", "allowAlways")
+            .await
+            .unwrap();
+        let gate = f.gate(PermMode::Default, Some("p1"));
+        let d = evaluate(&spec("mcp__acme__search"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
     }
 
     #[tokio::test]
