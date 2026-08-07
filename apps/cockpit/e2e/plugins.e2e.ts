@@ -104,7 +104,7 @@ test("install from source walks begin → trust review → confirm, and closes o
   await dialog.getByLabel("Plugin source").fill("https://github.com/acme/plugin");
   await dialog.getByRole("button", { name: "Continue" }).click();
 
-  await expect(dialog.getByText("acme-mcp")).toBeVisible();
+  await expect(dialog.getByText("acme-mcp", { exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "Trust & Install" }).click();
 
   await expect(page.getByRole("dialog")).toHaveCount(0);
