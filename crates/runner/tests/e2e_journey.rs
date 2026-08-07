@@ -56,11 +56,24 @@ fn config_survives_a_full_daemon_lifecycle() {
         });
     }
 
+    // I9 fix: `__daemon` runs `daemon::build_daemon`'s destructive v1->v2
+    // plugin migration with `cfg!(test)` FALSE (it spawns the real compiled
+    // binary), so it always resolves
+    // `plugins::bundle::installed_bundle_root()`. `HOME` alone does not
+    // fully redirect that on a Linux box that already exports
+    // `XDG_CONFIG_HOME` — `dirs::config_dir()` honors that var over `HOME` —
+    // so both `XDG_CONFIG_HOME` and the `RYUZI_PLUGINS_ROOT` test-seam env
+    // var are set explicitly here too (see `installed_bundle_root`'s doc).
+    let config_home = tmp.path().join("config");
+    let plugins_root = tmp.path().join("plugins-root");
+
     // 3. Daemon reaches running, then exits cleanly on SIGTERM.
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ryuzi"))
         .arg("__daemon")
         .env("XDG_DATA_HOME", &data_home)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("RYUZI_PLUGINS_ROOT", &plugins_root)
         .stdin(Stdio::null())
         .spawn()
         .expect("failed to spawn `ryuzi __daemon`");

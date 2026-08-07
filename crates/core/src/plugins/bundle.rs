@@ -217,7 +217,37 @@ pub struct InstalledBundle {
 }
 
 /// Root used by the component-bundle installer for the current user.
+///
+/// **Test seam (I9 fix):** when `RYUZI_PLUGINS_ROOT` is set, that directory
+/// is used verbatim instead of the real per-user config dir, and the OS
+/// config-dir lookup is never consulted. Unset (the production default) this
+/// has no effect.
+///
+/// This is the ONE function every call site that resolves the installed-
+/// plugins root goes through — `daemon::build_daemon`'s destructive v1->v2
+/// first-upgrade migration sweep, `control::lifecycle::ControlPlane::
+/// build_component_mcp_servers`/`enabled_plugin_content_roots`,
+/// `wasm_provider::discover_provider_components`,
+/// `wasm_gateway::discover_gateway_components`, `plugins::doctor::
+/// plugin_doctor`, and every `api::plugins_api` handler — so setting this one
+/// env var before the FIRST call in a test process makes every one of them
+/// hermetic against a tempdir instead of the real
+/// `~/.config/ryuzi/plugins`.
+///
+/// `daemon.rs` previously guarded its migration sweep with `cfg!(test)`
+/// alone, which is only `true` when THIS crate itself is compiled as the
+/// test target — it is `false` for an out-of-crate integration test (e.g.
+/// `crates/runner/tests/daemon.rs`, which spawns the real compiled `ryuzi`
+/// binary) and for the shipped binary. Any such caller MUST set
+/// `RYUZI_PLUGINS_ROOT` (alongside `HOME`/`XDG_DATA_HOME`) before spawning —
+/// this project has already destroyed one real user's installed plugins by
+/// relying on `cfg!(test)` alone for that guard.
 pub fn installed_bundle_root() -> PathBuf {
+    if let Ok(path) = std::env::var("RYUZI_PLUGINS_ROOT") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("ryuzi")
@@ -526,7 +556,52 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use serial_test::serial;
     use std::fs;
+
+    // ---------- I9: RYUZI_PLUGINS_ROOT test seam ----------
+    //
+    // Process-global env var — every test touching it must be `#[serial]`,
+    // matching this crate's convention for other global-env test seams (see
+    // e.g. `daemon.rs`'s `StateDirGuard`).
+
+    #[test]
+    #[serial]
+    fn installed_bundle_root_honors_the_env_var_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RYUZI_PLUGINS_ROOT", dir.path());
+        assert_eq!(
+            installed_bundle_root(),
+            dir.path(),
+            "the env override must win over the real OS config dir"
+        );
+        std::env::remove_var("RYUZI_PLUGINS_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn installed_bundle_root_falls_back_to_the_os_config_dir_when_unset() {
+        std::env::remove_var("RYUZI_PLUGINS_ROOT");
+        let root = installed_bundle_root();
+        assert!(
+            root.ends_with(Path::new("ryuzi").join("plugins")),
+            "unset must fall back to <config-dir>/ryuzi/plugins, got {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn installed_bundle_root_ignores_a_blank_env_var() {
+        std::env::set_var("RYUZI_PLUGINS_ROOT", "   ");
+        let root = installed_bundle_root();
+        assert!(
+            root.ends_with(Path::new("ryuzi").join("plugins")),
+            "a blank/whitespace-only override must be treated as unset, got {}",
+            root.display()
+        );
+        std::env::remove_var("RYUZI_PLUGINS_ROOT");
+    }
 
     const KEY_ID: &str = "first-party";
 
