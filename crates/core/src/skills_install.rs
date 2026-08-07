@@ -200,39 +200,9 @@ struct GitRepoCloner;
 #[async_trait::async_trait]
 impl RepoCloner for GitRepoCloner {
     async fn clone_repo(&self, source: &ParsedSkillSource, dest: &Path) -> Result<Option<String>> {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.arg("clone")
-            .arg("--depth")
-            .arg("1")
-            .arg(&source.repo)
-            .arg(dest);
-        crate::process_util::no_window(&mut cmd);
-        let output = cmd
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn git clone for {}", source.repo))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stderr.is_empty() {
-                bail!("git clone failed for {}", source.repo);
-            }
-            bail!("git clone failed for {}: {}", source.repo, stderr);
-        }
         // The clone still has `.git` at this point; `copy_dir_recursive`
-        // strips it later when the tree is installed. Resolve HEAD now while
-        // it's still available.
-        let head = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(dest)
-            .arg("rev-parse")
-            .arg("HEAD")
-            .output()
-            .await
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
-        Ok(head)
+        // strips it later when the tree is installed.
+        crate::install_common::git_clone_repo(&source.repo, dest).await
     }
 }
 
@@ -1893,26 +1863,7 @@ impl DirSwap {
 }
 
 fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_string_lossy() == ".git" {
-            continue;
-        }
-        let source_path = entry.path();
-        let dest_path = dest.join(&name);
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&source_path, &dest_path)?;
-        } else if file_type.is_file() {
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&source_path, &dest_path)?;
-        }
-    }
-    Ok(())
+    crate::install_common::copy_dir_recursive(source, dest)
 }
 
 /// Stable content hash of an installed tree. Walks files in sorted order,

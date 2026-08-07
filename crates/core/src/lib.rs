@@ -18,6 +18,7 @@ pub mod fsview;
 pub mod gateway;
 pub mod gateways;
 pub mod harness;
+pub(crate) mod install_common;
 pub mod learning;
 pub mod llm_router;
 pub mod mcp;
