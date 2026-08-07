@@ -87,10 +87,36 @@ pub async fn run(
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
-            if !install_is_v2(&dir) {
-                std::fs::remove_dir_all(&dir)?;
-                store.clear_component_releases(&id).await?;
-                report.dropped_installs.push(id);
+            match classify_install(&dir) {
+                InstallVerdict::V2 => continue,
+                InstallVerdict::Indeterminate(error) => {
+                    // Leave it strictly alone. `load_active_bundles` already
+                    // skip-and-warns anything unloadable, so the cost of not
+                    // cleaning up now is a log line; the cost of guessing
+                    // wrong is a destroyed install.
+                    tracing::warn!(
+                        plugin = %id,
+                        "plugins: could not classify install, leaving it untouched: {error}"
+                    );
+                }
+                InstallVerdict::NotV2 => {
+                    // Per-directory best-effort: one locked file must not
+                    // abort the sweep or the independent CSV migration below.
+                    if let Err(error) = std::fs::remove_dir_all(&dir) {
+                        tracing::warn!(
+                            plugin = %id,
+                            "plugins: could not remove v1 leftover (leaving it): {error}"
+                        );
+                        continue;
+                    }
+                    if let Err(error) = store.clear_component_releases(&id).await {
+                        tracing::warn!(
+                            plugin = %id,
+                            "plugins: removed v1 leftover but could not clear its ledger rows: {error}"
+                        );
+                    }
+                    report.dropped_installs.push(id);
+                }
             }
         }
     }
@@ -120,15 +146,40 @@ pub async fn run(
 /// contract 1), so this function does not re-implement contract detection —
 /// a v1 manifest (missing `contract`, or declaring `contract = 1`) simply
 /// fails to parse and this returns `false`.
-fn install_is_v2(plugin_dir: &Path) -> bool {
-    let Ok(current) = std::fs::read_to_string(plugin_dir.join("current")) else {
-        return false;
+/// What a directory under the plugins root looks like to the migration.
+#[derive(Debug)]
+enum InstallVerdict {
+    /// A readable pointer + manifest that parses as contract 2. Keep.
+    V2,
+    /// Definitively not a v2 install — the pointer or manifest is absent, or
+    /// the manifest is present and does NOT parse as v2. Safe to drop.
+    NotV2,
+    /// Could not be determined right now (permission denied, file locked,
+    /// antivirus scan, concurrent install). NEVER drop on this: an
+    /// indeterminate read must not be mistaken for a v1 leftover.
+    Indeterminate(std::io::Error),
+}
+
+/// Classify one plugin directory. Only `NotFound` counts as evidence of
+/// absence; every other I/O error is [`InstallVerdict::Indeterminate`] so a
+/// transient failure can never destroy a healthy install.
+fn classify_install(plugin_dir: &Path) -> InstallVerdict {
+    let current = match std::fs::read_to_string(plugin_dir.join("current")) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return InstallVerdict::NotV2,
+        Err(error) => return InstallVerdict::Indeterminate(error),
     };
     let manifest_path = plugin_dir.join(current.trim()).join("ryuzi-plugin.toml");
-    let Ok(text) = std::fs::read_to_string(manifest_path) else {
-        return false;
+    let text = match std::fs::read_to_string(manifest_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return InstallVerdict::NotV2,
+        Err(error) => return InstallVerdict::Indeterminate(error),
     };
-    ryuzi_plugin_sdk::PluginManifest::from_toml(&text).is_ok()
+    if ryuzi_plugin_sdk::PluginManifest::from_toml(&text).is_ok() {
+        InstallVerdict::V2
+    } else {
+        InstallVerdict::NotV2
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +304,66 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("secret")
+        );
+    }
+
+    /// The classifier must only treat ABSENCE as evidence of "not v2". Any
+    /// other I/O error is indeterminate, and an indeterminate directory is
+    /// never dropped — a transient lock or permission blip must not destroy a
+    /// healthy install. (Regression: an earlier version mapped every `Err` to
+    /// "not v2" and deleted real user installs.)
+    #[test]
+    fn classify_treats_only_absence_as_not_v2() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Nothing at all -> definitively not a v2 install.
+        let missing = tmp.path().join("gone");
+        std::fs::create_dir_all(&missing).unwrap();
+        assert!(matches!(classify_install(&missing), InstallVerdict::NotV2));
+
+        // Pointer present, manifest absent -> still definitively not v2.
+        let dangling = tmp.path().join("dangling");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::fs::write(dangling.join("current"), "0.1.0").unwrap();
+        assert!(matches!(classify_install(&dangling), InstallVerdict::NotV2));
+
+        // A contract-1 manifest parses as absent-from-v2 -> droppable.
+        let v1 = tmp.path().join("v1");
+        std::fs::create_dir_all(v1.join("0.1.0")).unwrap();
+        std::fs::write(v1.join("current"), "0.1.0").unwrap();
+        std::fs::write(
+            v1.join("0.1.0/ryuzi-plugin.toml"),
+            "contract = 1\nid = \"v1\"\nname = \"V1\"\n",
+        )
+        .unwrap();
+        assert!(matches!(classify_install(&v1), InstallVerdict::NotV2));
+
+        // `current` is a DIRECTORY, so reading it fails with an error that is
+        // not NotFound -> indeterminate, must be left alone.
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir_all(locked.join("current")).unwrap();
+        assert!(
+            matches!(classify_install(&locked), InstallVerdict::Indeterminate(_)),
+            "a non-NotFound read error must be indeterminate, never NotV2"
+        );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_installs_are_never_dropped() {
+        let (store, settings, tmp, _db) = test_harness().await;
+        // `current` as a directory reproduces a non-NotFound read error.
+        std::fs::create_dir_all(tmp.path().join("github/current")).unwrap();
+
+        let report = run(&store, &settings, tmp.path()).await.unwrap();
+
+        assert!(
+            report.dropped_installs.is_empty(),
+            "an indeterminate install must not be dropped, got {:?}",
+            report.dropped_installs
+        );
+        assert!(
+            tmp.path().join("github").exists(),
+            "the directory must be left on disk"
         );
     }
 

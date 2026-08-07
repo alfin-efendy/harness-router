@@ -423,25 +423,41 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // block below it: a failure to clean up one leftover install must never
     // refuse to start the whole daemon — `load_active_bundles` already
     // skip-and-warns any v1 leftover this migration failed to remove.
+    //
+    // The root is taken from `component_bootstrap` when the caller supplied
+    // one. Falling back to the REAL `installed_bundle_root()` is correct in
+    // production but catastrophic under `cfg!(test)`: the in-crate tests build
+    // daemons with `component_bootstrap: None`, which would point this
+    // destructive sweep at the developer's own installed plugins. It has
+    // already destroyed a real install once. Under test, no explicit root
+    // means no migration.
     {
         let plugins_root = match opts.component_bootstrap.as_ref() {
-            Some(cfg) => cfg.root.clone(),
-            None => crate::plugins::bundle::installed_bundle_root(),
+            Some(cfg) => Some(cfg.root.clone()),
+            None if cfg!(test) => None,
+            None => Some(crate::plugins::bundle::installed_bundle_root()),
         };
         let settings = SettingsStore::new(Arc::clone(&store));
-        match crate::plugins::migrate_v2::run(&store, &settings, &plugins_root).await {
-            Ok(report) if !report.is_empty() => {
-                tracing::info!(
-                    dropped_installs = ?report.dropped_installs,
-                    migrated_gateway_ids = ?report.migrated_gateway_ids,
-                    "plugins: v1 -> v2 first-upgrade migration ran"
-                );
+        match plugins_root {
+            None => {
+                tracing::debug!("plugins: skipping v2 migration (test build, no explicit root)");
             }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    "plugins: v1 -> v2 first-upgrade migration failed (continuing boot): {error}"
-                );
+            Some(plugins_root) => {
+                match crate::plugins::migrate_v2::run(&store, &settings, &plugins_root).await {
+                    Ok(report) if !report.is_empty() => {
+                        tracing::info!(
+                            dropped_installs = ?report.dropped_installs,
+                            migrated_gateway_ids = ?report.migrated_gateway_ids,
+                            "plugins: v1 -> v2 first-upgrade migration ran"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "plugins: v1 -> v2 first-upgrade migration failed (continuing boot): {error}"
+                        );
+                    }
+                }
             }
         }
     }
