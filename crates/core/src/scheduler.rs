@@ -34,6 +34,11 @@ pub struct JobRow {
     /// Model id this job's session should start with, overriding the
     /// project's/agent's default. `None` keeps the ordinary resolution.
     pub model_override: Option<String>,
+    /// The plugin that installed this job, if any (slot-4 origin column).
+    /// `None` for a user-created job. Written only by
+    /// `plugins::automation_sync` — the Scheduler screen's create/update
+    /// commands never set this.
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,7 +184,7 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 const JOB_COLS: &str =
-    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override";
+    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id";
 
 fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
@@ -197,6 +202,7 @@ fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         notify_fail: r.get::<_, i64>(11)? != 0,
         pre_check: r.get(12)?,
         model_override: r.get(13)?,
+        plugin_id: r.get(14)?,
     })
 }
 
@@ -233,25 +239,94 @@ pub async fn upsert_job(store: &Store, job: JobRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
+                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
                  ON CONFLICT(id) DO UPDATE SET \
                    name=excluded.name, cron=excluded.cron, mode=excluded.mode, \
                    natural_text=excluded.natural_text, project_id=excluded.project_id, \
                    branch=excluded.branch, gateway=excluded.gateway, \
                    enabled=excluded.enabled, prompt=excluded.prompt, \
                    notify_success=excluded.notify_success, notify_fail=excluded.notify_fail, \
-                   pre_check=excluded.pre_check, model_override=excluded.model_override",
+                   pre_check=excluded.pre_check, model_override=excluded.model_override, \
+                   plugin_id=excluded.plugin_id",
                 params![
                     job.id, job.name, job.cron, job.mode, job.natural_text, job.project_id,
                     job.branch, job.gateway, job.enabled as i64, job.prompt,
                     job.notify_success as i64, job.notify_fail as i64, job.pre_check,
-                    job.model_override, now
+                    job.model_override, job.plugin_id, now
                 ],
             )
             .map(|_| ())
         })
         .await
+}
+
+/// Delete every job `plugin_id` owns, and their run history — the uninstall
+/// counterpart of `plugins::automation_sync::sync_plugin_automations`. Called
+/// only from `plugins::automation_sync::remove_plugin_automations`.
+pub async fn delete_jobs_and_runs_for_plugin(store: &Store, plugin_id: &str) -> anyhow::Result<()> {
+    let plugin_id = plugin_id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "DELETE FROM job_runs WHERE job_id IN (SELECT id FROM jobs WHERE plugin_id=?1)",
+                params![plugin_id],
+            )?;
+            c.execute("DELETE FROM jobs WHERE plugin_id=?1", params![plugin_id])?;
+            Ok(())
+        })
+        .await
+}
+
+/// Delete every job `plugin_id` owns whose `id` is NOT in `keep_ids`, and
+/// their run history — the orphan-pruning counterpart of
+/// [`delete_jobs_and_runs_for_plugin`], used when a plugin update's
+/// manifest no longer declares a job it previously synced (F3: without
+/// this, a removed job kept firing forever with its stale config). Scoped
+/// to `plugin_id` only — a row with a different `plugin_id` (including a
+/// user's own jobs, where `plugin_id IS NULL`) is never touched regardless
+/// of an id collision. Returns the number of rows pruned.
+pub async fn prune_jobs_and_runs_for_plugin(
+    store: &Store,
+    plugin_id: &str,
+    keep_ids: &[String],
+) -> anyhow::Result<usize> {
+    let plugin_id = plugin_id.to_string();
+    let keep_ids = keep_ids.to_vec();
+    store
+        .with_conn(move |c| {
+            let mut stmt = c.prepare("SELECT id FROM jobs WHERE plugin_id=?1")?;
+            let ids = stmt
+                .query_map(params![plugin_id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut pruned = 0usize;
+            for id in ids {
+                if keep_ids.iter().any(|kept| kept == &id) {
+                    continue;
+                }
+                c.execute("DELETE FROM job_runs WHERE job_id=?1", params![id])?;
+                c.execute("DELETE FROM jobs WHERE id=?1", params![id])?;
+                pruned += 1;
+            }
+            Ok(pruned)
+        })
+        .await
+}
+
+/// Flip a job's `enabled` flag. Enabling is refused with a clear,
+/// user-facing message when the job has no `project_id` yet — a
+/// plugin-installed job lands exactly in this state on first sync (no
+/// target project a plugin could ever guess), and flipping it on blind
+/// would try to run an agent nowhere.
+pub async fn toggle(store: &Store, id: &str, enabled: bool) -> anyhow::Result<()> {
+    let mut job = get_job(store, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("unknown job: {id}"))?;
+    if enabled && job.project_id.trim().is_empty() {
+        anyhow::bail!("pick a project first — this job has no project to run in");
+    }
+    job.enabled = enabled;
+    upsert_job(store, job).await
 }
 
 pub async fn delete_job(store: &Store, id: &str) -> anyhow::Result<()> {
@@ -803,6 +878,21 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
         Err(_) => return,
     };
     for job in jobs.into_iter().filter(|j| j.enabled) {
+        // I1 fix: `job.enabled` alone used to gate firing, so disabling a
+        // plugin left its `[[jobs]]` presets still due-checked and firing —
+        // the scheduler-side twin of `automation::list_enabled_hooks`'s bug.
+        // A job with no `plugin_id` (user-created) is unaffected; a
+        // plugin-owned job is skipped unless its owner reads explicitly
+        // enabled, matching every other plugin-enablement read's
+        // default-to-disabled convention.
+        if let Some(plugin_id) = &job.plugin_id {
+            let key = crate::plugins::host::qualified_setting_key(plugin_id, "enabled");
+            let plugin_enabled =
+                store.get_setting_raw(&key).await.ok().flatten().as_deref() == Some("true");
+            if !plugin_enabled {
+                continue;
+            }
+        }
         let key = format!("job_last_fired.{}", job.id);
         let last_fired: i64 = store
             .get_setting(&key)
@@ -1004,6 +1094,98 @@ mod tests {
         assert!(val.parse::<i64>().unwrap() > 0);
     }
 
+    // I1: a plugin-owned job that's DUE must not fire while its owning
+    // plugin is disabled — the scheduler-side twin of
+    // `automation::list_enabled_hooks_excludes_a_disabled_plugins_hook_but_
+    // keeps_user_hooks`. Bypasses `tick()`'s own first-sighting anchor (a
+    // brand-new job never fires on its first tick — it just anchors) by
+    // seeding `job_last_fired` far in the past, so the job reads as
+    // genuinely due on the very first `tick()` call this test makes.
+    #[tokio::test]
+    async fn tick_skips_a_due_jobs_disabled_plugin_but_fires_once_enabled() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            crate::control::ControlPlane::new(
+                store.clone(),
+                crate::plugins::Registries::new(),
+                persistence,
+            )
+            .await
+        };
+
+        let mut job = sample_job("acme/nightly");
+        job.plugin_id = Some("acme".into());
+        upsert_job(&store, job.clone()).await.unwrap();
+
+        let key = format!("job_last_fired.{}", job.id);
+        let long_ago = crate::paths::now_ms() - 10 * 24 * 60 * 60 * 1000;
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                &key,
+                &long_ago.to_string(),
+            )
+            .await
+            .unwrap();
+
+        // No `plugin.acme.enabled` setting yet (default-to-disabled) — the
+        // fire anchor must not advance at all.
+        tick(&cp).await;
+        assert_eq!(
+            store.get_setting(&key).await.unwrap(),
+            Some(long_ago.to_string()),
+            "a disabled plugin's due job must not fire"
+        );
+
+        // Enable the plugin — the SAME due job must now attempt to fire
+        // (the anchor advances to "now").
+        store
+            .set_setting_raw("plugin.acme.enabled", "true")
+            .await
+            .unwrap();
+        tick(&cp).await;
+        let after: i64 = store
+            .get_setting(&key)
+            .await
+            .unwrap()
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!(
+            after > long_ago,
+            "an enabled plugin's due job must attempt to fire (anchor must advance)"
+        );
+
+        // A user-created job (no plugin_id) is unaffected either way.
+        let mut user_job = sample_job("user/nightly");
+        user_job.plugin_id = None;
+        upsert_job(&store, user_job.clone()).await.unwrap();
+        let user_key = format!("job_last_fired.{}", user_job.id);
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                &user_key,
+                &long_ago.to_string(),
+            )
+            .await
+            .unwrap();
+        tick(&cp).await;
+        let user_after: i64 = store
+            .get_setting(&user_key)
+            .await
+            .unwrap()
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!(
+            user_after > long_ago,
+            "a user-created job must never be gated on any plugin's enablement"
+        );
+    }
+
     #[tokio::test]
     async fn job_and_run_crud_roundtrip() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1024,6 +1206,7 @@ mod tests {
             notify_fail: true,
             pre_check: "git status --short".into(),
             model_override: None,
+            plugin_id: None,
         };
         upsert_job(&store, job.clone()).await.unwrap();
         assert_eq!(get_job(&store, "j1").await.unwrap().unwrap(), job);
@@ -1092,6 +1275,7 @@ mod tests {
             notify_fail: false,
             pre_check: String::new(),
             model_override: None,
+            plugin_id: None,
         }
     }
 

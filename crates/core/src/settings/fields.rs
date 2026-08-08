@@ -191,13 +191,6 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         ..BASE
     },
     ConfigField {
-        key: "enabled_gateways",
-        label: "Enabled gateways",
-        control: true,
-        help: "(managed by the Providers picker)",
-        ..BASE
-    },
-    ConfigField {
         key: "listen_addr",
         label: "Listen address",
         default: Some("127.0.0.1"),
@@ -291,12 +284,15 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_32_keys_and_correct_flags() {
+    fn schema_has_31_keys_and_correct_flags() {
         // Native Discord (the only historical gateway with catalog fields)
         // migrated to a WASM component bundle that declares its own settings,
-        // so the schema is now globals-only.
+        // so the schema is now globals-only. Task 4 also retired the
+        // `enabled_gateways` CSV `ConfigField` itself (32 → 31): every
+        // plugin's enablement, gateway included, now lives at the dynamic
+        // `plugin.<id>.enabled` key instead of a static global field.
         let fields = all_fields();
-        assert_eq!(fields.len(), 32); // 32 global, no native gateway fields
+        assert_eq!(fields.len(), 31); // 31 global, no native gateway fields
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));

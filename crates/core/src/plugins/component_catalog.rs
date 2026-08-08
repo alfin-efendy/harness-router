@@ -24,10 +24,9 @@
 //!   [`is_component_bundle`], so Cockpit can offer release management for it
 //!   against whichever row won.
 
-use ryuzi_plugin_sdk::bundle::{DeclaredTool, PluginBundleManifest};
-use ryuzi_plugin_sdk::{AuthKind, AuthSpec, PluginManifest, CONTRACT_VERSION};
+use ryuzi_plugin_sdk::{AuthKind, AuthSpec, DeclaredTool, PluginManifest};
 
-use super::host::{CorePlugin, PluginSource};
+use super::host::{qualified_setting_key, CorePlugin, PluginSource};
 
 /// The non-colliding first-party bundles, embedded from their in-repo
 /// manifest. Keep in sync with the component list in
@@ -98,132 +97,113 @@ pub const COMPONENT_BACKED_PROVIDER_IDS: &[&str] = &[
     "qwen",
 ];
 
-/// Derive the coarse auth contract a bundle implies (PR-3): declared OAuth
+/// Derive the coarse auth contract a manifest implies (PR-3): declared OAuth
 /// profiles → oauth; else a secret+required setting (e.g. discord's bot
 /// token) → token, pointing `setting` at its fully-qualified key; else none.
 /// Presentation/status metadata ONLY — component connect flows run through
 /// the profile RPCs, never the classic declarative OAuth engine.
-fn derive_bundle_auth(id: &str, bundle: &PluginBundleManifest) -> Option<AuthSpec> {
-    if !bundle.oauth.is_empty() {
+///
+/// v2 manifests still don't author an `[auth]` block for a component bundle
+/// (the bridge derives it, same as v1's bundle bridge did) — this now reads
+/// straight off `&PluginManifest` (`oauth` + `settings`, both present on
+/// every v2 manifest) instead of the deleted `PluginBundleManifest`.
+pub(crate) fn derive_manifest_auth(manifest: &PluginManifest) -> Option<AuthSpec> {
+    if !manifest.oauth.is_empty() {
         return Some(AuthSpec {
             kind: AuthKind::Oauth,
             ..Default::default()
         });
     }
-    bundle
+    manifest
         .settings
         .iter()
         .find(|f| f.secret && f.required)
         .map(|f| AuthSpec {
             kind: AuthKind::Token,
-            setting: Some(format!("plugin.{id}.{}", f.key)),
+            setting: Some(qualified_setting_key(&manifest.id, &f.key)),
             ..Default::default()
         })
 }
 
-/// Map a bundle manifest onto the declarative [`PluginManifest`] shape the
-/// plugin list speaks. `mcp`/`skills`/`provider` stay empty — the bundle
-/// format has no concept of them, and a component's behavior is contributed
-/// by the running component, never by this manifest. `auth`/`settings` ARE
-/// bridged (PR-3, [`derive_bundle_auth`]): the bundle's declared OAuth
-/// profiles / settings drive the wizard connect step, needs-setup status,
-/// and the setup checklist for component plugins, with every bare bundle
-/// settings key namespaced `plugin.<id>.<key>` to match the settings store.
-fn manifest_from_bundle(bundle: PluginBundleManifest) -> PluginManifest {
-    let auth = derive_bundle_auth(&bundle.id, &bundle);
-    let settings = bundle
-        .settings
-        .iter()
-        .map(|f| {
-            let mut f = f.clone();
-            f.key = format!("plugin.{}.{}", bundle.id, f.key);
-            f
-        })
-        .collect();
-    PluginManifest {
-        contract: CONTRACT_VERSION,
-        id: bundle.id,
-        name: bundle.name,
-        version: bundle.version,
-        publisher: if bundle.publisher.is_empty() {
-            "Ryuzi".to_string()
-        } else {
-            bundle.publisher
-        },
-        description: bundle.description,
-        homepage: None,
-        icon: None,
-        categories: vec!["component".to_string()],
-        slot: None,
-        verified: true,
-        experimental: false,
-        auth,
-        settings,
-        mcp: vec![],
-        extensions: vec![],
-        skills: vec![],
-        provider: None,
-    }
-}
-
-/// Parse `id`'s embedded first-party bundle manifest (PR-1). The single
-/// lookup+parse `declared_tool_count`/`declared_tools` always did, exposed
-/// whole so `plugin_release_detail` can preview a never-installed
-/// component's full manifest (tools, domains, oauth) without any fetch.
-/// `None` when `id` has no embedded manifest in
-/// [`COMPONENT_BUNDLE_MANIFESTS`] or its TOML fails to parse.
-pub fn declared_bundle_manifest(id: &str) -> Option<PluginBundleManifest> {
+/// Parse `id`'s embedded first-party manifest (PR-1). The single lookup+parse
+/// `declared_tool_count`/`declared_tools` always did, exposed whole so
+/// `plugin_release_detail` can preview a never-installed component's full
+/// manifest (tools, domains, oauth) without any fetch. `None` when `id` has
+/// no embedded manifest in [`COMPONENT_BUNDLE_MANIFESTS`] or its TOML fails
+/// to parse.
+///
+/// Unlike v1's `declared_bundle_manifest`, this is the RAW embedded manifest
+/// (bare settings keys, no derived `[auth]`) — the same shape
+/// [`component_catalog_plugins`] bridges into a `CorePlugin`. Callers that
+/// need the derived/qualified presentation (e.g.
+/// `host::component_required_settings_configured`) get it as-is here and
+/// qualify keys themselves via `host::qualified_setting_key`.
+pub fn declared_manifest(id: &str) -> Option<PluginManifest> {
     COMPONENT_BUNDLE_MANIFESTS
         .iter()
         .find(|(got, _)| *got == id)
-        .and_then(|(_, src)| toml::from_str::<PluginBundleManifest>(src).ok())
+        .and_then(|(_, src)| PluginManifest::from_toml(src).ok())
 }
 
-/// The number of tools `id`'s embedded first-party bundle manifest declares
+/// The number of tools `id`'s embedded first-party manifest declares
 /// (Task 1) — feeds `PluginInfo.tool_count`. `None` when `id` has no embedded
 /// manifest in [`COMPONENT_BUNDLE_MANIFESTS`] (e.g. a provider bundle
 /// represented by its builtin row, see [`COMPONENT_BACKED_PROVIDER_IDS`]) or
 /// its embedded TOML fails to parse.
 pub fn declared_tool_count(id: &str) -> Option<u32> {
-    declared_bundle_manifest(id).map(|m| m.tools.len() as u32)
+    declared_manifest(id).map(|m| m.tools.len() as u32)
 }
 
 /// The full declared-tool detail (name, description, writes) `id`'s embedded
-/// first-party bundle manifest declares (Task 1) — the same lookup
+/// first-party manifest declares (Task 1) — the same lookup
 /// [`declared_tool_count`] uses, but the tools themselves rather than just
 /// the count. Feeds `plugin_tools`' (Task 4) declared-manifest fallback.
 /// Empty (never an error) when `id` has no embedded manifest here or its
 /// embedded TOML fails to parse — same fallback `declared_tool_count` uses.
 pub fn declared_tools(id: &str) -> Vec<DeclaredTool> {
-    declared_bundle_manifest(id)
-        .map(|m| m.tools)
-        .unwrap_or_default()
+    declared_manifest(id).map(|m| m.tools).unwrap_or_default()
 }
 
 /// Every embedded component bundle as a manifest-only plugin. A manifest that
 /// fails to parse is logged and skipped rather than panicking, so one bad
 /// embedded file can never take the daemon down at startup.
+///
+/// v2 manifests are the UI manifest already — no `manifest_from_bundle`
+/// bridge step remains — but `auth`/settings-key qualification still happen
+/// here, same as v1's bridge: the embedded TOML author never writes `[auth]`
+/// for a component (it is derived), and `[[settings]]` keys stay BARE in the
+/// manifest, qualified to `plugin.<id>.<key>` only at this registration
+/// boundary.
 pub fn component_catalog_plugins() -> Vec<CorePlugin> {
     COMPONENT_BUNDLE_MANIFESTS
         .iter()
         .filter(|(id, _)| !provider_registry_owns(id))
-        .filter_map(
-            |(id, src)| match toml::from_str::<PluginBundleManifest>(src) {
-                Ok(bundle) => Some(CorePlugin {
-                    manifest: manifest_from_bundle(bundle),
+        .filter_map(|(id, src)| match PluginManifest::from_toml(src) {
+            Ok(mut manifest) => {
+                if manifest.auth.is_none() {
+                    manifest.auth = derive_manifest_auth(&manifest);
+                }
+                for field in &mut manifest.settings {
+                    field.key = qualified_setting_key(&manifest.id, &field.key);
+                }
+                if manifest.categories.is_empty() {
+                    manifest.categories = vec!["component".to_string()];
+                }
+                manifest.verified = true;
+                Some(CorePlugin {
+                    manifest,
                     harness: None,
                     gateway: None,
                     connector: None,
-                    extension: None,
                     provider: None,
-                    source: PluginSource::Component,
-                }),
-                Err(error) => {
-                    tracing::error!("component catalog: manifest `{id}` failed to parse: {error}");
-                    None
-                }
-            },
-        )
+                    source: PluginSource::Builtin,
+                })
+            }
+            Err(error) => {
+                tracing::error!("component catalog: manifest `{id}` failed to parse: {error}");
+                None
+            }
+        })
         .collect()
 }
 
@@ -236,13 +216,16 @@ mod tests {
     // light up. github/atlassian/bitbucket declare [[oauth]] → oauth;
     // discord declares a secret+required token setting (Task 10) → token —
     // until Task 10 lands, discord derives None here, so this test uses a
-    // synthetic bundle for the token case.
+    // synthetic manifest for the token case.
     #[test]
-    fn bridge_derives_auth_from_bundle() {
-        let github = manifest_from_bundle(declared_bundle_manifest("github").unwrap());
-        assert_eq!(github.auth.as_ref().map(|a| a.kind), Some(AuthKind::Oauth));
+    fn bridge_derives_auth_from_manifest() {
+        let github = declared_manifest("github").unwrap();
+        assert_eq!(
+            derive_manifest_auth(&github).map(|a| a.kind),
+            Some(AuthKind::Oauth)
+        );
 
-        let mut synthetic = declared_bundle_manifest("github").unwrap();
+        let mut synthetic = declared_manifest("github").unwrap();
         synthetic.id = "synth".into();
         synthetic.oauth.clear();
         synthetic.settings = vec![SettingField {
@@ -255,25 +238,25 @@ mod tests {
             options: vec![],
             default: None,
         }];
-        let m = manifest_from_bundle(synthetic);
-        assert_eq!(m.auth.as_ref().map(|a| a.kind), Some(AuthKind::Token));
-        assert_eq!(
-            m.auth.as_ref().and_then(|a| a.setting.as_deref()),
-            Some("plugin.synth.token")
-        );
-        assert_eq!(
-            m.settings[0].key, "plugin.synth.token",
-            "bridge prefixes bare keys"
-        );
+        let auth = derive_manifest_auth(&synthetic).expect("secret+required setting derives auth");
+        assert_eq!(auth.kind, AuthKind::Token);
+        assert_eq!(auth.setting.as_deref(), Some("plugin.synth.token"));
     }
 
     // Task 10: discord now declares its settings for real, so the bridge
     // derives AuthKind::Token from the embedded manifest itself (no more
-    // synthetic-bundle workaround, see `bridge_derives_auth_from_bundle`
-    // above).
+    // synthetic-manifest workaround, see `bridge_derives_auth_from_manifest`
+    // above). Goes through `component_catalog_plugins()` (not
+    // `declared_manifest` directly) because settings-key qualification and
+    // auth derivation both happen at that registration boundary.
     #[test]
-    fn discord_bundle_declares_token_settings_and_derives_token_auth() {
-        let m = manifest_from_bundle(declared_bundle_manifest("discord").unwrap());
+    fn discord_manifest_declares_token_settings_and_derives_token_auth() {
+        let plugins = component_catalog_plugins();
+        let m = &plugins
+            .iter()
+            .find(|p| p.manifest.id == "discord")
+            .expect("discord is registered")
+            .manifest;
         assert_eq!(m.auth.as_ref().map(|a| a.kind), Some(AuthKind::Token));
         assert_eq!(
             m.auth.as_ref().and_then(|a| a.setting.as_deref()),
@@ -289,8 +272,8 @@ mod tests {
     // client-id-setting the host-side 3LO wiring needs.
     #[test]
     fn atlassian_profile_carries_pkce_extras_and_client_id_setting() {
-        let bundle = declared_bundle_manifest("atlassian").unwrap();
-        let p = &bundle.oauth[0];
+        let manifest = declared_manifest("atlassian").unwrap();
+        let p = &manifest.oauth[0];
         assert_eq!(
             p.client_id_setting.as_deref(),
             Some("plugin.atlassian.oauth_client_id")
@@ -304,7 +287,7 @@ mod tests {
     #[test]
     fn every_embedded_manifest_parses_and_matches_its_declared_id() {
         for (id, toml_src) in COMPONENT_BUNDLE_MANIFESTS {
-            let manifest: PluginBundleManifest = toml::from_str(toml_src)
+            let manifest = PluginManifest::from_toml(toml_src)
                 .unwrap_or_else(|e| panic!("component manifest `{id}` failed to parse: {e}"));
             assert_eq!(&manifest.id, id, "declared id must match the embedded slot");
         }
@@ -357,9 +340,10 @@ mod tests {
     }
 
     #[test]
-    fn every_plugin_is_manifest_only_and_component_sourced() {
+    fn every_plugin_is_manifest_only_and_builtin_sourced() {
         for plugin in component_catalog_plugins() {
-            assert_eq!(plugin.source, PluginSource::Component);
+            assert_eq!(plugin.source, PluginSource::Builtin);
+            assert!(plugin.manifest.component.is_some(), "component-backed");
             assert!(plugin.connector.is_none(), "manifest-only registration");
             assert!(plugin.gateway.is_none(), "manifest-only registration");
             assert!(plugin.harness.is_none(), "manifest-only registration");
@@ -390,7 +374,7 @@ mod tests {
                 .iter()
                 .find(|(got, _)| *got == id)
                 .unwrap_or_else(|| panic!("`{id}` must be an embedded component manifest"));
-            let m: PluginBundleManifest = toml::from_str(src)
+            let m = PluginManifest::from_toml(src)
                 .unwrap_or_else(|e| panic!("component manifest `{id}` failed to parse: {e}"));
             assert!(!m.tools.is_empty(), "{id} must declare its tools");
             let mut names: Vec<_> = m.tools.iter().map(|t| t.name.as_str()).collect();
@@ -404,8 +388,8 @@ mod tests {
             .iter()
             .find(|(got, _)| *got == "discord")
             .unwrap_or_else(|| panic!("`discord` must be an embedded component manifest"));
-        let m: PluginBundleManifest =
-            toml::from_str(src).unwrap_or_else(|e| panic!("discord manifest failed to parse: {e}"));
+        let m = PluginManifest::from_toml(src)
+            .unwrap_or_else(|e| panic!("discord manifest failed to parse: {e}"));
         assert!(
             m.tools.is_empty(),
             "discord gateway must declare no agent tools"

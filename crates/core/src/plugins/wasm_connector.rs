@@ -7,33 +7,25 @@
 //! subprocess/HTTP MCP servers — and structurally cannot represent a tool
 //! whose implementation runs IN-PROCESS. The WIT `connector` interface
 //! (`list-tools` + `invoke`) is exactly such an in-process tool surface, so
-//! the correct seam is the extension-tools path, not `Connector`. This module
-//! mirrors [`crate::plugins::extension::tools`] (`ExtensionTools` /
-//! `ExtensionToolBinding`) and its `harness::native::tools::extension`
-//! counterpart, one-for-one:
+//! this module owns just that in-process activation: instantiate-per-call,
+//! `list-tools`/`invoke` dispatch, and WIT<->JSON conversion.
 //!
-//! - [`WasmTools::session_tools`] is the [`ExtensionTools::session_tools`]
-//!   analogue — it enumerates every enabled component bundle's
-//!   `connector.list-tools`, validates each definition, and yields a
-//!   [`WasmToolBinding`] per surviving tool.
-//! - `harness::native::tools::wasm::WasmTool` wraps one binding as a native
-//!   [`Tool`](crate::harness::native::tools::Tool), converting the harness's
-//!   JSON tool input into a WIT `tool-call`, invoking the component, and
-//!   converting the WIT `tool-result` back into a tool output — the
-//!   `ExtensionTool` analogue.
+//! [`crate::plugins::mcp_component::ComponentMcpServer`] is the seam that
+//! turns one [`WasmActivation`] into an in-process MCP server (Task 6): it
+//! enumerates `connector.list-tools` via [`WasmActivation::connector_list_tools`],
+//! validates each definition with [`parse_tool_def`], and dispatches calls
+//! through [`WasmActivation::connector_invoke`] — the SAME registry
+//! `mcp__<server>__<tool>` tools from an external stdio server flow through,
+//! via `harness::native::tools::mcp::McpTool`.
 //!
 //! Every value is validated before registering it (a missing/blank tool name
 //! skips that tool with a warning, never a crash — an installed component is
 //! untrusted code) and a component trap/timeout during `list-tools`/`invoke`
 //! is caught and turned into a skipped tool / tool error, never a daemon
-//! crash, exactly like the extension path already guarantees.
-//!
-//! [`ExtensionTools::session_tools`]: crate::plugins::extension::ExtensionTools::session_tools
+//! crash.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::domain::Principal;
@@ -43,14 +35,15 @@ use crate::plugins::runtime::{CompiledComponent, ComponentInstance, PluginRuntim
 
 /// One enabled component bundle, compiled once and ready to instantiate a
 /// fresh, isolated instance per operation. Shared by the connector adapter
-/// (this module) and the hook adapter ([`crate::plugins::wasm_hooks`]); both
-/// re-instantiate per call so concurrent sessions never share mutable Wasm
-/// state.
+/// (this module) and the MCP bridge ([`crate::plugins::mcp_component`]),
+/// which calls back into [`WasmActivation::connector_invoke`] over the same
+/// `ryuzi:connector/connector` export; both re-instantiate per call so
+/// concurrent sessions never share mutable Wasm state.
 pub struct WasmActivation {
     compiled: Arc<CompiledComponent>,
     ctx: Arc<PluginCapabilityContext>,
     component_id: String,
-    principal: Principal,
+    pub(crate) principal: Principal,
 }
 
 impl WasmActivation {
@@ -81,11 +74,6 @@ impl WasmActivation {
         self.compiled.exports_connector()
     }
 
-    /// Whether this component exports `ryuzi:hooks/hooks` (IMP-2).
-    pub(crate) fn exports_hooks(&self) -> bool {
-        self.compiled.exports_hooks()
-    }
-
     /// Instantiate a fresh, isolated instance of this bundle's component,
     /// running `start` under the fuel/epoch budget.
     pub(crate) async fn instantiate(&self) -> Result<ComponentInstance, PluginRuntimeError> {
@@ -95,7 +83,7 @@ impl WasmActivation {
     /// Enumerate this component's connector tool definitions. A component with
     /// no connector export (e.g. a hooks-only plugin) surfaces as an `Err`,
     /// which the caller treats as "contributes no tools".
-    async fn connector_list_tools(&self) -> Result<Vec<wit::ToolDefinition>, String> {
+    pub(crate) async fn connector_list_tools(&self) -> Result<Vec<wit::ToolDefinition>, String> {
         let mut instance = self.instantiate().await.map_err(|e| e.to_string())?;
         let result = instance
             .call(|inst, store| {
@@ -143,117 +131,13 @@ impl WasmActivation {
     }
 }
 
-/// A typed, validated connector tool definition — the WASM analogue of
-/// [`crate::plugins::extension::ExtensionToolDef`], with the JSON input schema
+/// A typed, validated connector tool definition, with the JSON input schema
 /// synthesized from the WIT `tool-parameter` list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WasmToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-}
-
-/// Everything `harness::native::tools::wasm::WasmTool` needs to wrap one
-/// component-provided tool as a native `Tool`: the validated def, the owning
-/// component's id (for `wasm__<component>__<tool>` naming), the owning
-/// plugin's [`Principal`], the shared [`WasmActivation`] to invoke through,
-/// and the bare WIT tool name to pass to `invoke`.
-pub struct WasmToolBinding {
-    pub def: WasmToolDef,
-    pub component_id: String,
-    pub principal: Principal,
-    pub(crate) activation: Arc<WasmActivation>,
-    pub(crate) tool_name: String,
-}
-
-/// The `wasm__<component>__<tool>` wire name a component tool is exposed to the
-/// model under — mirrors `plugins::extension::tools::full_tool_name`'s
-/// `ext__<extension>__<tool>` scheme. Single source of truth shared by
-/// [`WasmTools::session_tools`]'s collision dedup and
-/// `WasmTool::from_binding`'s own naming.
-pub(crate) fn wasm_tool_name(component_id: &str, tool_name: &str) -> String {
-    format!("wasm__{component_id}__{tool_name}")
-}
-
-/// Gather every enabled component bundle's connector tools — the
-/// [`ExtensionTools`](crate::plugins::extension::ExtensionTools) analogue that
-/// `harness::native`'s session start (`connect_wasm_tools`, mirroring
-/// `connect_extension_tools`) calls through `SessionCtx.wasm_tools`.
-#[async_trait]
-pub trait WasmTools: Send + Sync {
-    async fn session_tools(&self) -> Vec<WasmToolBinding>;
-}
-
-/// The concrete [`WasmTools`] over a fixed set of enabled component bundles,
-/// built once at session start by the control plane.
-pub struct WasmToolSet {
-    activations: Vec<Arc<WasmActivation>>,
-}
-
-impl WasmToolSet {
-    pub fn new(activations: Vec<Arc<WasmActivation>>) -> Self {
-        WasmToolSet { activations }
-    }
-}
-
-#[async_trait]
-impl WasmTools for WasmToolSet {
-    async fn session_tools(&self) -> Vec<WasmToolBinding> {
-        // Two different components could format the same
-        // `wasm__<component>__<tool>` full name only if they share a component
-        // id — which the installer forbids (one active bundle per plugin id) —
-        // but a component could still declare the SAME tool name twice in its
-        // own `list-tools`. Track emitted full names so a duplicate is dropped
-        // deterministically (first wins) rather than silently shadowing in the
-        // registry's `BTreeMap::insert`, mirroring `session_tools`'s own dedup.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut out = Vec::new();
-        for activation in &self.activations {
-            // IMP-2: skip a component that exports no connector interface (e.g.
-            // a hooks-only plugin) — never instantiate it just to fail
-            // `GuestIndices::new` and warn.
-            if !activation.exports_connector() {
-                continue;
-            }
-            let defs = match activation.connector_list_tools().await {
-                Ok(defs) => defs,
-                Err(reason) => {
-                    tracing::warn!(
-                        component = %activation.component_id(),
-                        "skipping component connector tools: {reason}"
-                    );
-                    continue;
-                }
-            };
-            for raw in &defs {
-                let Some(def) = parse_tool_def(raw) else {
-                    tracing::warn!(
-                        component = %activation.component_id(),
-                        "skipping malformed connector tool definition (missing/blank name)"
-                    );
-                    continue;
-                };
-                let full_name = wasm_tool_name(activation.component_id(), &def.name);
-                if !seen.insert(full_name.clone()) {
-                    tracing::warn!(
-                        full_name = %full_name,
-                        component = %activation.component_id(),
-                        "skipping duplicate connector tool: full name already claimed"
-                    );
-                    continue;
-                }
-                let tool_name = def.name.clone();
-                out.push(WasmToolBinding {
-                    def,
-                    component_id: activation.component_id().to_string(),
-                    principal: activation.principal.clone(),
-                    activation: activation.clone(),
-                    tool_name,
-                });
-            }
-        }
-        out
-    }
 }
 
 /// Validate one WIT tool definition into a [`WasmToolDef`]. Only a non-empty
@@ -503,7 +387,7 @@ mod tests {
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -542,20 +426,34 @@ mod tests {
             provider_ids: vec![],
         });
         let bundle = InstalledBundle {
-            manifest: PluginBundleManifest {
+            manifest: PluginManifest {
+                contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
                 id: plugin_id.to_string(),
                 name: plugin_id.to_string(),
                 version: "0.1.0".to_string(),
-                wit_api: "^0.1.0".to_string(),
-                lifecycle: PluginLifecycle::Singleton,
-                component: "plugin.wasm".to_string(),
                 publisher: String::new(),
                 description: String::new(),
+                homepage: None,
+                icon: None,
+                categories: vec![],
+                slot: None,
+                verified: false,
+                experimental: false,
+                auth: None,
+                settings: vec![],
+                component: Some(ComponentSpec {
+                    file: "plugin.wasm".to_string(),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: PluginLifecycle::Singleton,
+                }),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
-                provider_ids: vec![],
+                provider: None,
                 tools: vec![],
-                settings: vec![],
+                mcp: vec![],
+                hooks: vec![],
+                jobs: vec![],
+                gateway: false,
             },
             release: PluginRelease {
                 id: plugin_id.to_string(),
@@ -601,27 +499,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_tools_enumerates_and_synthesizes_schema() {
+    async fn connector_list_tools_enumerates_and_parse_tool_def_synthesizes_schema() {
         build_fixtures();
         let (activation, _tmp) = test_activation(Duration::from_secs(10)).await;
-        let set = WasmToolSet::new(vec![activation]);
-        let mut bindings = set.session_tools().await;
-        bindings.sort_by(|a, b| a.def.name.cmp(&b.def.name));
-        let names: Vec<&str> = bindings.iter().map(|b| b.def.name.as_str()).collect();
+        let defs = activation.connector_list_tools().await.unwrap();
+        let mut parsed: Vec<WasmToolDef> = defs.iter().filter_map(parse_tool_def).collect();
+        parsed.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<&str> = parsed.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["echo", "explode", "slow"]);
 
-        let echo = bindings.iter().find(|b| b.def.name == "echo").unwrap();
+        let echo = parsed.iter().find(|d| d.name == "echo").unwrap();
         assert_eq!(
-            echo.def.input_schema,
+            echo.input_schema,
             json!({
                 "type": "object",
                 "properties": { "message": { "type": "string" } },
                 "required": ["message"]
             })
-        );
-        assert_eq!(
-            wasm_tool_name(&echo.component_id, &echo.def.name),
-            "wasm__acme-tools__echo"
         );
     }
 
@@ -670,35 +564,21 @@ mod tests {
         );
     }
 
-    // ---------- IMP-2: skip components lacking the connector export ----------
+    // ---------- IMP-2: a hooks-only component exports no connector ----------
+    //
+    // The full "never even instantiated" guard now lives one layer up, in
+    // `plugins::mcp_component::ComponentMcpServer::discover` (see its
+    // `non_connector_component_yields_none` test) — it gates on this exact
+    // `exports_connector()` check before ever calling `connector_list_tools`.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn export_set_is_captured_per_component() {
+    async fn exports_connector_is_false_for_a_hooks_only_component() {
         build_fixtures();
-        let (connector, _c) =
-            build_activation(connector_artifact(), "acme-tools", HostPolicy::deny_all()).await;
-        let (hooks, _h) =
-            build_activation(hooks_artifact(), "acme-hooks", HostPolicy::deny_all()).await;
-        assert!(connector.exports_connector() && !connector.exports_hooks());
-        assert!(hooks.exports_hooks() && !hooks.exports_connector());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_tools_skips_a_hooks_only_component_without_instantiating() {
-        build_fixtures();
-        // A tiny timeout: if the hooks-only component were instantiated to
-        // enumerate tools, that would still yield no tools — but with the IMP-2
-        // guard it is skipped BEFORE instantiation, so it never runs `start`.
         let (hooks, _h) =
             build_activation(hooks_artifact(), "acme-hooks", HostPolicy::deny_all()).await;
         assert!(
             !hooks.exports_connector(),
-            "sanity: the hooks fixture exports no connector"
-        );
-        let set = WasmToolSet::new(vec![hooks]);
-        assert!(
-            set.session_tools().await.is_empty(),
-            "a hooks-only component must contribute no connector tools"
+            "a hooks-only component must not export the connector interface"
         );
     }
 }

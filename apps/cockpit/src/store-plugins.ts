@@ -9,6 +9,7 @@ import {
   type PluginInfo,
   type PluginProfileDeviceFlowStart,
   type PluginProfilePkceStart,
+  type PluginSourceInstallBegin,
   type PluginToolEntry,
 } from "./bindings";
 
@@ -115,6 +116,16 @@ type PluginsState = {
    *  refreshed `componentBootstrapStatus.pending` is the source of truth for
    *  whether the banner should still show. */
   retryComponentBootstrap: () => Promise<void>;
+  /** Task 13: "Install from source…" — a local path or git URL, outside the
+   *  catalog's tiered-trust model (Task 11's `install_sources`). `begin`
+   *  resolves the parsed manifest's trust prompt (network hosts, stdio
+   *  commands, per-tool writes flags) without touching the live install dir;
+   *  `confirm` actually installs, carrying the caller's explicit
+   *  accept/decline of that prompt through to the daemon. Both toast on
+   *  error and return `null`; a successful confirm also reloads the plugin
+   *  list so the new row shows up without a manual refresh. */
+  beginSourceInstall: (source: string) => Promise<PluginSourceInstallBegin | null>;
+  confirmSourceInstall: (token: string, acceptTrust: boolean) => Promise<PluginInfo | null>;
 };
 
 /** `update_all_plugins`'s outcome summary, shared so the store action and any
@@ -381,6 +392,26 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     set({ componentBootstrapStatus: res.data });
     if (res.data.pending) toast.warning(res.data.message ?? "Component plugins still couldn't be installed");
     else toast.success("Component plugins installed");
+  },
+
+  beginSourceInstall: async (source) => {
+    const res = await commands.beginPluginSourceInstall("local", source);
+    if (res.status === "error") {
+      toast.error(`Couldn't read that source: ${res.error.message}`);
+      return null;
+    }
+    return res.data;
+  },
+
+  confirmSourceInstall: async (token, acceptTrust) => {
+    const res = await commands.confirmPluginSourceInstall("local", token, acceptTrust);
+    if (res.status === "error") {
+      toast.error(`Install failed: ${res.error.message}`);
+      return null;
+    }
+    toast.success(`${res.data.name} installed`);
+    await get().load();
+    return res.data;
   },
 }));
 

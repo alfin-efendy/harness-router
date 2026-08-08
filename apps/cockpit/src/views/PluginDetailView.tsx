@@ -26,7 +26,6 @@ import {
   type ComponentManifestInfo,
   type ComponentReleaseDetail,
   type ComponentReleaseInfo,
-  type ExtensionStatusEntry,
   type PluginDetail,
   type PluginToolEntry,
 } from "@/bindings";
@@ -36,12 +35,16 @@ import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
 import type { WizardStepId } from "@/components/modals/wizard/wizard-steps";
 import { OauthProfileConnections } from "@/components/plugins/OauthProfileConnections";
+import { PluginContentsList } from "@/components/plugins/PluginContentsList";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { deriveSetupChecklist, SetupChecklist } from "@/components/plugins/SetupChecklist";
 import { declaredToolEntries } from "@/lib/plugin-hub";
 import { pluginIcon } from "@/lib/plugin-icons";
+import { useApps } from "@/store-apps";
+import { useAutomations } from "@/store-automations";
 import { useNav } from "@/store-nav";
 import { usePlugins } from "@/store-plugins";
+import { useScheduler } from "@/store-scheduler";
 
 const WARN = "#F59E0B";
 
@@ -58,46 +61,6 @@ function formatLedgerTimestamp(ms: number): string {
   return new Date(ms).toLocaleDateString();
 }
 
-/** Human label for an `ExtensionStatusEntry.status` value (Track D
- *  observability, DT8). Pure and exported so it stays unit-testable without
- *  mounting the view — mirrors `PluginsView.tsx`'s `catalogStatusLabel`
- *  convention. */
-export function extensionStatusLabel(status: string): string {
-  switch (status) {
-    case "running":
-      return "Running";
-    case "starting":
-      return "Starting";
-    case "restarting":
-      return "Restarting";
-    case "failed":
-      return "Failed";
-    case "stopped":
-      return "Stopped";
-    case "not-running":
-      return "Not running";
-    default:
-      return status;
-  }
-}
-
-/** `Pill` color variant for an `ExtensionStatusEntry.status` value — green-ish
- *  "primary" for healthy/running, "warn" amber for a mid-restart/transient
- *  state, "danger" red for failed, muted "secondary" for stopped/not-running. */
-export function extensionStatusPillVariant(status: string): "primary" | "warn" | "danger" | "secondary" {
-  switch (status) {
-    case "running":
-      return "primary";
-    case "starting":
-    case "restarting":
-      return "warn";
-    case "failed":
-      return "danger";
-    default:
-      return "secondary";
-  }
-}
-
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
 //
 // First-party components are registered manifest-only (`PluginSource::Component`,
@@ -107,7 +70,7 @@ export function extensionStatusPillVariant(status: string): "primary" | "warn" |
 // driven entirely by `plugin_release_detail`. Pure helpers here are exported
 // so they stay unit-testable without mounting the view.
 
-/** Human label for a `PluginBundleManifest.lifecycle` value (already a plain
+/** Human label for a `PluginManifest.lifecycle` value (already a plain
  *  kebab-case string on the wire — see `ComponentManifestInfo.lifecycle`). */
 export function componentLifecycleLabel(lifecycle: string): string {
   switch (lifecycle) {
@@ -182,10 +145,12 @@ export function canActivateVersion(detail: ComponentReleaseDetail, version: stri
 
 // ---------- Tabbed scaffold — Task 9 ----------
 
-/** The five sections this view can show, driven by the `Segmented` control
- *  under the hero. Every plugin always gets `overview`; the rest only appear
- *  when there's something to show in them (see `visibleTabs`). */
-export type DetailTab = "overview" | "tools" | "settings" | "versions" | "health";
+/** The sections this view can show, driven by the `Segmented` control under
+ *  the hero. Every plugin always gets `overview`; the rest only appear when
+ *  there's something to show in them (see `visibleTabs`). Task 14 adds
+ *  `contents` (a plugin's own commands/skills) and `automations` (its own
+ *  hooks/jobs). */
+export type DetailTab = "overview" | "tools" | "contents" | "automations" | "settings" | "versions" | "health";
 
 /** Pure tab-visibility gate — never touches component state so it stays
  *  unit-testable without mounting the view. `installed` is `PluginInfo.
@@ -194,10 +159,14 @@ export type DetailTab = "overview" | "tools" | "settings" | "versions" | "health
  *  is at least enabled/configured — before that, the hero's `Install` action
  *  is the only affordance (spec §4), except `versions`, whose own install
  *  gate lives on that tab for component-backed plugins regardless of
- *  `installed`. */
+ *  `installed`. `contents`/`automations` (Task 14) are likewise independent
+ *  of `installed` — a not-yet-installed plugin's declared commands/skills/
+ *  hooks/jobs are still worth previewing. */
 export function visibleTabs(input: {
   installed: boolean;
   hasTools: boolean;
+  hasContents: boolean;
+  hasAutomations: boolean;
   hasAuth: boolean;
   hasSettings: boolean;
   hasVersions: boolean;
@@ -205,6 +174,8 @@ export function visibleTabs(input: {
 }): DetailTab[] {
   const tabs: DetailTab[] = ["overview"];
   if (input.hasTools) tabs.push("tools");
+  if (input.hasContents) tabs.push("contents");
+  if (input.hasAutomations) tabs.push("automations");
   if (input.installed && (input.hasAuth || input.hasSettings)) tabs.push("settings");
   if (input.hasVersions) tabs.push("versions");
   if (input.installed && input.hasHealth) tabs.push("health");
@@ -452,6 +423,16 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     toolsLiveById,
     loadTools,
   } = usePlugins();
+  // Task 14: Tools tab per-tool perm select (installed + trusted plugins
+  // only — component-backed plugins' MCP tools live under server id
+  // `<plugin-id>` after Task 6/7, same `apps` list `set_app_tool_perm`
+  // already reads/writes for a hand-added MCP server); Automations tab's
+  // enable switches (hooks/jobs).
+  const apps = useApps((s) => s.apps);
+  const hydrateApps = useApps((s) => s.hydrate);
+  const setAppToolPerm = useApps((s) => s.setToolPerm);
+  const toggleHook = useAutomations((s) => s.toggle);
+  const toggleJob = useScheduler((s) => s.toggle);
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [authValue, setAuthValue] = useState("");
@@ -464,7 +445,6 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const [oauthCode, setOauthCode] = useState("");
   const [oauthBusy, setOauthBusy] = useState<"begin" | "complete" | "disconnect" | null>(null);
   const [updatingPack, setUpdatingPack] = useState(false);
-  const [extensionEntries, setExtensionEntries] = useState<ExtensionStatusEntry[]>([]);
   // Component-plugin (WASM bundle) release management — Task 12.
   const [releaseDetail, setReleaseDetail] = useState<ComponentReleaseDetail | null>(null);
   const [releaseLoaded, setReleaseLoaded] = useState(false);
@@ -535,25 +515,13 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     void loadTools(id);
   }, [id, loadTools]);
 
-  // Extension (Track D "code plugin") status — DT8. `extension_status` is a
-  // params-free rpc returning every plugin's entries (mirrors `catalog_status`),
-  // so this view fetches it only when the plugin actually declares the
-  // capability, then filters down to its own `id` client-side (same pattern
-  // `doctorFindings.find((f) => f.pluginId === id ...)` above uses).
-  const isExtensionPlugin = detail?.info.capabilities.includes("extension") ?? false;
+  // Task 14: the Tools tab's per-tool perm select reads this plugin's MCP
+  // server row (id === plugin id) from the apps list — hydrate it on mount
+  // rather than relying on PluginsView having already done so (a direct
+  // deep link into this view never went through the hub first).
   useEffect(() => {
-    if (!isExtensionPlugin) {
-      setExtensionEntries([]);
-      return;
-    }
-    let active = true;
-    void commands.extensionStatus(LOCAL_RUNNER).then((res) => {
-      if (active && res.status === "ok") setExtensionEntries(res.data.filter((e) => e.pluginId === id));
-    });
-    return () => {
-      active = false;
-    };
-  }, [isExtensionPlugin, id]);
+    void hydrateApps();
+  }, [hydrateApps]);
 
   useEffect(() => {
     let active = true;
@@ -666,6 +634,8 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
     const fallbackTabs = visibleTabs({
       installed: false,
       hasTools: false,
+      hasContents: false,
+      hasAutomations: false,
       hasAuth: false,
       hasSettings: false,
       hasVersions: true,
@@ -749,7 +719,7 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const hasComponentOauth = componentOauthProfiles.length > 0;
   const hasAuthTab = (!!detail.auth && detail.auth.kind !== "none") || hasComponentOauth;
   const hasSettingsTab = detail.settings.length > 0 || detail.mcp.length > 0;
-  const hasHealthTab = isExtensionPlugin || idFindings.length > 0;
+  const hasHealthTab = idFindings.length > 0;
 
   // Tools & Skills tab — Task 10. `fallbackTools` is the pre-install case: a
   // component-backed plugin's active or declared manifest tools (Task 2), mapped via
@@ -772,9 +742,22 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   // resolves with entries — hence the `resolvedTools.length > 0` arm below,
   // not just the two pre-load signals.
   const hasToolsTab = (info.toolCount ?? 0) > 0 || fallbackTools.length > 0 || resolvedTools.length > 0;
+  // Task 14: Contents (commands/skills) and Automations (hooks/jobs) — both
+  // gate purely on the plugin's own declared content, independent of
+  // `installed` (mirrors `hasVersions`'s reasoning: a not-yet-installed
+  // plugin's declared content is still worth previewing).
+  const hasContentsTab = detail.commands.length + detail.skills.length > 0;
+  const hasAutomationsTab = detail.hooks.length + detail.jobs.length > 0;
+  // Task 14: the Tools tab's per-tool perm select only makes sense once this
+  // plugin's MCP server is actually live in the `apps` list (installed +
+  // trusted — an unsigned/untrusted plugin's mcp surface never attaches).
+  const pluginApp = apps.find((a) => a.id === id);
+  const showToolPerms = info.installed && info.trusted && pluginApp != null;
   const tabs = visibleTabs({
     installed: info.installed,
     hasTools: hasToolsTab,
+    hasContents: hasContentsTab,
+    hasAutomations: hasAutomationsTab,
     hasAuth: hasAuthTab,
     hasSettings: hasSettingsTab,
     hasVersions: hasVersionsTab,
@@ -788,6 +771,8 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const TAB_LABEL: Record<DetailTab, string> = {
     overview: "Overview",
     tools: `Tools (${toolsTabCount})`,
+    contents: "Contents",
+    automations: "Automations",
     settings: "Settings",
     versions: "Versions",
     health: "Health",
@@ -818,6 +803,19 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
   const onToggleEnabled = async () => {
     if (experimental) return;
     await setEnabled(id, !info.enabled);
+    await load();
+  };
+
+  // Task 14: Automations tab enable switches. `toggleHook`/`toggleJob`
+  // (`useAutomations`/`useScheduler`) patch THEIR OWN store's row, not this
+  // view's own `detail.hooks`/`detail.jobs` — reload afterward so the
+  // Switch's `on` prop reflects the new state.
+  const onToggleHook = async (hookId: string, enabled: boolean) => {
+    await toggleHook(hookId, enabled);
+    await load();
+  };
+  const onToggleJob = async (jobId: string, enabled: boolean) => {
+    await toggleJob(jobId, enabled);
     await load();
   };
 
@@ -1015,7 +1013,6 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
 
         <div className="mb-4 flex flex-wrap items-center gap-1.5">
           <PluginStatusBadge verified={info.verified} experimental={info.experimental} />
-          {info.capabilities.includes("extension") && <Pill variant="mono">Runs code</Pill>}
           {pinned && (
             <Pill variant="mono">
               <Pin aria-hidden size={9} strokeWidth={2} className="mr-1 inline align-[-1px]" />
@@ -1120,8 +1117,102 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
             {/* Task 10: the real `plugin_tools`-backed list, grouped by kind
                 (Tools/Skills/Models) — a provider's models moved here from
                 the old Overview "Models" card, so this is now the ONE place
-                a provider's model list shows. */}
-            <PluginToolsList entries={resolvedTools} live={resolvedToolsLive} />
+                a provider's model list shows. Task 14: an installed +
+                trusted plugin's MCP tools live under server id
+                `<plugin-id>` in the apps list (Task 6/7) — when that row
+                exists, rows show their full `mcp__<id>__<tool>` name and
+                gain a per-tool allow/ask/deny select wired to the same
+                `set_app_tool_perm` RPC the Apps & MCP screen uses. */}
+            <PluginToolsList
+              entries={resolvedTools}
+              live={resolvedToolsLive}
+              formatName={showToolPerms ? (name) => `mcp__${id}__${name}` : undefined}
+              renderTrailing={
+                showToolPerms
+                  ? (name) => {
+                      const t = pluginApp?.tools.find((x) => x.name === name);
+                      if (!t) return null;
+                      return (
+                        <Segmented
+                          size="sm"
+                          options={[
+                            { id: "allow", label: "Allow" },
+                            { id: "ask", label: "Ask" },
+                            { id: "deny", label: "Deny" },
+                          ]}
+                          value={t.perm}
+                          onChange={(perm) => void setAppToolPerm(id, name, perm)}
+                        />
+                      );
+                    }
+                  : undefined
+              }
+            />
+          </div>
+        )}
+
+        {activeTab === "contents" && (
+          <div data-testid="tab-panel-contents">
+            <PluginContentsList commands={detail.commands} skills={detail.skills} />
+          </div>
+        )}
+
+        {activeTab === "automations" && (
+          <div data-testid="tab-panel-automations">
+            {detail.hooks.length > 0 && (
+              <Card className="mb-3">
+                <CardHeader>
+                  <CardTitle>Hooks</CardTitle>
+                </CardHeader>
+                {detail.hooks.map((hook) => (
+                  <CardRow key={hook.name}>
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="text-[13px] font-medium">{hook.name}</span>
+                      <span className="text-[11.5px] text-muted-foreground">
+                        {hook.triggerAlias ? `${hook.triggerAlias} · ${hook.trigger}` : hook.trigger}
+                      </span>
+                    </div>
+                    {hook.needsTarget ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => nav.navigate({ kind: "automations", tab: "hooks", targetId: hook.id })}
+                      >
+                        Set up…
+                      </Button>
+                    ) : (
+                      <Switch on={hook.enabled} onToggle={() => void onToggleHook(hook.id, !hook.enabled)} label={`Enable ${hook.name}`} />
+                    )}
+                  </CardRow>
+                ))}
+              </Card>
+            )}
+            {detail.jobs.length > 0 && (
+              <Card className="mb-3">
+                <CardHeader>
+                  <CardTitle>Jobs</CardTitle>
+                </CardHeader>
+                {detail.jobs.map((job) => (
+                  <CardRow key={job.id}>
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="text-[13px] font-medium">{job.name}</span>
+                      <span className="text-[11.5px] text-muted-foreground">{job.schedule}</span>
+                    </div>
+                    {job.needsTarget ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => nav.navigate({ kind: "automations", tab: "scheduler", targetId: job.id })}
+                      >
+                        Set up…
+                      </Button>
+                    ) : (
+                      <Switch on={job.enabled} onToggle={() => void onToggleJob(job.id, !job.enabled)} label={`Enable ${job.name}`} />
+                    )}
+                  </CardRow>
+                ))}
+              </Card>
+            )}
           </div>
         )}
 
@@ -1344,30 +1435,6 @@ export function PluginDetailView({ id, initialTab }: { id: string; initialTab?: 
                     {f.suggestedAction && <div className="mt-1 text-[11px]">{f.suggestedAction}</div>}
                   </div>
                 ))}
-              </Card>
-            )}
-
-            {info.capabilities.includes("extension") && (
-              <Card>
-                <CardHeader>
-                  <CardTitle>Extension</CardTitle>
-                </CardHeader>
-                {extensionEntries.length === 0 ? (
-                  <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">No extension status reported yet.</div>
-                ) : (
-                  extensionEntries.map((e) => (
-                    <CardRow key={e.name}>
-                      <span className="w-[120px] shrink-0 truncate text-[13px] font-medium">{e.name}</span>
-                      <Pill variant={extensionStatusPillVariant(e.status)}>{extensionStatusLabel(e.status)}</Pill>
-                      {e.restartCount > 0 && (
-                        <span className="shrink-0 text-[11.5px] text-muted-foreground">
-                          {e.restartCount} restart{e.restartCount === 1 ? "" : "s"}
-                        </span>
-                      )}
-                      {e.lastError && <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">{e.lastError}</span>}
-                    </CardRow>
-                  ))
-                )}
               </Card>
             )}
           </div>

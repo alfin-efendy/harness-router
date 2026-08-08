@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
-import type { AutomationHookDetail, AutomationHookInfo, AutomationHookInput, EndpointStatusInfo, Project } from "@/bindings";
+import type { AutomationHookDetail, AutomationHookInfo, AutomationHookInput, EndpointStatusInfo, PluginInfo, Project } from "@/bindings";
 
 const project: Project = {
   projectId: "project-1",
@@ -33,6 +33,7 @@ const inbound: AutomationHookInfo = {
   inboundPath: "wh_x",
   createdAt: 1,
   updatedAt: 1,
+  pluginId: null,
 };
 const outbound: AutomationHookInfo = {
   id: "outbound-1",
@@ -43,6 +44,7 @@ const outbound: AutomationHookInfo = {
   inboundPath: null,
   createdAt: 1,
   updatedAt: 1,
+  pluginId: null,
 };
 
 const inboundDetail: AutomationHookDetail = {
@@ -99,12 +101,106 @@ const outboundDetail: AutomationHookDetail = {
   ],
 };
 
+// A plugin-owned hook with its target already filled in: shows the plugin
+// badge and offers Duplicate as mine, but no Edit/Delete.
+const pluginHook: AutomationHookInfo = {
+  id: "plugin-1",
+  name: "acme/deploy-notify",
+  triggerKind: "session.end",
+  actionKind: "agent.run",
+  enabled: true,
+  inboundPath: null,
+  createdAt: 1,
+  updatedAt: 1,
+  pluginId: "acme",
+};
+const pluginHookDetail: AutomationHookDetail = {
+  hook: pluginHook,
+  action: {
+    kind: "agent.run",
+    config: {
+      projectId: "project-1",
+      branch: "",
+      gatewayId: "local",
+      prompt: "Notify on deploy",
+      agentId: null,
+      modelOverride: null,
+      subtask: false,
+    },
+  },
+  runs: [],
+};
+
+// The same plugin's hook synced with no project (the sync convention every
+// plugin-installed agent.run hook starts with) — needs a target before it
+// can be enabled.
+const pluginHookNeedsTarget: AutomationHookInfo = { ...pluginHook, id: "plugin-2", name: "acme/triage", enabled: false };
+const pluginHookNeedsTargetDetail: AutomationHookDetail = {
+  hook: pluginHookNeedsTarget,
+  action: {
+    kind: "agent.run",
+    config: {
+      projectId: "",
+      branch: "",
+      gatewayId: "local",
+      prompt: "Triage",
+      agentId: null,
+      modelOverride: null,
+      subtask: false,
+    },
+  },
+  runs: [],
+};
+
+const acmePlugin: PluginInfo = {
+  id: "acme",
+  name: "Acme",
+  description: "Acme integration",
+  icon: null,
+  categories: [],
+  slot: null,
+  ownsSlot: false,
+  verified: true,
+  experimental: false,
+  enabled: true,
+  source: "catalog",
+  capabilities: [],
+  configured: false,
+  kind: "integration",
+  installed: true,
+  family: null,
+  pinned: false,
+  sourceSpec: null,
+  resolvedCommit: null,
+  installedAt: null,
+  updatedAt: null,
+  trustTier: null,
+  catalogVersion: null,
+  componentBacked: false,
+  blockedReason: null,
+  status: "ok",
+  statusDetail: null,
+  authKind: "none",
+  toolCount: null,
+  skillCount: null,
+  surfaces: [],
+  provenance: "catalog",
+  trusted: true,
+};
+
+const detailsById: Record<string, AutomationHookDetail> = {
+  [inbound.id]: inboundDetail,
+  [outbound.id]: outboundDetail,
+  [pluginHook.id]: pluginHookDetail,
+  [pluginHookNeedsTarget.id]: pluginHookNeedsTargetDetail,
+};
+
 const endpointStatus = mock(async () => ({ status: "ok" as const, data: endpoint }));
 const listEndpointKeys = mock(async () => ({ status: "ok" as const, data: [] }));
 const listAutomationHooks = mock(async () => ({ status: "ok" as const, data: [inbound, outbound] }));
 const automationHookDetail = mock(async (_runner: string, id: string) => ({
   status: "ok" as const,
-  data: id === inbound.id ? inboundDetail : outboundDetail,
+  data: detailsById[id] ?? outboundDetail,
 }));
 const testAutomationHook = mock(async () => ({ status: "ok" as const, data: outboundDetail }));
 const nativeAgents = mock(async () => ({ status: "error" as const, error: { message: "not needed by this test" } }));
@@ -135,6 +231,7 @@ const { HooksTab } = await import("./HooksTab");
 const { useAutomations } = await import("@/store-automations");
 const { useEndpoint } = await import("@/store-endpoint");
 const { useNative } = await import("@/store-native");
+const { usePlugins } = await import("@/store-plugins");
 
 afterEach(() => {
   cleanup();
@@ -143,12 +240,13 @@ afterEach(() => {
   useNative.setState({ agentsByProject: {} });
   useStore.setState({ focusedSession: null });
   useNav.setState({ history: { back: [], current: { kind: "automations", tab: "hooks" }, forward: [] } });
+  usePlugins.setState({ plugins: [] });
   endpointStatus.mockClear();
   listAutomationHooks.mockClear();
   listAutomationHooks.mockImplementation(async () => ({ status: "ok" as const, data: [inbound, outbound] }));
   automationHookDetail.mockImplementation(async (_runner: string, id: string) => ({
     status: "ok" as const,
-    data: id === inbound.id ? inboundDetail : outboundDetail,
+    data: detailsById[id] ?? outboundDetail,
   }));
   testAutomationHook.mockClear();
   nativeAgents.mockClear();
@@ -292,4 +390,64 @@ test("redacts outbound header values, tests delivery, and shows three attempts i
   expect(await screen.findByText("HTTP 502")).toBeTruthy();
   expect(screen.getByText("Attempt 3 · HTTP 502")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Open session session-1" })).toBeTruthy();
+});
+
+test("shows the Claude alias as a mono caption on a list row and in the trigger dropdown", async () => {
+  render(<HooksTab projects={[project]} />);
+  await screen.findByText("Post release");
+  // `outbound`'s trigger is `session.end` — its Claude alias is `Stop`
+  // (deliberately not `SessionEnd`, per `claude_alias_for`'s ordering).
+  expect(screen.getByText("Stop")).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit Post release" }));
+  fireEvent.click(await screen.findByRole("combobox", { name: "Trigger" }));
+  expect(await screen.findByText("PreToolUse · tool.before")).toBeTruthy();
+  expect(screen.getByText("SessionStart · session.start")).toBeTruthy();
+  // A trigger with no Claude alias falls back to its own dotted value.
+  expect(screen.getByText("webhook.inbound")).toBeTruthy();
+});
+
+test("a plugin-owned hook shows its badge, hides Edit, and Duplicate as mine opens a fully-editable, prefilled create form", async () => {
+  usePlugins.setState({ plugins: [acmePlugin] });
+  listAutomationHooks.mockImplementation(async () => ({ status: "ok" as const, data: [pluginHook] }));
+  render(<HooksTab projects={[project]} />);
+
+  await screen.findByText("acme/deploy-notify");
+  expect(screen.getByText("Plugin: Acme")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Edit acme/deploy-notify" })).toBeNull();
+  const duplicateButton = screen.getByRole("button", { name: "Duplicate acme/deploy-notify as mine" });
+
+  fireEvent.click(duplicateButton);
+  expect(await screen.findByRole("dialog", { name: "New hook" })).toBeTruthy();
+  const name = screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement;
+  expect(name.value).toBe("acme/deploy-notify (copy)");
+  expect(name.disabled).toBe(false);
+  expect((screen.getByRole("textbox", { name: "Prompt" }) as HTMLTextAreaElement).value).toBe("Notify on deploy");
+  expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
+  await waitFor(() => expect(createAutomationHook).toHaveBeenCalledTimes(1));
+  const input = createAutomationHook.mock.calls[0]?.[1] as AutomationHookInput;
+  expect(input.name).toBe("acme/deploy-notify (copy)");
+  expect(Object.keys(input)).not.toContain("pluginId");
+});
+
+test("a needs-target plugin hook offers Set up… instead of a toggle, and opens a target-only editor", async () => {
+  usePlugins.setState({ plugins: [acmePlugin] });
+  listAutomationHooks.mockImplementation(async () => ({ status: "ok" as const, data: [pluginHookNeedsTarget] }));
+  render(<HooksTab projects={[project]} />);
+
+  await screen.findByText("acme/triage");
+  expect(screen.getByRole("button", { name: "Set up…" })).toBeTruthy();
+  expect(screen.queryByRole("switch")).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Set up…" }));
+  expect(await screen.findByRole("dialog")).toBeTruthy();
+  expect(screen.getByText("Installed by a plugin — only the target project and branch can be changed here.")).toBeTruthy();
+  expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).disabled).toBe(true);
+  expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+
+  // The Project field (a target field) stays interactive: opening it reveals options.
+  fireEvent.click(screen.getByRole("combobox", { name: "Project" }));
+  expect(await screen.findByRole("option", { name: /Cockpit/ })).toBeTruthy();
 });

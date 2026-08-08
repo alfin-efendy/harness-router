@@ -1636,7 +1636,7 @@ mod gateway_impl_tests {
     use crate::store::{ComponentPluginReleaseRecord, Store};
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1659,6 +1659,10 @@ mod gateway_impl_tests {
     async fn build_test_gateway(config: GatewayConfig) -> (WasmGateway, tempfile::NamedTempFile) {
         build_fixtures();
         let mut policy = HostPolicy::deny_all();
+        // The gateway export is first-party-only now (Task 4); this test
+        // fixture stands in for a first-party-signed component — see the
+        // identical grant in `wasm_gateway`'s own `build_test_supervisor`.
+        policy.allow_gateway = true;
         policy.limits.timeout = Duration::from_secs(5);
         let component_path = gateway_artifact();
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1674,20 +1678,34 @@ mod gateway_impl_tests {
             provider_ids: vec![],
         });
         let bundle = InstalledBundle {
-            manifest: PluginBundleManifest {
+            manifest: PluginManifest {
+                contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
                 id: "acme-gateway".to_string(),
                 name: "acme-gateway".to_string(),
                 version: "0.1.0".to_string(),
-                wit_api: "^0.1.0".to_string(),
-                lifecycle: PluginLifecycle::Singleton,
-                component: "plugin.wasm".to_string(),
                 publisher: String::new(),
                 description: String::new(),
+                homepage: None,
+                icon: None,
+                categories: vec![],
+                slot: None,
+                verified: false,
+                experimental: false,
+                auth: None,
+                settings: vec![],
+                component: Some(ComponentSpec {
+                    file: "plugin.wasm".to_string(),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: PluginLifecycle::Singleton,
+                }),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
-                provider_ids: vec![],
+                provider: None,
                 tools: vec![],
-                settings: vec![],
+                mcp: vec![],
+                hooks: vec![],
+                jobs: vec![],
+                gateway: true,
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),
@@ -2833,7 +2851,7 @@ mod gateway_impl_tests {
         std::fs::write(
             version_dir.join("ryuzi-plugin.toml"),
             format!(
-                "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+                "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\ngateway = true\n\n[component]\nfile = \"{component}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
             ),
         )
         .unwrap();
@@ -2851,7 +2869,12 @@ mod gateway_impl_tests {
                 version: version.into(),
                 source_url: "https://example.invalid".into(),
                 sha256: sha,
-                signing_key_id: "test".into(),
+                // Task 4: the gateway export is first-party-only —
+                // `HostPolicy::for_installed_bundle` derives `allow_gateway`
+                // from exactly this field, so a non-first-party signing key
+                // here would make every gateway compile denied and every
+                // "constructed" assertion below fail closed.
+                signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.into(),
                 installed_at: 0,
                 active: false,
                 revoked: false,
@@ -2965,7 +2988,7 @@ mod gateway_impl_tests {
 
     /// Final-review fix: enabled is not the same as configured. `discord` is
     /// the one embedded catalog manifest
-    /// (`component_catalog::declared_bundle_manifest`) with a `secret +
+    /// (`component_catalog::declared_manifest`) with a `secret +
     /// required` settings field (its bot token) — installing this throwaway
     /// fixture component under the literal id `"discord"` is what exercises
     /// `component_required_settings_configured` here, since that check reads

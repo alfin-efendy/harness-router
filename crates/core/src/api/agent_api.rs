@@ -3093,6 +3093,7 @@ mod tests {
                 status_detail: None,
                 auth_kind: "none".into(),
                 auth_detail: None,
+                plugin_id: None,
             },
         )
         .await

@@ -1,11 +1,14 @@
+contract = 2
 id = "github"
 name = "GitHub"
 version = "0.1.1"
-wit-api = ">=0.1.0, <0.2.0"
-lifecycle = "per-call"
-component = "github.wasm"
 publisher = "Ryuzi"
 description = "GitHub connector: auth status, repositories, issues, and pull requests, plus arbitrary REST/GraphQL calls, over host-managed OAuth. Every mutating tool (issue/PR create, comment, review, merge, GraphQL mutations) is gated behind an explicit `confirm=true` argument — an unconfirmed mutation never leaves the component."
+
+[component]
+file = "github.wasm"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
 
 # The only hosts the component may reach through the host-mediated OAuth egress
 # (`ryuzi:oauth/oauth`'s `authorized-request`, which is bounded to this same

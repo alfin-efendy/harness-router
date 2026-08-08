@@ -57,12 +57,13 @@ pub(crate) struct Section {
 /// Build the ordered list of system-prompt sections for a session rooted at
 /// `work_dir`. Instruction files with byte-identical trimmed bodies are
 /// injected only once (keep-first): a `CLAUDE.md` that is a symlink to — or a
-/// copy of — `AGENTS.md` no longer doubles the prompt. `extra_skill_dirs` are
-/// the plugin-bundled skill directories folded into skill discovery; `memory`
-/// is the persistent-memory snapshot (primary agents only).
+/// copy of — `AGENTS.md` no longer doubles the prompt. `plugin_skill_roots`
+/// are each enabled plugin's live `skills/` directory (id, path), folded into
+/// skill discovery at `SkillOrigin::Plugin` precedence; `memory` is the
+/// persistent-memory snapshot (primary agents only).
 pub(crate) fn build_sections(
     work_dir: &Path,
-    extra_skill_dirs: &[std::path::PathBuf],
+    plugin_skill_roots: &[(String, std::path::PathBuf)],
     memory: Option<&str>,
     allowed_skills: Option<&[String]>,
 ) -> Vec<Section> {
@@ -149,7 +150,7 @@ pub(crate) fn build_sections(
     }
 
     // Available skills (names + descriptions only; bodies load via the tool).
-    if let Some(guidance) = skill_guidance(work_dir, extra_skill_dirs, allowed_skills) {
+    if let Some(guidance) = skill_guidance(work_dir, plugin_skill_roots, allowed_skills) {
         sections.push(Section {
             label: "skills",
             body: guidance,
@@ -186,13 +187,13 @@ pub(crate) fn breakdown_of(sections: &[Section]) -> Vec<(&'static str, u64)> {
 /// Assemble the system prompt for callers that only need the final string.
 pub fn assemble_system(
     work_dir: &Path,
-    extra_skill_dirs: &[std::path::PathBuf],
+    plugin_skill_roots: &[(String, std::path::PathBuf)],
     memory: Option<&str>,
     allowed_skills: Option<&[String]>,
 ) -> String {
     join_sections(&build_sections(
         work_dir,
-        extra_skill_dirs,
+        plugin_skill_roots,
         memory,
         allowed_skills,
     ))
@@ -200,23 +201,24 @@ pub fn assemble_system(
 
 fn skill_guidance(
     work_dir: &Path,
-    extra_skill_dirs: &[std::path::PathBuf],
+    plugin_skill_roots: &[(String, std::path::PathBuf)],
     allowed_skills: Option<&[String]>,
 ) -> Option<String> {
-    let guidance = super::skills::SkillRegistry::load_with(work_dir, extra_skill_dirs)
-        .all()
-        .into_iter()
-        .filter(|skill| {
-            allowed_skills
-                .map(|allowed| allowed.iter().any(|name| name == &skill.name))
-                .unwrap_or(true)
-        })
-        .map(|skill| {
-            let description: String = skill.description.chars().take(60).collect();
-            format!("- {}: {description}", skill.name)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let guidance =
+        super::skills::SkillRegistry::load_with_plugin_roots(work_dir, plugin_skill_roots)
+            .all()
+            .into_iter()
+            .filter(|skill| {
+                allowed_skills
+                    .map(|allowed| allowed.iter().any(|name| name == &skill.name))
+                    .unwrap_or(true)
+            })
+            .map(|skill| {
+                let description: String = skill.description.chars().take(60).collect();
+                format!("- {}: {description}", skill.name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
     (!guidance.is_empty()).then(|| {
         format!(
             "Available skills. You MUST scan this list at the start of every \

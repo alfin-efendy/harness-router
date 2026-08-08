@@ -669,6 +669,14 @@ pub(crate) async fn discover_gateway_components(
     let mut components = Vec::new();
     for bundle in bundles {
         let id = bundle.manifest.id.clone();
+        // Gateway discovery keys off the manifest's own `gateway = true`
+        // declaration — cheaper than compiling every non-gateway bundle just
+        // to learn it doesn't export `ryuzi:gateway/gateway` (IMP-2's
+        // `exports_gateway()` check below still guards against a manifest
+        // that lies about it).
+        if !bundle.manifest.gateway {
+            continue;
+        }
         match crate::plugins::host::component_plugin_enabled(settings, &id).await {
             Ok(true) => {}
             Ok(false) => continue,
@@ -695,6 +703,19 @@ pub(crate) async fn discover_gateway_components(
                 tracing::warn!(plugin = %id, "wasm gateway: configured-settings check failed: {error}");
                 continue;
             }
+        }
+        // Task 11 tiered trust: belt-and-braces over the Task 4 signing gate
+        // — a gateway export is already first-party-only structurally
+        // (`HostPolicy::for_installed_bundle`'s `allow_gateway`, enforced at
+        // instantiation by `ComponentRuntime::compile`), but an untrusted
+        // unsigned bundle must not even reach compilation.
+        let provenance = crate::plugins::install_sources::read_install_provenance(&bundle.root);
+        if !crate::plugins::host::component_surfaces_trusted_for(settings, &id, &provenance).await {
+            tracing::info!(
+                plugin = %id,
+                "wasm gateway: skipping {id}: unsigned component requires explicit trust acceptance"
+            );
+            continue;
         }
         // Single source of truth for the installed-bundle capability policy
         // (incl. the first-party-only `allow_self_auth` gate) — see
@@ -768,7 +789,7 @@ mod tests {
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
     };
     use std::path::PathBuf;
 
@@ -786,6 +807,11 @@ mod tests {
         timeout: Duration,
     ) -> (WasmGatewaySupervisor, tempfile::NamedTempFile) {
         let mut policy = HostPolicy::deny_all();
+        // The gateway export is first-party-only now (Task 4); this test
+        // fixture stands in for a first-party-signed component, so grant it
+        // explicitly the same way `for_installed_bundle` would derive it from
+        // a real `signing_key_id == FIRST_PARTY_KEY_ID` release.
+        policy.allow_gateway = true;
         policy.limits.timeout = timeout;
         let component_path = gateway_artifact();
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -801,20 +827,34 @@ mod tests {
             provider_ids: vec![],
         });
         let bundle = InstalledBundle {
-            manifest: PluginBundleManifest {
+            manifest: PluginManifest {
+                contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
                 id: "acme-gateway".to_string(),
                 name: "acme-gateway".to_string(),
                 version: "0.1.0".to_string(),
-                wit_api: "^0.1.0".to_string(),
-                lifecycle: PluginLifecycle::Singleton,
-                component: "plugin.wasm".to_string(),
                 publisher: String::new(),
                 description: String::new(),
+                homepage: None,
+                icon: None,
+                categories: vec![],
+                slot: None,
+                verified: false,
+                experimental: false,
+                auth: None,
+                settings: vec![],
+                component: Some(ComponentSpec {
+                    file: "plugin.wasm".to_string(),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: PluginLifecycle::Singleton,
+                }),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
-                provider_ids: vec![],
+                provider: None,
                 tools: vec![],
-                settings: vec![],
+                mcp: vec![],
+                hooks: vec![],
+                jobs: vec![],
+                gateway: true,
             },
             release: PluginRelease {
                 id: "acme-gateway".to_string(),

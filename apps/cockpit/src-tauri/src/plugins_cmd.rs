@@ -8,9 +8,8 @@
 //! `cancel_plugin_install`), the skill/plugin distribution surface
 //! (`begin_skill_install` / `confirm_skill_install` / `update_plugin` /
 //! `update_all_plugins` / `set_plugin_pin` / `plugin_doctor` /
-//! `plugins_restart_required`), the remote catalog surface
-//! (`refresh_catalog` / `catalog_status`), and the extension (Track D "code
-//! plugin") observability surface (`extension_status`).
+//! `plugins_restart_required`), and the remote catalog surface
+//! (`refresh_catalog` / `catalog_status`).
 //!
 //! Behavior change from the pre-daemon version: `begin_plugin_oauth` and
 //! `begin_plugin_install` no longer open the system browser directly — the
@@ -45,11 +44,12 @@ use tokio::sync::oneshot;
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
     CatalogStatus, ComponentBootstrapStatus, ComponentManifestInfo, ComponentOauthProfileInfo,
-    ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, ExtensionStatusEntry,
-    PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo, PluginInstallBeginResult,
+    ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, PluginAuthInfo, PluginDetail,
+    PluginFieldInfo, PluginHookInfo, PluginInfo, PluginInstallBeginResult, PluginJobInfo,
     PluginMcpInfo, PluginOauthBeginResult, PluginProfileDeviceFlowStart, PluginProfilePkceStart,
-    PluginToolEntry, PluginToolsResult, SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto,
-    UpdateOutcomeEntry,
+    PluginSourceComponentToolInfo, PluginSourceComponentTrustInfo, PluginSourceInstallBegin,
+    PluginSourceMcpServerInfo, PluginSourceSurfacesInfo, PluginToolEntry, PluginToolsResult,
+    SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -841,6 +841,49 @@ pub async fn confirm_skill_install(
         .await
 }
 
+/// Task 11/12 phase 1: stage a local-folder or git-URL plugin source
+/// (cloning/copying it, never touching the original) and return the
+/// `PluginSourceInstallBegin` trust prompt the wizard must show before
+/// `confirm_plugin_source_install` can proceed.
+#[tauri::command]
+#[specta::specta]
+pub async fn begin_plugin_source_install(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    source: String,
+) -> R<PluginSourceInstallBegin> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "begin_plugin_source_install",
+            serde_json::json!({ "source": source }),
+        )
+        .await
+}
+
+/// Phase 2: complete a staged plugin-source install after the user has
+/// acknowledged its `PluginSourceInstallBegin` trust prompt (`acceptTrust`
+/// only matters when `trustRequired` was `true` — it gates the unsigned
+/// `[[mcp]]`/`[component]` surfaces, never the skills/commands/hooks/jobs
+/// surfaces, which always activate). The token is single-use. Returns the
+/// newly-installed plugin's full `PluginInfo` row.
+#[tauri::command]
+#[specta::specta]
+pub async fn confirm_plugin_source_install(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    token: String,
+    accept_trust: bool,
+) -> R<PluginInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "confirm_plugin_source_install",
+            serde_json::json!({ "token": token, "accept_trust": accept_trust }),
+        )
+        .await
+}
+
 /// Update one installed pack. `force` overrides the local-edits guard but
 /// never the pinned guard or the hook-script re-ack gate.
 #[tauri::command]
@@ -935,24 +978,6 @@ pub async fn refresh_catalog(engine: Engine<'_>, runner_id: Option<String>) -> R
 pub async fn catalog_status(engine: Engine<'_>, runner_id: Option<String>) -> R<CatalogStatus> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client.rpc("catalog_status", serde_json::json!({})).await
-}
-
-// ---------- Extension (Track D "code plugin") observability: DT8 ----------
-
-/// Per-extension live state (running/starting/restarting/failed/stopped/
-/// not-running), restart count, and sanitized last error — one entry per
-/// extension the daemon's `ExtensionHost` currently knows about, across
-/// every enabled extension-capable plugin. Read-only, never mutates state
-/// (no spawn/restart/shutdown). `PluginDetailView` calls this for an
-/// extension-capable plugin and filters the result down to its own `id`.
-#[tauri::command]
-#[specta::specta]
-pub async fn extension_status(
-    engine: Engine<'_>,
-    runner_id: Option<String>,
-) -> R<Vec<ExtensionStatusEntry>> {
-    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client.rpc("extension_status", serde_json::json!({})).await
 }
 
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------

@@ -705,7 +705,7 @@ mod tests {
         let context = ToolInputCtx {
             work_dir: dir.path(),
             attachments_dir: None,
-            extra_skill_dirs: &extra,
+            plugin_skill_roots: &extra,
         };
         ArgumentGateway::validate(
             WireToolCall::new("call", "schema_test", start_input, raw, false),

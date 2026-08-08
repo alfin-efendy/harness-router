@@ -1,21 +1,22 @@
 //! Declarative plugins: turn a `PluginManifest`'s `[[mcp]]` entries into a
 //! working `Connector` via placeholder substitution — no bespoke Rust code
-//! required per plugin. Used both for manifest-authored builtins/catalog
-//! entries and for user plugins discovered from disk
-//! (`plugins::load_skill_pack_plugins`).
+//! required per plugin. Used for manifest-authored builtins/catalog entries;
+//! full plugin-folder installs from disk arrive in a later task.
+//!
+//! v2 note: the old `[[extension]]` → `ExtensionFactory` half (Track D
+//! subprocess extensions) is gone — the SDK's `PluginManifest` has no
+//! `extensions` field anymore, so this module is mcp-only.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ryuzi_plugin_sdk::subst::{resolve, Resolver};
-use ryuzi_plugin_sdk::{AuthKind, ExtensionDef, McpServerDef, McpTransportDef, PluginManifest};
+use ryuzi_plugin_sdk::{AuthKind, McpServerDef, McpTransportDef, PluginManifest};
 use serde::Deserialize;
 
 use crate::connector::{Connector, ConnectorCtx};
 use crate::domain::{McpServerSpec, McpTransport};
-use crate::harness::native::hooks::HookEvent;
-use crate::plugins::extension::{ExtensionCtx, ExtensionFactory, ExtensionSpec};
 use crate::plugins::oauth::{needs_refresh, PluginOauthToken};
 
 use super::host::{CorePlugin, PluginSource};
@@ -34,9 +35,8 @@ struct PluginOauthRefreshResponse {
 
 /// Build a `CorePlugin` from a manifest. Harness capability can
 /// never come from a manifest alone (it requires Rust code — see
-/// `harness::native`); a declarative
-/// plugin can carry a connector (when `manifest.mcp` is non-empty) and/or an
-/// extension (when `manifest.extensions` is non-empty).
+/// `harness::native`); a declarative plugin can carry a connector when
+/// `manifest.mcp` is non-empty.
 pub fn declarative_plugin(
     manifest: PluginManifest,
     source: PluginSource,
@@ -49,19 +49,11 @@ pub fn declarative_plugin(
             manifest: manifest.clone(),
         }))
     };
-    let extension: Option<Arc<dyn ExtensionFactory>> = if manifest.extensions.is_empty() {
-        None
-    } else {
-        Some(Arc::new(DeclarativeExtension {
-            manifest: manifest.clone(),
-        }))
-    };
     Ok(CorePlugin {
         manifest,
         harness: None,
         gateway: None,
         connector,
-        extension,
         provider: None,
         source,
     })
@@ -105,26 +97,29 @@ impl Connector for DeclarativeConnector {
         // Beyond the (auth-specific) credential above, some manifests
         // declare non-auth `[[settings]]` fields that an `[[mcp]]` entry's
         // `${setting:KEY}` placeholder depends on to function at all (e.g.
-        // honcho's `plugin.honcho.user` header, datadog's
-        // `plugin.datadog.app_key` header) — `required = true` marks those.
-        // A missing one would otherwise only surface once the MCP server
-        // rejects an empty/absent header, so check it up front here too,
-        // with the same friendly "name the plugin + key (+ help_url)" shape
-        // as the auth error above.
+        // honcho's `user` header, datadog's `app_key` header) —
+        // `required = true` marks those. A missing one would otherwise only
+        // surface once the MCP server rejects an empty/absent header, so
+        // check it up front here too, with the same friendly "name the
+        // plugin + key (+ help_url)" shape as the auth error above. v2
+        // manifests keep `[[settings]]` keys BARE — qualify through the
+        // single namespacing site before reading the persisted row.
         for field in &self.manifest.settings {
             if !field.required {
                 continue;
             }
+            let qualified_key =
+                crate::plugins::host::qualified_setting_key(&self.manifest.id, &field.key);
             let present = ctx
                 .settings
-                .get(&field.key)
+                .get(&qualified_key)
                 .await?
                 .is_some_and(|v| !v.is_empty());
             if present {
                 continue;
             }
             let id = &self.manifest.id;
-            let key = &field.key;
+            let key = &qualified_key;
             match self
                 .manifest
                 .auth
@@ -393,126 +388,6 @@ impl DeclarativeConnector {
     }
 }
 
-/// An extension factory whose entire behavior is "substitute placeholders
-/// into this manifest's `[[extension]]` entries" — mirrors
-/// `DeclarativeConnector`, but for Track D's subprocess extension axis
-/// instead of MCP connectors.
-struct DeclarativeExtension {
-    manifest: PluginManifest,
-}
-
-#[async_trait]
-impl ExtensionFactory for DeclarativeExtension {
-    async fn extensions(&self, ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
-        let resolver = self.resolver(ctx).await?;
-        self.manifest
-            .extensions
-            .iter()
-            .map(|extension| build_extension_spec(extension, &resolver))
-            .collect()
-    }
-}
-
-impl DeclarativeExtension {
-    /// Resolve the manifest's `[auth]` value the same way
-    /// `DeclarativeConnector::resolve_auth` does — duplicated rather than
-    /// shared because the two live behind different `Ctx` shapes
-    /// (`ConnectorCtx` carries `project_id`/`work_dir`; `ExtensionCtx`
-    /// deliberately does not — see its doc).
-    async fn resolve_auth(&self, ctx: &ExtensionCtx) -> anyhow::Result<Option<String>> {
-        let Some(auth) = &self.manifest.auth else {
-            return Ok(None);
-        };
-        if let Some(key) = &auth.setting {
-            if let Some(v) = ctx.settings.get(key).await? {
-                if !v.is_empty() {
-                    return Ok(Some(v));
-                }
-            }
-        }
-        if let Some(var) = &auth.env {
-            if let Ok(v) = std::env::var(var) {
-                if !v.is_empty() {
-                    return Ok(Some(v));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Build the (sync) `Resolver` backing placeholder substitution — same
-    /// pre-fetch-then-resolve-synchronously shape as
-    /// `DeclarativeConnector::resolver` (see its doc). `oauth_bearer_token`
-    /// is always `None`: HTTP-OAuth bearer injection is an MCP HTTP
-    /// transport concern (`${auth}` substitution alone covers everything an
-    /// extension's `command`/`args` can reference).
-    async fn resolver(&self, ctx: &ExtensionCtx) -> anyhow::Result<PreloadedResolver> {
-        let auth = self.resolve_auth(ctx).await?;
-        let mut settings = HashMap::new();
-        for key in extension_setting_keys(&self.manifest.extensions) {
-            if let Some(v) = ctx.settings.get(&key).await? {
-                settings.insert(key, v);
-            }
-        }
-        Ok(PreloadedResolver {
-            auth,
-            oauth_bearer_token: None,
-            settings,
-        })
-    }
-}
-
-/// Every distinct `${setting:KEY}` key referenced in any extension's
-/// `command` or `args` (mirrors `setting_keys`, the `[[mcp]]` equivalent).
-fn extension_setting_keys(extensions: &[ExtensionDef]) -> HashSet<String> {
-    let mut keys = HashSet::new();
-    for extension in extensions {
-        for s in std::iter::once(&extension.command).chain(extension.args.iter()) {
-            collect_setting_keys(s, &mut keys);
-        }
-    }
-    keys
-}
-
-/// Map one `ExtensionDef` to its resolved `ExtensionSpec`, substituting
-/// placeholders into `command`/`args` and parsing `events` into `HookEvent`s
-/// (already validated against the known vocabulary by
-/// `PluginManifest::validate`, so `HookEvent::from_str` cannot fail here in
-/// practice — a mismatch would mean the SDK's `KNOWN_HOOK_EVENTS` and
-/// `HookEvent::as_str` have drifted, which `hooks.rs`'s own vocabulary-sync
-/// test guards against).
-fn build_extension_spec(
-    extension: &ExtensionDef,
-    resolver: &PreloadedResolver,
-) -> anyhow::Result<ExtensionSpec> {
-    let command = resolve(&extension.command, resolver)?;
-    let args = extension
-        .args
-        .iter()
-        .map(|a| resolve(a, resolver))
-        .collect::<Result<Vec<_>, _>>()?;
-    let events = extension
-        .events
-        .iter()
-        .map(|e| {
-            e.parse::<HookEvent>()
-                .map_err(|err| anyhow::anyhow!("extension \"{}\": {err}", extension.name))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let timeout_ms = extension
-        .timeout_ms
-        .unwrap_or(crate::plugins::extension::DEFAULT_EVENT_TIMEOUT_MS);
-    Ok(ExtensionSpec {
-        name: extension.name.clone(),
-        command,
-        args,
-        events,
-        provides_tools: extension.provides_tools,
-        timeout: std::time::Duration::from_millis(timeout_ms),
-        env: Vec::new(),
-    })
-}
-
 fn is_terminal_oauth_refresh_error(body: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
@@ -663,7 +538,7 @@ mod tests {
     }
 
     const GITHUB_STDIO_MANIFEST: &str = r#"
-contract = 1
+contract = 2
 id = "github"
 name = "GitHub"
 
@@ -689,7 +564,7 @@ env = { GITHUB_TOKEN = "${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(GITHUB_STDIO_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin
             .connector
             .clone()
@@ -721,7 +596,7 @@ env = { GITHUB_TOKEN = "${auth}" }
     async fn ensure_auth_errs_with_help_url_when_secret_is_missing_everywhere() {
         let (_store, settings, _tmp) = open_settings().await;
         let manifest = PluginManifest::from_toml(GITHUB_STDIO_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -744,14 +619,14 @@ env = { GITHUB_TOKEN = "${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(GITHUB_STDIO_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         connector.ensure_auth(&ctx(settings)).await.unwrap();
     }
 
     const ACME_REQUIRED_SETTING_MANIFEST: &str = r#"
-contract = 1
+contract = 2
 id = "acme-required"
 name = "Acme Required"
 
@@ -761,7 +636,7 @@ setting = "plugin.acme-required.token"
 help_url = "https://acme.example.com/tokens"
 
 [[settings]]
-key = "plugin.acme-required.user"
+key = "user"
 label = "Acme user"
 help = "Sent as a header identifying the acting user."
 required = true
@@ -774,7 +649,7 @@ headers = { Authorization = "Bearer ${auth}", X-Acme-User = "${setting:plugin.ac
 "#;
 
     const ACME_HTTP_OAUTH_MANIFEST: &str = r#"
-contract = 1
+contract = 2
 id = "acme-http-oauth"
 name = "Acme HTTP OAuth"
 
@@ -790,7 +665,7 @@ headers = { Authorization = "Basic stale", X-Trace = "trace-123" }
 "#;
 
     const GOOGLE_STYLE_STDIO_OAUTH_MANIFEST: &str = r#"
-contract = 1
+contract = 2
 id = "google-workspace"
 name = "Google Workspace"
 
@@ -817,7 +692,7 @@ env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_REQUIRED_SETTING_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -848,7 +723,7 @@ env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_REQUIRED_SETTING_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         connector.ensure_auth(&ctx(settings)).await.unwrap();
@@ -864,7 +739,7 @@ env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
 
         let toml_str = format!(
             r#"
-contract = 1
+contract = 2
 id = "acme"
 name = "Acme"
 
@@ -876,7 +751,7 @@ env = {{ TOKEN = "${{env:{var}}}" }}
 "#
         );
         let manifest = PluginManifest::from_toml(&toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -899,7 +774,7 @@ env = {{ TOKEN = "${{env:{var}}}" }}
             .unwrap();
 
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "acme"
 name = "Acme"
 
@@ -910,7 +785,7 @@ command = "acme-mcp"
 args = ["--host", "${setting:plugin.acme.host}"]
 "#;
         let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -934,7 +809,7 @@ args = ["--host", "${setting:plugin.acme.host}"]
             .unwrap();
 
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "acme-http"
 name = "Acme HTTP"
 
@@ -949,7 +824,7 @@ url = "https://api.acme.dev/mcp"
 headers = { Authorization = "Bearer ${auth}" }
 "#;
         let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -984,7 +859,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -1055,7 +930,7 @@ headers = { Authorization = "Bearer ${auth}" }
             &format!("help_url = \"https://acme.example.com/oauth\"\ntoken-url = \"{token_url}\""),
         );
         let manifest = PluginManifest::from_toml(&toml).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -1141,7 +1016,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
@@ -1174,7 +1049,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.mcp_servers(&ctx(settings)).await.unwrap_err();
@@ -1232,7 +1107,7 @@ headers = { Authorization = "Bearer ${auth}" }
             &format!("help_url = \"https://acme.example.com/oauth\"\ntoken-url = \"{token_url}\""),
         );
         let manifest = PluginManifest::from_toml(&toml).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -1253,7 +1128,7 @@ headers = { Authorization = "Bearer ${auth}" }
     async fn http_oauth_manifest_requires_stored_plugin_token_for_ensure_auth_and_mcp_servers() {
         let (_store, settings, _tmp) = open_settings().await;
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector
@@ -1295,7 +1170,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
@@ -1319,7 +1194,7 @@ headers = { Authorization = "Bearer ${auth}" }
             .unwrap();
 
         let manifest = PluginManifest::from_toml(GOOGLE_STYLE_STDIO_OAUTH_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
         connector.ensure_auth(&ctx(settings.clone())).await.unwrap();
@@ -1341,112 +1216,15 @@ headers = { Authorization = "Bearer ${auth}" }
     #[test]
     fn manifest_with_no_mcp_servers_gets_no_connector() {
         let toml_str = r#"
-contract = 1
+contract = 2
 id = "meta-only"
 name = "Meta Only"
 "#;
         let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Builtin).unwrap();
         assert!(plugin.connector.is_none());
         assert!(plugin.harness.is_none());
         assert!(plugin.gateway.is_none());
-        assert!(plugin.extension.is_none());
-    }
-
-    // ---------- DeclarativeExtension (Track D, Slice DT3) ----------
-
-    fn ext_ctx(settings: SettingsStore) -> crate::plugins::extension::ExtensionCtx {
-        crate::plugins::extension::ExtensionCtx { settings }
-    }
-
-    const LINTER_EXTENSION_MANIFEST: &str = r#"
-contract = 1
-id = "acme-linter"
-name = "Acme Linter"
-
-[auth]
-kind = "token"
-setting = "plugin.acme-linter.token"
-
-[[extension]]
-name = "my-linter"
-command = "my-linter-ext"
-args = ["--serve", "--token=${auth}", "--host=${setting:plugin.acme-linter.host}"]
-events = ["tool.before", "tool.after"]
-provides_tools = true
-timeout_ms = 9000
-"#;
-
-    #[tokio::test]
-    async fn extensions_resolves_auth_and_setting_placeholders_in_args() {
-        let (store, settings, _tmp) = open_settings().await;
-        store
-            .set_setting_raw("plugin.acme-linter.token", "secret-tok")
-            .await
-            .unwrap();
-        store
-            .set_setting_raw("plugin.acme-linter.host", "acme.example.com")
-            .await
-            .unwrap();
-
-        let manifest = PluginManifest::from_toml(LINTER_EXTENSION_MANIFEST).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
-        let factory = plugin
-            .extension
-            .clone()
-            .expect("an extension-bearing manifest gets an extension factory");
-
-        let specs = factory.extensions(&ext_ctx(settings)).await.unwrap();
-        assert_eq!(specs.len(), 1);
-        let spec = &specs[0];
-        assert_eq!(spec.name, "my-linter");
-        assert_eq!(spec.command, "my-linter-ext");
-        assert_eq!(
-            spec.args,
-            vec![
-                "--serve".to_string(),
-                "--token=secret-tok".to_string(),
-                "--host=acme.example.com".to_string(),
-            ]
-        );
-        assert_eq!(
-            spec.events,
-            vec![
-                crate::harness::native::hooks::HookEvent::ToolBefore,
-                crate::harness::native::hooks::HookEvent::ToolAfter,
-            ]
-        );
-        assert!(spec.provides_tools);
-        assert_eq!(spec.timeout, std::time::Duration::from_millis(9000));
-        assert!(
-            spec.env.is_empty(),
-            "the SDK's ExtensionDef has no env table yet — env must stay empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn extensions_default_timeout_when_manifest_omits_timeout_ms() {
-        let (_store, settings, _tmp) = open_settings().await;
-        let toml_str = r#"
-contract = 1
-id = "acme-bare"
-name = "Acme Bare"
-
-[[extension]]
-name = "bare"
-command = "bare-ext"
-"#;
-        let manifest = PluginManifest::from_toml(toml_str).unwrap();
-        let plugin = declarative_plugin(manifest, PluginSource::Component).unwrap();
-        let factory = plugin.extension.clone().unwrap();
-
-        let specs = factory.extensions(&ext_ctx(settings)).await.unwrap();
-        assert_eq!(
-            specs[0].timeout,
-            std::time::Duration::from_millis(crate::plugins::extension::DEFAULT_EVENT_TIMEOUT_MS)
-        );
-        assert!(specs[0].events.is_empty());
-        assert!(!specs[0].provides_tools);
     }
 
     #[test]
@@ -1454,7 +1232,7 @@ command = "bare-ext"
         // Hand-built (not through `from_toml`, which would already validate),
         // so this exercises `declarative_plugin`'s own `validate()` call.
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: "bad id with spaces".to_string(),
             name: "Bad".to_string(),
             version: String::new(),
@@ -1468,11 +1246,16 @@ command = "bare-ext"
             experimental: false,
             auth: None,
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
-        assert!(declarative_plugin(manifest, PluginSource::Component).is_err());
+        assert!(declarative_plugin(manifest, PluginSource::Builtin).is_err());
     }
 }

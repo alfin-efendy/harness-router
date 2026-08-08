@@ -33,7 +33,6 @@ pub mod artifact;
 pub mod bash;
 pub mod delegate;
 pub mod edit;
-pub mod extension;
 pub mod glob;
 pub mod grep;
 pub mod ls;
@@ -48,7 +47,6 @@ pub mod session_search;
 pub mod skill;
 pub mod task;
 pub mod todo;
-pub mod wasm;
 pub mod webfetch;
 pub mod websearch;
 pub mod write;
@@ -337,10 +335,10 @@ pub struct ToolCtx {
     /// — a SECOND read root beside the worktree jail, so the model can open
     /// files the user attached. `None` in bare test contexts.
     pub attachments_dir: Option<PathBuf>,
-    /// Extra skill directories consulted by the `skill` tool alongside
-    /// `work_dir`'s own skill dirs — see `SessionCtx::extra_skill_dirs` for
-    /// why this no longer carries plugin-bundled dirs in production.
-    pub extra_skill_dirs: Vec<PathBuf>,
+    /// Every ENABLED, installed plugin's `skills/` directory, paired with
+    /// its plugin id — consulted by the `skill` tool alongside `work_dir`'s
+    /// own skill dirs. See `SessionCtx::plugin_skill_roots`.
+    pub plugin_skill_roots: Vec<(String, PathBuf)>,
     pub artifacts: Arc<crate::artifacts::ArtifactService>,
     pub(crate) pinned_file_reference:
         Option<crate::harness::native::file_reference::PinnedFileTarget>,
@@ -1162,7 +1160,7 @@ pub(crate) mod testutil {
             run_id: "test-run".into(),
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
-            extra_skill_dirs: vec![],
+            plugin_skill_roots: vec![],
             artifacts,
             pinned_file_reference: None,
             preflight_file_target: None,
@@ -1949,7 +1947,7 @@ mod tests {
         let ctx = ToolInputCtx {
             work_dir: root.path(),
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
         let input = serde_json::json!({"value": "unchanged"});
         let normalized = tool.normalize_input(&ctx, input.clone()).unwrap();
@@ -1972,7 +1970,7 @@ mod tests {
         let ctx = ToolInputCtx {
             work_dir: root.path(),
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
 
         assert_eq!(

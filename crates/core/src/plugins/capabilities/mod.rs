@@ -75,17 +75,13 @@ pub struct PluginCapabilityContext {
     /// `HostPolicy::allow_provider_auth` gates the capability grant on, so one
     /// rule governs both. Host-internal call sites that only need transport
     /// registration may seed it from
-    /// `PluginBundleManifest::resolved_provider_ids` (which falls back to the
+    /// `PluginManifest::resolved_provider_ids` (which falls back to the
     /// bundle id); that never widens a credential grant, because with no
     /// declared `provider-ids` the capability is not linked at all.
     pub provider_ids: Vec<String>,
 }
 
-/// Case-insensitive substrings that mark a field *name* as secret-shaped —
-/// mirrors `crate::plugins::extension::events::SECRET_SHAPED_MARKERS`
-/// (kept as a separate copy: that list screens free-form deny-reason
-/// *text*, this one screens setting/log *field names*, and the two lists
-/// are allowed to diverge independently over time).
+/// Case-insensitive substrings that mark a field *name* as secret-shaped.
 const SECRET_SHAPED_MARKERS: &[&str] = &[
     "authorization",
     "bearer",
@@ -148,7 +144,7 @@ mod tests {
         // another test's plugin in the same test binary.
         let id = "task7-capredact-plugin";
         let manifest = ryuzi_plugin_sdk::PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: "Redaction Test Plugin".to_string(),
             version: String::new(),
@@ -170,10 +166,15 @@ mod tests {
                 ..Default::default()
             }),
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = crate::plugins::PluginHost::new();
         host.add(crate::plugins::CorePlugin {
@@ -181,7 +182,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: crate::plugins::PluginSource::Builtin,
         });

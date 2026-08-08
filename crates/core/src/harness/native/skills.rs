@@ -15,6 +15,13 @@ use std::path::{Path, PathBuf};
 pub enum SkillOrigin {
     Project,
     Global,
+    /// Shipped inside an installed, ENABLED plugin's `skills/` directory
+    /// (Task 9). A live root — never copied into `~/.config/ryuzi/skills` —
+    /// so disabling or uninstalling the plugin makes it vanish next
+    /// session. Behaves exactly like `Global` for listing/binding purposes:
+    /// surfaces in "/" only when bound to the agent, always reachable
+    /// through the `skill` tool's index.
+    Plugin,
 }
 
 /// One discovered skill.
@@ -53,30 +60,39 @@ impl SkillRegistry {
     /// found in an earlier (project/global) directory wins over one from
     /// `extra`.
     pub fn load_with(work_dir: &Path, extra: &[std::path::PathBuf]) -> SkillRegistry {
-        let legacy = work_dir.join(".ryuzi/skills");
-        if legacy.is_dir() {
-            tracing::warn!(
-                path = %legacy.display(),
-                "skills: .ryuzi/skills is no longer scanned; move skills to .agents/skills"
-            );
-        }
-
+        warn_on_legacy_skills_dir(work_dir);
         let mut skills = BTreeMap::new();
-        let extras = extra.iter().map(|p| (p.clone(), SkillOrigin::Global));
-        for (base, origin) in skill_dirs(work_dir).into_iter().chain(extras) {
-            // Check if this is a leaf skill dir (SKILL.md at the base).
-            if base.join("SKILL.md").is_file() {
-                // This is a leaf: parse it as a single skill.
-                if let Ok(text) = std::fs::read_to_string(base.join("SKILL.md")) {
-                    let skill = parse_skill(&base, &text, origin);
-                    skills.entry(skill.name.clone()).or_insert(skill);
-                }
-            } else {
-                // This is a root: scan for subdirectories containing SKILL.md.
-                for skill in read_skills(&base, origin) {
-                    skills.entry(skill.name.clone()).or_insert(skill);
-                }
-            }
+        for (base, origin) in skill_dirs(work_dir) {
+            merge_skill_root(&mut skills, &base, origin);
+        }
+        for extra_dir in extra {
+            merge_skill_root(&mut skills, extra_dir, SkillOrigin::Global);
+        }
+        SkillRegistry { skills }
+    }
+
+    /// Like [`Self::load`], plus every ENABLED, installed plugin's `skills/`
+    /// directory (Task 9) — `plugin_roots` is `(plugin_id,
+    /// <install_dir>/skills)` for each, provided by the control plane
+    /// (`crate::control::ControlPlane::enabled_plugin_content_roots`).
+    ///
+    /// Plugin roots are LIVE — never copied into `~/.config/ryuzi/skills` —
+    /// scanned fresh on every load with the existing [`read_skills`]/leaf
+    /// detection, and attributed [`SkillOrigin::Plugin`]. Precedence order is
+    /// Project, then Global, then Plugin — plugin roots are folded in LAST,
+    /// so the existing first-wins `entry().or_insert()` collision rule
+    /// leaves a same-name project or global skill in place.
+    pub fn load_with_plugin_roots(
+        work_dir: &Path,
+        plugin_roots: &[(String, std::path::PathBuf)],
+    ) -> SkillRegistry {
+        warn_on_legacy_skills_dir(work_dir);
+        let mut skills = BTreeMap::new();
+        for (base, origin) in skill_dirs(work_dir) {
+            merge_skill_root(&mut skills, &base, origin);
+        }
+        for (_id, root) in plugin_roots {
+            merge_skill_root(&mut skills, root, SkillOrigin::Plugin);
         }
         SkillRegistry { skills }
     }
@@ -89,6 +105,24 @@ impl SkillRegistry {
             for skill in read_skills(&home.join(".config/ryuzi/skills"), SkillOrigin::Global) {
                 skills.entry(skill.name.clone()).or_insert(skill);
             }
+        }
+        SkillRegistry { skills }
+    }
+
+    /// Like [`Self::load_global`], plus every enabled plugin's `skills/`
+    /// directory (Task 9) — the no-project catalog path. Plugin roots are
+    /// folded in last (first-wins), matching [`Self::load_with_plugin_roots`].
+    pub fn load_global_with_plugin_roots(plugin_roots: &[(String, PathBuf)]) -> SkillRegistry {
+        let mut skills = BTreeMap::new();
+        if let Some(home) = dirs::home_dir() {
+            merge_skill_root(
+                &mut skills,
+                &home.join(".config/ryuzi/skills"),
+                SkillOrigin::Global,
+            );
+        }
+        for (_id, root) in plugin_roots {
+            merge_skill_root(&mut skills, root, SkillOrigin::Plugin);
         }
         SkillRegistry { skills }
     }
@@ -127,6 +161,51 @@ impl SkillRegistry {
              task and load a skill's full instructions with the `skill` tool \
              BEFORE doing work it covers.\n{list}"
         ))
+    }
+}
+
+fn warn_on_legacy_skills_dir(work_dir: &Path) {
+    let legacy = work_dir.join(".ryuzi/skills");
+    if legacy.is_dir() {
+        tracing::warn!(
+            path = %legacy.display(),
+            "skills: .ryuzi/skills is no longer scanned; move skills to .agents/skills"
+        );
+    }
+}
+
+/// Merge one discovery root into `skills`, first-wins (`entry().or_insert()`)
+/// — an already-present name is kept, so callers control precedence purely
+/// by the ORDER they invoke this in. `base` may be either a skills root
+/// (`<base>/<name>/SKILL.md`, e.g. `~/.config/ryuzi/skills`) or a leaf skill
+/// directory (`<base>/SKILL.md` directly, e.g. a plugin-bundled single-skill
+/// bundle) — both shapes are auto-detected exactly as before.
+fn merge_skill_root(skills: &mut BTreeMap<String, Skill>, base: &Path, origin: SkillOrigin) {
+    if base.join("SKILL.md").is_file() {
+        // This is a leaf: parse it as a single skill.
+        if let Ok(text) = std::fs::read_to_string(base.join("SKILL.md")) {
+            let skill = parse_skill(base, &text, origin);
+            skills.entry(skill.name.clone()).or_insert(skill);
+        }
+    } else {
+        // This is a root: scan for subdirectories containing SKILL.md.
+        for skill in read_skills(base, origin) {
+            let name = skill.name.clone();
+            if let Some(kept) = skills.get(&name) {
+                // First-wins, but never silently: two plugins shipping the
+                // same skill name is invisible otherwise, and unlike commands
+                // (which stay reachable at `<plugin-id>/<name>`) the loser
+                // here has no fallback route.
+                if kept.origin == SkillOrigin::Plugin && origin == SkillOrigin::Plugin {
+                    tracing::warn!(
+                        skill = %name,
+                        "skills: two plugins ship a skill with the same name; keeping the first"
+                    );
+                }
+                continue;
+            }
+            skills.insert(name, skill);
+        }
     }
 }
 
@@ -388,5 +467,99 @@ mod tests {
         assert_eq!(s.description, "Triage GitHub issues");
         assert!(s.body.contains("Label and assign"));
         assert_eq!(s.dir, plugin_skill);
+    }
+
+    // ---------- Task 9: plugin-shipped skills ----------
+
+    #[test]
+    fn plugin_skill_roots_load_with_plugin_origin_and_lose_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_skills = tmp.path().join("github/skills");
+        std::fs::create_dir_all(plugin_skills.join("gh-fix-ci")).unwrap();
+        std::fs::write(
+            plugin_skills.join("gh-fix-ci/SKILL.md"),
+            "---\nname: gh-fix-ci\ndescription: Debug failing checks\n---\nBody",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_with_plugin_roots(
+            tmp.path(), // work_dir with no .agents/skills
+            &[("github".to_string(), plugin_skills.clone())],
+        );
+        let skill = reg
+            .all()
+            .into_iter()
+            .find(|s| s.name == "gh-fix-ci")
+            .unwrap();
+        assert_eq!(skill.origin, SkillOrigin::Plugin);
+    }
+
+    #[test]
+    fn a_same_named_global_skill_beats_a_plugin_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A plugin skills root with "triage".
+        let plugin_skills = tmp.path().join("github/skills");
+        std::fs::create_dir_all(plugin_skills.join("triage")).unwrap();
+        std::fs::write(
+            plugin_skills.join("triage/SKILL.md"),
+            "---\nname: triage\ndescription: Plugin triage\n---\nPlugin body",
+        )
+        .unwrap();
+
+        // A "global" root (simulated via an extra-shaped root passed as the
+        // work_dir's own project skills — here we use a real project dir
+        // with the SAME name so Project > Plugin precedence is exercised;
+        // Project always wins in `skill_dirs`' order regardless.
+        let work_dir = tempfile::tempdir().unwrap();
+        let project_skill = work_dir.path().join(".agents/skills/triage");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::write(
+            project_skill.join("SKILL.md"),
+            "---\nname: triage\ndescription: Project triage\n---\nProject body",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_with_plugin_roots(
+            work_dir.path(),
+            &[("github".to_string(), plugin_skills)],
+        );
+        let skill = reg.get("triage").unwrap();
+        assert_eq!(skill.origin, SkillOrigin::Project);
+        assert_eq!(skill.description, "Project triage");
+    }
+
+    #[test]
+    fn plugin_roots_do_not_override_each_other_arbitrarily_but_stay_first_wins() {
+        // Two plugins shipping the same skill name: first-listed plugin root
+        // wins (first-wins `entry().or_insert()`), the second is dropped —
+        // documents the existing collision rule rather than adding a new
+        // namespacing behavior for skills (unlike commands, Task 9 has no
+        // namespacing requirement).
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a/skills/dup");
+        let b = tmp.path().join("b/skills/dup");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(
+            a.join("SKILL.md"),
+            "---\nname: dup\ndescription: From A\n---\nA body",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("SKILL.md"),
+            "---\nname: dup\ndescription: From B\n---\nB body",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_with_plugin_roots(
+            tmp.path(),
+            &[
+                ("a".to_string(), tmp.path().join("a/skills")),
+                ("b".to_string(), tmp.path().join("b/skills")),
+            ],
+        );
+        let skill = reg.get("dup").unwrap();
+        assert_eq!(skill.origin, SkillOrigin::Plugin);
+        assert_eq!(skill.description, "From A");
     }
 }

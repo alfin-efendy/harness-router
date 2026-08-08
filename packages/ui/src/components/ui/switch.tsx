@@ -5,10 +5,11 @@ type SwitchProps = {
   onToggle: () => void;
   size?: "md" | "lg";
   label?: string;
+  disabled?: boolean;
 };
 
 // Design toggle: pill track with a sliding knob (36×21 default, 40×23 large).
-function Switch({ on, onToggle, size = "md", label }: SwitchProps) {
+function Switch({ on, onToggle, size = "md", label, disabled = false }: SwitchProps) {
   const lg = size === "lg";
   return (
     <button
@@ -16,9 +17,11 @@ function Switch({ on, onToggle, size = "md", label }: SwitchProps) {
       role="switch"
       aria-checked={on}
       aria-label={label}
+      disabled={disabled}
       onClick={onToggle}
       className={cn(
-        "relative shrink-0 cursor-pointer rounded-full border-none p-0 transition-colors duration-150",
+        "relative shrink-0 rounded-full border-none p-0 transition-colors duration-150",
+        disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer",
         lg ? "h-[23px] w-10" : "h-[21px] w-9",
       )}
       style={{ background: on ? "var(--primary)" : "var(--input)" }}

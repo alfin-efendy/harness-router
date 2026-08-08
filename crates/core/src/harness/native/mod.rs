@@ -62,15 +62,15 @@ struct AdaptedPrimary {
 /// excludes it. There is no "everything empty" shortcut to `ToolFilter::All`:
 /// an empty decision map already means every native tool is `Ask` (enabled),
 /// so an agent with no plugin/app bindings still resolves to exactly the
-/// native registry, not a blanket allow that would also sweep in
-/// `mcp__`/`ext__`/`wasm__` tools it never configured.
+/// native registry, not a blanket allow that would also sweep in `mcp__`
+/// tools it never configured. There is one namespace for every plugin- or
+/// server-provided tool (Task 6 merged the old `wasm__` component path into
+/// `mcp__`), so only that one prefix is special-cased below.
 fn tool_filter_for_profile(
     profile: &crate::agents::types::AgentProfile,
     available: &[String],
 ) -> agents::ToolFilter {
-    let namespaced = |name: &str| {
-        name.starts_with("mcp__") || name.starts_with("ext__") || name.starts_with("wasm__")
-    };
+    let namespaced = |name: &str| name.starts_with("mcp__");
     let mut allowed: Vec<String> = available
         .iter()
         .filter(|name| !namespaced(name))
@@ -87,24 +87,16 @@ fn tool_filter_for_profile(
             Some((provider, tool)) => allowed.extend(
                 available
                     .iter()
-                    .filter(|name| {
-                        *name == &format!("mcp__{provider}__{tool}")
-                            || *name == &format!("ext__{provider}__{tool}")
-                            || *name == &format!("wasm__{provider}__{tool}")
-                    })
+                    .filter(|name| *name == &format!("mcp__{provider}__{tool}"))
                     .cloned(),
             ),
             // Bare plugin id: every tool the plugin contributes, mirroring the
             // app arm below. The old code fed ("<id>", "") through the exact
-            // arm and matched `wasm__<id>__` — i.e. nothing.
+            // arm and matched `mcp__<id>__` — i.e. nothing.
             None => allowed.extend(
                 available
                     .iter()
-                    .filter(|name| {
-                        name.starts_with(&format!("mcp__{plugin}__"))
-                            || name.starts_with(&format!("ext__{plugin}__"))
-                            || name.starts_with(&format!("wasm__{plugin}__"))
-                    })
+                    .filter(|name| name.starts_with(&format!("mcp__{plugin}__")))
                     .cloned(),
             ),
         }
@@ -261,47 +253,30 @@ async fn connect_mcp_tools(
     extra
 }
 
-/// Gather every currently-provided extension tool (Track D, DT6) from the
-/// daemon-global extension host and wrap each as a native `Tool` — the
-/// extension analogue of `connect_mcp_tools`, called at the same session-
-/// start point. `None` (the common case: no extensions spawned, and every
-/// bare test `SessionCtx`) is a true zero-cost no-op — no await, no extra
-/// tools — mirroring how `ctx.extension_events: None` keeps every hook fire
-/// site inert.
-async fn connect_extension_tools(
-    extension_tools: Option<&Arc<dyn crate::plugins::extension::ExtensionTools>>,
-) -> Vec<Arc<dyn tools::Tool>> {
-    let Some(host) = extension_tools else {
-        return Vec::new();
-    };
-    host.session_tools()
-        .await
-        .into_iter()
-        .map(|binding| {
-            Arc::new(tools::extension::ExtensionTool::from_binding(binding)) as Arc<dyn tools::Tool>
-        })
-        .collect()
-}
-
-/// Gather every enabled WASM component bundle's connector tool (Task 9) and
-/// wrap each as a native `Tool` — the component analogue of
-/// `connect_extension_tools`, called at the same session-start point and
-/// folded into the same registry. `None` (no enabled component bundle
+/// Wrap every enabled WASM component's already-discovered connector tools
+/// (Task 6) as `mcp__<component>__<tool>` native `Tool`s — called at the same
+/// session-start point as `connect_mcp_tools` and folded into the SAME
+/// registry, via the SAME `McpTool` wrapper an external stdio MCP server's
+/// tools go through. An empty `component_mcp` (no enabled component bundle
 /// installed — the common case, and every bare test `SessionCtx`) is a true
-/// zero-cost no-op, mirroring `connect_extension_tools`.
-async fn connect_wasm_tools(
-    wasm_tools: Option<&Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
+/// zero-cost no-op — no allocation, no extra tools.
+fn connect_component_mcp_tools(
+    component_mcp: &[Arc<crate::plugins::mcp_component::ComponentMcpServer>],
 ) -> Vec<Arc<dyn tools::Tool>> {
-    let Some(host) = wasm_tools else {
-        return Vec::new();
-    };
-    host.session_tools()
-        .await
-        .into_iter()
-        .map(|binding| {
-            Arc::new(tools::wasm::WasmTool::from_binding(binding)) as Arc<dyn tools::Tool>
-        })
-        .collect()
+    let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
+    for server in component_mcp {
+        for def in &server.tools {
+            extra.push(Arc::new(tools::mcp::McpTool::new(
+                &server.server_id,
+                &def.name,
+                &def.description,
+                def.input_schema.clone(),
+                server.clone() as Arc<dyn mcp_client::McpCaller>,
+                Some(server.principal.clone()),
+            )));
+        }
+    }
+    extra
 }
 
 async fn resolve_native_model(
@@ -356,17 +331,17 @@ impl Harness for NativeHarness {
         crate::llm_router::model_meta::spawn_refresh();
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
-        let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
+        let commands = Arc::new(commands::CommandRegistry::load_with_plugins(
+            &ctx.work_dir,
+            &ctx.plugin_command_roots,
+        ));
         // The durable snapshot owns this session's native persona. Legacy
         // worktree agents remain available only for slash-command/subagent
         // selection; they must never replace a durable primary by name.
         // Plugin hooks: observational — a `session.start` hook is notified but
-        // cannot block startup (only `tool.before` gates). Fires to both the
-        // on-disk script sink and (Track D) any subscribed extensions.
+        // cannot block startup (only `tool.before` gates).
         let _ = hooks::fire_hook(
             &ctx.work_dir,
-            ctx.extension_events.as_ref(),
-            ctx.wasm_hooks.as_ref(),
             hooks::HookEvent::SessionStart,
             &json!({
                 "session": ctx.session_pk.clone(),
@@ -388,18 +363,14 @@ impl Harness for NativeHarness {
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
         let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
-        // Track D, DT6: fold in every currently-provided extension tool
-        // alongside the MCP ones — both flow into the SAME registry, so the
-        // runner dispatches either through the identical `deps.tools.get(name)`
-        // path with no special-casing.
-        extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
-        // Task 9: fold in every enabled WASM component bundle's connector tool
-        // alongside the MCP + extension ones — all flow into the SAME registry,
-        // dispatched through the identical `deps.tools.get(name)` path with no
-        // special-casing by source.
-        extra_tools.extend(connect_wasm_tools(ctx.wasm_tools.as_ref()).await);
+        // Task 6: fold in every enabled WASM component's connector tools
+        // alongside the external MCP ones — both are `McpTool`s in the SAME
+        // registry now, dispatched through the identical `deps.tools.get(name)`
+        // path with no special-casing by source, and governed by the same
+        // `mcp__*` permission path.
+        extra_tools.extend(connect_component_mcp_tools(&ctx.component_mcp));
         let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
-        // The registry is complete only after MCP and extension attachment.
+        // The registry is complete only after MCP and WASM-tool attachment.
         // Resolve this immutable profile against that final namespace so a
         // constrained explicit target cannot fall back to `ToolFilter::All`.
         let primary_turn = primary_turn_config_with_tools(
@@ -468,9 +439,8 @@ impl Harness for NativeHarness {
                     .then_some(ctx.attachments_dir)
                     .flatten(),
                 artifacts: ctx.artifacts,
-                extra_skill_dirs: ctx.extra_skill_dirs,
-                extension_events: ctx.extension_events,
-                wasm_hooks: ctx.wasm_hooks,
+                plugin_command_roots: ctx.plugin_command_roots,
+                plugin_skill_roots: ctx.plugin_skill_roots,
                 model,
                 turn_effort_policy: Arc::new(effort_policy),
                 meta,
@@ -599,13 +569,10 @@ impl HarnessSession for NativeSession {
         // exactly one place — `ControlPlane::end_session`'s teardown, the
         // sole path that removes the live handle from `running` — so this
         // fires once per real session end, never on a `stop_session`
-        // interrupt (which cancels but does not `end()`). Fires to both the
-        // on-disk script sink and (Track D) any subscribed extensions.
+        // interrupt (which cancels but does not `end()`).
         let deps = self.deps.lock().unwrap().clone();
         let _ = hooks::fire_hook(
             &deps.work_dir,
-            deps.extension_events.as_ref(),
-            deps.wasm_hooks.as_ref(),
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
@@ -717,7 +684,7 @@ pub fn native_plugin() -> CorePlugin {
 pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory>) -> CorePlugin {
     CorePlugin {
         manifest: PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: NATIVE_ID.to_string(),
             name: "Ryuzi".to_string(),
             version: "0.0.0".to_string(),
@@ -731,17 +698,21 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             experimental: false,
             auth: None,
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         },
         harness: Some(Arc::new(NativeHarnessFactory::with_llm_factory(
             llm_factory,
         ))),
         gateway: None,
         connector: None,
-        extension: None,
         provider: None,
         source: PluginSource::Builtin,
     }
@@ -880,11 +851,9 @@ mod tests {
             resume: None,
             mcp_servers: vec![],
             mcp_principals: std::collections::HashMap::new(),
-            extra_skill_dirs: vec![],
-            extension_events: None,
-            extension_tools: None,
-            wasm_tools: None,
-            wasm_hooks: None,
+            plugin_command_roots: vec![],
+            plugin_skill_roots: vec![],
+            component_mcp: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,
@@ -1186,169 +1155,6 @@ mod tests {
         );
     }
 
-    /// The positive direction of the refresh fix: a BOUND plugin tool that is
-    /// live in the registry must still be advertised on the second prompt,
-    /// alongside a non-empty native tool list (the two `tools.native` shapes
-    /// the design spec calls out: empty and populated). Task 1's test alone
-    /// would pass under a wrong fix that collapses the refresh filter to
-    /// `Only(natives)`; this one fails under both that and the original
-    /// `All` clobber. `#[cfg(unix)]`: the fake extension is an `sh -c`
-    /// subprocess, like the DT6 extension test above.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn refresh_primary_turn_keeps_bound_plugin_tools_advertised() {
-        use crate::plugins::extension::{
-            ExtensionCtx as ExtCtx, ExtensionFactory, ExtensionHost, ExtensionSpec, ExtensionTools,
-        };
-        use crate::plugins::host::PluginHost;
-        use crate::settings::SettingsStore;
-        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
-        use std::collections::BTreeSet;
-        use std::time::Duration;
-
-        struct FakeExtFactory {
-            spec: ExtensionSpec,
-        }
-        #[async_trait]
-        impl ExtensionFactory for FakeExtFactory {
-            async fn extensions(&self, _ctx: &ExtCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
-                Ok(vec![self.spec.clone()])
-            }
-        }
-
-        let manifest = PluginManifest {
-            contract: 1,
-            id: "github-plugin".into(),
-            name: "GitHub Plugin".into(),
-            version: String::new(),
-            publisher: String::new(),
-            description: String::new(),
-            homepage: None,
-            icon: None,
-            categories: vec![],
-            slot: None,
-            verified: false,
-            experimental: false,
-            auth: None,
-            settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
-            provider: None,
-        };
-        // Acks `extension/initialize` with one tool def ("search"), then
-        // blocks on a second read for the extension's lifetime (the model
-        // never calls the tool in this test; only ADVERTISEMENT matters).
-        let body = "IFS= read -r line; \
-             id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
-             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true,\"events\":[],\"tools\":[{\"name\":\"search\",\"description\":\"search github\"}]}}\\n' \"$id\"; \
-             IFS= read -r line2";
-        let spec = ExtensionSpec {
-            name: "github".into(),
-            command: "sh".into(),
-            args: vec!["-c".into(), body.into()],
-            events: vec![],
-            provides_tools: true,
-            timeout: Duration::from_millis(500),
-            env: vec![],
-        };
-        let mut plugin_host = PluginHost::new();
-        plugin_host.add(CorePlugin {
-            manifest,
-            harness: None,
-            gateway: None,
-            connector: None,
-            extension: Some(Arc::new(FakeExtFactory { spec })),
-            provider: None,
-            source: PluginSource::Builtin,
-        });
-
-        let work_dir = tempfile::tempdir().unwrap();
-        let profile_db = tempfile::NamedTempFile::new().unwrap();
-        let store = Arc::new(Store::open(profile_db.path()).await.unwrap());
-        store
-            .set_setting_raw("plugin.github-plugin.enabled", "true")
-            .await
-            .unwrap();
-        let mut ctx = ctx_for(store.clone(), work_dir.path().to_path_buf()).await;
-        let settings = SettingsStore::new(store);
-        let ext_host = Arc::new(ExtensionHost::new());
-        ext_host.spawn_all(&plugin_host, &ExtCtx { settings }).await;
-        ctx.extension_tools = Some(ext_host.clone() as Arc<dyn ExtensionTools>);
-
-        let mut primary = (*ctx.primary_agent).clone();
-        primary.profile.id = "plugin-bound-target".into();
-        primary.profile.name = "Plugin bound target".into();
-        // Under the new absent=Ask=enabled semantics, `allow_map(&["read"])`
-        // alone would leave every OTHER builtin absent (still enabled), so
-        // the advertised set would balloon past the two tools this test
-        // asserts on. `Off` every builtin except `read` to keep the fixture
-        // narrowed to exactly the two-element expectation below.
-        primary.profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
-        primary
-            .profile
-            .permissions
-            .native
-            .insert("read".into(), NativeToolDecision::Allow);
-        primary.profile.tools.plugins = vec!["github.search".into()];
-        ctx.primary_agent = Arc::new(primary);
-        ctx.main_agent_id = "plugin-bound-target".into();
-        ctx.isolated_target = true;
-        let refresh_agent = ctx.primary_agent.clone();
-        let run_id = ctx.run_id.clone();
-        let root_run_id = ctx.root_run_id.clone();
-
-        let turn = vec![
-            text_delta("done"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let llm = Arc::new(RecordingLlm::new(vec![turn.clone(), turn]));
-        struct TwoTurnFactory(Arc<RecordingLlm>);
-        impl llm::LlmStreamFactory for TwoTurnFactory {
-            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
-                self.0.clone()
-            }
-        }
-        let harness = NativeHarness::with_llm_factory(Arc::new(TwoTurnFactory(llm.clone())));
-        let session = harness.start_session(ctx).await.unwrap();
-        session
-            .send_prompt(TurnPrompt::text("first", "first"))
-            .await
-            .unwrap();
-        let registry_blind =
-            primary_turn_config(refresh_agent, run_id, root_run_id, PermMode::Default).unwrap();
-        session.refresh_primary_turn(registry_blind).await;
-        session
-            .send_prompt(TurnPrompt::text("second", "second"))
-            .await
-            .unwrap();
-
-        let expected: BTreeSet<String> = ["read", "ext__github__search"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        {
-            let bodies = llm.bodies.lock().unwrap();
-            let advertised = |i: usize| -> BTreeSet<String> {
-                bodies[i]["tools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
-                    .collect()
-            };
-            assert_eq!(advertised(0), expected, "start-path guard");
-            assert_eq!(
-                advertised(1),
-                expected,
-                "a bound plugin tool and a bound native tool must both survive the prompt-time refresh"
-            );
-        }
-
-        ext_host.shutdown_all(Duration::from_millis(200)).await;
-    }
-
     #[test]
     fn profile_tool_filter_resolves_native_plugin_and_app_tools_without_fallback() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
@@ -1361,20 +1167,18 @@ mod tests {
             .permissions
             .native
             .insert("read".into(), NativeToolDecision::Allow);
-        profile.tools.plugins = vec!["github.search".into(), "lint.check".into()];
+        profile.tools.plugins = vec!["github.search".into()];
         profile.tools.apps = vec!["slack".into()];
         let available = vec![
             "read".into(),
             "write".into(),
             "mcp__github__search".into(),
-            "ext__lint__check".into(),
             "mcp__slack__send".into(),
         ];
 
         assert_eq!(
             tool_filter_for_profile(&profile, &available),
             agents::ToolFilter::Only(vec![
-                "ext__lint__check".into(),
                 "mcp__github__search".into(),
                 "mcp__slack__send".into(),
                 "read".into(),
@@ -1410,12 +1214,7 @@ mod tests {
             .native
             .insert("write".into(), NativeToolDecision::Off);
         profile.tools.plugins = vec!["github.search".into()];
-        let available = vec![
-            "read".into(),
-            "write".into(),
-            "mcp__github__search".into(),
-            "ext__lint__check".into(),
-        ];
+        let available = vec!["read".into(), "write".into(), "mcp__github__search".into()];
         assert_eq!(
             tool_filter_for_profile(&profile, &available),
             agents::ToolFilter::Only(vec!["mcp__github__search".into(), "read".into()])
@@ -1423,7 +1222,7 @@ mod tests {
     }
 
     // PR-2 fix F: a bare plugin id in tools.plugins used to demand an exact
-    // match on `wasm__<id>__` (empty tool segment) and therefore granted
+    // match on `mcp__<id>__` (empty tool segment) and therefore granted
     // NOTHING. It must grant every tool the plugin contributes, mirroring the
     // app arm's prefix match. The namespaced form stays exact.
     #[test]
@@ -1432,18 +1231,18 @@ mod tests {
         profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
         profile.tools.plugins = vec!["github".into()];
         let available = vec![
-            "wasm__github__create_issue".to_string(),
-            "wasm__github__get_repo".to_string(),
-            "wasm__discord__send".to_string(),
+            "mcp__github__create_issue".to_string(),
+            "mcp__github__get_repo".to_string(),
+            "mcp__discord__send".to_string(),
             "read_file".to_string(),
         ];
         let agents::ToolFilter::Only(allowed) = tool_filter_for_profile(&profile, &available)
         else {
             panic!("expected Only");
         };
-        assert!(allowed.contains(&"wasm__github__create_issue".to_string()));
-        assert!(allowed.contains(&"wasm__github__get_repo".to_string()));
-        assert!(!allowed.contains(&"wasm__discord__send".to_string()));
+        assert!(allowed.contains(&"mcp__github__create_issue".to_string()));
+        assert!(allowed.contains(&"mcp__github__get_repo".to_string()));
+        assert!(!allowed.contains(&"mcp__discord__send".to_string()));
     }
 
     #[test]
@@ -1452,15 +1251,15 @@ mod tests {
         profile.permissions.native = off_map(&tools::ToolRegistry::builtin_ids());
         profile.tools.plugins = vec!["github.create_issue".into()];
         let available = vec![
-            "wasm__github__create_issue".to_string(),
-            "wasm__github__get_repo".to_string(),
+            "mcp__github__create_issue".to_string(),
+            "mcp__github__get_repo".to_string(),
         ];
         let agents::ToolFilter::Only(allowed) = tool_filter_for_profile(&profile, &available)
         else {
             panic!("expected Only");
         };
-        assert!(allowed.contains(&"wasm__github__create_issue".to_string()));
-        assert!(!allowed.contains(&"wasm__github__get_repo".to_string()));
+        assert!(allowed.contains(&"mcp__github__create_issue".to_string()));
+        assert!(!allowed.contains(&"mcp__github__get_repo".to_string()));
     }
 
     #[test]
@@ -1481,7 +1280,7 @@ mod tests {
     #[test]
     fn native_plugin_manifest_has_expected_identity() {
         let plugin = native_plugin();
-        assert_eq!(plugin.manifest.contract, 1);
+        assert_eq!(plugin.manifest.contract, 2);
         assert_eq!(plugin.manifest.id, "native");
         assert_eq!(plugin.manifest.name, "Ryuzi");
         assert_eq!(plugin.manifest.publisher, "ryuzi");
@@ -2314,119 +2113,8 @@ mod tests {
         assert!(tools.is_empty());
     }
 
-    #[tokio::test]
-    async fn connect_extension_tools_is_a_no_op_with_no_host() {
-        assert!(connect_extension_tools(None).await.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn connect_extension_tools_wraps_a_running_provides_tools_extension_and_executes_it() {
-        // Track D, DT6 end-to-end: a real (hermetic `sh -c`) fake extension
-        // declares `provides_tools` and hands back one tool def at init;
-        // `connect_extension_tools` must wrap it as a native `Tool` named
-        // `ext__<extension>__<tool>`, and calling `execute` on it must
-        // dispatch `tool/call` over the real subprocess pipe and render the
-        // reply exactly like an MCP tool would.
-        use crate::plugins::extension::{
-            ExtensionCtx as ExtCtx, ExtensionFactory, ExtensionHost, ExtensionSpec, ExtensionTools,
-        };
-        use crate::plugins::host::PluginHost;
-        use crate::settings::SettingsStore;
-        use std::time::Duration;
-
-        struct FakeExtFactory {
-            spec: ExtensionSpec,
-        }
-        #[async_trait]
-        impl ExtensionFactory for FakeExtFactory {
-            async fn extensions(&self, _ctx: &ExtCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
-                Ok(vec![self.spec.clone()])
-            }
-        }
-
-        let manifest = PluginManifest {
-            contract: 1,
-            id: "linter-plugin".into(),
-            name: "Linter Plugin".into(),
-            version: String::new(),
-            publisher: String::new(),
-            description: String::new(),
-            homepage: None,
-            icon: None,
-            categories: vec![],
-            slot: None,
-            verified: false,
-            experimental: false,
-            auth: None,
-            settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
-            provider: None,
-        };
-
-        // Reads the `extension/initialize` request, acks it with one tool
-        // def ("lint"), then reads the follow-up `tool/call` request and
-        // replies with an MCP-shaped result — proving `render_tool_result`'s
-        // content flattening is reused end to end.
-        let body = "IFS= read -r line; \
-             id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
-             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true,\"events\":[],\"tools\":[{\"name\":\"lint\",\"description\":\"lint code\"}]}}\\n' \"$id\"; \
-             IFS= read -r line2; \
-             id2=$(printf '%s' \"$line2\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
-             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"0 problems\"}]}}\\n' \"$id2\"";
-
-        let spec = ExtensionSpec {
-            name: "linter".into(),
-            command: "sh".into(),
-            args: vec!["-c".into(), body.into()],
-            events: vec![],
-            provides_tools: true,
-            timeout: Duration::from_millis(500),
-            env: vec![],
-        };
-
-        let mut plugin_host = PluginHost::new();
-        plugin_host.add(CorePlugin {
-            manifest,
-            harness: None,
-            gateway: None,
-            connector: None,
-            extension: Some(Arc::new(FakeExtFactory { spec })),
-            provider: None,
-            source: PluginSource::Builtin,
-        });
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
-        store
-            .set_setting_raw("plugin.linter-plugin.enabled", "true")
-            .await
-            .unwrap();
-        let settings = SettingsStore::new(store.clone());
-
-        let ext_host = Arc::new(ExtensionHost::new());
-        ext_host.spawn_all(&plugin_host, &ExtCtx { settings }).await;
-
-        let extension_tools = Some(ext_host.clone() as Arc<dyn ExtensionTools>);
-        let wrapped = connect_extension_tools(extension_tools.as_ref()).await;
-        assert_eq!(
-            wrapped.len(),
-            1,
-            "one provides_tools extension tool must be wrapped"
-        );
-        assert_eq!(wrapped[0].name(), "ext__linter__lint");
-
-        let dir = tempfile::tempdir().unwrap();
-        let tool_ctx = tools::testutil::ctx_at(dir.path()).await;
-        let out = wrapped[0]
-            .execute(&tool_ctx, serde_json::json!({}))
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        assert_eq!(out.for_model, "0 problems");
-
-        ext_host.shutdown_all(Duration::from_millis(200)).await;
+    #[test]
+    fn connect_component_mcp_tools_is_a_no_op_with_no_components() {
+        assert!(connect_component_mcp_tools(&[]).is_empty());
     }
 }

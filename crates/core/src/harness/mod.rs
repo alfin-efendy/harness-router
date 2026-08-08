@@ -55,54 +55,39 @@ pub struct SessionCtx {
     pub resume: Option<String>,
     /// MCP servers to attach (from the connector axis).
     pub mcp_servers: Vec<McpServerSpec>,
-    /// `McpServerSpec.name` → the plugin that attached that server, for
-    /// every server in `mcp_servers` sourced from a connector plugin (built
-    /// in `ControlPlane::attach_plugin_mcp_servers`, keyed at the same
-    /// binding site the servers themselves are resolved). A DB-configured
-    /// server (no plugin) simply has no entry here. The native runtime looks
-    /// this up per `mcp__<server>__<tool>` tool so approvals can attribute
-    /// the call to its plugin (see [`crate::domain::Principal`]).
+    /// `McpServerSpec.name` → the plugin that owns that server, for every
+    /// server in `mcp_servers` whose `mcp_servers.plugin_id` is set (Task
+    /// 7's `crate::plugins::mcp_sync::sync_plugin_mcp` writes it; built here
+    /// by `ControlPlane::mcp_principals_for`, re-reading that column per
+    /// session). A user-added server (no plugin) simply has no entry here.
+    /// The native runtime looks this up per `mcp__<server>__<tool>` tool so
+    /// approvals can attribute the call to its plugin (see
+    /// [`crate::domain::Principal`]).
     pub mcp_principals: HashMap<String, Principal>,
-    /// Extra skill directories folded in beside the native runtime's usual
-    /// project/global skill dirs. The daemon no longer feeds plugin-bundled
-    /// dirs here — installed skill packs reach sessions via the global root
-    /// (`~/.config/ryuzi/skills`) instead — but the field remains for tests
-    /// and embedders that want to inject skill dirs directly.
-    pub extra_skill_dirs: Vec<PathBuf>,
-    /// Live handle to the daemon's extension host (Track D) — every hook
-    /// fire site (`harness::native::hooks::fire_hook`) dispatches to it
-    /// alongside the on-disk script sink. `None` when the daemon has no
-    /// extension-capable plugins spawned (the common case, and every bare
-    /// test `SessionCtx`): every fire site then behaves exactly as it did
-    /// before Track D existed — see `ControlPlane::start_harness_session`
-    /// and `plugins::extension::ExtensionHost::is_empty`. A live handle, not
-    /// config, so it is never serialized.
-    pub extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
-    /// Sibling accessor to `extension_events`, threaded from the SAME
-    /// daemon-global extension host (Track D, DT6) — `None` under the exact
-    /// same condition (`ExtensionHost::is_empty`), so a session with no
-    /// extensions spawned builds its tool registry with zero extra work,
-    /// exactly like `extension_events: None` keeps every hook fire site a
-    /// true no-op. The native runtime's session start (mirroring
-    /// `connect_mcp_tools`) calls `session_tools()` through this to gather
-    /// every `Running`, `provides_tools` extension's tools and wrap them as
-    /// native `Tool`s via `harness::native::tools::extension::ExtensionTool`.
-    pub extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>>,
-    /// Enabled WASM component bundles' connector tools (Task 9), the component
-    /// analogue of `extension_tools`. `None` when no enabled component bundle
-    /// is installed (the common case, and every bare test `SessionCtx`), so a
-    /// session with no component plugins builds its tool registry with zero
-    /// extra work. The native runtime's session start (mirroring
-    /// `connect_extension_tools`) calls `session_tools()` through this to
-    /// enumerate each component's `connector.list-tools` and wrap them as
-    /// native `Tool`s via `harness::native::tools::wasm::WasmTool`.
-    pub wasm_tools: Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
-    /// Enabled WASM component bundles' `ryuzi:hooks/hooks` dispatcher (Task 9),
-    /// threaded next to `extension_events`. `fire_hook` fans a `tool.before`
-    /// gating event out to both sinks; a component that rejects denies, while a
-    /// trapping/timing-out component fails OPEN. `None` under the same
-    /// condition as `wasm_tools`.
-    pub wasm_hooks: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
+    /// Every ENABLED, installed plugin's `commands/` directory, paired with
+    /// its plugin id (Task 8) — `crate::control::ControlPlane::
+    /// enabled_plugin_content_roots` builds this once and shares it with
+    /// `plugin_skill_roots` below. Consumed only at session start to build
+    /// the session's `CommandRegistry` with plugin-shipped commands at the
+    /// lowest precedence (builtin > project > global > plugin).
+    pub plugin_command_roots: Vec<(String, PathBuf)>,
+    /// Every ENABLED, installed plugin's `skills/` directory, paired with
+    /// its plugin id (Task 9) — live roots, NOT copied into
+    /// `~/.config/ryuzi/skills`: disabling or uninstalling a plugin makes
+    /// its skills vanish next session. Folded into skill discovery beside
+    /// the native runtime's usual project/global skill dirs, at Plugin
+    /// precedence (below Project and Global).
+    pub plugin_skill_roots: Vec<(String, PathBuf)>,
+    /// Enabled WASM component bundles, each exposed as an in-process MCP
+    /// server (Task 6 — component tools flow through the SAME `mcp__<server>
+    /// __<tool>` naming/permission path as an external stdio MCP server).
+    /// Empty when no enabled component bundle is installed (the common case,
+    /// and every bare test `SessionCtx`), so a session with no component
+    /// plugins builds its tool registry with zero extra work. The native
+    /// runtime's session start iterates each server's already-discovered
+    /// `tools` and wraps them as `harness::native::tools::mcp::McpTool`s,
+    /// alongside `connect_mcp_tools`'s external-server ones.
+    pub component_mcp: Vec<Arc<crate::plugins::mcp_component::ComponentMcpServer>>,
     /// Event bus for normalized session output.
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
@@ -332,11 +317,9 @@ mod tests {
             resume: None,
             mcp_servers: vec![],
             mcp_principals: HashMap::new(),
-            extra_skill_dirs: vec![],
-            extension_events: None,
-            extension_tools: None,
-            wasm_tools: None,
-            wasm_hooks: None,
+            plugin_command_roots: vec![],
+            plugin_skill_roots: vec![],
+            component_mcp: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,

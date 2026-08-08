@@ -40,11 +40,29 @@ impl<'a> ScopedSettings<'a> {
     /// Reject a WIT `key` that is already fully-qualified (starts with
     /// `"plugin."`) — see the module doc. On success, returns the effective
     /// key: `plugin.<plugin_id>.<key>`.
+    ///
+    /// I2 fix: also rejects the host-owned control keys `enabled` and
+    /// `trusted`. `host::register_plugin_fields` always registers
+    /// `plugin.<id>.enabled`/`plugin.<id>.trusted` in `PLUGIN_FIELDS` for
+    /// EVERY plugin (so the settings-tab schema recognizes them) — which
+    /// means, absent this check, a WASM guest could call
+    /// `settings.set("enabled", "true")` to silently undo a user's disable,
+    /// or `settings.set("trusted", "true")` to grant itself the Task 11
+    /// trust gate it was never given. Neither key is ever declared in a
+    /// manifest's own `[[settings]]`, so a legitimate plugin has no reason
+    /// to read or write either through this capability — every real write
+    /// site for both is host-only (`crate::plugins::toggle_enabled`,
+    /// `install_sources::confirm_plugin_install`).
     fn effective_key(&self, key: &str) -> Result<String, SettingsErr> {
         if key.starts_with("plugin.") {
             return Err(SettingsErr::Invalid(
                 "settings key must be a bare field name".to_string(),
             ));
+        }
+        if key == "enabled" || key == "trusted" {
+            return Err(SettingsErr::Invalid(format!(
+                "{key} is a host-owned control key and cannot be read or written by a plugin"
+            )));
         }
         let effective = format!("plugin.{}.{}", self.ctx.plugin_id, key);
         if crate::plugins::plugin_field(&effective).is_none() {
@@ -129,7 +147,7 @@ mod tests {
     /// `register_test_plugin` helper.
     fn register_test_plugin(id: &str) {
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Task7 Test Plugin {id}"),
             version: String::new(),
@@ -156,10 +174,15 @@ mod tests {
                 options: Vec::new(),
                 default: None,
             }],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -167,7 +190,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });
@@ -266,5 +288,59 @@ mod tests {
                 "expected Invalid, got {result:?}"
             );
         }
+    }
+
+    // ---------- I2: a guest must never reach the host-owned `enabled`/
+    // `trusted` control keys through this capability ----------
+
+    #[tokio::test]
+    async fn a_guest_cannot_self_enable_or_self_trust_via_the_bare_control_keys() {
+        let id = "task7-github-self-enable";
+        register_test_plugin(id);
+        let (store, _tmp) = open_test_store().await;
+        let store = Arc::new(store);
+        let ctx = ctx_for(store.clone(), id).await;
+        let settings = ScopedSettings::new(&ctx);
+
+        for key in ["enabled", "trusted"] {
+            let get_result = settings.get(key).await;
+            assert!(
+                matches!(get_result, Err(SettingsErr::Invalid(_))),
+                "{key}: get should be Invalid, got {get_result:?}"
+            );
+            let set_result = settings.set(key, "true").await;
+            assert!(
+                matches!(set_result, Err(SettingsErr::Invalid(_))),
+                "{key}: a guest must not be able to write its own {key} flag, got {set_result:?}"
+            );
+            let remove_result = settings.remove(key).await;
+            assert!(
+                matches!(remove_result, Err(SettingsErr::Invalid(_))),
+                "{key}: remove should be Invalid, got {remove_result:?}"
+            );
+        }
+
+        // The write attempts above must have left no trace: a host-side
+        // disable/un-trust set directly on the row (bypassing this
+        // capability, the way `toggle_enabled`/uninstall actually do it)
+        // must survive untouched.
+        let qualified_enabled = format!("plugin.{id}.enabled");
+        let qualified_trusted = format!("plugin.{id}.trusted");
+        store
+            .set_setting_raw(&qualified_enabled, "false")
+            .await
+            .unwrap();
+        store
+            .set_setting_raw(&qualified_trusted, "false")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_setting_raw(&qualified_enabled).await.unwrap(),
+            Some("false".to_string())
+        );
+        assert_eq!(
+            store.get_setting_raw(&qualified_trusted).await.unwrap(),
+            Some("false".to_string())
+        );
     }
 }

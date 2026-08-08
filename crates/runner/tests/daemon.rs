@@ -20,6 +20,20 @@ fn lifecycle(entry: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let data_home = tmp.path().join("data");
     let home = tmp.path().to_path_buf();
+    // I9 fix: this test spawns the REAL compiled `ryuzi` binary, so
+    // `daemon::build_daemon`'s destructive v1->v2 first-upgrade plugin
+    // migration runs with `cfg!(test)` FALSE (that guard only sees this
+    // crate's own tests) — it always resolves
+    // `plugins::bundle::installed_bundle_root()`. Redirecting `HOME` alone
+    // is NOT sufficient on a Linux box that already exports
+    // `XDG_CONFIG_HOME` in its environment: `dirs::config_dir()` honors that
+    // var over `HOME`, so the migration sweep would still land on the
+    // developer's real `~/.config/ryuzi/plugins` — exactly the class of bug
+    // that already destroyed a real user's installed plugins once. Redirect
+    // both explicitly so the child process never has a path to the real
+    // config dir regardless of the host environment.
+    let config_home = tmp.path().join("config");
+    let plugins_root = tmp.path().join("plugins-root");
 
     // Redirect ryuzi_core::paths::state_dir() (and thus db_path()) into the
     // tempdir on both Linux (XDG_DATA_HOME) and macOS (HOME) — same
@@ -27,6 +41,8 @@ fn lifecycle(entry: &str) {
     // integration tests (see e.g. crates/runner/tests/e2e_journey.rs).
     std::env::set_var("XDG_DATA_HOME", &data_home);
     std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    std::env::set_var("RYUZI_PLUGINS_ROOT", &plugins_root);
 
     let db_path = ryuzi_core::paths::db_path();
     let data_dir = db_path
@@ -34,15 +50,15 @@ fn lifecycle(entry: &str) {
         .expect("db_path must have a parent dir")
         .to_path_buf();
 
-    // Seed settings BEFORE spawning: empty enabled_gateways (zero-gateway
-    // daemon). The Store is opened and dropped here so the child owns the
+    // Seed settings BEFORE spawning: a fresh db already boots zero-gateway
+    // (Task 4 retired the `enabled_gateways` CSV — there is no seed left to
+    // clear). The Store is opened and dropped here so the child owns the
     // only live handle.
     {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "").await.unwrap();
             settings.set("auto_update", "off").await.unwrap();
         });
     }
@@ -51,6 +67,8 @@ fn lifecycle(entry: &str) {
         .arg(entry)
         .env("XDG_DATA_HOME", &data_home)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("RYUZI_PLUGINS_ROOT", &plugins_root)
         .stdin(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn `ryuzi {entry}`: {e}"));

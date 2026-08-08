@@ -25,7 +25,22 @@ export const DEFAULT_SEQUENCE_PATH = "scripts/catalog/sequence.txt";
 export const DEFAULT_OUT_JSON_PATH = "catalog.json";
 export const DEFAULT_OUT_SIG_PATH = "catalog.json.sig";
 
-/** The schema version every shipped feed declares; must match `CatalogFeed::schema_version`'s accepted value (`remote_catalog.rs`, currently `1`). */
+/**
+ * The schema version every shipped feed declares; must match
+ * `CatalogFeed::schema_version`'s accepted value (`remote_catalog.rs`,
+ * currently `1`). This versions the feed ENVELOPE — `{schemaVersion,
+ * sequence, generatedAt, entries[{id, manifestToml}], blocked[]}` — which has
+ * not changed since it was introduced. The manifest CONTRACT embedded in
+ * each entry's `manifestToml` string is versioned independently by the
+ * manifest's own `contract` key (see `ryuzi_plugin_sdk::PluginManifest`), so
+ * a contract bump (e.g. the Task 17 manifest-v2 rollout) does NOT require
+ * bumping this constant. Do not bump `SCHEMA_VERSION` for a manifest
+ * contract change — the client already drops per-entry manifests it can't
+ * parse (`remote_catalog.rs`'s `fetch_and_cache_with`) while still applying
+ * `blocked[]`, which is what keeps the revocation channel working for
+ * clients that predate a new contract. Only bump this when the envelope
+ * shape itself changes.
+ */
 export const SCHEMA_VERSION = 1;
 
 export interface CatalogFeedEntry {

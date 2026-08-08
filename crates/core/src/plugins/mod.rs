@@ -21,15 +21,19 @@
 //! catalog in one call.
 
 pub mod artifact_verify;
+pub mod automation_sync;
 pub mod bundle;
 pub mod capabilities;
 pub mod catalog_feed_key;
 pub mod component_catalog;
 pub mod declarative;
 pub mod doctor;
-pub mod extension;
 pub mod first_party_key;
 pub mod host;
+pub mod install_sources;
+pub mod mcp_component;
+pub mod mcp_sync;
+pub mod migrate_v2;
 pub mod oauth;
 pub mod providers;
 pub mod remote_catalog;
@@ -37,7 +41,6 @@ pub mod runtime;
 pub mod wasm_connector;
 pub mod wasm_gateway;
 pub mod wasm_gateway_bridge;
-pub mod wasm_hooks;
 pub mod wasm_provider;
 pub mod wit;
 
@@ -79,15 +82,14 @@ mod discord_e2e;
 #[cfg(test)]
 mod atlassian_bitbucket_e2e;
 
-use crate::settings::{csv, SettingsStore};
+use crate::settings::SettingsStore;
 use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
-pub use extension::{
-    ExtensionCtx, ExtensionEvents, ExtensionFactory, ExtensionHost, ExtensionProc,
-    ExtensionSnapshot, ExtensionSpec, ExtensionStatus,
+pub use host::{
+    plugin_field, plugin_fields_all, qualified_setting_key, CorePlugin, InstallProvenance,
+    PluginHost, PluginSource, Registries,
 };
-pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Build every `tests/fixtures/*` component EXACTLY ONCE per test process.
 ///
@@ -95,7 +97,7 @@ pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSo
 /// `build-components.sh`'s `materialize_deps` rewrites each fixture's
 /// `wit/deps/` non-atomically (`rm -rf` then repopulate) — so two concurrent
 /// invocations corrupt each other and `cargo build` fails. Routing every
-/// fixture test (in `runtime`, `wasm_connector`, `wasm_hooks`) through this
+/// fixture test (in `runtime`, `wasm_connector`) through this
 /// shared `OnceLock` serializes the build to a single run the whole binary
 /// waits on, then reuses the artifacts.
 #[cfg(test)]
@@ -290,11 +292,116 @@ pub fn install_providers(regs: &mut Registries) {
     }
 }
 
+/// Boot-time registration (Task 11) for every plugin installed under
+/// `root/<id>/current` — the local-folder/git-URL install pipeline's
+/// counterpart to [`install_builtins`]. Scans `root`, and for each `<id>`
+/// directory whose `current` pointer resolves to a readable, parseable v2
+/// manifest, registers a MANIFEST-ONLY `CorePlugin { source: Installed { dir,
+/// provenance } }` — `dir` is the resolved version directory (the same path
+/// `bundle::InstalledBundle::root` would use for a component-backed
+/// sibling), and `provenance` comes from that version dir's `install.json`
+/// stamp (defaulting to `Catalog` when absent, e.g. a bundle installed
+/// through the signed-catalog pipeline rather than this one).
+///
+/// First-registration-wins (`PluginHost::add`/`Registries::add_plugin`) keeps
+/// an embedded first-party row (added by [`install_builtins`], called
+/// BEFORE this) authoritative for its id even if the same id also happens to
+/// exist on disk — this function is purely additive for ids nothing else
+/// already claimed.
+///
+/// Registered manifest-only (no live harness/gateway/connector/provider): the
+/// real behavioral capabilities are built transiently by
+/// `install_sources::confirm_plugin_install` when it runs the post-install
+/// syncs, and any `[component]` surface goes through the WASM
+/// bundle-discovery path (`bundle::load_active_bundles`) instead. This
+/// registration exists purely for identity/enablement bookkeeping
+/// (`PluginHost::is_enabled`'s manifest-only "always true" branch is what
+/// keeps an installed plugin's commands/skills/hooks/jobs active without a
+/// separate enable step) and as the fallback source
+/// `control::lifecycle::ControlPlane::enabled_plugin_content_roots`'s union
+/// reads for a declarative-only install (no `[component]`, so
+/// `bundle::load_active_bundles` — which hard-requires one — never sees it).
+///
+/// Warn-and-skip per plugin directory: an unreadable/unparseable manifest, a
+/// dangling `current` pointer, or a missing version directory must not blind
+/// the rest of the scan (mirrors `bundle::load_active_bundles`'s discipline).
+/// A missing `root` itself is a silent no-op (nothing installed yet).
+pub fn install_installed_plugins(regs: &mut Registries, root: &std::path::Path) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let plugin_dir = entry.path();
+        if !plugin_dir.is_dir() {
+            continue;
+        }
+        let pointer = plugin_dir.join("current");
+        let version = match std::fs::read_to_string(&pointer) {
+            Ok(v) => v.trim().to_string(),
+            Err(_) => continue,
+        };
+        if version.is_empty() || version.contains(['/', '\\']) || version == "." || version == ".."
+        {
+            tracing::warn!(
+                dir = %plugin_dir.display(),
+                "installed-plugin scan: malformed active pointer, skipping"
+            );
+            continue;
+        }
+        let version_dir = plugin_dir.join(&version);
+        let manifest_path = version_dir.join("ryuzi-plugin.toml");
+        let manifest_toml = match std::fs::read_to_string(&manifest_path) {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!(
+                    dir = %plugin_dir.display(),
+                    "installed-plugin scan: no readable manifest at the active version, skipping"
+                );
+                continue;
+            }
+        };
+        let mut manifest = match ryuzi_plugin_sdk::PluginManifest::from_toml(&manifest_toml) {
+            Ok(m) => m,
+            Err(error) => {
+                tracing::warn!(
+                    dir = %plugin_dir.display(),
+                    "installed-plugin scan: unparseable manifest: {error}"
+                );
+                continue;
+            }
+        };
+        // C1 fix: v2 manifests keep `[[settings]]` keys BARE — qualify to
+        // `plugin.<id>.<key>` at THIS registration boundary too, exactly as
+        // `component_catalog::component_catalog_plugins` already does for
+        // the embedded manifests. Without this, an installed plugin's
+        // settings field registers as a GLOBAL key (`token`) while the
+        // connector and the WASM settings capability both read the
+        // qualified key (`plugin.<id>.token`) — the plugin can never be
+        // configured through the Settings tab.
+        for field in &mut manifest.settings {
+            field.key = host::qualified_setting_key(&manifest.id, &field.key);
+        }
+        let provenance = install_sources::read_install_provenance(&version_dir);
+        regs.add_plugin(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            provider: None,
+            source: PluginSource::Installed {
+                dir: version_dir,
+                provenance,
+            },
+        });
+    }
+}
+
 /// Coarse plugin classification shared by the plugins list
 /// (`api::plugins_api::derive_kind`) and the agent configuration catalog
 /// (`agents::catalog::build_live_catalog`). Priority order matters: a
-/// provider manifest wins over runtime meta (ollama is both), and a
-/// skill-pack source wins over connector shape.
+/// provider manifest wins over runtime meta (ollama is both).
 pub fn plugin_kind(plugin: &CorePlugin) -> &'static str {
     if plugin.manifest.provider.is_some() {
         return "provider";
@@ -302,16 +409,16 @@ pub fn plugin_kind(plugin: &CorePlugin) -> &'static str {
     if plugin.harness.is_some() {
         return "runtime";
     }
-    if matches!(plugin.source, PluginSource::SkillPack(_)) {
-        return "skill-pack";
-    }
-    if plugin.gateway.is_some()
-        || plugin
-            .manifest
-            .categories
-            .iter()
-            .any(|category| category == "chat-gateway")
-    {
+    // F5: `kind = "gateway"` is reserved for a plugin that actually carries a
+    // live `Gateway` factory (`plugin.gateway.is_some()`) — gateways are
+    // internal, first-party-only (see docs/development/plugins.md). A
+    // manifest-declared `categories = ["chat-gateway"]` clause used to be
+    // able to promote ANY third-party plugin to this kind on its own say-so,
+    // changing UI/uninstall behavior for content the host never vetted as a
+    // gateway. No first-party manifest ever declared this category, so
+    // dropping the clause is a pure hardening — it never changes any
+    // shipped plugin's classification.
+    if plugin.gateway.is_some() {
         return "gateway";
     }
     "integration"
@@ -362,98 +469,6 @@ pub fn register_builtin_plugin_fields() {
     let mut regs = Registries::new();
     regs.add_plugin(crate::harness::native::native_plugin());
     install_builtins(&mut regs);
-    load_skill_pack_plugins(&mut regs);
-}
-
-/// Discover and register installed skill-pack plugins from
-/// `~/.config/ryuzi/plugins/*/ryuzi-plugin.toml`. Call after
-/// [`install_builtins`] so a skill-pack manifest can never shadow a
-/// built-in (`Registries::add_plugin` keeps the first registration for a
-/// given id — see `host`'s module doc).
-///
-/// Only directories the skills installer produced are accepted: the
-/// directory must carry a `.ryuzi-skill.json` provenance stamp
-/// (`skills_install::install_plugin_pack` writes it), or — legacy packs
-/// installed before the stamp existed — the directory's own name must
-/// equal the manifest's plugin id *and* the skills root must hold
-/// materialized provenance naming that same id, in which case the stamp
-/// is healed into the plugin directory one time. The dir-name check
-/// blocks a hand-authored directory from spoofing another installed
-/// pack's id to ride its materialized provenance into a heal. Hand-authored
-/// manifests match neither and are skipped with a `tracing::warn!`.
-///
-/// A missing config directory is not an error (most installs have none).
-/// A plugin directory that fails to parse or fails manifest validation is
-/// logged via `tracing::warn!` and skipped — never panics, and never
-/// stops the rest of the scan.
-pub fn load_skill_pack_plugins(regs: &mut Registries) {
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("could not resolve home directory — skipping skill-pack plugin discovery");
-        return;
-    };
-    let config = home.join(".config/ryuzi");
-    load_skill_pack_plugins_from(regs, &config.join("plugins"), &config.join("skills"));
-}
-
-/// The scan behind [`load_skill_pack_plugins`], factored out so tests can
-/// pass tempdirs instead of the real config directories.
-pub(crate) fn load_skill_pack_plugins_from(
-    regs: &mut Registries,
-    plugins_root: &std::path::Path,
-    skills_root: &std::path::Path,
-) {
-    let Ok(entries) = std::fs::read_dir(plugins_root) else {
-        return; // no skill-pack plugin directory — nothing to do
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let manifest_path = dir.join("ryuzi-plugin.toml");
-        let text = match std::fs::read_to_string(&manifest_path) {
-            Ok(text) => text,
-            Err(_) => continue, // no manifest in this directory — not a plugin
-        };
-        let manifest = match ryuzi_plugin_sdk::PluginManifest::from_toml(&text) {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                tracing::warn!(
-                    "skipping skill-pack plugin at {}: invalid manifest: {e}",
-                    manifest_path.display()
-                );
-                continue;
-            }
-        };
-        // Skill-pack provenance gate: accept the installer's stamp, or
-        // heal a legacy install from the skills root's materialized
-        // provenance; skip hand-authored manifests (neither).
-        let stamped = dir.join(crate::skills_install::PROVENANCE_FILE).is_file()
-            || crate::skills_install::stamp_legacy_skill_pack_provenance(
-                skills_root,
-                &dir,
-                &manifest.id,
-            );
-        if !stamped {
-            tracing::warn!(
-                "skipping {}: not an installed skill pack (no .ryuzi-skill.json stamp and no \
-                 materialized skill provenance for `{}` in the skills root) — hand-authored \
-                 plugin manifests are no longer loaded",
-                manifest_path.display(),
-                manifest.id
-            );
-            continue;
-        }
-        match declarative::declarative_plugin(manifest, PluginSource::SkillPack(dir.clone())) {
-            Ok(plugin) => regs.add_plugin(plugin),
-            Err(e) => {
-                tracing::warn!(
-                    "skipping skill-pack plugin at {}: {e}",
-                    manifest_path.display()
-                );
-            }
-        }
-    }
 }
 
 /// Toggle `id`'s enablement — the single source of truth behind Cockpit's
@@ -462,17 +477,22 @@ pub(crate) fn load_skill_pack_plugins_from(
 /// [`PluginHost::is_enabled`]'s read side:
 /// - unknown id → an error (`"unknown plugin: {id}"`)
 /// - harness-capable → an error (the native runtime is always enabled)
-/// - gateway-capable → add/remove `id` in the `enabled_gateways` CSV setting
+/// - gateway-capable → set `plugin.<id>.enabled` to `"true"`/`"false"` — the
+///   same key every other capability axis uses (Task 4 retired the
+///   `enabled_gateways` CSV)
 /// - experimental (docs-only, no capability) → an error, since
 ///   `is_enabled` always reports it disabled regardless of any
 ///   `plugin.<id>.enabled` write (see that method's doc) — toggling would
 ///   silently no-op
 /// - component-backed provider → set the TRANSPORT key `plugin.<id>.enabled` (display axis unchanged; see body comment)
-/// - no harness/gateway/connector capability (manifest-only, e.g. a
-///   provider metadata entry) → an error, since `is_enabled`
-///   always reports it enabled regardless of any `plugin.<id>.enabled`
-///   write — toggling would silently no-op
-/// - connector-only → set `plugin.<id>.enabled` to `"true"`/`"false"`
+/// - no harness/gateway/connector capability AND no declared `[[mcp]]`
+///   (manifest-only, e.g. a provider metadata entry) → an error, since
+///   `is_enabled` always reports it enabled regardless of any
+///   `plugin.<id>.enabled` write — toggling would silently no-op
+/// - connector-only, OR manifest-only with a non-empty `manifest.mcp` (a
+///   source-installed plugin, whose connector is only ever built
+///   transiently at install time — see C2's fix) → set
+///   `plugin.<id>.enabled` to `"true"`/`"false"`
 pub async fn toggle_enabled(
     host: &PluginHost,
     settings: &SettingsStore,
@@ -499,14 +519,26 @@ pub async fn toggle_enabled(
     // (`component_plugin_enabled`). Flip that same key — otherwise the
     // manifest-only branch below would refuse ("always available") and the
     // component could never be turned on through the UI. Mirrors
-    // `PluginHost::is_enabled`'s component branch.
-    if plugin.source == PluginSource::Component {
-        return settings
+    // `PluginHost::is_enabled`'s component branch. Component-ness is read off
+    // `manifest.component.is_some()` (v2) regardless of `source`.
+    if plugin.manifest.component.is_some() {
+        settings
             .set(
-                &format!("plugin.{id}.enabled"),
+                &qualified_setting_key(id, "enabled"),
                 if enable { "true" } else { "false" },
             )
-            .await;
+            .await?;
+        // Task 10: a component's `[[hooks]]`/`[[jobs]]` sync into the
+        // Automation/Scheduler domains on enable — same "flip from disabled
+        // to enabled" trigger point `mcp_sync` already uses below for
+        // connectors. Disable deliberately never calls
+        // `automation_sync::remove_plugin_automations` — a synced row (and
+        // any target/enablement the user set on it) survives a
+        // disable/enable cycle; only uninstall removes it.
+        if enable {
+            automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
+        }
+        return Ok(());
     }
     // A component-BACKED provider (mimo/opencode + COMPONENT_BACKED_PROVIDER_IDS):
     // its plugin-list row is the CATALOG builtin (that registration won the id),
@@ -521,47 +553,66 @@ pub async fn toggle_enabled(
     if plugin.manifest.provider.is_some()
         && crate::plugins::component_catalog::is_component_bundle(id)
     {
-        return settings
+        settings
             .set(
-                &format!("plugin.{id}.enabled"),
+                &qualified_setting_key(id, "enabled"),
                 if enable { "true" } else { "false" },
             )
-            .await;
+            .await?;
+        if enable {
+            automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
+        }
+        return Ok(());
     }
+    // Gateway-capable (native OR component-backed, e.g. Discord) uses the
+    // SAME `plugin.<id>.enabled` key every other axis does — Task 4 retired
+    // the `enabled_gateways` CSV so a gateway toggle can never drift from the
+    // `PluginHost::is_enabled`/`component_plugin_enabled` read side.
     if plugin.gateway.is_some() {
-        return toggle_csv(settings, "enabled_gateways", id, enable).await;
+        settings
+            .set(
+                &qualified_setting_key(id, "enabled"),
+                if enable { "true" } else { "false" },
+            )
+            .await?;
+        if enable {
+            automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
+        }
+        return Ok(());
     }
     if plugin.manifest.experimental {
         anyhow::bail!("{id} is experimental — nothing to enable");
     }
-    if plugin.connector.is_none() {
+    // C2 fix: a source-installed plugin's `[[mcp]]` entries are a real
+    // enableable axis even though `install_installed_plugins` always
+    // registers such a plugin manifest-only (`connector: None`) — its
+    // behavioral connector is only ever built transiently, by
+    // `install_sources::confirm_plugin_install_at`, at install time. Gate on
+    // `manifest.mcp` instead of `plugin.connector` so this key can still be
+    // flipped for it; mirrors `PluginHost::is_enabled`'s matching fix.
+    if plugin.connector.is_none() && plugin.manifest.mcp.is_empty() {
         anyhow::bail!("{id} is always available");
     }
     settings
         .set(
-            &format!("plugin.{id}.enabled"),
+            &qualified_setting_key(id, "enabled"),
             if enable { "true" } else { "false" },
         )
-        .await
-}
-
-/// Add (or remove) `id` in a CSV settings value, preserving the existing
-/// entries' order and never introducing a duplicate.
-async fn toggle_csv(
-    settings: &SettingsStore,
-    key: &str,
-    id: &str,
-    enable: bool,
-) -> anyhow::Result<()> {
-    let mut values = csv(settings.get(key).await?.as_deref());
+        .await?;
+    // Task 7: a connector-only plugin's `[[mcp]]` entries sync into the Apps
+    // domain right here, on enable — the only place this axis flips from
+    // disabled (where `mcp_sync::sync_plugin_mcp` is never called) to
+    // enabled. Disable deliberately does NOT call `remove_plugin_mcp` — the
+    // row (and any perm a user set on it) survives a disable/enable cycle;
+    // `mcp::servers_for_session`'s own enabled-plugin gate is what keeps a
+    // disabled plugin's servers out of new sessions.
     if enable {
-        if !values.iter().any(|v| v == id) {
-            values.push(id.to_string());
-        }
-    } else {
-        values.retain(|v| v != id);
+        mcp_sync::sync_plugin_mcp(&settings.store(), settings, &plugin).await?;
+        // Task 10: same enable-time trigger as the mcp sync just above, for
+        // this plugin's `[[hooks]]`/`[[jobs]]` presets.
+        automation_sync::sync_plugin_automations(&settings.store(), &plugin).await?;
     }
-    settings.set(key, &values.join(",")).await
+    Ok(())
 }
 
 /// Whether the remote catalog's signed feed has blocked `id`, per the cached
@@ -590,14 +641,12 @@ pub async fn is_blocked(store: &Store, id: &str) -> (bool, Option<String>) {
 /// Best-effort per id: a single plugin's settings write failing is logged
 /// and does not abort the rest of the sweep.
 ///
-/// Scope note: the `plugin.<id>.enabled=false` key this writes is the
-/// *connector*-plugin enable flag. It is a deliberate no-op for gateway ids
-/// (which are toggled via the `enabled_gateways` CSV, not per-id settings) and
-/// for harness- or manifest-only ids. That is correct for the real domain
-/// here — remote-catalog entries are always connector plugins, so a blocked id
-/// always maps to this key — but do not repurpose this sweep for
-/// gateway/harness blocks without also handling their distinct enable
-/// mechanisms.
+/// Scope note: the `plugin.<id>.enabled=false` key this writes is now the
+/// SAME key every capability axis reads (Task 4 unified gateway enablement
+/// onto it too), so this sweep correctly disables a blocked gateway id as
+/// well as a blocked connector id. It remains a no-op for harness- or
+/// manifest-only ids, which is correct for the real domain here —
+/// remote-catalog entries are never harness/manifest-only.
 pub async fn apply_blocked_denylist(
     store: &Store,
     settings: &SettingsStore,
@@ -612,7 +661,10 @@ pub async fn apply_blocked_denylist(
         .collect();
     for id in &blocked {
         if host.get(id).is_some() && host.is_enabled(settings, id).await.unwrap_or(false) {
-            match settings.set(&format!("plugin.{id}.enabled"), "false").await {
+            match settings
+                .set(&qualified_setting_key(id, "enabled"), "false")
+                .await
+            {
                 Ok(()) => tracing::warn!("catalog: auto-disabled blocked plugin {id}"),
                 Err(e) => {
                     tracing::warn!("catalog: failed to auto-disable blocked plugin {id}: {e}")
@@ -832,7 +884,7 @@ mod toggle_enabled_tests {
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: id.to_string(),
             version: String::new(),
@@ -846,10 +898,15 @@ mod toggle_enabled_tests {
             experimental: false,
             auth: None,
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         }
     }
 
@@ -859,7 +916,6 @@ mod toggle_enabled_tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -871,7 +927,6 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -883,7 +938,6 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
@@ -895,23 +949,30 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         }
     }
 
     /// A first-party component bundle row: manifest-only (its capability runs
-    /// off-disk) with `PluginSource::Component`.
+    /// off-disk). Component-ness is read off `manifest.component.is_some()`
+    /// (v2), not a dedicated `PluginSource` variant.
     fn component_only(id: &str) -> CorePlugin {
         CorePlugin {
-            manifest: manifest(id),
+            manifest: PluginManifest {
+                component: Some(ryuzi_plugin_sdk::ComponentSpec {
+                    file: format!("{id}.wasm"),
+                    wit_api: "^0.1.0".to_string(),
+                    lifecycle: ryuzi_plugin_sdk::PluginLifecycle::PerCall,
+                }),
+                version: "0.1.0".to_string(),
+                ..manifest(id)
+            },
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
-            source: PluginSource::Component,
+            source: PluginSource::Builtin,
         }
     }
 
@@ -943,27 +1004,32 @@ mod toggle_enabled_tests {
     }
 
     #[tokio::test]
-    async fn gateway_capable_toggles_enabled_gateways_csv() {
+    async fn gateway_capable_toggles_plugin_enabled_key() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
-        // A fresh store no longer seeds `enabled_gateways` (the native Discord
-        // seed was removed with the native gateway), so this starts empty and
-        // proves the CSV add/remove round-trip in isolation.
         host.add(gateway_only("slack"));
 
         toggle_enabled(&host, &settings, "slack", true)
             .await
             .unwrap();
         assert_eq!(
-            settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("slack")
+            settings
+                .get("plugin.slack.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
         );
         toggle_enabled(&host, &settings, "slack", false)
             .await
             .unwrap();
         assert_eq!(
-            settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("")
+            settings
+                .get("plugin.slack.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("false")
         );
     }
 
@@ -1277,199 +1343,6 @@ mod toggle_enabled_tests {
 }
 
 #[cfg(test)]
-mod load_skill_pack_plugins_tests {
-    use super::*;
-
-    const VALID_MANIFEST: &str = r#"
-contract = 1
-id = "acme-user"
-name = "Acme User Plugin"
-
-[[mcp]]
-name = "svc"
-transport = "stdio"
-command = "acme-mcp"
-"#;
-
-    fn write_manifest(plugins_root: &std::path::Path, plugin_dir: &str, toml_str: &str) {
-        let dir = plugins_root.join(plugin_dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ryuzi-plugin.toml"), toml_str).unwrap();
-    }
-
-    /// The stamp `skills_install::install_plugin_pack` writes into the
-    /// plugin directory (snake_case keys — see `SkillInstallProvenance`).
-    fn stamp_pack(plugins_root: &std::path::Path, plugin_dir: &str, plugin_id: &str) {
-        std::fs::write(
-            plugins_root.join(plugin_dir).join(".ryuzi-skill.json"),
-            format!(
-                r#"{{"source":"https://github.com/acme/pack","plugin_id":"{plugin_id}","installed_at":"2026-07-10T00:00:00.000Z"}}"#
-            ),
-        )
-        .unwrap();
-    }
-
-    /// Legacy layout: provenance lives only in a materialized skill dir
-    /// under the skills root (installs that predate the plugin-dir stamp).
-    fn write_legacy_skills_provenance(skills_root: &std::path::Path, plugin_id: &str) {
-        let dir = skills_root.join(format!("{plugin_id}--triage"));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(".ryuzi-skill.json"),
-            format!(
-                r#"{{"source":"https://github.com/acme/pack","plugin_id":"{plugin_id}","installed_at":"2026-01-01T00:00:00.000Z"}}"#
-            ),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn stamped_skill_pack_registers_with_skill_pack_source() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "acme", VALID_MANIFEST);
-        stamp_pack(plugins_root.path(), "acme", "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        let plugin = regs
-            .plugins
-            .get("acme-user")
-            .expect("stamped skill pack should register");
-        assert!(
-            plugin.connector.is_some(),
-            "manifest has an [[mcp]] entry, so it should be connector-capable"
-        );
-        assert_eq!(
-            plugin.source,
-            PluginSource::SkillPack(plugins_root.path().join("acme")),
-            "source should record the manifest's own directory"
-        );
-    }
-
-    #[test]
-    fn legacy_pack_with_skills_root_provenance_loads_and_gets_stamped() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        // The heal only trusts a directory whose name equals the manifest's
-        // plugin id (see `stamp_legacy_skill_pack_provenance`), matching
-        // `install_plugin_pack`'s invariant that packs always live at
-        // `plugins_root/<plugin_id>` — so this legacy-layout fixture uses
-        // "acme-user" for both the directory and the manifest id.
-        write_manifest(plugins_root.path(), "acme-user", VALID_MANIFEST);
-        write_legacy_skills_provenance(skills_root.path(), "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_some(),
-            "legacy pack must load"
-        );
-        assert!(
-            plugins_root
-                .path()
-                .join("acme-user/.ryuzi-skill.json")
-                .is_file(),
-            "one-time heal must stamp the plugin directory"
-        );
-    }
-
-    #[test]
-    fn legacy_heal_rejects_dir_name_spoofing_an_installed_id() {
-        // A hand-authored directory named anything other than the manifest's
-        // plugin id must not be healed or loaded, even when it claims a real
-        // installed pack's id and that id has genuine materialized
-        // skills-root provenance — otherwise a spoofed manifest could ride
-        // another pack's provenance to get itself permanently trusted.
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "impostor", VALID_MANIFEST);
-        write_legacy_skills_provenance(skills_root.path(), "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_none(),
-            "dir name mismatching the claimed plugin id must not be healed or loaded"
-        );
-        assert!(
-            !plugins_root
-                .path()
-                .join("impostor/.ryuzi-skill.json")
-                .is_file(),
-            "the impostor directory must not receive a provenance stamp"
-        );
-    }
-
-    #[test]
-    fn hand_authored_manifest_without_provenance_is_skipped() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "acme", VALID_MANIFEST);
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_none(),
-            "no stamp and no skills-root provenance means the directory is skipped"
-        );
-    }
-
-    #[test]
-    fn broken_toml_is_skipped_without_panicking_and_other_packs_still_load() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "broken", "this is not valid toml {{{");
-        write_manifest(plugins_root.path(), "acme", VALID_MANIFEST);
-        stamp_pack(plugins_root.path(), "acme", "acme-user");
-
-        let mut regs = Registries::new();
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        assert!(
-            regs.plugins.get("acme-user").is_some(),
-            "the well-formed sibling pack should still load"
-        );
-        assert_eq!(
-            regs.plugins.list().len(),
-            1,
-            "the broken manifest must not register anything"
-        );
-    }
-
-    #[test]
-    fn manifest_id_colliding_with_a_builtin_is_skipped_by_add_plugin() {
-        let plugins_root = tempfile::tempdir().unwrap();
-        let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(
-            plugins_root.path(),
-            "fake-anthropic",
-            r#"
-contract = 1
-id = "anthropic"
-name = "Fake Anthropic"
-"#,
-        );
-        stamp_pack(plugins_root.path(), "fake-anthropic", "anthropic");
-
-        let mut regs = Registries::new();
-        install_builtins(&mut regs); // registers the real "anthropic" provider plugin
-        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
-
-        let plugin = regs.plugins.get("anthropic").unwrap();
-        assert_eq!(
-            plugin.source,
-            PluginSource::Builtin,
-            "first registration (the builtin) must win over the colliding pack"
-        );
-    }
-}
-
-#[cfg(test)]
 mod install_builtins_tests {
     use super::*;
 
@@ -1528,9 +1401,8 @@ mod install_builtins_tests {
             let Some(plugin) = regs.plugins.get(id) else {
                 continue; // not every excluded id is in the router CATALOG
             };
-            assert_ne!(
-                plugin.source,
-                host::PluginSource::Component,
+            assert!(
+                plugin.manifest.component.is_none(),
                 "`{id}` must stay owned by its builtin, not the component"
             );
         }
@@ -1594,5 +1466,118 @@ mod install_builtins_tests {
                 component.manifest.id
             );
         }
+    }
+
+    // F5: a manifest-declared `categories = ["chat-gateway"]` must NOT be
+    // able to promote a plugin to `kind = "gateway"` on its own — that kind
+    // is reserved for a plugin that actually carries a live `Gateway`
+    // factory (`plugin.gateway.is_some()`), a host-vetted, first-party-only
+    // property. A third-party plugin self-declaring this category must
+    // still classify as an ordinary "integration".
+    #[test]
+    fn a_self_declared_chat_gateway_category_does_not_promote_kind() {
+        let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(
+            "contract = 2\nid = \"acme\"\nname = \"Acme\"\ncategories = [\"chat-gateway\"]\n",
+        )
+        .unwrap();
+        let plugin = CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            provider: None,
+            source: PluginSource::Builtin,
+        };
+        assert_eq!(
+            plugin_kind(&plugin),
+            "integration",
+            "a manifest-only chat-gateway category claim must not promote kind"
+        );
+    }
+}
+
+#[cfg(test)]
+mod install_installed_plugins_tests {
+    use super::*;
+
+    fn write_plugin_dir(root: &std::path::Path, id: &str, version: &str, toml: &str) {
+        let version_dir = root.join(id).join(version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("ryuzi-plugin.toml"), toml).unwrap();
+        std::fs::write(root.join(id).join("current"), version).unwrap();
+    }
+
+    fn manifest_toml(id: &str) -> String {
+        format!("contract = 2\nid = \"{id}\"\nname = \"{id}\"\n")
+    }
+
+    #[test]
+    fn registers_a_manifest_only_installed_plugin() {
+        let root = tempfile::tempdir().unwrap();
+        write_plugin_dir(
+            root.path(),
+            "acme-scan",
+            "0.0.0",
+            &manifest_toml("acme-scan"),
+        );
+
+        let mut regs = Registries::new();
+        install_installed_plugins(&mut regs, root.path());
+
+        let plugin = regs.plugins.get("acme-scan").expect("must register");
+        assert!(plugin.harness.is_none());
+        assert!(plugin.gateway.is_none());
+        assert!(plugin.connector.is_none());
+        match &plugin.source {
+            PluginSource::Installed { dir, provenance } => {
+                assert_eq!(dir, &root.path().join("acme-scan").join("0.0.0"));
+                // No install.json stamp was written for this fixture — the
+                // safe default is Catalog (pre-Task-11 install paths never
+                // wrote one either).
+                assert_eq!(provenance, &InstallProvenance::Catalog);
+            }
+            other => panic!("expected Installed source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_registration_wins_over_a_same_id_disk_entry() {
+        let root = tempfile::tempdir().unwrap();
+        write_plugin_dir(root.path(), "github", "0.0.0", &manifest_toml("github"));
+
+        let mut regs = Registries::new();
+        install_builtins(&mut regs); // embedded "github" component registers first
+        install_installed_plugins(&mut regs, root.path());
+
+        let plugin = regs.plugins.get("github").unwrap();
+        assert_eq!(
+            plugin.source,
+            PluginSource::Builtin,
+            "the embedded first-party row must stay authoritative"
+        );
+    }
+
+    #[test]
+    fn a_malformed_entry_is_skipped_without_blinding_a_healthy_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        // Malformed: current pointer names a version directory that doesn't exist.
+        std::fs::create_dir_all(root.path().join("broken")).unwrap();
+        std::fs::write(root.path().join("broken").join("current"), "0.0.0").unwrap();
+        write_plugin_dir(root.path(), "healthy", "0.0.0", &manifest_toml("healthy"));
+
+        let mut regs = Registries::new();
+        install_installed_plugins(&mut regs, root.path());
+
+        assert!(regs.plugins.get("broken").is_none());
+        assert!(regs.plugins.get("healthy").is_some());
+    }
+
+    #[test]
+    fn a_missing_root_is_a_silent_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("does-not-exist");
+        let mut regs = Registries::new();
+        install_installed_plugins(&mut regs, &missing);
+        assert!(regs.plugins.list().is_empty());
     }
 }

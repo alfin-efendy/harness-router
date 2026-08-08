@@ -66,6 +66,24 @@ export function jobById(jobs: JobInfo[], id: string): JobInfo | undefined {
   return jobs.find((j) => j.id === id);
 }
 
+/** `true` for a job with no project selected — the same "no plugin can guess
+ *  the user's project" convention as the backend's `PluginJobInfo::needs_target`
+ *  (`crate::api::plugins_api::plugin_job_info`), generalized to any job (a
+ *  plugin sync is the only realistic way to end up here, since the
+ *  create/edit UI always requires a project). `toggleJob`'s backend guard
+ *  refuses enabling one of these, so the scheduler screens route enabling
+ *  into `JobDetailView` instead of offering a blind `Switch`. */
+export function jobNeedsTarget(job: JobInfo): boolean {
+  return job.projectId.trim() === "";
+}
+
+/** Resolve a job to duplicate as a fresh, user-owned copy — same shape as
+ *  `toInput`, minus the source's own id/`pluginId` (neither round-trips
+ *  through `JobInput` anyway) and with the name suffixed `" (copy)"`. */
+export function duplicateJobInput(job: JobInfo): JobInput {
+  return { ...toInput(job), name: `${job.name} (copy)` };
+}
+
 /** Build the JobInput mirror of an existing job for partial updates. */
 export function toInput(j: JobInfo): JobInput {
   return {

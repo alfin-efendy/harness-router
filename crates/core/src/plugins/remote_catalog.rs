@@ -13,7 +13,7 @@ use crate::control::ControlPlane;
 use crate::plugins::bundle::ComponentBundleInstaller;
 use crate::settings::SettingsStore;
 use crate::store::{ComponentPluginReleaseRecord, RemoteCatalogRow, Store};
-use ryuzi_plugin_sdk::{PluginBundleManifest, PluginManifest, PluginRelease};
+use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 
 /// Default feed location: the `catalog.json` asset attached to the latest
 /// GitHub release. Overridable via settings for self-hosted feeds.
@@ -557,7 +557,14 @@ fn release_base_url_for(build_tag: Option<&str>, version: Option<&str>) -> Strin
 /// is respected and bootstrap never re-runs. It stays
 /// ABSENT while any bundle is still missing, so a transient failure is retried
 /// on the next boot.
-pub const FIRST_PARTY_BOOTSTRAP_MARKER: &str = "first_party_components_bootstrapped_v1";
+///
+/// `_v2` spelling (plugins v2 Task 5): the v1-marked-string is intentionally
+/// gone, not aliased. `migrate_v2::run` drops every v1 install tree so a
+/// previously-bootstrapped user's mimo/opencode bundles no longer exist
+/// on disk; renaming the marker means their old `..._v1` row simply no
+/// longer matches, `component_bootstrap_status` reads it as "not yet
+/// bootstrapped", and first-party install re-runs to re-seed them.
+pub const FIRST_PARTY_BOOTSTRAP_MARKER: &str = "first_party_components_bootstrapped_v2";
 
 /// Settings key holding a human-readable retry message when the last bootstrap
 /// attempt landed NOTHING (every download/verify failed). Read by the
@@ -672,7 +679,7 @@ pub async fn install_component_release(
     // (larger) wasm download — so a malformed feed fails fast, and to learn the
     // component filename to stage the wasm under. `verify_bundle` re-parses and
     // re-checks everything; this parse only drives staging.
-    let manifest = PluginBundleManifest::from_toml(
+    let manifest = PluginManifest::from_toml(
         std::str::from_utf8(&manifest_bytes).context("fetched ryuzi-plugin.toml is not UTF-8")?,
     )
     .context("parsing fetched ryuzi-plugin.toml")?;
@@ -701,7 +708,10 @@ pub async fn install_component_release(
     //   1. Arbitrary-file-write: the staged wasm filename must stay inside the
     //      staging dir (no absolute path / drive-UNC prefix / `..`).
     //   2. SSRF: the wasm must be fetched from the release base's own origin.
-    sanitize_staged_component(&manifest.component)?;
+    let Some(component) = manifest.component.as_ref() else {
+        anyhow::bail!("release feed manifest `{plugin_id}` declares no [component]");
+    };
+    sanitize_staged_component(&component.file)?;
     require_same_origin(base_url, &release.component_url)?;
 
     // Download the component wasm named by the release.
@@ -718,7 +728,7 @@ pub async fn install_component_release(
     std::fs::write(staging_path.join("plugin.sig"), &sig_bytes)?;
     // Stage the wasm under the exact filename the manifest names; verify_bundle
     // resolves and canonicalizes `manifest.component` against the staging root.
-    let component_dest = staging_path.join(&manifest.component);
+    let component_dest = staging_path.join(&component.file);
     if let Some(parent) = component_dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -897,7 +907,7 @@ mod component_install_tests {
         let wasm = format!("wasm bytes for {id} {version}").into_bytes();
         let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
         let manifest_toml = format!(
-            "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+            "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"{component}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
         )
         .into_bytes();
         let release_json = format!(
@@ -1381,7 +1391,7 @@ mod tests {
     fn feed_json(seq: u64) -> String {
         format!(
             r#"{{"schemaVersion":1,"sequence":{seq},"generatedAt":0,
-                "entries":[{{"id":"acme","manifestToml":"contract=1\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}}],
+                "entries":[{{"id":"acme","manifestToml":"contract=2\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}}],
                 "blocked":[]}}"#
         )
     }
@@ -1407,6 +1417,64 @@ mod tests {
             parse_and_check_with(&tampered, &sig, 0, &pubkey),
             Err(CatalogFeedError::BadSignature)
         ));
+    }
+
+    // `schemaVersion` versions the feed ENVELOPE, not the embedded manifest
+    // contract — a schemaVersion-1 envelope carrying contract-2 manifest
+    // bodies is a perfectly normal feed (every shipped feed looks like this)
+    // and must parse+verify fine. Manifest contract compatibility is
+    // enforced per-entry by `PluginManifest::from_toml`, not by the envelope
+    // schema check.
+    #[test]
+    fn schema_version_1_envelope_with_contract_2_entries_accepted() {
+        let bytes = feed_json(5).into_bytes();
+        let sig = sign(&bytes);
+        let pubkey = test_keypair().verifying_key().to_bytes();
+        let feed = parse_and_check_with(&bytes, &sig, 0, &pubkey).unwrap();
+        assert_eq!(feed.schema_version, 1);
+        assert_eq!(feed.entries[0].id, "acme");
+    }
+
+    // The property that keeps revocation working for old/un-upgraded
+    // clients: even when EVERY entry's manifest fails to parse (e.g. all
+    // carry a manifest contract this client predates), the feed must still
+    // be accepted at the envelope level and its `blocked[]` list must still
+    // be applied. Rejecting the whole envelope on a contract mismatch would
+    // sever the revocation channel for every already-shipped client — this
+    // is exactly what F1 restores by keeping `schemaVersion` at 1.
+    #[tokio::test]
+    async fn unparseable_entries_still_apply_blocked_list() {
+        let bytes = concat!(
+            r#"{"schemaVersion":1,"sequence":9,"generatedAt":0,"#,
+            r#""entries":[{"id":"acme","manifestToml":"contract=999\nid=\"acme\""}],"#,
+            r#""blocked":[{"id":"evil","reason":"malware","sinceSequence":9}]}"#,
+        )
+        .as_bytes()
+        .to_vec();
+        let sig = sign(&bytes);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let http = FakeHttp {
+            feed: (200, bytes),
+            sig: (200, sig),
+        };
+        let outcome = fetch_and_cache_with(
+            &store,
+            &http,
+            "http://x/catalog.json",
+            &test_keypair().verifying_key().to_bytes(),
+        )
+        .await;
+        assert!(
+            outcome.applied,
+            "an envelope with only unparseable entries must still apply"
+        );
+        assert_eq!(outcome.entries, 0, "the unparseable entry must be dropped");
+        assert_eq!(outcome.blocked, 1, "the blocked list must still land");
+        let rows = store.list_remote_catalog().await.unwrap();
+        let blocked_row = rows.iter().find(|r| r.id == "evil").unwrap();
+        assert!(blocked_row.blocked);
+        assert_eq!(blocked_row.blocked_reason.as_deref(), Some("malware"));
     }
 
     #[test]
@@ -1733,8 +1801,8 @@ mod tests {
         let feed = concat!(
             r#"{"schemaVersion":1,"sequence":8,"generatedAt":0,"#,
             r#""entries":["#,
-            r#"{"id":"bad","manifestToml":"contract=1\nid=\"bad\"\nname=\"\"\nversion=\"1.0.0\""},"#,
-            r#"{"id":"good","manifestToml":"contract=1\nid=\"good\"\nname=\"Good\"\nversion=\"2.0.0\""}"#,
+            r#"{"id":"bad","manifestToml":"contract=2\nid=\"bad\"\nname=\"\"\nversion=\"1.0.0\""},"#,
+            r#"{"id":"good","manifestToml":"contract=2\nid=\"good\"\nname=\"Good\"\nversion=\"2.0.0\""}"#,
             r#"],"blocked":[]}"#,
         );
         let bytes = feed.as_bytes().to_vec();

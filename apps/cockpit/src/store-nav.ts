@@ -10,7 +10,15 @@ export type View =
   | { kind: "models" }
   | { kind: "providerDetail"; provider: string }
   | { kind: "scheduler" }
-  | { kind: "automations"; tab?: "scheduler" | "hooks" | "commands" }
+  | {
+      kind: "automations";
+      tab?: "scheduler" | "hooks" | "commands";
+      /** Task 14: the plugin detail Automations tab's "Set up…" affordance
+       *  for a `needsTarget` hook/job — deep-links here; `AutomationsView`
+       *  forwards it to `HooksTab`/`SchedulerView`, which open that row's
+       *  editor once it's loaded (Task 16). */
+      targetId?: string;
+    }
   | { kind: "jobDetail"; id: string }
   | { kind: "jobNew" }
   | { kind: "plugins" }

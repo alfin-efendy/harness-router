@@ -8,11 +8,12 @@ import { mutationFromDetail } from "./agentMutation";
 
 // `detail.pluginTools` ids resolve against installed plugins by their
 // provider segment (see `tool_filter_for_profile` in the native harness,
-// which splits on the first '.' to match
-// `mcp__provider__tool`/`ext__provider__tool`/`wasm__provider__tool`
-// names). Catalog pluginTools entries themselves carry the BARE plugin
-// manifest id (one entry per installed plugin — `build_live_catalog`), so
-// for those the provider is simply the id.
+// which splits on the first '.' to match `mcp__provider__tool` names — one
+// namespace for every plugin/server tool, including WASM components, since
+// Task 6 merged the old `wasm__provider__tool` path into it). Catalog
+// pluginTools entries themselves carry the BARE plugin manifest id (one
+// entry per installed plugin — `build_live_catalog`), so for those the
+// provider is simply the id.
 function providerOf(id: string): string {
   const dot = id.indexOf(".");
   return dot === -1 ? id : id.slice(0, dot);

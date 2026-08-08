@@ -139,7 +139,6 @@ impl SettingsStore {
     /// and gateway keys) because they come from a runtime manifest, not a
     /// compile-time schema.
     pub async fn missing_required(&self) -> anyhow::Result<Vec<String>> {
-        use crate::settings::catalog::CATALOG;
         use crate::settings::fields::GLOBAL_FIELDS;
 
         let mut out = Vec::new();
@@ -148,28 +147,20 @@ impl SettingsStore {
                 out.push(f.key.to_string());
             }
         }
-        for id in csv(self.get("enabled_gateways").await?.as_deref()) {
-            if let Some(gw) = CATALOG.gateway(&id) {
-                for f in gw.fields {
-                    if f.required && self.get(f.key).await?.is_none() {
-                        out.push(f.key.to_string());
-                    }
-                }
-            }
-        }
         // Gated on the raw `plugin.<id>.enabled` setting — the same key
-        // `PluginHost::is_enabled`'s connector-only branch reads (mirrored
-        // rather than called: this facade never holds a
-        // `PluginHost`/`Registries` handle), so a disabled connector
-        // plugin's required fields don't block onboarding/`is_configured()`
-        // forever. This key is never set for gateway-capable plugins (their
-        // `is_enabled` reads `enabled_gateways` instead), so their fields —
-        // already covered by the gateway loop above — are correctly skipped
-        // here rather than double-counted. Harness-capable and manifest-only
-        // plugins (always-enabled regardless of this key) declare no
-        // required custom settings fields today; if one ever does, it would
-        // need `plugin.<id>.enabled=true` set explicitly for this loop to
-        // see it as enabled — a known simplification.
+        // `PluginHost::is_enabled` reads for EVERY capability axis, gateway
+        // included (Task 4 retired the `enabled_gateways` CSV and its own
+        // `CATALOG`-descriptor loop here, which had been dead since the
+        // native Discord gateway — the only entry `CATALOG.gateways` ever
+        // held — migrated to this WASM component path; a gateway-capable
+        // component's own `manifest.settings[]` fields already flow through
+        // `plugin_fields_all()` below like any other plugin's). Mirrored
+        // rather than called through `PluginHost::is_enabled` because this
+        // facade never holds a `PluginHost`/`Registries` handle. Harness- and
+        // manifest-only plugins (always-enabled regardless of this key)
+        // declare no required custom settings fields today; if one ever does,
+        // it would need `plugin.<id>.enabled=true` set explicitly for this
+        // loop to see it as enabled — a known simplification.
         let mut plugin_required: Vec<(String, String)> = crate::plugins::plugin_fields_all()
             .into_iter()
             .filter(|(_, f)| f.required)
@@ -177,7 +168,7 @@ impl SettingsStore {
             .collect();
         plugin_required.sort();
         for (plugin_id, key) in plugin_required {
-            let enabled_key = format!("plugin.{plugin_id}.enabled");
+            let enabled_key = crate::plugins::qualified_setting_key(&plugin_id, "enabled");
             if self.get(&enabled_key).await?.as_deref() != Some("true") {
                 continue;
             }
@@ -186,12 +177,6 @@ impl SettingsStore {
             }
         }
         Ok(out)
-    }
-
-    /// At least one gateway enabled, and no required setting is missing.
-    pub async fn is_configured(&self) -> anyhow::Result<bool> {
-        let gateways = csv(self.get("enabled_gateways").await?.as_deref());
-        Ok(!gateways.is_empty() && self.missing_required().await?.is_empty())
     }
 }
 
@@ -239,7 +224,7 @@ mod tests {
         use ryuzi_plugin_sdk::{AuthKind, AuthSpec, FieldKind, PluginManifest, SettingField};
 
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Test Plugin {id}"),
             version: String::new(),
@@ -266,10 +251,15 @@ mod tests {
                 options: Vec::new(),
                 default: None,
             }],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -277,7 +267,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });
@@ -335,7 +324,7 @@ mod tests {
         use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Test Enum Plugin {id}"),
             version: String::new(),
@@ -358,10 +347,15 @@ mod tests {
                 options: vec!["free".to_string(), "pro".to_string()],
                 default: None,
             }],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -369,7 +363,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });
@@ -437,7 +430,7 @@ mod tests {
         use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 
         let manifest = PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: format!("Test Default Plugin {id}"),
             version: String::new(),
@@ -472,10 +465,15 @@ mod tests {
                     default: None,
                 },
             ],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {
@@ -483,7 +481,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });
@@ -602,10 +599,5 @@ mod tests {
             .unwrap()
             .iter()
             .any(|k| k == "workdir_root"));
-        // No gateway enabled yet (the native Discord seed is gone) → not configured.
-        assert!(!settings.is_configured().await.unwrap());
-        // Enabling a gateway (one with no required catalog fields) satisfies it.
-        settings.set("enabled_gateways", "acme-gw").await.unwrap();
-        assert!(settings.is_configured().await.unwrap());
     }
 }

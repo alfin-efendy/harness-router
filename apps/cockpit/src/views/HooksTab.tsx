@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Combobox, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, SettingsCard, Switch, Textarea } from "@ryuzi/ui";
 import type { AutomationHookDetail, AutomationHookInfo, AutomationHookInput, Project, TriggerKind } from "@/bindings";
 import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
+import { Pill, PluginBadge } from "@/components/common/bits";
 import { useAgents } from "@/store-agents";
 import { useAutomations } from "@/store-automations";
 import { useEndpoint } from "@/store-endpoint";
@@ -10,17 +11,45 @@ import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
+import { usePlugins } from "@/store-plugins";
 
-const TRIGGERS: { value: TriggerKind; label: string }[] = [
-  { value: "session.start", label: "Session starts" },
-  { value: "tool.before", label: "Before a tool runs" },
-  { value: "tool.after", label: "After a tool runs" },
-  { value: "session.end", label: "Session ends" },
+// The Claude Code alias spelling for each trigger, when one exists — ORDER
+// MATTERS the same way `crate::automation::claude_alias_for` documents:
+// `session.end`'s alias is deliberately `Stop`, never `SessionEnd` (Claude
+// Code lists both, but `Stop` is the canonical one to surface). This mirrors
+// the backend's already-resolved table rather than re-deriving an inverse
+// map from `ryuzi_plugin_sdk::CLAUDE_ALIASES` in TS.
+const TRIGGERS: { value: TriggerKind; label: string; alias?: string }[] = [
+  { value: "session.start", label: "Session starts", alias: "SessionStart" },
+  { value: "tool.before", label: "Before a tool runs", alias: "PreToolUse" },
+  { value: "tool.after", label: "After a tool runs", alias: "PostToolUse" },
+  { value: "session.end", label: "Session ends", alias: "Stop" },
   { value: "scheduler.run.success", label: "Scheduled run succeeds" },
   { value: "scheduler.run.failed", label: "Scheduled run fails" },
   { value: "gateway.status.changed", label: "Gateway status changes" },
   { value: "webhook.inbound", label: "Inbound webhook" },
 ];
+
+const TRIGGER_OPTIONS = TRIGGERS.map((item) => ({
+  value: item.value,
+  label: item.label,
+  description: item.alias ? `${item.alias} · ${item.value}` : item.value,
+}));
+
+/** The Claude Code alias for a trigger, when one exists — e.g. `"Stop"` for
+ *  `"session.end"`. Powers the small mono caption on hook rows. */
+export function triggerAlias(trigger: TriggerKind): string | undefined {
+  return TRIGGERS.find((item) => item.value === trigger)?.alias;
+}
+
+/** `true` for an `agent.run` hook whose detail has an empty project id — the
+ *  same "no plugin can guess the user's project" convention as the backend's
+ *  `PluginHookInfo::needs_target` (`crate::api::plugins_api::plugin_hook_info`).
+ *  `undefined` detail (not loaded yet) is treated as not needing a target so
+ *  the row falls back to a plain toggle rather than blocking on a fetch. */
+export function hookNeedsTarget(detail: AutomationHookDetail | undefined): boolean {
+  return detail !== undefined && detail.action.kind === "agent.run" && detail.action.config.projectId.trim() === "";
+}
 
 const RUN_TONE: Record<string, string> = {
   success: "text-green-600",
@@ -132,9 +161,22 @@ function eventPayloadExample(): string {
   );
 }
 
-function HookRow({ hook, detail, onEdit }: { hook: AutomationHookInfo; detail?: AutomationHookDetail; onEdit: () => void }) {
+function HookRow({
+  hook,
+  detail,
+  onEdit,
+  onDuplicate,
+}: {
+  hook: AutomationHookInfo;
+  detail?: AutomationHookDetail;
+  onEdit: () => void;
+  onDuplicate: () => void;
+}) {
   const toggle = useAutomations((state) => state.toggle);
+  const plugins = usePlugins((state) => state.plugins);
   const latest = detail?.runs[0];
+  const alias = triggerAlias(hook.triggerKind);
+  const needsTarget = hookNeedsTarget(detail);
   return (
     <SettingsCard className="flex items-center gap-3 px-[18px] py-3">
       <Button
@@ -146,9 +188,17 @@ function HookRow({ hook, detail, onEdit }: { hook: AutomationHookInfo; detail?: 
           <Webhook aria-hidden size={17} />
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-sm font-semibold">{hook.name}</span>
-          <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+          <span className="flex items-center gap-1.5">
+            <span className="truncate text-sm font-semibold">{hook.name}</span>
+            {hook.pluginId !== null && <PluginBadge pluginId={hook.pluginId} plugins={plugins} className="shrink-0" />}
+          </span>
+          <span className="mt-0.5 flex items-center gap-1.5 truncate text-xs text-muted-foreground">
             {triggerLabel(hook.triggerKind)} · {hook.actionKind === "agent.run" ? "Agent run" : "Webhook delivery"}
+            {alias && (
+              <Pill variant="mono" className="shrink-0">
+                {alias}
+              </Pill>
+            )}
           </span>
         </span>
       </Button>
@@ -163,14 +213,26 @@ function HookRow({ hook, detail, onEdit }: { hook: AutomationHookInfo; detail?: 
           "No runs yet"
         )}
       </span>
-      <Switch
-        on={hook.enabled}
-        onToggle={() => void toggle(hook.id, !hook.enabled)}
-        label={`${hook.enabled ? "Disable" : "Enable"} ${hook.name}`}
-      />
-      <Button variant="ghost" size="icon" aria-label={`Edit ${hook.name}`} onClick={onEdit}>
-        <Edit3 aria-hidden size={15} />
-      </Button>
+      {needsTarget ? (
+        <Button variant="outline" size="sm" onClick={onEdit}>
+          Set up…
+        </Button>
+      ) : (
+        <Switch
+          on={hook.enabled}
+          onToggle={() => void toggle(hook.id, !hook.enabled)}
+          label={`${hook.enabled ? "Disable" : "Enable"} ${hook.name}`}
+        />
+      )}
+      {hook.pluginId !== null ? (
+        <Button variant="ghost" size="icon" aria-label={`Duplicate ${hook.name} as mine`} onClick={onDuplicate}>
+          <Copy aria-hidden size={15} />
+        </Button>
+      ) : (
+        <Button variant="ghost" size="icon" aria-label={`Edit ${hook.name}`} onClick={onEdit}>
+          <Edit3 aria-hidden size={15} />
+        </Button>
+      )}
     </SettingsCard>
   );
 }
@@ -254,8 +316,21 @@ function InboundEndpoint({ hook, status }: { hook: AutomationHookInfo | null; st
   );
 }
 
-function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | null; projects: Project[]; onClose: () => void }) {
+function HookEditor({
+  hook,
+  initialDraft,
+  projects,
+  onClose,
+}: {
+  hook: AutomationHookInfo | null;
+  /** Seeds the draft for a "Duplicate as mine" create (Task 16) — ignored
+   *  once `hook` is set, since an existing hook's own detail always wins. */
+  initialDraft?: HookDraft;
+  projects: Project[];
+  onClose: () => void;
+}) {
   const selectedProjectId = useStore((state) => state.selectedProjectId);
+  const plugins = usePlugins((state) => state.plugins);
   const detail = useAutomations((state) => (hook ? state.detailsById[hook.id] : undefined));
   const loadDetail = useAutomations((state) => state.loadDetail);
   const create = useAutomations((state) => state.create);
@@ -267,9 +342,15 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
   const hydrateEndpoint = useEndpoint((state) => state.hydrate);
   const models = useAgents((state) => state.models);
   const [draft, setDraft] = useState<HookDraft>(() =>
-    detail ? draftFor(detail) : blankDraft(selectedProjectId ?? projects[0]?.projectId ?? ""),
+    detail ? draftFor(detail) : (initialDraft ?? blankDraft(selectedProjectId ?? projects[0]?.projectId ?? "")),
   );
   const [saving, setSaving] = useState(false);
+  // A plugin-owned hook is read-only except its target (project/branch) — the
+  // only fields `needs_target`'s "Set up…" flow can legitimately change; the
+  // plugin still authors the name/trigger/prompt. Hidden entirely when
+  // duplicating (create mode never carries `hook`), so the copy is fully
+  // editable.
+  const pluginOwned = hook?.pluginId != null;
   const projectAgents = useNative((state) => (draft.projectId ? state.agentsByProject[draft.projectId] : undefined));
   const [deleting, setDeleting] = useState(false);
   const [deleteTrigger, setDeleteTrigger] = useState<HTMLButtonElement | null>(null);
@@ -320,8 +401,21 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
     <>
       <Modal onClose={onClose} width={680} busy={saving} initialFocus={nameRef}>
         <ModalHeader
-          title={hook ? `Edit ${hook.name}` : "New hook"}
-          description="Hooks run locally when canonical automation events occur."
+          title={
+            hook ? (
+              <span className="flex items-center gap-2">
+                {`Edit ${hook.name}`}
+                {pluginOwned && <PluginBadge pluginId={hook.pluginId as string} plugins={plugins} />}
+              </span>
+            ) : (
+              "New hook"
+            )
+          }
+          description={
+            pluginOwned
+              ? "Installed by a plugin — only the target project and branch can be changed here."
+              : "Hooks run locally when canonical automation events occur."
+          }
         />
         <ModalBody className="flex flex-col gap-5">
           <section className="flex flex-col gap-3">
@@ -331,6 +425,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                 ref={nameRef}
                 aria-label="Name"
                 value={draft.name}
+                disabled={pluginOwned}
                 onChange={(event) => patchDraft((current) => ({ ...current, name: event.target.value }))}
                 placeholder="Notify on session end"
               />
@@ -338,8 +433,9 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
             <FormField label="When">
               <Combobox
                 aria-label="Trigger"
-                options={TRIGGERS}
+                options={TRIGGER_OPTIONS}
                 value={draft.triggerKind}
+                disabled={pluginOwned}
                 onValueChange={(triggerKind) =>
                   patchDraft((current) => ({
                     ...current,
@@ -361,6 +457,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                     { value: "webhook.outbound", label: "Deliver a webhook" },
                   ]}
                   value={draft.actionKind}
+                  disabled={pluginOwned}
                   onValueChange={(actionKind) =>
                     patchDraft((current) => ({ ...current, actionKind: actionKind as HookDraft["actionKind"] }))
                   }
@@ -399,6 +496,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                     aria-label="Agent"
                     options={agentOptions}
                     value={draft.agentId ?? ""}
+                    disabled={pluginOwned}
                     onValueChange={(agentId) => patchDraft((current) => ({ ...current, agentId: agentId || null }))}
                     placeholder="Default agent"
                   />
@@ -408,6 +506,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                     aria-label="Model"
                     options={modelOptions}
                     value={draft.modelOverride ?? ""}
+                    disabled={pluginOwned}
                     onValueChange={(modelOverride) => patchDraft((current) => ({ ...current, modelOverride: modelOverride || null }))}
                     placeholder="Default model"
                   />
@@ -417,6 +516,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                 <span className="text-xs">Run as subtask</span>
                 <Switch
                   on={draft.subtask}
+                  disabled={pluginOwned}
                   onToggle={() => patchDraft((current) => ({ ...current, subtask: !current.subtask }))}
                   label="Run as subtask"
                 />
@@ -425,6 +525,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                 <Textarea
                   aria-label="Prompt"
                   value={draft.prompt}
+                  disabled={pluginOwned}
                   onChange={(event) => patchDraft((current) => ({ ...current, prompt: event.target.value }))}
                   rows={5}
                   placeholder="Review $EVENT"
@@ -440,6 +541,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                   <Input
                     aria-label="URL"
                     value={draft.url}
+                    disabled={pluginOwned}
                     onChange={(event) => patchDraft((current) => ({ ...current, url: event.target.value }))}
                     placeholder="https://example.com/hooks"
                   />
@@ -449,6 +551,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                     aria-label="Method"
                     options={[{ value: "POST", label: "POST" }]}
                     value={draft.method}
+                    disabled={pluginOwned}
                     onValueChange={(method) => patchDraft((current) => ({ ...current, method }))}
                   />
                 </FormField>
@@ -460,6 +563,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                     <Input
                       aria-label={`Header name ${index + 1}`}
                       value={header.name}
+                      disabled={pluginOwned}
                       onChange={(event) =>
                         patchDraft((current) => ({
                           ...current,
@@ -474,6 +578,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                       aria-label={`Header value ${index + 1}`}
                       type="password"
                       value={header.value}
+                      disabled={pluginOwned}
                       onChange={(event) =>
                         patchDraft((current) => ({
                           ...current,
@@ -488,6 +593,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                       variant="ghost"
                       size="icon"
                       aria-label={`Remove header ${index + 1}`}
+                      disabled={pluginOwned}
                       onClick={() =>
                         patchDraft((current) => ({
                           ...current,
@@ -502,6 +608,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                 <Button
                   variant="outline"
                   size="sm"
+                  disabled={pluginOwned}
                   className="w-fit"
                   onClick={() => patchDraft((current) => ({ ...current, headers: [...current.headers, { name: "", value: "" }] }))}
                 >
@@ -522,6 +629,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
                 <Textarea
                   aria-label="Payload template"
                   value={draft.payloadTemplate}
+                  disabled={pluginOwned}
                   onChange={(event) => patchDraft((current) => ({ ...current, payloadTemplate: event.target.value }))}
                   rows={5}
                   // biome-ignore lint/suspicious/noTemplateCurlyInString: backend placeholder syntax is intentionally shown literally.
@@ -544,7 +652,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
         </ModalBody>
         <ModalFooter className="justify-between">
           <span>
-            {hook && (
+            {hook && !pluginOwned && (
               <Button
                 variant="ghost"
                 className="text-destructive"
@@ -580,7 +688,17 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
   );
 }
 
-export function HooksTab({ projects: providedProjects }: { projects?: Project[] }) {
+export function HooksTab({
+  projects: providedProjects,
+  targetHookId,
+}: {
+  projects?: Project[];
+  /** Deep-linked from the plugin detail Automations tab's "Set up…" button
+   *  (Task 14) via `AutomationsView`'s `targetId` — opens that hook's editor
+   *  once it's loaded, letting the user fill in the target Task 10's backend
+   *  guard is blocking on. */
+  targetHookId?: string;
+}) {
   const storeProjects = useStore((state) => state.projects);
   const projects = providedProjects ?? storeProjects;
   const hooks = useAutomations((state) => state.hooks);
@@ -589,6 +707,8 @@ export function HooksTab({ projects: providedProjects }: { projects?: Project[] 
   const load = useAutomations((state) => state.load);
   const loadDetail = useAutomations((state) => state.loadDetail);
   const [editing, setEditing] = useState<AutomationHookInfo | null | undefined>(undefined);
+  const [duplicateSeed, setDuplicateSeed] = useState<HookDraft | undefined>(undefined);
+  const openedTargetRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     void load();
@@ -596,7 +716,26 @@ export function HooksTab({ projects: providedProjects }: { projects?: Project[] 
   useEffect(() => {
     for (const hook of hooks) void loadDetail(hook.id);
   }, [hooks, loadDetail]);
+  useEffect(() => {
+    if (!targetHookId || openedTargetRef.current === targetHookId) return;
+    const target = hooks.find((hook) => hook.id === targetHookId);
+    if (!target) return;
+    openedTargetRef.current = targetHookId;
+    setDuplicateSeed(undefined);
+    setEditing(target);
+  }, [targetHookId, hooks]);
   const sortedHooks = useMemo(() => [...hooks].sort((left, right) => right.updatedAt - left.updatedAt), [hooks]);
+
+  const duplicate = (hook: AutomationHookInfo) => {
+    const detail = detailsById[hook.id];
+    if (!detail) return;
+    setDuplicateSeed({ ...draftFor(detail), name: `${detail.hook.name} (copy)` });
+    setEditing(null);
+  };
+  const closeEditor = () => {
+    setEditing(undefined);
+    setDuplicateSeed(undefined);
+  };
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
@@ -614,17 +753,25 @@ export function HooksTab({ projects: providedProjects }: { projects?: Project[] 
           <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">Loading hooks…</SettingsCard>
         ) : sortedHooks.length === 0 ? (
           <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">
-            No hooks yet. Create a hook to respond to engine events.
+            No hooks yet. Plugins you install can also add hook presets here.
           </SettingsCard>
         ) : (
           <div className="flex flex-col gap-2">
             {sortedHooks.map((hook) => (
-              <HookRow key={hook.id} hook={hook} detail={detailsById[hook.id]} onEdit={() => setEditing(hook)} />
+              <HookRow
+                key={hook.id}
+                hook={hook}
+                detail={detailsById[hook.id]}
+                onEdit={() => setEditing(hook)}
+                onDuplicate={() => duplicate(hook)}
+              />
             ))}
           </div>
         )}
       </div>
-      {editing !== undefined && <HookEditor hook={editing} projects={projects} onClose={() => setEditing(undefined)} />}
+      {editing !== undefined && (
+        <HookEditor hook={editing} initialDraft={editing === null ? duplicateSeed : undefined} projects={projects} onClose={closeEditor} />
+      )}
     </div>
   );
 }

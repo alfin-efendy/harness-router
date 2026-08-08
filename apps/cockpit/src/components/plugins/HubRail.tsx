@@ -1,7 +1,15 @@
 import { MonitorUp, RefreshCw } from "lucide-react";
 import { Button, cn } from "@ryuzi/ui";
 import type { CatalogStatus } from "@/bindings";
-import { kindCounts, railCounts, type HubItem, type HubItemKind, type RailFilter, type RailState } from "@/lib/plugin-hub";
+import {
+  ALL_SURFACES,
+  railCounts,
+  type HubItem,
+  type RailFilter,
+  type RailState,
+  surfaceCounts,
+  type SurfaceBadge,
+} from "@/lib/plugin-hub";
 
 const STATE_ORDER: RailState[] = ["all", "installed", "discover", "attention", "updates"];
 const STATE_LABELS: Record<RailState, string> = {
@@ -12,15 +20,20 @@ const STATE_LABELS: Record<RailState, string> = {
   updates: "Updates",
 };
 
-// Design doc §3: kind filters collapse integration+gateway into one
-// "Integrations" entry (matches `kindCounts`'s pre-seeded `integrations`
-// aggregate) — there is no separate Integrations/Gateway split in the rail.
-const KIND_ENTRIES: { key: HubItemKind | "integrations"; label: string }[] = [
-  { key: "integrations", label: "Integrations" },
-  { key: "mcp-server", label: "MCP servers" },
-  { key: "skill-pack", label: "Skill packs" },
-  { key: "provider", label: "Providers" },
-];
+const SURFACE_LABEL: Record<SurfaceBadge, string> = {
+  provider: "Provider",
+  tools: "Tools",
+  mcp: "MCP",
+  skills: "Skills",
+  commands: "Commands",
+  hooks: "Hooks",
+  jobs: "Jobs",
+};
+
+// Task 13: the rail's second filter group is now surface-based (replacing
+// the old kind taxonomy) — one entry per `SurfaceBadge`, in the backend's
+// stable emission order (`ALL_SURFACES`).
+const SURFACE_ENTRIES: { key: SurfaceBadge; label: string }[] = ALL_SURFACES.map((key) => ({ key, label: SURFACE_LABEL[key] }));
 
 /** Subtle rail-footer status line summarizing the last `catalog_status`/
  *  `refresh_catalog` snapshot (replaces the old Browse-tab status line).
@@ -79,7 +92,7 @@ export function HubRail({
   onUpdateAll: () => void;
 }) {
   const counts = railCounts(items);
-  const kCounts = kindCounts(items);
+  const sCounts = surfaceCounts(items);
   const categories = Array.from(new Set(items.flatMap((i) => i.categories))).sort();
 
   return (
@@ -102,13 +115,13 @@ export function HubRail({
       </div>
 
       <div className="flex flex-col gap-0.5 border-t border-border pt-3">
-        {KIND_ENTRIES.map((entry) => (
+        {SURFACE_ENTRIES.map((entry) => (
           <RailRow
             key={entry.key}
             label={entry.label}
-            count={kCounts[entry.key] ?? 0}
-            active={filter.kind === entry.key}
-            onClick={() => onChange({ ...filter, kind: filter.kind === entry.key ? null : entry.key })}
+            count={sCounts[entry.key] ?? 0}
+            active={filter.surface === entry.key}
+            onClick={() => onChange({ ...filter, surface: filter.surface === entry.key ? null : entry.key })}
           />
         ))}
       </div>

@@ -7,6 +7,7 @@ import { pluginIcon } from "@/lib/plugin-icons";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { ConnectStep, DoneStep, InstallComponentStep, OverviewStep, PermissionsStep, SettingsStep } from "./steps-component";
 import { ConnectorConnectStep, InstallConnectorStep } from "./steps-connector";
+import { ContentsStep } from "./steps-contents";
 import { InstallSkillPackStep, SkillTrustStep } from "./steps-skillpack";
 import { InstallProviderStep, ProviderConnectStep } from "./steps-provider";
 import { planWizardSteps, stepLabel, type WizardStepId } from "./wizard-steps";
@@ -191,6 +192,7 @@ export function UniversalInstallWizard({
       trustRequired: skillTrust != null,
       hasOauthProfiles: (releaseDetail?.activeManifest?.oauthProfiles.length ?? 0) > 0,
       freeBuiltin: detail.info.kind === "provider" && detail.info.categories.includes("free"),
+      hasContents: detail.commands.length + detail.skills.length + detail.hooks.length + detail.jobs.length > 0,
     });
   }, [detail, releaseDetail, skillTrust]);
 
@@ -327,6 +329,8 @@ function StepBody({ step, ctx, onNext }: { step: WizardStepId; ctx: WizardCtx; o
   switch (step) {
     case "overview":
       return <OverviewStep ctx={ctx} onNext={onNext} />;
+    case "contents":
+      return <ContentsStep ctx={ctx} onNext={onNext} />;
     case "permissions":
       return ctx.skillTrust ? <SkillTrustStep ctx={ctx} onNext={onNext} /> : <PermissionsStep ctx={ctx} onNext={onNext} />;
     case "install":

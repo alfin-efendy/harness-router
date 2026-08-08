@@ -31,18 +31,22 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use ryuzi_plugin_sdk::{OAuthProfile, PluginBundleManifest};
+use ryuzi_plugin_sdk::{OAuthProfile, PluginManifest};
 
 use crate::domain::Principal;
+use crate::harness::native::mcp_client::McpCaller;
+use crate::harness::native::tools::mcp::McpTool;
+use crate::harness::native::tools::Tool;
 use crate::plugins::build_github_component_once;
 use crate::plugins::bundle::{load_active_bundles, ComponentBundleInstaller};
 use crate::plugins::capabilities::oauth::{OauthErr, ProfileOauth};
 use crate::plugins::capabilities::PluginCapabilityContext;
 use crate::plugins::first_party_key::FIRST_PARTY_KEY_ID;
+use crate::plugins::mcp_component::ComponentMcpServer;
 use crate::plugins::oauth::PluginOauthToken;
 use crate::plugins::remote_catalog::{install_component_release, CatalogHttp};
 use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
-use crate::plugins::wasm_connector::{wasm_tool_name, WasmActivation, WasmToolSet, WasmTools};
+use crate::plugins::wasm_connector::WasmActivation;
 use crate::settings::SettingsStore;
 use crate::store::{PluginOauthProfileClient, Store};
 use crate::telemetry::NoopTelemetry;
@@ -67,7 +71,7 @@ fn github_manifest_path() -> PathBuf {
 /// requires the release descriptor's version to equal the manifest's.
 fn github_manifest_version() -> String {
     let toml = std::fs::read_to_string(github_manifest_path()).unwrap();
-    ryuzi_plugin_sdk::PluginBundleManifest::from_toml(&toml)
+    ryuzi_plugin_sdk::PluginManifest::from_toml(&toml)
         .unwrap()
         .version
 }
@@ -79,10 +83,10 @@ fn github_wasm_path() -> PathBuf {
 /// The component's own committed manifest — the single source of truth for the
 /// tools' metadata, the network allowlist, and the declared `github` OAuth
 /// profile that the OAuth e2e below drives.
-fn github_manifest() -> PluginBundleManifest {
+fn github_manifest() -> PluginManifest {
     let toml = std::fs::read_to_string(github_manifest_path())
         .expect("reading plugins/github/ryuzi-plugin.toml");
-    PluginBundleManifest::from_toml(&toml).expect("parsing the github bundle manifest")
+    PluginManifest::from_toml(&toml).expect("parsing the github manifest")
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +417,9 @@ async fn github_activation(store: &Arc<Store>, root: &Path) -> Arc<WasmActivatio
     ))
 }
 
-/// The exact `wasm__github__*` wire names for the `0.1.0` tool set.
+/// The exact `mcp__github__*` wire names for the `0.1.0` tool set (Task 6:
+/// component connector tools flow through the same MCP naming as an external
+/// stdio server's — previously `wasm__github__*`).
 fn expected_tool_names() -> Vec<String> {
     let mut names: Vec<String> = [
         "auth_status",
@@ -431,7 +437,7 @@ fn expected_tool_names() -> Vec<String> {
     ]
     .iter()
     .copied()
-    .map(|t| wasm_tool_name("github", t))
+    .map(|t| format!("mcp__github__{t}"))
     .collect();
     names.sort();
     names
@@ -441,13 +447,31 @@ fn expected_tool_names() -> Vec<String> {
 async fn installed_github_enumerates_the_0_1_0_connector_tools() {
     let (store, _tmp, root) = install_real_github().await;
     let activation = github_activation(&store, root.path()).await;
-    let set = WasmToolSet::new(vec![activation]);
+    let server = Arc::new(
+        ComponentMcpServer::discover(activation)
+            .await
+            .expect("the real github component exports connector tools"),
+    );
 
-    let mut names: Vec<String> = set
-        .session_tools()
-        .await
-        .into_iter()
-        .map(|b| wasm_tool_name(&b.component_id, &b.def.name))
+    // Build the exact `McpTool`s the native runtime's session-tool assembly
+    // would (`harness::native::mod`'s `connect_component_mcp_tools`), so this
+    // asserts the REAL `mcp__github__*` wire names a session advertises to
+    // the model, not a hand-formatted stand-in.
+    let mut names: Vec<String> = server
+        .tools
+        .iter()
+        .map(|def| {
+            McpTool::new(
+                &server.server_id,
+                &def.name,
+                &def.description,
+                def.input_schema.clone(),
+                server.clone() as Arc<dyn McpCaller>,
+                Some(server.principal.clone()),
+            )
+            .name()
+            .to_string()
+        })
         .collect();
     names.sort();
     assert_eq!(names, expected_tool_names());

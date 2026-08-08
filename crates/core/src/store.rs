@@ -57,11 +57,25 @@ CREATE INDEX sessions_primary_agent_idx ON sessions(primary_agent_id);
 const OAUTH_CLIENT_SECRET_SETTING_MIGRATION_SQL: &str =
     "ALTER TABLE plugin_oauth_profile_clients ADD COLUMN client_secret_setting TEXT;";
 
+/// v3 -> v4: plugin-shipped automations/MCP provenance — which plugin (if
+/// any) installed a hook/job/MCP server, so uninstall can cascade and the
+/// UI can badge origin. NULL = user-created. Added for plugins v2 Task 5;
+/// populated by Task 7 (MCP server sync) and Task 10 (automation sync) — this
+/// migration only adds the columns/indexes, it writes no data itself.
+const PLUGIN_ORIGIN_MIGRATION_SQL: &str = "
+ALTER TABLE automation_hooks ADD COLUMN plugin_id TEXT;
+ALTER TABLE jobs ADD COLUMN plugin_id TEXT;
+ALTER TABLE mcp_servers ADD COLUMN plugin_id TEXT;
+CREATE INDEX idx_automation_hooks_plugin ON automation_hooks(plugin_id);
+CREATE INDEX idx_jobs_plugin ON jobs(plugin_id);
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
         M::up(AGENT_STATS_MIGRATION_SQL),
         M::up(OAUTH_CLIENT_SECRET_SETTING_MIGRATION_SQL),
+        M::up(PLUGIN_ORIGIN_MIGRATION_SQL),
     ])
 }
 
@@ -616,9 +630,10 @@ impl Store {
         // `to_latest` would otherwise fail with an opaque "database too far
         // ahead". Detect it up front and return an actionable error instead.
         // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage, 3 =
-        // + plugin_oauth_profile_clients.client_secret_setting.)
+        // + plugin_oauth_profile_clients.client_secret_setting, 4 =
+        // + automation_hooks/jobs/mcp_servers.plugin_id origin columns.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 3;
+        const LATEST_VERSION: i64 = 4;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -3792,6 +3807,27 @@ impl Store {
         .await
     }
 
+    /// Wipe every release-ledger row for `plugin_id` — the whole history, not
+    /// just the active one (unlike [`Self::deactivate_component_releases`],
+    /// which only clears the active flag and keeps the versions around for a
+    /// reinstall). The `active` flag lives on these same rows, so deleting
+    /// them also clears the active pointer; there is no separate
+    /// "active pointer" row to touch. Used by the v2 first-upgrade migration
+    /// ([`crate::plugins::migrate_v2::run`]) to erase a dropped v1 install's
+    /// ledger history alongside its on-disk directory. Idempotent — an id
+    /// with no rows is a no-op `Ok`.
+    pub async fn clear_component_releases(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM component_plugin_releases WHERE plugin_id=?1",
+                params![plugin_id],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Fetch a value a WASM component plugin has stored under its own
     /// `plugin_id` and `key`. `None` if no such row exists.
     pub async fn get_component_storage(
@@ -6710,10 +6746,15 @@ mod tests {
     async fn settings_raw_roundtrip_and_seeds() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        // No gateway seed on open anymore (the native Discord seed was removed
-        // with the native gateway) — a fresh store has no `enabled_gateways`.
+        // No gateway seed on open anymore (the native Discord seed was
+        // removed with the native gateway, and Task 4 retired the
+        // `enabled_gateways` CSV entirely) — a fresh store has no
+        // `plugin.discord.enabled` row.
         assert_eq!(
-            store.get_setting_raw("enabled_gateways").await.unwrap(),
+            store
+                .get_setting_raw("plugin.discord.enabled")
+                .await
+                .unwrap(),
             None
         );
         // Upsert + empty string is a real value:
@@ -9744,10 +9785,11 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 3 database (v1 squashed baseline + v2
+    // produce a `user_version` 4 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
-    // plugin_oauth_profile_clients.client_secret_setting) whose schema +
-    // seeded rows exactly match the golden fixture.
+    // plugin_oauth_profile_clients.client_secret_setting + v4
+    // automation_hooks/jobs/mcp_servers.plugin_id origin columns) whose
+    // schema + seeded rows exactly match the golden fixture.
     //
     // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
     // version, messages_fts_data blocks), which are artifacts of the bundled
@@ -9760,8 +9802,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 3,
-            "squashed baseline + agent_stats + oauth-client-secret-setting migrations must be user_version 3"
+            user_version, 4,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin migrations must be user_version 4"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

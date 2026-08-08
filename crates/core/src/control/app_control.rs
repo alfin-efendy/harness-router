@@ -105,6 +105,7 @@ impl AppControl for AppControlImpl {
             notify_fail: true,
             pre_check: String::new(),
             model_override: spec.model_override,
+            plugin_id: None,
         };
         crate::scheduler::upsert_job(cp.store(), job).await?;
         self.audit("app_jobs", "create").await;

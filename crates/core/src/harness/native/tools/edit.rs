@@ -29,7 +29,7 @@ fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
     ToolInputCtx {
         work_dir: &ctx.work_dir,
         attachments_dir: None,
-        extra_skill_dirs: &[],
+        plugin_skill_roots: &[],
     }
 }
 
@@ -969,7 +969,7 @@ mod tests {
         let input_ctx = ToolInputCtx {
             work_dir: &ctx.work_dir,
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
 
         let normalized = Edit

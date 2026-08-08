@@ -8,7 +8,7 @@ use crate::agents::learning_queue::LearningQueue;
 use crate::agents::registry::AgentRegistry;
 use crate::control::ControlPlane;
 use crate::llm_router::server::RouterServer;
-use crate::plugins::{CorePlugin, PluginSource};
+use crate::plugins::{CorePlugin, InstallProvenance, PluginSource};
 use crate::settings::SettingsStore;
 use crate::store::Device;
 use axum::extract::{ConnectInfo, Path, State};
@@ -620,8 +620,11 @@ fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
-        PluginSource::Component => "component",
-        PluginSource::SkillPack(_) => "skill-pack",
+        PluginSource::Installed { provenance, .. } => match provenance {
+            InstallProvenance::Catalog => "catalog",
+            InstallProvenance::LocalPath => "local-path",
+            InstallProvenance::GitUrl(_) => "git-url",
+        },
     }
 }
 
@@ -719,7 +722,7 @@ mod tests {
 
     fn minimal_manifest(id: &str, name: &str) -> PluginManifest {
         PluginManifest {
-            contract: 1,
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: id.to_string(),
             name: name.to_string(),
             version: String::new(),
@@ -733,10 +736,15 @@ mod tests {
             experimental: false,
             auth: None,
             settings: vec![],
-            mcp: vec![],
-            extensions: vec![],
-            skills: vec![],
+            component: None,
+            permissions: Default::default(),
+            oauth: vec![],
             provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         }
     }
 
@@ -754,7 +762,6 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(NoopConnector)),
-            extension: None,
             provider: None,
             source: PluginSource::Builtin,
         });
@@ -822,7 +829,7 @@ mod tests {
         let body: Value = resp.json().await.unwrap();
 
         assert_eq!(body["id"], "anthropic");
-        assert_eq!(body["contract"], 1);
+        assert_eq!(body["contract"], 2);
         assert_eq!(body["provider"]["format"], "anthropic");
         assert_eq!(body["enabled"], true);
         assert_eq!(body["source"], "builtin");

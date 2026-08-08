@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, GatewayInfo, JobInfo, Result } from "@/bindings";
+import { useNav } from "@/store-nav";
 
 const jobs: JobInfo[] = [
   {
@@ -93,4 +94,12 @@ test("uses the requested initial tab after a keyed route change", async () => {
   rerender(renderForTab("hooks"));
 
   expect(await screen.findByRole("heading", { name: "Hooks" })).toBeTruthy();
+});
+
+test("forwards a plugin detail deep-link targetId to the Scheduler tab, which redirects into the job's detail view", async () => {
+  await act(async () => {
+    render(<AutomationsView initialTab="scheduler" targetId="job-1" />);
+  });
+
+  expect(useNav.getState().history.current).toEqual({ kind: "jobDetail", id: "job-1" });
 });

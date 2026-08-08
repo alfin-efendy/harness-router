@@ -459,7 +459,7 @@ impl Default for Dispatcher {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 pub enum TriggerKind {
     #[serde(rename = "session.start")]
     SessionStart,
@@ -479,6 +479,24 @@ pub enum TriggerKind {
     WebhookInbound,
 }
 
+/// Hand-written rather than `#[derive(Deserialize)]` so JSON API payloads
+/// accept a Claude Code alias spelling (`"Stop"`, `"PreToolUse"`, ...) on
+/// input, not just the canonical dotted form — `AutomationHookInput.trigger_kind`
+/// (and therefore `create_automation_hook`/`update_automation_hook`'s RPC
+/// bodies) deserializes through here. Routes through `FromStr`, which already
+/// resolves aliases via `ryuzi_plugin_sdk::canonical_trigger` before falling
+/// back to an error; canonical spellings still match on the first attempt, so
+/// this is purely additive over the old derive's exact-match behavior.
+impl<'de> Deserialize<'de> for TriggerKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        TriggerKind::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
 impl TriggerKind {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -494,6 +512,21 @@ impl TriggerKind {
     }
 }
 
+/// The Claude Code alias spelling for a canonical `trigger`
+/// (`TriggerKind::as_str`'s output), when one exists — the inverse of
+/// `ryuzi_plugin_sdk::CLAUDE_ALIASES`. ORDER MATTERS: `CLAUDE_ALIASES` lists
+/// `Stop` before `SessionEnd` for `session.end` deliberately (see that
+/// table's doc), so this returns the FIRST matching alias in table order
+/// rather than building a `HashMap` (which would make the winner
+/// nondeterministic / last-write-wins). Used by `crate::api::plugins_api` to
+/// populate `PluginHookInfo.trigger_alias`.
+pub fn claude_alias_for(trigger: &str) -> Option<&'static str> {
+    ryuzi_plugin_sdk::CLAUDE_ALIASES
+        .iter()
+        .find(|(_, canonical)| *canonical == trigger)
+        .map(|(alias, _)| *alias)
+}
+
 impl FromStr for TriggerKind {
     type Err = anyhow::Error;
 
@@ -507,7 +540,15 @@ impl FromStr for TriggerKind {
             "scheduler.run.failed" => Ok(Self::SchedulerRunFailed),
             "gateway.status.changed" => Ok(Self::GatewayStatusChanged),
             "webhook.inbound" => Ok(Self::WebhookInbound),
-            _ => bail!("unknown automation trigger kind: {value}"),
+            // Not a canonical spelling outright — try a Claude Code alias
+            // (`PreToolUse`, `Stop`, ...) before giving up, so API payloads
+            // may use either spelling while serde/DB storage stay canonical.
+            // `canonical_trigger` always resolves to one of the arms above,
+            // so this recursion is exactly one level deep.
+            _ => match ryuzi_plugin_sdk::canonical_trigger(value) {
+                Some(canonical) => Self::from_str(canonical),
+                None => bail!("unknown automation trigger kind: {value}"),
+            },
         }
     }
 }
@@ -671,6 +712,12 @@ pub struct HookRow {
     pub action: HookActionInput,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The plugin that installed this hook, if any (slot-4 origin column).
+    /// `None` for a user-created hook. Written only by
+    /// `plugins::automation_sync` — `create_hook`/`update_hook` (the user-facing
+    /// mutation path) never set this.
+    #[serde(default)]
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -918,8 +965,7 @@ fn inbound_path(trigger_kind: TriggerKind) -> Option<String> {
     (trigger_kind == TriggerKind::WebhookInbound).then(|| format!("wh_{}", Uuid::new_v4().simple()))
 }
 
-const HOOK_COLUMNS: &str =
-    "id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at";
+const HOOK_COLUMNS: &str = "id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at,plugin_id";
 const RUN_COLUMNS: &str = "id,hook_id,status,envelope_json,snapshot_json,session_pk,error,attempt_count,last_http_status,queued_at,started_at,finished_at";
 
 fn sql_json_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> rusqlite::Error {
@@ -1111,6 +1157,7 @@ fn hook_from(row: &Row<'_>) -> rusqlite::Result<HookRow> {
         action: decode_action_from_storage(&config_json).map_err(sql_json_error)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        plugin_id: row.get(9)?,
     })
 }
 
@@ -1176,6 +1223,9 @@ pub async fn create_hook(store: &Store, input: HookInput) -> Result<HookRow, Hoo
         action: input.action,
         created_at: now,
         updated_at: now,
+        // The user-facing create path never attributes a hook to a plugin —
+        // only `plugins::automation_sync::put_hook_row` sets this.
+        plugin_id: None,
     };
     let stored = hook.clone();
     store
@@ -1183,8 +1233,8 @@ pub async fn create_hook(store: &Store, input: HookInput) -> Result<HookRow, Hoo
             let config_json = encode_action_for_storage(&stored.action)
                 .map_err(sql_json_error)?;
             c.execute(
-                "INSERT INTO automation_hooks(id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO automation_hooks(id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at,plugin_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     stored.id,
                     stored.name,
@@ -1195,6 +1245,7 @@ pub async fn create_hook(store: &Store, input: HookInput) -> Result<HookRow, Hoo
                     config_json,
                     stored.created_at,
                     stored.updated_at,
+                    stored.plugin_id,
                 ],
             )?;
             Ok(())
@@ -1278,14 +1329,39 @@ pub async fn list_hooks(store: &Store) -> anyhow::Result<Vec<HookRow>> {
         .await
 }
 
+/// Look up the `webhook.inbound` hook for `path`, EXCLUDING a plugin-owned
+/// row whose owning plugin is currently disabled.
+///
+/// Same fix as `list_enabled_hooks`, applied to the RPC-facing lookup the
+/// HTTP server (`llm_router/server.rs::invoke_webhook`) calls before
+/// dispatching an inbound webhook. It only ever checked `hook.enabled` (which
+/// the caller still checks itself, to return 409 CONFLICT rather than 404 NOT
+/// FOUND for a hook the user disabled directly) — so a plugin-shipped
+/// `webhook.inbound` hook stayed network-triggerable after the user disabled
+/// the OWNING PLUGIN. Joins against the `settings` table's
+/// `plugin.<plugin_id>.enabled` row for a plugin-owned hook; a row with no
+/// `plugin_id` (user-created) is unaffected. Deliberately does NOT filter on
+/// `h.enabled` here — that stays the caller's job so it can keep
+/// distinguishing "hook disabled" (409) from "hook not found" (404); a
+/// plugin-disabled hook falls into "not found", matching every other
+/// disabled-plugin content-visibility rule in this crate.
 pub async fn find_inbound_hook(store: &Store, path: &str) -> anyhow::Result<Option<HookRow>> {
     let path = path.to_string();
     store
         .with_conn(move |c| {
+            let cols: String = HOOK_COLUMNS
+                .split(',')
+                .map(|col| format!("h.{col}"))
+                .collect::<Vec<_>>()
+                .join(",");
             c.query_row(
                 &format!(
-                    "SELECT {HOOK_COLUMNS} FROM automation_hooks \
-                     WHERE trigger_kind='webhook.inbound' AND inbound_path=?1"
+                    "SELECT {cols} FROM automation_hooks h \
+                     LEFT JOIN settings s \
+                       ON h.plugin_id IS NOT NULL \
+                       AND s.key = 'plugin.' || h.plugin_id || '.enabled' \
+                     WHERE h.trigger_kind='webhook.inbound' AND h.inbound_path=?1 \
+                       AND (h.plugin_id IS NULL OR s.value='true')"
                 ),
                 params![path],
                 hook_from,
@@ -1295,6 +1371,20 @@ pub async fn find_inbound_hook(store: &Store, path: &str) -> anyhow::Result<Opti
         .await
 }
 
+/// Every enabled hook for `trigger`, EXCLUDING a plugin-owned row whose
+/// owning plugin is currently disabled.
+///
+/// I1 fix: `automation_hooks.enabled` alone used to gate this query, so
+/// disabling a plugin left its hooks (in particular `webhook.outbound`
+/// presets, which may ship enabled on first sync — see
+/// `plugins::automation_sync`'s module doc) still firing and POSTing to the
+/// plugin author's URL after the user turned the plugin off. Joins against
+/// the `settings` table's `plugin.<plugin_id>.enabled` row for any hook that
+/// carries a `plugin_id`; a row with no `plugin_id` (user-created) is
+/// unaffected — the join only excludes when `plugin_id IS NOT NULL AND
+/// settings.value != 'true'` (covers both an explicit `"false"` and no
+/// setting row at all, matching every other "is this plugin enabled" read's
+/// default-to-disabled convention).
 pub async fn list_enabled_hooks(
     store: &Store,
     trigger: TriggerKind,
@@ -1302,8 +1392,19 @@ pub async fn list_enabled_hooks(
     let trigger = trigger.as_str().to_string();
     store
         .with_conn(move |c| {
+            let cols: String = HOOK_COLUMNS
+                .split(',')
+                .map(|col| format!("h.{col}"))
+                .collect::<Vec<_>>()
+                .join(",");
             let mut statement = c.prepare(&format!(
-                "SELECT {HOOK_COLUMNS} FROM automation_hooks WHERE enabled=1 AND trigger_kind=?1 ORDER BY created_at DESC"
+                "SELECT {cols} FROM automation_hooks h \
+                 LEFT JOIN settings s \
+                   ON h.plugin_id IS NOT NULL \
+                   AND s.key = 'plugin.' || h.plugin_id || '.enabled' \
+                 WHERE h.enabled=1 AND h.trigger_kind=?1 \
+                   AND (h.plugin_id IS NULL OR s.value='true') \
+                 ORDER BY h.created_at DESC"
             ))?;
             let hooks = statement
                 .query_map(params![trigger], hook_from)?
@@ -1407,7 +1508,101 @@ pub async fn delete_hook(store: &Store, id: &str) -> anyhow::Result<()> {
         .await
 }
 
+/// Delete every hook `plugin_id` owns whose `name` is NOT in `keep_names`,
+/// and their run history — the orphan-pruning counterpart of
+/// [`delete_hooks_and_runs_for_plugin`], used when a plugin update's
+/// manifest no longer declares a hook it previously synced (F3: without
+/// this, a removed hook kept firing forever with its stale config). Scoped
+/// to `plugin_id` only — a row with a different `plugin_id` (including a
+/// user's own hooks, where `plugin_id IS NULL`) is never touched regardless
+/// of a name collision. Returns the number of rows pruned.
+pub async fn prune_hooks_and_runs_for_plugin(
+    store: &Store,
+    plugin_id: &str,
+    keep_names: &[String],
+) -> anyhow::Result<usize> {
+    let plugin_id = plugin_id.to_string();
+    let keep_names = keep_names.to_vec();
+    store
+        .with_conn(move |c| {
+            let mut stmt = c.prepare("SELECT id, name FROM automation_hooks WHERE plugin_id=?1")?;
+            let rows = stmt
+                .query_map(params![plugin_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut pruned = 0usize;
+            for (id, name) in rows {
+                if keep_names.iter().any(|kept| kept == &name) {
+                    continue;
+                }
+                c.execute(
+                    "DELETE FROM automation_hook_attempts WHERE run_id IN \
+                     (SELECT id FROM automation_hook_runs WHERE hook_id=?1)",
+                    params![id],
+                )?;
+                c.execute(
+                    "DELETE FROM automation_hook_runs WHERE hook_id=?1",
+                    params![id],
+                )?;
+                c.execute("DELETE FROM automation_hooks WHERE id=?1", params![id])?;
+                pruned += 1;
+            }
+            Ok(pruned)
+        })
+        .await
+}
+
+/// Delete every hook `plugin_id` owns, and — unlike [`delete_hook`], which
+/// deliberately leaves a hook's run history behind as an audit trail — their
+/// run history (`automation_hook_runs` + `automation_hook_attempts`) too.
+/// The uninstall counterpart of `plugins::automation_sync::sync_plugin_automations`;
+/// called only from `plugins::automation_sync::remove_plugin_automations`, so
+/// every plugin-hook lifecycle operation has one obvious home.
+pub async fn delete_hooks_and_runs_for_plugin(
+    store: &Store,
+    plugin_id: &str,
+) -> anyhow::Result<()> {
+    let plugin_id = plugin_id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "DELETE FROM automation_hook_attempts WHERE run_id IN \
+                 (SELECT r.id FROM automation_hook_runs r \
+                  JOIN automation_hooks h ON h.id = r.hook_id WHERE h.plugin_id = ?1)",
+                params![plugin_id],
+            )?;
+            c.execute(
+                "DELETE FROM automation_hook_runs WHERE hook_id IN \
+                 (SELECT id FROM automation_hooks WHERE plugin_id = ?1)",
+                params![plugin_id],
+            )?;
+            c.execute(
+                "DELETE FROM automation_hooks WHERE plugin_id = ?1",
+                params![plugin_id],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// Flip a hook's `enabled` flag. Enabling is refused with a clear,
+/// user-facing message when the hook's action is `agent.run` and it has no
+/// `project_id` yet — a plugin-installed `agent.run` hook lands exactly in
+/// this state on first sync (no target project a plugin could ever guess),
+/// and flipping it on blind would try to run an agent nowhere. Task 16's UI
+/// opens an editor instead of calling this directly for such a row; this is
+/// the backend refusal that makes that necessary regardless of caller.
 pub async fn toggle_hook(store: &Store, id: &str, enabled: bool) -> anyhow::Result<()> {
+    if enabled {
+        if let Some(hook) = get_hook(store, id).await? {
+            if let HookActionInput::AgentRun(config) = &hook.action {
+                if config.project_id.trim().is_empty() {
+                    bail!("pick a project first — this hook has no project to run in");
+                }
+            }
+        }
+    }
     let id = id.to_string();
     let updated_at = now_ms();
     store
@@ -1419,6 +1614,84 @@ pub async fn toggle_hook(store: &Store, id: &str, enabled: bool) -> anyhow::Resu
             if changed == 0 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             }
+            Ok(())
+        })
+        .await
+}
+
+/// Fetch a single hook row by id, or `None` if it does not exist.
+pub async fn get_hook(store: &Store, id: &str) -> anyhow::Result<Option<HookRow>> {
+    let id = id.to_string();
+    store
+        .with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {HOOK_COLUMNS} FROM automation_hooks WHERE id=?1"),
+                params![id],
+                hook_from,
+            )
+            .optional()
+        })
+        .await
+}
+
+/// Look up a hook row by its (unique, NOCASE) `name` — used by
+/// `plugins::automation_sync` to find a plugin's previously-synced row
+/// (named `"{plugin_id}/{def.name}"`) across a re-sync, so its `id` and any
+/// user-set fields survive.
+pub async fn find_hook_by_name(store: &Store, name: &str) -> anyhow::Result<Option<HookRow>> {
+    let name = name.to_string();
+    store
+        .with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {HOOK_COLUMNS} FROM automation_hooks WHERE name=?1"),
+                params![name],
+                hook_from,
+            )
+            .optional()
+        })
+        .await
+}
+
+/// Direct hook-row insert-or-update keyed by `id`, bypassing the
+/// user-input validation `create_hook`/`update_hook` enforce (in particular
+/// `validate_action`'s unconditional non-empty-`project_id` requirement for
+/// `agent.run`). Used only by `plugins::automation_sync`, whose rows may
+/// legitimately be written with an empty `agent.run` target — installed
+/// disabled, with no project a plugin could ever guess. The caller (sync)
+/// owns every merge decision (what a re-sync overwrites vs. preserves);
+/// this just persists whatever fully-formed [`HookRow`] it is given.
+/// `inbound_path` is still managed here exactly like `update_hook`: a
+/// `webhook.inbound` row keeps its existing path (COALESCE) or mints one,
+/// every other trigger clears it.
+pub async fn put_hook_row(store: &Store, hook: HookRow) -> anyhow::Result<()> {
+    store
+        .with_conn(move |c| {
+            let config_json =
+                encode_action_for_storage(&hook.action).map_err(sql_json_error)?;
+            // Candidate inbound_path if this insert wins outright (no existing
+            // row): only webhook.inbound rows ever get one.
+            let candidate_inbound_path = inbound_path(hook.trigger_kind);
+            c.execute(
+                "INSERT INTO automation_hooks(id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at,plugin_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   name=excluded.name, trigger_kind=excluded.trigger_kind, action_kind=excluded.action_kind, \
+                   enabled=excluded.enabled, \
+                   inbound_path=CASE WHEN excluded.trigger_kind='webhook.inbound' THEN COALESCE(automation_hooks.inbound_path, excluded.inbound_path) ELSE NULL END, \
+                   config_json=excluded.config_json, updated_at=excluded.updated_at, plugin_id=excluded.plugin_id",
+                params![
+                    hook.id,
+                    hook.name,
+                    hook.trigger_kind.as_str(),
+                    hook.action_kind.as_str(),
+                    hook.enabled as i64,
+                    candidate_inbound_path,
+                    config_json,
+                    hook.created_at,
+                    hook.updated_at,
+                    hook.plugin_id,
+                ],
+            )?;
             Ok(())
         })
         .await
@@ -2761,5 +3034,381 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
+    }
+
+    #[test]
+    fn trigger_kind_from_str_accepts_claude_aliases_and_stays_canonical() {
+        assert_eq!(
+            TriggerKind::from_str("PreToolUse").unwrap(),
+            TriggerKind::ToolBefore
+        );
+        assert_eq!(
+            TriggerKind::from_str("PostToolUse").unwrap(),
+            TriggerKind::ToolAfter
+        );
+        assert_eq!(
+            TriggerKind::from_str("SessionStart").unwrap(),
+            TriggerKind::SessionStart
+        );
+        assert_eq!(
+            TriggerKind::from_str("Stop").unwrap(),
+            TriggerKind::SessionEnd
+        );
+        assert_eq!(
+            TriggerKind::from_str("SessionEnd").unwrap(),
+            TriggerKind::SessionEnd
+        );
+        // Canonical spellings still resolve directly.
+        assert_eq!(
+            TriggerKind::from_str("tool.before").unwrap(),
+            TriggerKind::ToolBefore
+        );
+        assert!(TriggerKind::from_str("NotARealAlias").is_err());
+    }
+
+    #[test]
+    fn trigger_kind_deserializes_claude_aliases_and_canonical_spellings() {
+        // The JSON payload layer (`serde_json::from_value` on
+        // `AutomationHookInput.trigger_kind`) must accept both spellings,
+        // matching `FromStr` — this is what closes the gap between the two.
+        assert_eq!(
+            serde_json::from_value::<TriggerKind>(json!("Stop")).unwrap(),
+            TriggerKind::SessionEnd
+        );
+        assert_eq!(
+            serde_json::from_value::<TriggerKind>(json!("PreToolUse")).unwrap(),
+            TriggerKind::ToolBefore
+        );
+        assert_eq!(
+            serde_json::from_value::<TriggerKind>(json!("session.end")).unwrap(),
+            TriggerKind::SessionEnd
+        );
+        assert!(serde_json::from_value::<TriggerKind>(json!("NotARealAlias")).is_err());
+    }
+
+    #[test]
+    fn claude_alias_for_picks_the_first_listed_alias_for_session_end() {
+        // `session.end` has two Claude aliases (`Stop`, `SessionEnd`); the
+        // table lists `Stop` first, so that's the one that must win — never
+        // `SessionEnd`, and never nondeterministic.
+        assert_eq!(claude_alias_for("session.end"), Some("Stop"));
+        assert_eq!(claude_alias_for("tool.before"), Some("PreToolUse"));
+        assert_eq!(claude_alias_for("tool.after"), Some("PostToolUse"));
+        assert_eq!(claude_alias_for("session.start"), Some("SessionStart"));
+        // A trigger with no Claude alias at all.
+        assert_eq!(claude_alias_for("webhook.inbound"), None);
+        assert_eq!(claude_alias_for("not-a-trigger"), None);
+    }
+
+    #[tokio::test]
+    async fn put_hook_row_bypasses_validation_and_find_hook_by_name_round_trips() {
+        let (store, _db) = mem_store().await;
+        // An `agent.run` hook with an EMPTY project id would be rejected by
+        // `create_hook`'s `validate_action` — exactly the shape a plugin's
+        // first sync must be able to write (installed disabled, no project
+        // a plugin could ever guess).
+        let row = HookRow {
+            id: new_id(),
+            name: "acme/triage".into(),
+            trigger_kind: TriggerKind::ToolBefore,
+            action_kind: ActionKind::AgentRun,
+            enabled: false,
+            inbound_path: None,
+            action: HookActionInput::AgentRun(AgentRunAction {
+                project_id: String::new(),
+                branch: String::new(),
+                gateway_id: String::new(),
+                prompt: "Triage this".into(),
+                agent_id: None,
+                model_override: None,
+                subtask: false,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, row.clone()).await.unwrap();
+
+        let found = find_hook_by_name(&store, "acme/triage")
+            .await
+            .unwrap()
+            .expect("row must be findable by name");
+        assert_eq!(found.id, row.id);
+        assert_eq!(found.plugin_id.as_deref(), Some("acme"));
+        assert!(!found.enabled);
+
+        assert!(find_hook_by_name(&store, "acme/does-not-exist")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // I1: `list_enabled_hooks` (the scheduler-adjacent trigger fan-out's
+    // read side, `control.rs`'s only caller) must exclude an enabled hook
+    // whose OWNING PLUGIN is disabled — the class of bug that let a
+    // `webhook.outbound` preset (which may ship enabled on first sync, per
+    // `plugins::automation_sync`'s module doc) keep POSTing to its author's
+    // URL after the user disabled the plugin.
+    #[tokio::test]
+    async fn list_enabled_hooks_excludes_a_disabled_plugins_hook_but_keeps_user_hooks() {
+        let (store, _db) = mem_store().await;
+        let plugin_hook = HookRow {
+            id: new_id(),
+            name: "acme/notify".into(),
+            trigger_kind: TriggerKind::SessionEnd,
+            action_kind: ActionKind::WebhookOutbound,
+            enabled: true,
+            inbound_path: None,
+            action: HookActionInput::WebhookOutbound(WebhookOutboundAction {
+                url: "https://acme.example.com/webhook".into(),
+                method: "POST".into(),
+                headers: Vec::new(),
+                payload_template: None,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, plugin_hook.clone()).await.unwrap();
+
+        let user_hook = create_hook(
+            &store,
+            HookInput::outbound(
+                "User hook",
+                TriggerKind::SessionEnd,
+                "https://example.org",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        // No `plugin.acme.enabled` setting yet — the default-to-disabled
+        // convention every other plugin-enablement read uses.
+        let enabled = list_enabled_hooks(&store, TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        let names: Vec<&str> = enabled.iter().map(|h| h.name.as_str()).collect();
+        assert!(
+            !names.contains(&"acme/notify"),
+            "a plugin hook must not fire while its plugin is disabled (no setting), got: {names:?}"
+        );
+        assert!(
+            names.contains(&user_hook.name.as_str()),
+            "a user-created hook (no plugin_id) must be unaffected, got: {names:?}"
+        );
+
+        // Explicit "false" — same exclusion.
+        store
+            .set_setting_raw("plugin.acme.enabled", "false")
+            .await
+            .unwrap();
+        let enabled = list_enabled_hooks(&store, TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        assert!(!enabled.iter().any(|h| h.name == "acme/notify"));
+
+        // Enabling the plugin lets its hook fire again.
+        store
+            .set_setting_raw("plugin.acme.enabled", "true")
+            .await
+            .unwrap();
+        let enabled = list_enabled_hooks(&store, TriggerKind::SessionEnd)
+            .await
+            .unwrap();
+        let names: Vec<&str> = enabled.iter().map(|h| h.name.as_str()).collect();
+        assert!(
+            names.contains(&"acme/notify"),
+            "an enabled plugin's hook must fire again, got: {names:?}"
+        );
+        assert!(names.contains(&user_hook.name.as_str()));
+    }
+
+    // F2: `find_inbound_hook` is the RPC-facing lookup `invoke_webhook` calls
+    // before dispatching a POST — it must exclude a plugin-owned
+    // `webhook.inbound` hook whose owning plugin is disabled, same as
+    // `list_enabled_hooks` above, so a disabled plugin's hook stops being
+    // network-triggerable. A user-created hook (no `plugin_id`) must be
+    // unaffected.
+    #[tokio::test]
+    async fn find_inbound_hook_excludes_a_disabled_plugins_hook_but_keeps_user_hooks() {
+        let (store, _db) = mem_store().await;
+        let plugin_hook = HookRow {
+            id: new_id(),
+            name: "acme/inbound".into(),
+            trigger_kind: TriggerKind::WebhookInbound,
+            action_kind: ActionKind::AgentRun,
+            enabled: true,
+            inbound_path: Some("wh_acmeplugininbound00000000000000".into()),
+            action: HookActionInput::AgentRun(AgentRunAction {
+                project_id: "project-1".into(),
+                branch: String::new(),
+                gateway_id: "local".into(),
+                prompt: "handle inbound".into(),
+                agent_id: None,
+                model_override: None,
+                subtask: false,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, plugin_hook.clone()).await.unwrap();
+        // `put_hook_row` mints its OWN `inbound_path` for a fresh
+        // `webhook.inbound` row on insert (see its doc comment) rather than
+        // trusting whatever the caller's `HookRow` carried — look up the
+        // real, persisted path.
+        let plugin_path = find_hook_by_name(&store, "acme/inbound")
+            .await
+            .unwrap()
+            .expect("plugin hook row inserted")
+            .inbound_path
+            .expect("webhook.inbound row must get a path");
+
+        let user_hook = create_hook(
+            &store,
+            HookInput::agent_run(
+                "User inbound",
+                TriggerKind::WebhookInbound,
+                "project-1",
+                "",
+                "local",
+                "handle inbound",
+            ),
+        )
+        .await
+        .unwrap();
+        let user_path = user_hook.inbound_path.clone().unwrap();
+
+        // No `plugin.acme.enabled` setting yet — default-to-disabled.
+        assert!(
+            find_inbound_hook(&store, &plugin_path)
+                .await
+                .unwrap()
+                .is_none(),
+            "a plugin hook must not be found while its plugin is disabled (no setting)"
+        );
+        assert!(
+            find_inbound_hook(&store, &user_path)
+                .await
+                .unwrap()
+                .is_some(),
+            "a user-created hook (no plugin_id) must be unaffected"
+        );
+
+        // Explicit "false" — same exclusion.
+        store
+            .set_setting_raw("plugin.acme.enabled", "false")
+            .await
+            .unwrap();
+        assert!(find_inbound_hook(&store, &plugin_path)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Enabling the plugin makes its hook findable again.
+        store
+            .set_setting_raw("plugin.acme.enabled", "true")
+            .await
+            .unwrap();
+        let found = find_inbound_hook(&store, &plugin_path)
+            .await
+            .unwrap()
+            .expect("an enabled plugin's hook must be found again");
+        assert_eq!(found.id, plugin_hook.id);
+    }
+
+    #[tokio::test]
+    async fn toggle_hook_refuses_to_enable_a_targetless_agent_run_hook() {
+        let (store, _db) = mem_store().await;
+        let row = HookRow {
+            id: new_id(),
+            name: "acme/triage".into(),
+            trigger_kind: TriggerKind::ToolBefore,
+            action_kind: ActionKind::AgentRun,
+            enabled: false,
+            inbound_path: None,
+            action: HookActionInput::AgentRun(AgentRunAction {
+                project_id: String::new(),
+                branch: String::new(),
+                gateway_id: String::new(),
+                prompt: "Triage this".into(),
+                agent_id: None,
+                model_override: None,
+                subtask: false,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, row.clone()).await.unwrap();
+
+        let error = toggle_hook(&store, &row.id, true).await.unwrap_err();
+        assert!(
+            error.to_string().contains("pick a project first"),
+            "unexpected error message: {error}"
+        );
+        let still_disabled = find_hook_by_name(&store, "acme/triage")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!still_disabled.enabled);
+
+        // Disabling always stays allowed, targetless or not.
+        toggle_hook(&store, &row.id, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_hooks_and_runs_for_plugin_cascades_only_that_plugins_rows() {
+        let (store, _db) = mem_store().await;
+        let owned = HookRow {
+            id: new_id(),
+            name: "acme/notify".into(),
+            trigger_kind: TriggerKind::SessionEnd,
+            action_kind: ActionKind::WebhookOutbound,
+            enabled: true,
+            inbound_path: None,
+            action: HookActionInput::WebhookOutbound(WebhookOutboundAction {
+                url: "https://example.com".into(),
+                method: "POST".into(),
+                headers: Vec::new(),
+                payload_template: None,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, owned.clone()).await.unwrap();
+        let owned_run = create_run(&store, &owned.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        let user_hook = create_hook(
+            &store,
+            HookInput::outbound(
+                "User hook",
+                TriggerKind::SessionEnd,
+                "https://example.org",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let user_run = create_run(&store, &user_hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        delete_hooks_and_runs_for_plugin(&store, "acme")
+            .await
+            .unwrap();
+
+        let remaining_hooks = list_hooks(&store).await.unwrap();
+        assert_eq!(remaining_hooks.len(), 1);
+        assert_eq!(remaining_hooks[0].id, user_hook.id);
+        assert!(list_runs(&store, &owned.id).await.unwrap().is_empty());
+        let user_runs = list_runs(&store, &user_hook.id).await.unwrap();
+        assert_eq!(user_runs.len(), 1);
+        assert_eq!(user_runs[0].id, user_run.id);
+        let _ = owned_run;
     }
 }

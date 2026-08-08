@@ -1,11 +1,15 @@
+contract = 2
 id = "discord"
 name = "Discord"
 version = "0.1.0"
-wit-api = ">=0.1.0, <0.2.0"
-lifecycle = "singleton"
-component = "discord.wasm"
 publisher = "Ryuzi"
 description = "Discord gateway: connects the Discord gateway (wss) over the host-managed ryuzi:websocket transport and Discord REST over ryuzi:http, bridging Discord channels/threads to Cockpit projects/sessions (mentions, thread replies, DMs, the four slash commands, and tool-approval buttons)."
+gateway = true
+
+[component]
+file = "discord.wasm"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "singleton"
 
 # Every host the component may reach — enforced by the host on the websocket
 # `connect` url (and re-checked on every component-driven reconnect) and on every
@@ -28,7 +32,7 @@ network = ["gateway.discord.gg", "*.discord.gg", "discord.com", "*.discord.com",
 # the plugin list, and this component reads them back by bare key through
 # `ryuzi:settings/settings` (see `src/guest.rs`'s `KEY_TOKEN`/`KEY_APP_ID`/
 # `KEY_GUILD_ID`). `token` being secret+required is also what
-# `component_catalog::derive_bundle_auth` reads to derive this bundle's
+# `component_catalog::derive_manifest_auth` reads to derive this bundle's
 # `AuthKind::Token` (setting `plugin.discord.token`) for the needs-setup /
 # connect surfaces.
 [[settings]]

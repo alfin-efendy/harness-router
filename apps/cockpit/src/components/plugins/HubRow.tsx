@@ -2,15 +2,21 @@ import { Pin } from "lucide-react";
 import { Button, SettingsCard as Card } from "@ryuzi/ui";
 import { Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
 import { pluginIcon } from "@/lib/plugin-icons";
-import { fixTargetTab, statusPresentation, type HubItem, type HubItemKind } from "@/lib/plugin-hub";
+import { fixTargetTab, statusPresentation, type HubItem, type SurfaceBadge } from "@/lib/plugin-hub";
 
-const KIND_LABELS: Record<HubItemKind, string> = {
-  integration: "Integration",
-  gateway: "Gateway",
+// Task 13: short surface badge labels (brief §"HubRow renders up to 3 badges
+// + '+N' overflow, using the short labels Provider / Tools / MCP / Skills /
+// Commands / Hooks / Jobs"). Replaces the old single per-kind pill.
+const SURFACE_LABELS: Record<SurfaceBadge, string> = {
   provider: "Provider",
-  "skill-pack": "Skill pack",
-  "mcp-server": "MCP server",
+  tools: "Tools",
+  mcp: "MCP",
+  skills: "Skills",
+  commands: "Commands",
+  hooks: "Hooks",
+  jobs: "Jobs",
 };
+const MAX_VISIBLE_SURFACES = 3;
 
 /** One unified hub row (design doc §3 "Row anatomy"): a 38px icon/chip, a
  *  two-line body (name + badges / description + counts + status), and one
@@ -44,15 +50,20 @@ export function HubRow({
         aria-label={`Open ${item.name}`}
         className="h-auto min-w-0 flex-1 justify-start gap-3 p-0 text-left"
       >
-        {item.kind === "mcp-server" ? (
-          <Chip initial={item.appInitial ?? "?"} color={item.appColor ?? "var(--muted-foreground)"} size={38} mono />
+        {item.appInitial != null ? (
+          <Chip initial={item.appInitial} color={item.appColor ?? "var(--muted-foreground)"} size={38} mono />
         ) : (
           <IconChip icon={pluginIcon(item.icon)} size={38} />
         )}
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-1.5">
             <span className="overflow-hidden text-ellipsis whitespace-nowrap text-sm font-semibold">{item.name}</span>
-            <Pill variant="mono">{KIND_LABELS[item.kind]}</Pill>
+            {item.surfaces.slice(0, MAX_VISIBLE_SURFACES).map((s) => (
+              <Pill key={s} variant="mono">
+                {SURFACE_LABELS[s]}
+              </Pill>
+            ))}
+            {item.surfaces.length > MAX_VISIBLE_SURFACES && <Pill variant="mono">+{item.surfaces.length - MAX_VISIBLE_SURFACES}</Pill>}
             <PluginStatusBadge verified={item.verified} experimental={item.experimental} />
             {item.pinned && (
               <Pill variant="mono">

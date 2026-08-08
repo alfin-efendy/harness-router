@@ -27,7 +27,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use ryuzi_plugin_sdk::{PluginBundleManifest, PluginLifecycle};
+use ryuzi_plugin_sdk::{PluginLifecycle, PluginManifest};
 
 use crate::plugins::build_discord_component_once;
 use crate::plugins::bundle::{load_active_bundles, ComponentBundleInstaller};
@@ -256,7 +256,10 @@ async fn discord_release_signs_installs_and_loads_through_the_generic_pipeline()
         .find(|b| b.manifest.id == "discord")
         .expect("the installed discord bundle must be discovered");
     assert_eq!(discord.release.version, "0.1.0");
-    assert_eq!(discord.manifest.lifecycle, PluginLifecycle::Singleton);
+    assert_eq!(
+        discord.manifest.component.as_ref().unwrap().lifecycle,
+        PluginLifecycle::Singleton
+    );
     assert!(discord.manifest.oauth.is_empty());
     let hosts: Vec<&str> = discord
         .manifest
@@ -338,9 +341,9 @@ async fn discord_install_rejects_an_untrusted_signing_key() {
 /// Sanity check that the manifest actually still declares its own id/wit-api
 /// the way the artifact builder above assumes (belt-and-suspenders — a drift
 /// here would silently invalidate the signed release.json's metadata).
-fn discord_manifest() -> PluginBundleManifest {
+fn discord_manifest() -> PluginManifest {
     let toml = std::fs::read_to_string(discord_manifest_path()).expect("reading discord manifest");
-    PluginBundleManifest::from_toml(&toml).expect("parsing the discord bundle manifest")
+    PluginManifest::from_toml(&toml).expect("parsing the discord manifest")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

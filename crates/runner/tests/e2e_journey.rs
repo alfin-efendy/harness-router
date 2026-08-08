@@ -39,8 +39,10 @@ fn config_survives_a_full_daemon_lifecycle() {
         .success()
         .stdout(predicate::str::contains("high"));
 
-    // 2. Seed zero-gateway settings so the daemon never touches the network
-    //    (same seeding as crates/runner/tests/daemon.rs).
+    // 2. Seed settings so the daemon never touches the network (same seeding
+    //    as crates/runner/tests/daemon.rs). A fresh db already boots
+    //    zero-gateway — Task 4 retired the `enabled_gateways` CSV, so there
+    //    is no longer a seed to clear.
     std::env::set_var("XDG_DATA_HOME", &data_home);
     std::env::set_var("HOME", &home);
     let db_path = ryuzi_core::paths::db_path();
@@ -50,16 +52,28 @@ fn config_survives_a_full_daemon_lifecycle() {
         rt.block_on(async {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "").await.unwrap();
             settings.set("auto_update", "off").await.unwrap();
         });
     }
+
+    // I9 fix: `__daemon` runs `daemon::build_daemon`'s destructive v1->v2
+    // plugin migration with `cfg!(test)` FALSE (it spawns the real compiled
+    // binary), so it always resolves
+    // `plugins::bundle::installed_bundle_root()`. `HOME` alone does not
+    // fully redirect that on a Linux box that already exports
+    // `XDG_CONFIG_HOME` — `dirs::config_dir()` honors that var over `HOME` —
+    // so both `XDG_CONFIG_HOME` and the `RYUZI_PLUGINS_ROOT` test-seam env
+    // var are set explicitly here too (see `installed_bundle_root`'s doc).
+    let config_home = tmp.path().join("config");
+    let plugins_root = tmp.path().join("plugins-root");
 
     // 3. Daemon reaches running, then exits cleanly on SIGTERM.
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ryuzi"))
         .arg("__daemon")
         .env("XDG_DATA_HOME", &data_home)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("RYUZI_PLUGINS_ROOT", &plugins_root)
         .stdin(Stdio::null())
         .spawn()
         .expect("failed to spawn `ryuzi __daemon`");

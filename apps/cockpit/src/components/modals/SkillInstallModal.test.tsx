@@ -15,7 +15,6 @@ const trustPrompt: TrustPromptDto = {
   skills: ["S"],
   hookScripts: ["tool.before/g.sh"],
   totalBytes: 12,
-  runsCode: false,
   curated: false,
 };
 
@@ -98,7 +97,6 @@ test("arbitrary source shows the trust-ack step before installing", async () => 
         skills: ["S"],
         hookScripts: ["tool.before/g.sh"],
         totalBytes: 12,
-        runsCode: false,
         curated: false,
       },
       plugin: null,
@@ -190,34 +188,11 @@ test("a trust prompt with no hook scripts renders no hook-script warning", async
   expect(screen.queryByText(/Hook scripts/)).toBeNull();
 });
 
-test("a trust prompt with runsCode shows a distinct code-execution warning", async () => {
+test("a curated trust prompt does not claim the source isn't curated", async () => {
   beginSkillInstall.mockImplementationOnce(() =>
     ok({
       completed: false,
-      trust: { ...trustPrompt, runsCode: true },
-      plugin: null,
-    }),
-  );
-  await renderSkillWizard("acme/p");
-
-  await screen.findByText(/acme\/p/);
-  expect(screen.getByText("Runs code")).toBeTruthy();
-  expect(screen.getByText(/runs code in a supervised subprocess/)).toBeTruthy();
-});
-
-test("a trust prompt without runsCode renders no code-execution warning", async () => {
-  await renderSkillWizard("acme/p");
-
-  await screen.findByText(/acme\/p/);
-  expect(screen.queryByText("Runs code")).toBeNull();
-  expect(screen.queryByText(/runs code in a supervised subprocess/)).toBeNull();
-});
-
-test("a curated-but-code-running trust prompt does not claim the source isn't curated", async () => {
-  beginSkillInstall.mockImplementationOnce(() =>
-    ok({
-      completed: false,
-      trust: { ...trustPrompt, runsCode: true, curated: true },
+      trust: { ...trustPrompt, curated: true },
       plugin: null,
     }),
   );

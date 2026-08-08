@@ -167,6 +167,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
             auth_detail: row.auth_detail,
             tools,
             agent_access,
+            plugin_id: row.plugin_id,
         });
     }
     Ok(out)
@@ -251,6 +252,7 @@ async fn add_app(state: &ApiState, input: AddAppInput) -> Result<Vec<AppInfo>, A
             status_detail: None,
             auth_kind: auth_kind.into(),
             auth_detail,
+            plugin_id: None,
         },
     )
     .await?;

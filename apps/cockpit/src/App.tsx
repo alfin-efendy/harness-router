@@ -46,7 +46,7 @@ function MainView() {
     case "scheduler":
       return <AutomationsView key="scheduler" initialTab="scheduler" />;
     case "automations":
-      return <AutomationsView key={view.tab ?? "scheduler"} initialTab={view.tab} />;
+      return <AutomationsView key={view.tab ?? "scheduler"} initialTab={view.tab} targetId={view.targetId} />;
     case "jobDetail":
       return <JobDetailView id={view.id} />;
     case "jobNew":

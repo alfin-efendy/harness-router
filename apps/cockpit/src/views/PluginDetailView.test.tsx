@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { DoctorFinding, ExtensionStatusEntry, PluginDetail, PluginToolEntry } from "@/bindings";
+import type { AppInfo, AutomationHookInfo, DoctorFinding, JobInfo, PluginDetail, PluginToolEntry } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
@@ -45,6 +45,9 @@ const githubDetail: PluginDetail = {
     authKind: "token",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
   },
   auth: {
     kind: "token",
@@ -62,6 +65,10 @@ const githubDetail: PluginDetail = {
   models: [],
   homepage: "https://github.com/github/github-mcp-server",
   publisher: "GitHub (official)",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
 
 const ollamaDetail: PluginDetail = {
@@ -97,6 +104,9 @@ const ollamaDetail: PluginDetail = {
     authKind: "none",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
   },
   auth: null,
   settings: [
@@ -116,6 +126,10 @@ const ollamaDetail: PluginDetail = {
   models: ["llama3", "mistral"],
   homepage: null,
   publisher: "Ollama (local)",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
 
 const sandboxDetail: PluginDetail = {
@@ -150,6 +164,9 @@ const sandboxDetail: PluginDetail = {
     authKind: "none",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
   },
   auth: null,
   settings: [],
@@ -157,6 +174,10 @@ const sandboxDetail: PluginDetail = {
   models: [],
   homepage: "https://vercel.com/docs/vercel-sandbox",
   publisher: "Vercel (no MCP surface)",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
 
 // A catalog connector genuinely never touched — not enabled, not configured,
@@ -195,6 +216,9 @@ const freshDetail: PluginDetail = {
     authKind: "none",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
   },
   auth: null,
   settings: [],
@@ -202,52 +226,10 @@ const freshDetail: PluginDetail = {
   models: [],
   homepage: null,
   publisher: "Acme",
-};
-
-// A plugin declaring an `[[extension]]` (Track D "code plugin") capability —
-// exercises the Extension status card (DT8), gated on
-// `info.capabilities.includes("extension")`.
-const extensionDetail: PluginDetail = {
-  info: {
-    id: "acme-ext",
-    name: "Acme Ext",
-    description: "Ships a supervised extension subprocess.",
-    icon: "sparkles",
-    categories: [],
-    slot: null,
-    ownsSlot: false,
-    verified: false,
-    experimental: false,
-    enabled: true,
-    source: "catalog",
-    capabilities: ["extension"],
-    configured: false,
-    kind: "integration",
-    // enabled: true above → installed_flag's `configured || enabled` is true
-    // (needed so the Health tab, which carries the Extension card, exists).
-    installed: true,
-    family: null,
-    pinned: false,
-    sourceSpec: null,
-    resolvedCommit: null,
-    installedAt: null,
-    updatedAt: null,
-    trustTier: null,
-    catalogVersion: null,
-    componentBacked: false,
-    blockedReason: null,
-    status: "not-installed",
-    statusDetail: null,
-    authKind: "none",
-    toolCount: null,
-    skillCount: null,
-  },
-  auth: null,
-  settings: [],
-  mcp: [],
-  models: [],
-  homepage: null,
-  publisher: "Acme",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
 
 // Installed via the tracked git-clone path — carries a full
@@ -289,6 +271,9 @@ const skillPackDetail: PluginDetail = {
     authKind: "none",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
   },
   auth: null,
   settings: [],
@@ -296,6 +281,10 @@ const skillPackDetail: PluginDetail = {
   models: [],
   homepage: null,
   publisher: "acme/pack",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
 
 const oauthDetail: PluginDetail = {
@@ -331,6 +320,9 @@ const oauthDetail: PluginDetail = {
     authKind: "oauth",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
   },
   auth: {
     kind: "oauth",
@@ -348,6 +340,10 @@ const oauthDetail: PluginDetail = {
   models: [],
   homepage: "https://acme.example.com",
   publisher: "Acme",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
 
 // Task 11: the SAME oauth plugin as `oauthDetail`, but already connected —
@@ -396,6 +392,9 @@ const richFieldsDetail: PluginDetail = {
     authKind: "none",
     toolCount: null,
     skillCount: null,
+    surfaces: [],
+    provenance: null,
+    trusted: true,
   },
   auth: null,
   settings: [
@@ -437,7 +436,61 @@ const richFieldsDetail: PluginDetail = {
   models: [],
   homepage: null,
   publisher: "Acme",
+  commands: [],
+  skills: [],
+  hooks: [],
+  jobs: [],
 };
+
+// ---------- Contents + Automations tabs, Tools tab per-tool perms — Task 14 ----------
+//
+// An installed, trusted plugin whose manifest declares commands/skills
+// (Contents) and hooks/jobs (Automations) — one hook needs a target, one
+// doesn't, same shape for the job pair, so both the enable-switch and the
+// "Set up…" deep-link affordances get real coverage. `hooks`/`jobs` are
+// mutable module state (like `acmePackPinned`) so the `toggleAutomationHook`/
+// `toggleJob` mocks below can flip a row and the view's post-toggle reload
+// (`load()`) sees the change reflected.
+const acmeSuiteBaseInfo = { ...githubDetail.info, id: "acme-suite", name: "Acme Suite", trusted: true };
+let acmeSuiteHooks: PluginDetail["hooks"] = [
+  {
+    id: "hook-ready",
+    name: "acme-suite/ready",
+    trigger: "session.end",
+    triggerAlias: "Stop",
+    action: "webhook.outbound",
+    enabled: true,
+    needsTarget: false,
+  },
+  {
+    id: "hook-needs-target",
+    name: "acme-suite/onrun",
+    trigger: "session.start",
+    triggerAlias: null,
+    action: "agent.run",
+    enabled: false,
+    needsTarget: true,
+  },
+];
+let acmeSuiteJobs: PluginDetail["jobs"] = [
+  { id: "job-ready", name: "Nightly sweep", schedule: "0 2 * * *", enabled: true, needsTarget: false },
+  { id: "job-needs-target", name: "New job", schedule: "every day", enabled: false, needsTarget: true },
+];
+function acmeSuiteDetail(): PluginDetail {
+  return {
+    info: { ...acmeSuiteBaseInfo, surfaces: ["tools", "mcp", "skills", "commands", "hooks", "jobs"] },
+    auth: null,
+    settings: [],
+    mcp: [{ name: "acme-suite", transport: "stdio", commandOrUrl: "acme-suite-server" }],
+    models: [],
+    homepage: null,
+    publisher: "Acme",
+    commands: ["review", "deploy"],
+    skills: ["release-notes"],
+    hooks: acmeSuiteHooks,
+    jobs: acmeSuiteJobs,
+  };
+}
 
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 const err = (message: string) => Promise.resolve({ status: "error" as const, error: { message } });
@@ -481,6 +534,10 @@ function componentDetail(id: string): PluginDetail {
     // bare `getByText`) stays unambiguous — the header subtitle falls back to
     // the (distinct) description above, not the plugin id.
     publisher: "",
+    commands: [],
+    skills: [],
+    hooks: [],
+    jobs: [],
   };
 }
 
@@ -492,8 +549,8 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "acme-rich") return ok(richFieldsDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
   if (id === "acme-fresh") return ok(freshDetail);
-  if (id === "acme-ext") return ok(extensionDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
+  if (id === "acme-suite") return ok(acmeSuiteDetail());
   // First-party component (WASM bundle) plugins are registered manifest-only
   // now, so `plugin_detail` resolves them. The release ledger + install gate
   // still come from `pluginReleaseDetail`/`ComponentReleaseCard`.
@@ -520,8 +577,6 @@ const pluginsRestartRequired = mock(() => ok(false));
 const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
 let doctorFindingsFixture: DoctorFinding[] = [];
 const pluginDoctor = mock(() => ok(doctorFindingsFixture));
-let extensionStatusFixture: ExtensionStatusEntry[] = [];
-const extensionStatus = mock(() => ok(extensionStatusFixture));
 const updatePlugin = mock((_runnerId: string, _id: string, _force: boolean) => ok({ kind: "updated" as const }));
 const setPluginPin = mock((_runnerId: string, id: string, pinned: boolean, _reason: string | null) => {
   if (id === "acme-pack") acmePackPinned = pinned;
@@ -707,6 +762,41 @@ const pluginOauthCompletedMsgListen = mock(async (cb: (event: OauthCompletedEven
   };
 });
 
+// Task 14: the Tools tab per-tool perm select reads the plugin's MCP server
+// row (id === plugin id) from the apps list — `listApps` backs
+// `useApps().hydrate()`, which this view now calls on mount.
+let appsFixture: AppInfo[] = [];
+const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
+const setAppToolPerm = mock(async (_runnerId: string, id: string, tool: string, perm: string) => {
+  appsFixture = appsFixture.map((a) => (a.id === id ? { ...a, tools: a.tools.map((t) => (t.name === tool ? { ...t, perm } : t)) } : a));
+  return { status: "ok" as const, data: appsFixture };
+});
+// Task 14: the Automations tab's enable switches. Mutates the module-level
+// `acmeSuiteHooks`/`acmeSuiteJobs` fixtures so the view's post-toggle
+// `load()` (re-fetches `pluginDetail`) sees the flipped row.
+const toggleAutomationHook = mock(async (_runnerId: string, id: string, enabled: boolean) => {
+  acmeSuiteHooks = acmeSuiteHooks.map((h) => (h.id === id ? { ...h, enabled } : h));
+  const hook = acmeSuiteHooks.find((h) => h.id === id);
+  return {
+    status: "ok" as const,
+    data: {
+      id,
+      name: hook?.name ?? id,
+      triggerKind: "session.end",
+      actionKind: "agent.run",
+      enabled,
+      inboundPath: null,
+      createdAt: 0,
+      updatedAt: 0,
+      pluginId: "acme-suite",
+    } as AutomationHookInfo,
+  };
+});
+const toggleJob = mock(async (_runnerId: string, id: string, enabled: boolean) => {
+  acmeSuiteJobs = acmeSuiteJobs.map((j) => (j.id === id ? { ...j, enabled } : j));
+  return { status: "ok" as const, data: [] as JobInfo[] };
+});
+
 mock.module("@/bindings", () => ({
   events: {
     pluginOauthAuthorizeUrlMsg: {
@@ -730,7 +820,6 @@ mock.module("@/bindings", () => ({
     updatePlugin,
     setPluginPin,
     uninstallPlugin,
-    extensionStatus,
     pluginReleaseDetail,
     installComponentPlugin,
     rollbackComponentPlugin,
@@ -738,6 +827,10 @@ mock.module("@/bindings", () => ({
     cancelPluginInstall,
     setPluginOauthClientId,
     pluginTools,
+    listApps,
+    setAppToolPerm,
+    toggleAutomationHook,
+    toggleJob,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
@@ -745,6 +838,7 @@ mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
 const { PluginDetailView, visibleTabs } = await import("@/views/PluginDetailView");
 const { usePlugins } = await import("@/store-plugins");
 const { useNav } = await import("@/store-nav");
+const { useApps } = await import("@/store-apps");
 
 beforeEach(() => {
   pluginDetail.mockClear();
@@ -763,7 +857,6 @@ beforeEach(() => {
   updatePlugin.mockClear();
   setPluginPin.mockClear();
   uninstallPlugin.mockClear();
-  extensionStatus.mockClear();
   pluginReleaseDetail.mockClear();
   installComponentPlugin.mockClear();
   rollbackComponentPlugin.mockClear();
@@ -771,13 +864,41 @@ beforeEach(() => {
   cancelPluginInstall.mockClear();
   setPluginOauthClientId.mockClear();
   pluginTools.mockClear();
+  listApps.mockClear();
+  setAppToolPerm.mockClear();
+  toggleAutomationHook.mockClear();
+  toggleJob.mockClear();
   doctorFindingsFixture = [];
-  extensionStatusFixture = [];
   acmePackPinned = false;
+  acmeSuiteHooks = [
+    {
+      id: "hook-ready",
+      name: "acme-suite/ready",
+      trigger: "session.end",
+      triggerAlias: "Stop",
+      action: "webhook.outbound",
+      enabled: true,
+      needsTarget: false,
+    },
+    {
+      id: "hook-needs-target",
+      name: "acme-suite/onrun",
+      trigger: "session.start",
+      triggerAlias: null,
+      action: "agent.run",
+      enabled: false,
+      needsTarget: true,
+    },
+  ];
+  acmeSuiteJobs = [
+    { id: "job-ready", name: "Nightly sweep", schedule: "0 2 * * *", enabled: true, needsTarget: false },
+    { id: "job-needs-target", name: "New job", schedule: "every day", enabled: false, needsTarget: true },
+  ];
   mimoReleaseFixture = emptyReleaseDetail("mimo");
   componentReleaseFixtures = {};
   pluginToolsFixtures = {};
   pluginToolsPendingIds.clear();
+  appsFixture = [];
   openUrl.mockClear();
   usePlugins.setState({
     plugins: [],
@@ -791,6 +912,7 @@ beforeEach(() => {
     toolsById: {},
     toolsLiveById: {},
   });
+  useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
 });
 
 afterEach(() => {
@@ -807,28 +929,37 @@ afterEach(() => {
     toolsById: {},
     toolsLiveById: {},
   });
+  useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
 });
 
-// ---------- visibleTabs (Task 9) — pure, no mounting ----------
+// ---------- visibleTabs (Task 9, extended Task 14) — pure, no mounting ----------
+
+function tabInput(overrides: Partial<Parameters<typeof visibleTabs>[0]> = {}): Parameters<typeof visibleTabs>[0] {
+  return {
+    installed: false,
+    hasTools: false,
+    hasContents: false,
+    hasAutomations: false,
+    hasAuth: false,
+    hasSettings: false,
+    hasVersions: false,
+    hasHealth: false,
+    ...overrides,
+  };
+}
 
 test("visibleTabs: pre-install component row shows overview, tools, and versions", () => {
-  expect(
-    visibleTabs({ installed: false, hasTools: true, hasAuth: false, hasSettings: false, hasVersions: true, hasHealth: false }),
-  ).toEqual(["overview", "tools", "versions"]);
+  expect(visibleTabs(tabInput({ installed: false, hasTools: true, hasVersions: true }))).toEqual(["overview", "tools", "versions"]);
 });
 
-test("visibleTabs: installed connector with auth+findings shows all five tabs", () => {
-  expect(visibleTabs({ installed: true, hasTools: true, hasAuth: true, hasSettings: true, hasVersions: true, hasHealth: true })).toEqual([
-    "overview",
-    "tools",
-    "settings",
-    "versions",
-    "health",
-  ]);
+test("visibleTabs: installed connector with auth+findings shows all five pre-Task-14 tabs", () => {
+  expect(
+    visibleTabs(tabInput({ installed: true, hasTools: true, hasAuth: true, hasSettings: true, hasVersions: true, hasHealth: true })),
+  ).toEqual(["overview", "tools", "settings", "versions", "health"]);
 });
 
 test("visibleTabs: installed, no auth, no settings omits the settings tab even with everything else present", () => {
-  expect(visibleTabs({ installed: true, hasTools: true, hasAuth: false, hasSettings: false, hasVersions: true, hasHealth: true })).toEqual([
+  expect(visibleTabs(tabInput({ installed: true, hasTools: true, hasVersions: true, hasHealth: true }))).toEqual([
     "overview",
     "tools",
     "versions",
@@ -837,27 +968,52 @@ test("visibleTabs: installed, no auth, no settings omits the settings tab even w
 });
 
 test("visibleTabs: settings needs BOTH installed and (auth or settings) — not-installed hides it despite auth/settings", () => {
-  expect(
-    visibleTabs({ installed: false, hasTools: false, hasAuth: true, hasSettings: true, hasVersions: false, hasHealth: false }),
-  ).toEqual(["overview"]);
+  expect(visibleTabs(tabInput({ installed: false, hasAuth: true, hasSettings: true }))).toEqual(["overview"]);
 });
 
 test("visibleTabs: health needs BOTH installed and hasHealth — not-installed hides it despite findings", () => {
-  expect(
-    visibleTabs({ installed: false, hasTools: false, hasAuth: false, hasSettings: false, hasVersions: false, hasHealth: true }),
-  ).toEqual(["overview"]);
+  expect(visibleTabs(tabInput({ installed: false, hasHealth: true }))).toEqual(["overview"]);
 });
 
 test("visibleTabs: versions is independent of installed (a component-backed plugin's install gate lives there)", () => {
-  expect(
-    visibleTabs({ installed: false, hasTools: false, hasAuth: false, hasSettings: false, hasVersions: true, hasHealth: false }),
-  ).toEqual(["overview", "versions"]);
+  expect(visibleTabs(tabInput({ installed: false, hasVersions: true }))).toEqual(["overview", "versions"]);
 });
 
 test("visibleTabs: nothing beyond overview when every input is false", () => {
+  expect(visibleTabs(tabInput({ installed: true }))).toEqual(["overview"]);
+});
+
+// ---------- Task 14: contents/automations tabs ----------
+
+test("visibleTabs: contents appears when hasContents is true, independent of installed", () => {
+  expect(visibleTabs(tabInput({ installed: false, hasContents: true }))).toEqual(["overview", "contents"]);
+});
+
+test("visibleTabs: automations appears when hasAutomations is true, independent of installed", () => {
+  expect(visibleTabs(tabInput({ installed: false, hasAutomations: true }))).toEqual(["overview", "automations"]);
+});
+
+test("visibleTabs: contents and automations both absent when both inputs are false", () => {
+  const tabs = visibleTabs(tabInput({ installed: true, hasTools: true, hasSettings: true, hasAuth: true }));
+  expect(tabs).not.toContain("contents");
+  expect(tabs).not.toContain("automations");
+});
+
+test("visibleTabs: full order is overview, tools, contents, automations, settings, versions, health", () => {
   expect(
-    visibleTabs({ installed: true, hasTools: false, hasAuth: false, hasSettings: false, hasVersions: false, hasHealth: false }),
-  ).toEqual(["overview"]);
+    visibleTabs(
+      tabInput({
+        installed: true,
+        hasTools: true,
+        hasContents: true,
+        hasAutomations: true,
+        hasAuth: true,
+        hasSettings: true,
+        hasVersions: true,
+        hasHealth: true,
+      }),
+    ),
+  ).toEqual(["overview", "tools", "contents", "automations", "settings", "versions", "health"]);
 });
 
 test("renders identity, about, and category/status badges from the manifest detail", async () => {
@@ -1222,85 +1378,6 @@ test("omits the attach-failed banner when doctor has no finding for this plugin"
   await screen.findByText("GitHub");
 
   expect(screen.queryByText("Attach failed")).toBeNull();
-});
-
-// ---------- Extension (Track D "code plugin") status card — DT8 ----------
-
-test("a non-extension plugin never calls extension_status and renders no Extension card", async () => {
-  render(<PluginDetailView id="github" />);
-  await screen.findByText("GitHub");
-
-  expect(extensionStatus).not.toHaveBeenCalled();
-  expect(screen.queryByText("Extension")).toBeNull();
-  expect(screen.queryByText("Runs code")).toBeNull();
-});
-
-test("an extension-capable plugin fetches extension_status and shows the Runs code badge", async () => {
-  extensionStatusFixture = [];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-
-  // "Runs code" is a hero badge (always visible); the Extension card itself
-  // moved into the Health tab.
-  expect(screen.getByText("Runs code")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-  expect(await screen.findByText("Extension")).toBeTruthy();
-  await waitFor(() => expect(extensionStatus).toHaveBeenCalled());
-  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
-});
-
-test("renders a Running extension's status badge", async () => {
-  extensionStatusFixture = [
-    {
-      pluginId: "acme-ext",
-      name: "linter",
-      status: "running",
-      restartCount: 0,
-      lastError: null,
-      confirmedEvents: ["tool.before"],
-      toolCount: 2,
-    },
-  ];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-
-  expect(await screen.findByText("linter")).toBeTruthy();
-  expect(screen.getByText("Running")).toBeTruthy();
-  expect(screen.queryByText(/restart/)).toBeNull();
-});
-
-test("renders a Failed extension's restart count and sanitized last error", async () => {
-  extensionStatusFixture = [
-    {
-      pluginId: "acme-ext",
-      name: "linter",
-      status: "failed",
-      restartCount: 5,
-      lastError: "linter: restart-exhausted: 5 restarts within 300s",
-      confirmedEvents: [],
-      toolCount: 0,
-    },
-  ];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-
-  expect(await screen.findByText("Failed")).toBeTruthy();
-  expect(screen.getByText("5 restarts")).toBeTruthy();
-  expect(screen.getByText("linter: restart-exhausted: 5 restarts within 300s")).toBeTruthy();
-});
-
-test("extension_status entries for a different plugin are filtered out", async () => {
-  extensionStatusFixture = [
-    { pluginId: "other-plugin", name: "other", status: "running", restartCount: 0, lastError: null, confirmedEvents: [], toolCount: 0 },
-  ];
-  render(<PluginDetailView id="acme-ext" />);
-  await screen.findByText("Acme Ext");
-  fireEvent.click(screen.getByRole("button", { name: "Health" }));
-
-  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
-  expect(screen.queryByText("other")).toBeNull();
 });
 
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
@@ -1708,9 +1785,8 @@ test("initialTab deep-link is honored when the tab is visible (App.tsx's Fix →
 });
 
 test("initialTab snaps back to overview when the requested tab isn't visible for this plugin", async () => {
-  // github has no doctor findings and isn't an extension plugin, so it has
-  // no Health tab at all — a stale/irrelevant deep link must not strand the
-  // view on dead tab state.
+  // github has no doctor findings, so it has no Health tab at all — a
+  // stale/irrelevant deep link must not strand the view on dead tab state.
   render(<PluginDetailView id="github" initialTab="health" />);
   await screen.findByText("GitHub");
 
@@ -1812,4 +1888,151 @@ test("the checklist's install action reuses the hero's Install handler (componen
   // (component-backed → open the universal wizard) — proves the checklist
   // reused that handler rather than duplicating the branch.
   expect(await screen.findByRole("dialog", { name: "Install mimo" })).toBeTruthy();
+});
+
+// ---------- Task 14: Contents tab ----------
+
+test("Contents tab lists commands (as /name, mono) and skills", async () => {
+  render(<PluginDetailView id="acme-suite" />);
+  await screen.findByText("Acme Suite");
+
+  fireEvent.click(screen.getByRole("button", { name: "Contents" }));
+  const panel = within(screen.getByTestId("tab-panel-contents"));
+
+  expect(panel.getByText("/review")).toBeTruthy();
+  expect(panel.getByText("/deploy")).toBeTruthy();
+  expect(panel.getByText("release-notes")).toBeTruthy();
+});
+
+test("Contents tab is absent for a plugin with no commands or skills", async () => {
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(screen.queryByRole("button", { name: "Contents" })).toBeNull();
+});
+
+// ---------- Task 14: Automations tab ----------
+
+test("Automations tab shows a trigger-alias label, toggles a ready hook's enable switch, and reloads the row", async () => {
+  render(<PluginDetailView id="acme-suite" />);
+  await screen.findByText("Acme Suite");
+
+  fireEvent.click(screen.getByRole("button", { name: "Automations" }));
+  const panel = within(screen.getByTestId("tab-panel-automations"));
+
+  expect(panel.getByText("Stop · session.end")).toBeTruthy();
+  const sw = panel.getByRole("switch", { name: "Enable acme-suite/ready" });
+  expect(sw.getAttribute("aria-checked")).toBe("true");
+
+  fireEvent.click(sw);
+  await waitFor(() => expect(toggleAutomationHook).toHaveBeenCalledWith(LOCAL_RUNNER, "hook-ready", false));
+  await waitFor(() => expect(panel.getByRole("switch", { name: "Enable acme-suite/ready" }).getAttribute("aria-checked")).toBe("false"));
+});
+
+test("a needsTarget hook shows 'Set up…' instead of a switch, and it deep-links to Automations", async () => {
+  render(<PluginDetailView id="acme-suite" />);
+  await screen.findByText("Acme Suite");
+  fireEvent.click(screen.getByRole("button", { name: "Automations" }));
+  const panel = within(screen.getByTestId("tab-panel-automations"));
+
+  expect(panel.queryByRole("switch", { name: "Enable acme-suite/onrun" })).toBeNull();
+  // Two "Set up…" buttons render (one for the hook, one for the job below) —
+  // Hooks is the first card, so index 0 is this one.
+  fireEvent.click(panel.getAllByRole("button", { name: "Set up…" })[0]);
+
+  expect(useNav.getState().history.current).toEqual({ kind: "automations", tab: "hooks", targetId: "hook-needs-target" });
+  expect(toggleAutomationHook).not.toHaveBeenCalledWith(LOCAL_RUNNER, "hook-needs-target", expect.anything());
+});
+
+test("Automations tab toggles a ready job's enable switch", async () => {
+  render(<PluginDetailView id="acme-suite" />);
+  await screen.findByText("Acme Suite");
+  fireEvent.click(screen.getByRole("button", { name: "Automations" }));
+  const panel = within(screen.getByTestId("tab-panel-automations"));
+
+  const sw = panel.getByRole("switch", { name: "Enable Nightly sweep" });
+  fireEvent.click(sw);
+  await waitFor(() => expect(toggleJob).toHaveBeenCalledWith(LOCAL_RUNNER, "job-ready", false));
+});
+
+test("a needsTarget job shows 'Set up…' that deep-links to the Scheduler", async () => {
+  render(<PluginDetailView id="acme-suite" />);
+  await screen.findByText("Acme Suite");
+  fireEvent.click(screen.getByRole("button", { name: "Automations" }));
+  const panel = within(screen.getByTestId("tab-panel-automations"));
+
+  expect(panel.queryByRole("switch", { name: "Enable New job" })).toBeNull();
+  const setupButtons = panel.getAllByRole("button", { name: "Set up…" });
+  fireEvent.click(setupButtons[1]);
+
+  expect(useNav.getState().history.current).toEqual({ kind: "automations", tab: "scheduler", targetId: "job-needs-target" });
+});
+
+test("Automations tab is absent for a plugin with no hooks or jobs", async () => {
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(screen.queryByRole("button", { name: "Automations" })).toBeNull();
+});
+
+// ---------- Task 14: Tools tab per-tool perm select ----------
+
+test("an installed + trusted plugin with a matching MCP app row shows full mcp__<id>__<tool> names and a perm select", async () => {
+  appsFixture = [
+    {
+      id: "acme-suite",
+      name: "Acme Suite",
+      kind: "mcp",
+      initial: "A",
+      color: "#123456",
+      desc: "",
+      transport: "stdio",
+      command: "acme-suite-server",
+      args: [],
+      url: null,
+      scope: "global",
+      scopeGateways: [],
+      status: "connected",
+      statusDetail: null,
+      version: null,
+      publisher: null,
+      authKind: "none",
+      authDetail: null,
+      tools: [{ name: "create_issue", desc: "Open an issue", perm: "ask" }],
+      agentAccess: [],
+      pluginId: "acme-suite",
+    },
+  ];
+  pluginToolsFixtures["acme-suite"] = {
+    live: true,
+    entries: [{ name: "create_issue", description: "Open an issue", kind: "tool", writes: true }],
+  };
+  render(<PluginDetailView id="acme-suite" />);
+  await screen.findByText("Acme Suite");
+  await waitFor(() => expect(listApps).toHaveBeenCalled());
+
+  fireEvent.click(await screen.findByRole("button", { name: /^Tools/ }));
+  const panel = within(screen.getByTestId("tab-panel-tools"));
+
+  expect(await panel.findByText("mcp__acme-suite__create_issue")).toBeTruthy();
+  expect(panel.queryByText("create_issue")).toBeNull();
+
+  fireEvent.click(panel.getByRole("button", { name: "Deny" }));
+  await waitFor(() => expect(setAppToolPerm).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-suite", "create_issue", "deny"));
+});
+
+test("Tools tab renders short names with no perm select when the plugin has no matching app row (not installed/trusted live)", async () => {
+  pluginToolsFixtures.github = {
+    live: true,
+    entries: [{ name: "create_issue", description: "Open an issue", kind: "tool", writes: true }],
+  };
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  fireEvent.click(await screen.findByRole("button", { name: /^Tools/ }));
+  const panel = within(screen.getByTestId("tab-panel-tools"));
+
+  expect(await panel.findByText("create_issue")).toBeTruthy();
+  expect(panel.queryByText("mcp__github__create_issue")).toBeNull();
+  expect(panel.queryByRole("button", { name: "Deny" })).toBeNull();
 });

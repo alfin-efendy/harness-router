@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use ryuzi_plugin_sdk::{PluginBundleManifest, PluginRelease};
+use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 
 /// One verified stem's summary, for the caller to log/assert on.
 #[derive(Debug, Clone)]
@@ -64,15 +64,19 @@ pub fn verify_artifacts_dir(
         let release_bytes = read(".release.json")?;
         let sig_bytes = read(".release.json.sig")?;
 
-        let manifest = PluginBundleManifest::from_toml(
+        let manifest = PluginManifest::from_toml(
             std::str::from_utf8(&manifest_bytes)
                 .with_context(|| format!("{stem}: manifest is not UTF-8"))?,
         )
         .with_context(|| format!("{stem}: parsing manifest"))?;
+        let component = manifest
+            .component
+            .as_ref()
+            .with_context(|| format!("{stem}: manifest declares no [component]"))?;
         let release = PluginRelease::from_json(&release_bytes)
             .with_context(|| format!("{stem}: parsing release.json"))?;
         if let Some(base) = expect_base {
-            let expected = format!("{}/{}", base.trim_end_matches('/'), manifest.component);
+            let expected = format!("{}/{}", base.trim_end_matches('/'), component.file);
             if release.component_url != expected {
                 bail!(
                     "{stem}: component_url {:?} != expected {expected:?}",
@@ -83,14 +87,14 @@ pub fn verify_artifacts_dir(
 
         // Same pre-write guard the install pipeline runs: the component name
         // must stay inside the restage dir before anything is copied there.
-        super::remote_catalog::sanitize_staged_component(&manifest.component)
+        super::remote_catalog::sanitize_staged_component(&component.file)
             .with_context(|| format!("{stem}: component filename"))?;
         let staged = tempfile::tempdir().context("creating restage dir")?;
         std::fs::write(staged.path().join("ryuzi-plugin.toml"), &manifest_bytes)?;
         std::fs::write(staged.path().join("release.json"), &release_bytes)?;
         std::fs::write(staged.path().join("plugin.sig"), &sig_bytes)?;
-        let wasm_src = dir.join(&manifest.component);
-        std::fs::copy(&wasm_src, staged.path().join(&manifest.component))
+        let wasm_src = dir.join(&component.file);
+        std::fs::copy(&wasm_src, staged.path().join(&component.file))
             .with_context(|| format!("{stem}: copying {}", wasm_src.display()))?;
 
         let bundle = crate::plugins::bundle::verify_bundle(staged.path(), trusted_keys)
@@ -135,9 +139,10 @@ mod tests {
         let wasm = b"\0asm test bytes".to_vec();
         let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
         let manifest = format!(
-            "id = \"{id}\"\nname = \"Test\"\nversion = \"{version}\"\n\
-             wit-api = \">=0.1.0, <0.2.0\"\nlifecycle = \"per-call\"\n\
-             component = \"{component}\"\npublisher = \"Ryuzi\"\ndescription = \"test\"\n"
+            "contract = 2\nid = \"{id}\"\nname = \"Test\"\nversion = \"{version}\"\n\
+             publisher = \"Ryuzi\"\ndescription = \"test\"\n\n\
+             [component]\nfile = \"{component}\"\n\
+             wit-api = \">=0.1.0, <0.2.0\"\nlifecycle = \"per-call\"\n"
         );
         let release = format!(
             "{{\n  \"id\": \"{id}\",\n  \"version\": \"{version}\",\n  \"wit-api\": \"0.1.0\",\n  \
@@ -211,5 +216,62 @@ mod tests {
         let key = test_key();
         let dir = tempfile::tempdir().unwrap();
         assert!(verify_artifacts_dir(dir.path(), &trusted(&key), None).is_err());
+    }
+
+    // A contract-1 manifest artifact must be rejected through this exact CI
+    // verification path, not just at the SDK layer — `PluginManifest::from_toml`
+    // (Task 2) rejects any non-`contract = 2` manifest outright, and this proves
+    // that rejection propagates as a clear, attributable `verify_artifacts_dir`
+    // error rather than some other parse failure. `[component]` here is
+    // otherwise v2-shaped (a table, not the old top-level string) so the
+    // failure is unambiguously about the contract version, not an unrelated
+    // TOML shape mismatch.
+    #[test]
+    fn contract_1_artifact_rejected() {
+        let key = test_key();
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "github";
+        let component = "github.wasm";
+        let wasm = b"\0asm test bytes".to_vec();
+        let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
+        let manifest = format!(
+            "contract = 1\nid = \"github\"\nname = \"GitHub\"\nversion = \"0.1.1\"\n\
+             publisher = \"Ryuzi\"\ndescription = \"test\"\n\n\
+             [component]\nfile = \"{component}\"\n\
+             wit-api = \">=0.1.0, <0.2.0\"\nlifecycle = \"per-call\"\n"
+        );
+        let release = format!(
+            "{{\n  \"id\": \"github\",\n  \"version\": \"0.1.1\",\n  \"wit-api\": \"0.1.0\",\n  \
+             \"component_url\": \"https://github.com/alfin-efendy/ryuzi/releases/download/v0.1.1/{component}\",\n  \
+             \"component_sha256\": \"{sha}\"\n}}\n"
+        );
+        let sig = key.sign(release.as_bytes());
+        let envelope = format!(
+            "{{\"key_id\":\"{KEY_ID}\",\"signature\":\"{}\"}}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
+        std::fs::write(
+            dir.path().join(format!("{stem}.ryuzi-plugin.toml")),
+            &manifest,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(format!("{stem}.release.json")), &release).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{stem}.release.json.sig")),
+            &envelope,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(component), &wasm).unwrap();
+
+        let err = verify_artifacts_dir(dir.path(), &trusted(&key), None).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("contract"),
+            "expected the underlying error to mention 'contract', got: {full}"
+        );
+        assert!(
+            full.contains('1') && full.contains('2'),
+            "expected the error to name both the found (1) and supported (2) contract, got: {full}"
+        );
     }
 }

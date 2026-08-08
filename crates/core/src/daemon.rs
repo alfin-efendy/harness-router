@@ -20,7 +20,7 @@ use crate::llm_router::server::RouterServer;
 use crate::plugins::Registries;
 use crate::policy;
 use crate::router::Router;
-use crate::settings::{csv, SettingsStore, CATALOG};
+use crate::settings::{SettingsStore, CATALOG};
 use crate::store::Store;
 use crate::telemetry::{ConsoleTelemetry, Telemetry};
 use futures::FutureExt;
@@ -43,9 +43,9 @@ pub struct BuildDaemonOpts {
     /// Console, or OTLP behind the `otel` feature once `otel_endpoint` is set.
     pub telemetry: Option<Arc<dyn Telemetry>>,
     /// Native (in-process) gateway factories available to wire, keyed by the
-    /// id an entry in the `enabled_gateways` setting names. Empty in
-    /// production today — Discord migrated to a WASM component bundle (wired
-    /// via `build_wasm_gateways` below) — but retained as the generic
+    /// id whose `plugin.<id>.enabled` setting gates whether it starts. Empty
+    /// in production today — Discord migrated to a WASM component bundle
+    /// (wired via `build_wasm_gateways` below) — but retained as the generic
     /// injection seam a future native gateway (and the daemon tests) use.
     pub extra_gateway_factories: Vec<(String, Arc<dyn GatewayFactory>)>,
     /// Test seam: replace the single native harness factory with a fake.
@@ -323,11 +323,6 @@ impl Daemon {
         self.learning_handle.abort();
         self.artifact_retention_handle.abort();
         self.router_server.stop().await;
-        // Track D: gracefully stop every spawned extension subprocess. Safe
-        // even when nothing was ever spawned (every test daemon, or a real
-        // daemon whose entry never reached `spawn_extensions`) — see
-        // `ControlPlane::shutdown_extensions`'s doc.
-        self.cp.shutdown_extensions().await;
         self.telemetry.shutdown();
     }
 
@@ -398,8 +393,8 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// `Store::open` → settings → telemetry select → `Registries` (always
 /// installs the native plugin, then `install_builtins`, then applies
 /// `opts.harness_factory` if set) → `ControlPlane::new_with_telemetry`
-/// → gateways (from `enabled_gateways` + `extra_gateway_factories` + the
-/// provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
+/// → gateways (from `extra_gateway_factories`, each gated on its own
+/// `plugin.<id>.enabled` setting, + the provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
 /// → a second, inbound-only `Router` handed to every gateway via
 /// `Gateway::set_router` (Task 6 — see `router.rs`'s module doc for why two
 /// instances) → the approval fan-out spawned on another `cp.subscribe()`
@@ -418,6 +413,54 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
+    // v1 -> v2 first-upgrade migration (plugins v2 Task 5): drop any
+    // contract-1 component install trees (+ their release-ledger rows) and
+    // carry a legacy `enabled_gateways` CSV value forward into per-plugin
+    // `plugin.<id>.enabled` keys. MUST run before anything below touches the
+    // plugins install root or the component bootstrap/registries start
+    // registering `plugin.*` fields — see `plugins::migrate_v2`'s module doc.
+    // Non-propagating (warn-and-continue), mirroring the component-bootstrap
+    // block below it: a failure to clean up one leftover install must never
+    // refuse to start the whole daemon — `load_active_bundles` already
+    // skip-and-warns any v1 leftover this migration failed to remove.
+    //
+    // The root is taken from `component_bootstrap` when the caller supplied
+    // one. Falling back to the REAL `installed_bundle_root()` is correct in
+    // production but catastrophic under `cfg!(test)`: the in-crate tests build
+    // daemons with `component_bootstrap: None`, which would point this
+    // destructive sweep at the developer's own installed plugins. It has
+    // already destroyed a real install once. Under test, no explicit root
+    // means no migration.
+    {
+        let plugins_root = match opts.component_bootstrap.as_ref() {
+            Some(cfg) => Some(cfg.root.clone()),
+            None if cfg!(test) => None,
+            None => Some(crate::plugins::bundle::installed_bundle_root()),
+        };
+        let settings = SettingsStore::new(Arc::clone(&store));
+        match plugins_root {
+            None => {
+                tracing::debug!("plugins: skipping v2 migration (test build, no explicit root)");
+            }
+            Some(plugins_root) => {
+                match crate::plugins::migrate_v2::run(&store, &settings, &plugins_root).await {
+                    Ok(report) if !report.is_empty() => {
+                        tracing::info!(
+                            dropped_installs = ?report.dropped_installs,
+                            migrated_gateway_ids = ?report.migrated_gateway_ids,
+                            "plugins: v1 -> v2 first-upgrade migration ran"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "plugins: v1 -> v2 first-upgrade migration failed (continuing boot): {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Auto-connect the MiMo/OpenCode free tiers on first run so a fresh
     // install has runnable models (and the `free` route below has candidates)
     // without any "Add account" step. Idempotent + self-healing: recreates missing built-in free rows on every start.
@@ -522,7 +565,14 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     for plugin in crate::plugins::component_catalog::component_catalog_plugins() {
         registries.add_plugin(plugin);
     }
-    crate::plugins::load_skill_pack_plugins(&mut registries);
+    // Task 11: every plugin installed from a local folder or git URL
+    // (`plugins::install_sources`) — scanned last so first-registration-wins
+    // keeps every embedded first-party row above authoritative for its id;
+    // this call is purely additive for ids nothing else already claimed.
+    crate::plugins::install_installed_plugins(
+        &mut registries,
+        &crate::plugins::bundle::installed_bundle_root(),
+    );
     if let Some(factory) = opts.harness_factory {
         registries.harness = factory;
     }
@@ -540,15 +590,24 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let factories: HashMap<String, Arc<dyn GatewayFactory>> =
         opts.extra_gateway_factories.into_iter().collect();
     let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
-    for id in csv(settings.get("enabled_gateways").await?.as_deref()) {
-        let Some(factory) = factories.get(&id) else {
-            continue; // no registered factory for this id — skip silently
-        };
+    for (id, factory) in &factories {
+        // Task 4: every plugin's enablement — native gateway factories
+        // included — lives at `plugin.<id>.enabled`, the same key
+        // `PluginHost::is_enabled`'s gateway branch reads. No CSV to consult;
+        // a factory with no explicit enable write simply never starts.
+        let enabled = settings
+            .get(&crate::plugins::qualified_setting_key(id, "enabled"))
+            .await?
+            .as_deref()
+            == Some("true");
+        if !enabled {
+            continue;
+        }
         // Assemble the gateway's config from its CATALOG-declared settings
         // fields, if any. A native gateway with no catalog descriptor (or no
         // declared fields) builds with an empty config.
         let mut config = serde_json::Map::new();
-        if let Some(descriptor) = CATALOG.gateway(&id) {
+        if let Some(descriptor) = CATALOG.gateway(id) {
             for field in descriptor.fields {
                 let value = settings.get(field.key).await?.unwrap_or_default();
                 config.insert(field.key.to_string(), serde_json::Value::String(value));
@@ -1123,7 +1182,7 @@ mod tests {
         let component = format!("{id}.wasm");
         let component_url = format!("{base}/{id}.wasm");
         let manifest_toml = format!(
-            "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+            "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"{component}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
         )
         .into_bytes();
         let release_json = format!(
@@ -1754,8 +1813,14 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            // Raw write: `plugin.acme-gw.enabled` is a synthetic test id never
+            // registered via `PluginHost::add`, so the validated `SettingsStore::set`
+            // would reject it as "unknown setting" — the daemon's boot loop only
+            // ever READS this key, never validates it.
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let daemon = build_daemon(BuildDaemonOpts {
@@ -1783,9 +1848,17 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings
-                .set("enabled_gateways", "acme-gw,bogus")
+            // Raw writes: these synthetic test ids are never registered via
+            // `PluginHost::add`, so the validated `SettingsStore::set` would
+            // reject them as "unknown setting". "bogus" is enabled but has no
+            // registered factory — proves an enabled id with nothing to wire
+            // it is skipped, not just a disabled one.
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
+            store
+                .set_setting_raw("plugin.bogus.enabled", "true")
                 .await
                 .unwrap();
         }
@@ -1817,8 +1890,10 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
@@ -1896,8 +1971,10 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
@@ -2002,8 +2079,10 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
@@ -2093,94 +2172,6 @@ mod tests {
                 "component bundle `{id}` must be registered by build_daemon: {ids:?}"
             );
         }
-    }
-
-    /// Track D hermeticity: `build_daemon` must never spawn a real extension
-    /// subprocess, even when an enabled extension-capable plugin is present
-    /// in the composed `Registries` — extension spawning happens ONLY from
-    /// the daemon's real entry point (`crates/runner/src/daemon_cmd.rs`, via
-    /// `ControlPlane::spawn_extensions`), mirroring
-    /// `run_startup_maintenance`'s own hermeticity discipline (see that
-    /// method's doc). `cargo test`'s `build_daemon` calls must stay safe to
-    /// run in parallel without ever touching a real process tree.
-    ///
-    /// Proven two ways: (1) a marker file the fake extension's shell command
-    /// would touch on spawn must remain absent; (2) the constructed
-    /// `ExtensionHost` itself must report no spawned entry for the plugin.
-    /// `#[serial]` because this test overrides `$HOME` (the only way to feed
-    /// an extension-capable plugin into `build_daemon`'s real
-    /// `load_skill_pack_plugins` composition step, since `BuildDaemonOpts`
-    /// has no plugin-injection seam) — see `plugins::extension::proc`'s own
-    /// `#[serial]` env-var test for the same reasoning.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn build_daemon_never_spawns_extension_subprocesses() {
-        let (_guard, db_path) = temp_db_path();
-        let fake_home = tempfile::tempdir().unwrap();
-        let plugin_dir = fake_home.path().join(".config/ryuzi/plugins/marker-ext");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        let marker = fake_home.path().join("spawned.marker");
-        let manifest_toml = format!(
-            "contract = 1\nid = \"marker-ext\"\nname = \"Marker Extension\"\n\n\
-             [[extension]]\nname = \"marker\"\ncommand = \"sh\"\n\
-             args = [\"-c\", \"touch '{}'\"]\nevents = [\"tool.before\"]\n",
-            marker.display()
-        );
-        std::fs::write(plugin_dir.join("ryuzi-plugin.toml"), manifest_toml).unwrap();
-        std::fs::write(
-            plugin_dir.join(".ryuzi-skill.json"),
-            r#"{"source":"https://example.test/marker","plugin_id":"marker-ext","installed_at":"2026-07-11T00:00:00.000Z"}"#,
-        )
-        .unwrap();
-
-        {
-            let store = Store::open(&db_path).await.unwrap();
-            // `set_setting_raw` (not `SettingsStore::set`, which validates
-            // the key against `PLUGIN_FIELDS` — not yet populated for
-            // "marker-ext" this early) — mirrors
-            // `plugins::extension::proc`'s own tests seeding a plugin's
-            // enable flag.
-            store
-                .set_setting_raw("plugin.marker-ext.enabled", "true")
-                .await
-                .unwrap();
-        }
-
-        let previous_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", fake_home.path());
-        let result = build_daemon(BuildDaemonOpts {
-            db_path: db_path.clone(),
-            config_root: tempfile::tempdir().unwrap().keep(),
-            telemetry: Some(Arc::new(NoopTelemetry)),
-            extra_gateway_factories: vec![],
-            harness_factory: None,
-            component_bootstrap: None,
-        })
-        .await;
-        match previous_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-
-        let daemon = result
-            .expect("build_daemon must succeed even with an extension-capable plugin present");
-        assert!(
-            daemon.cp.plugins().get("marker-ext").is_some(),
-            "sanity: the extension-capable skill-pack plugin must have registered"
-        );
-
-        // Give any hypothetical stray spawn a moment to touch the marker
-        // before asserting its absence.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            !marker.exists(),
-            "build_daemon must stay hermetic: it must never spawn a real extension subprocess"
-        );
-        assert!(
-            daemon.cp.extension_host().get("marker-ext").await.is_empty(),
-            "the constructed ExtensionHost must have no spawned entry until spawn_extensions() runs"
-        );
     }
 
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------
@@ -3967,8 +3958,10 @@ mod tests {
         .await;
         {
             let store = Store::open(&db_path).await.unwrap();
-            let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+            store
+                .set_setting_raw("plugin.acme-gw.enabled", "true")
+                .await
+                .unwrap();
         }
 
         let captured = Arc::new(Mutex::new(None));

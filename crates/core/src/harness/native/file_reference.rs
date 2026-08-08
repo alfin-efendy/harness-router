@@ -414,8 +414,10 @@ impl FilesystemProbe<'_> {
         let Some(relative) = relative.to_str().filter(|path| !path.is_empty()) else {
             return CandidateProbeResult::Rejected;
         };
-        let registry =
-            SkillRegistry::load_with(self.context.work_dir, self.context.extra_skill_dirs);
+        let registry = SkillRegistry::load_with_plugin_roots(
+            self.context.work_dir,
+            self.context.plugin_skill_roots,
+        );
         let Some(skill) = registry.get(name) else {
             return CandidateProbeResult::Rejected;
         };
@@ -658,7 +660,8 @@ fn exact_pinned_resolution(
             if relative.as_os_str().is_empty() {
                 return Err(changed_file_reference());
             }
-            let registry = SkillRegistry::load_with(context.work_dir, context.extra_skill_dirs);
+            let registry =
+                SkillRegistry::load_with_plugin_roots(context.work_dir, context.plugin_skill_roots);
             let skill = registry.get(name).ok_or_else(changed_file_reference)?;
             (skill.dir.clone(), relative.to_path_buf())
         }
@@ -1453,7 +1456,7 @@ mod tests {
         let ctx = ToolInputCtx {
             work_dir: work.path(),
             attachments_dir: Some(attachments.path()),
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
 
         let skill = resolve_read_reference(&ctx, "skills/demo/notes:2").unwrap();
@@ -1488,7 +1491,7 @@ mod tests {
         let ctx = ToolInputCtx {
             work_dir: dir.path(),
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
         for (tool, input) in [
             (
@@ -1514,7 +1517,7 @@ mod tests {
         let ctx = ToolInputCtx {
             work_dir: dir.path(),
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
 
         let error = resolve_workspace_reference(&ctx, "notes:12").unwrap_err();
@@ -1533,7 +1536,7 @@ mod tests {
         let ctx = ToolInputCtx {
             work_dir: root.path(),
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
 
         let error = resolve_workspace_reference(&ctx, "escape/secret:2").unwrap_err();
@@ -1550,7 +1553,7 @@ mod tests {
         let ctx = ToolInputCtx {
             work_dir: dir.path(),
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         };
 
         let resolved = resolve_workspace_reference(&ctx, &input).unwrap();
@@ -1562,7 +1565,7 @@ mod tests {
         ToolInputCtx {
             work_dir: path,
             attachments_dir: None,
-            extra_skill_dirs: &[],
+            plugin_skill_roots: &[],
         }
     }
 

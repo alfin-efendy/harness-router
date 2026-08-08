@@ -2,7 +2,6 @@
 //! harness-session wiring and the background prompt driver.
 
 use super::{ControlPlane, WorkerBinding, RESUME_NUDGE};
-use crate::connector::ConnectorCtx;
 use crate::domain::{
     AgentRunKind, AttachmentRef, CoreEvent, NewAgentRun, PermMode, Project, QueuedSessionPrompt,
     Session, SessionGitOptions, SessionKind, SessionStatus,
@@ -16,8 +15,20 @@ use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::sessions::ownership::require_executable_session_agent;
 use crate::settings::SettingsStore;
 use crate::worktree;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// One installed, ENABLED plugin's declarative-content roots — the
+/// directories `commands/` and `skills/` are discovered by directory
+/// convention (Tasks 8/9), mirroring Claude Code. Built once by
+/// [`ControlPlane::enabled_plugin_content_roots`] and shared by both
+/// surfaces so there is exactly one walk over installed plugin bundles per
+/// session start.
+pub(crate) struct PluginContentRoots {
+    pub id: String,
+    pub commands: PathBuf,
+    pub skills: PathBuf,
+}
 
 fn agent_model_parts(model: &crate::agents::types::AgentModel) -> (Option<String>, Option<String>) {
     match model {
@@ -1594,52 +1605,41 @@ impl ControlPlane {
         // override the selected primary agent's model, effort, or permissions.
         let harness = self.registries.harness.create()?;
 
-        // Attach the Apps screen's enabled MCP servers to the session. The MCP
-        // per-agent allowlist has a single agent id: "native".
-        let mut mcp_servers =
+        // Attach every enabled Apps-domain MCP server to the session — both
+        // user-added ones and Task 7's plugin-synced rows (a disabled
+        // plugin's rows are already excluded by `servers_for_session`
+        // itself). The MCP per-agent allowlist has a single agent id:
+        // "native". Plugin `[[mcp]]` servers no longer attach transiently
+        // here (the deleted `attach_plugin_mcp_servers` used to scan every
+        // enabled connector plugin on every session start) — they sync into
+        // `mcp_servers` once, at enable/install-complete time
+        // (`crate::plugins::mcp_sync::sync_plugin_mcp`), and ride the exact
+        // same path a user-added server does from here on.
+        let mcp_servers =
             crate::mcp::servers_for_session(&self.store, crate::harness::native::NATIVE_ID)
                 .await
                 .unwrap_or_default();
-        // A chat session has no project to scope plugin connectors by —
-        // `ConnectorCtx.project_id` isn't read by any connector today, so the
-        // session id is a harmless, uniquely-scoped stand-in.
-        let scope_id = project.map(|p| p.project_id.as_str()).unwrap_or(session_pk);
-        let mcp_principals = self
-            .attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
-            .await;
-        // Plugin-bundled live skill dirs are no longer discovery sources —
-        // installed skill packs are materialized into ~/.config/ryuzi/skills
-        // by skills_install and reach sessions via the global root.
-        let extra_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
-        // Track D: thread the daemon's extension host in only when it has
-        // something spawned — `None` keeps every hook fire site a true
-        // no-op (zero extra dispatch/await) for the common case, and for
-        // every test `ControlPlane` (which never calls `spawn_extensions`).
-        let extension_host_empty = self.extension_host.is_empty().await;
-        let extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>> =
-            if extension_host_empty {
-                None
-            } else {
-                Some(self.extension_host.clone()
-                    as Arc<dyn crate::plugins::extension::ExtensionEvents>)
-            };
-        // DT6: the tool-provision sibling to `extension_events` above — same
-        // guard, same source (`self.extension_host`), so a daemon with no
-        // extensions spawned pays nothing extra building either the hook
-        // dispatch path or the session's tool registry.
-        let extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>> =
-            if extension_host_empty {
-                None
-            } else {
-                Some(self.extension_host.clone()
-                    as Arc<dyn crate::plugins::extension::ExtensionTools>)
-            };
-        // Task 9: discover enabled WASM component bundles and expose their
-        // connector tools + hook dispatcher to this session, mirroring the
-        // extension seams above. `(None, None)` when no enabled component
-        // bundle is installed (the common case), so no component runtime is
-        // even constructed.
-        let (wasm_tools, wasm_hooks) = self.build_wasm_session_providers(&settings).await;
+        let mcp_principals = self.mcp_principals_for(&mcp_servers).await;
+        // Tasks 8/9: every enabled, installed plugin's `commands/` and
+        // `skills/` directories, discovered by directory convention — LIVE
+        // roots, never copied into `~/.config/ryuzi/{commands,skills}`, so
+        // disabling or uninstalling a plugin makes its content vanish next
+        // session. One walk shared by both surfaces (`enabled_plugin_content_
+        // roots`), split into the two lists each registry consumes.
+        let plugin_content_roots = self.enabled_plugin_content_roots().await;
+        let plugin_command_roots: Vec<(String, std::path::PathBuf)> = plugin_content_roots
+            .iter()
+            .map(|roots| (roots.id.clone(), roots.commands.clone()))
+            .collect();
+        let plugin_skill_roots: Vec<(String, std::path::PathBuf)> = plugin_content_roots
+            .into_iter()
+            .map(|roots| (roots.id, roots.skills))
+            .collect();
+        // Task 6: discover enabled WASM component bundles and expose each as
+        // an in-process MCP server. Empty when no enabled component bundle is
+        // installed (the common case), so no component runtime is even
+        // constructed.
+        let component_mcp = self.build_component_mcp_servers(&settings).await;
         // `kind`/`agent` come from the session row rather than a caller
         // parameter — every caller of `start_harness_session` (fresh start,
         // cold-resume, crash-resume) has already inserted the row before
@@ -1714,11 +1714,9 @@ impl ControlPlane {
             resume,
             mcp_servers,
             mcp_principals,
-            extra_skill_dirs,
-            extension_events,
-            extension_tools,
-            wasm_tools,
-            wasm_hooks,
+            plugin_command_roots,
+            plugin_skill_roots,
+            component_mcp,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             automation_events: Some(Arc::new(super::ControlPlaneAutomationSink(Arc::downgrade(
@@ -1753,13 +1751,14 @@ impl ControlPlane {
     /// Discover every active WASM component bundle
     /// ([`crate::plugins::bundle::load_active_bundles`]), keep only the ENABLED
     /// ([`crate::plugins::host::component_plugin_enabled`], the same
-    /// `plugin.<id>.enabled` convention connector/extension plugins use) AND
+    /// `plugin.<id>.enabled` convention connector plugins use) AND
     /// CONFIGURED (`component_required_settings_configured` — every setting
     /// its derived auth requires, e.g. discord's bot token, is actually
     /// stored) ones, and build one shared [`WasmActivation`] per attached
-    /// bundle. Returns a [`WasmTools`] provider (its connector tools) and a
-    /// [`WasmHookDispatcher`] (its `ryuzi:hooks/hooks` export) over the same
-    /// activations, to thread into the session next to the extension seams.
+    /// bundle. Each surviving activation is wrapped as a
+    /// [`ComponentMcpServer`](crate::plugins::mcp_component::ComponentMcpServer)
+    /// (Task 6 — an in-process MCP server), to thread into the session
+    /// alongside every external stdio MCP server.
     ///
     /// Every failure mode is warn-and-skip: a missing bundle root, a discovery
     /// error, an unavailable component runtime, a per-bundle compile failure,
@@ -1767,39 +1766,36 @@ impl ControlPlane {
     /// affected bundle (or the whole set) rather than blocking the session
     /// from starting — a broken OR not-yet-configured component plugin must
     /// never brick a session, and a needs-setup one must never restart-loop
-    /// either. `(None, None)` when nothing enabled+configured is installed,
-    /// so the common case constructs no component runtime at all. Declarative
+    /// either. An empty vec when nothing enabled+configured is installed, so
+    /// the common case constructs no component runtime at all. Declarative
     /// connectors are untouched (this migration phase keeps both paths live).
-    async fn build_wasm_session_providers(
+    pub(crate) async fn build_component_mcp_servers(
         &self,
         settings: &SettingsStore,
-    ) -> (
-        Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
-        Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
-    ) {
+    ) -> Vec<Arc<crate::plugins::mcp_component::ComponentMcpServer>> {
+        use crate::plugins::mcp_component::ComponentMcpServer;
         use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
-        use crate::plugins::wasm_connector::{WasmActivation, WasmToolSet};
-        use crate::plugins::wasm_hooks::WasmHookDispatcher;
+        use crate::plugins::wasm_connector::WasmActivation;
 
         let root = crate::plugins::bundle::installed_bundle_root();
         if !root.exists() {
-            return (None, None);
+            return Vec::new();
         }
         let bundles = match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
             Ok(bundles) => bundles,
             Err(error) => {
                 tracing::warn!("wasm: discovering component bundles failed: {error}");
-                return (None, None);
+                return Vec::new();
             }
         };
         if bundles.is_empty() {
-            return (None, None);
+            return Vec::new();
         }
         let runtime = match ComponentRuntime::new() {
             Ok(runtime) => runtime,
             Err(error) => {
                 tracing::warn!("wasm: component runtime unavailable: {error}");
-                return (None, None);
+                return Vec::new();
             }
         };
         let mut activations: Vec<Arc<WasmActivation>> = Vec::new();
@@ -1832,6 +1828,24 @@ impl ControlPlane {
                     tracing::warn!(plugin = %id, "wasm: configured-settings check failed: {error}");
                     continue;
                 }
+            }
+            // Task 11 tiered trust: a `[component]` (WASM, sandboxed but
+            // still executable code) installed from an unsigned source
+            // (local folder / git URL) must not attach until the user has
+            // explicitly accepted the trust prompt. Belt-and-braces over the
+            // Task 4 signing gate — `HostPolicy::for_installed_bundle`
+            // already keeps `allow_self_auth`/`allow_gateway` false for a
+            // non-first-party signing key, but that alone doesn't stop the
+            // component from attaching and exposing its tools at all.
+            let provenance = crate::plugins::install_sources::read_install_provenance(&bundle.root);
+            if !crate::plugins::host::component_surfaces_trusted_for(settings, &id, &provenance)
+                .await
+            {
+                tracing::info!(
+                    plugin = %id,
+                    "wasm: skipping {id}: unsigned component requires explicit trust acceptance"
+                );
+                continue;
             }
             // Capabilities are granted from the bundle's own manifest
             // declarations + verified install provenance — the single source of
@@ -1873,123 +1887,178 @@ impl ControlPlane {
             };
             activations.push(Arc::new(WasmActivation::new(compiled, ctx, id, principal)));
         }
-        if activations.is_empty() {
-            return (None, None);
+        let mut servers = Vec::with_capacity(activations.len());
+        for activation in activations {
+            let component_id = activation.component_id().to_string();
+            match ComponentMcpServer::discover(activation).await {
+                Some(server) => servers.push(Arc::new(server)),
+                // `discover` warn-logs its own specific reason (no connector
+                // export, list-tools failure, or zero surviving tool defs);
+                // this component simply contributes no MCP server.
+                None => tracing::debug!(
+                    plugin = %component_id,
+                    "wasm: component contributes no MCP tools"
+                ),
+            }
         }
-        let wasm_tools: Arc<dyn crate::plugins::wasm_connector::WasmTools> =
-            Arc::new(WasmToolSet::new(activations.clone()));
-        let wasm_hooks: Arc<dyn crate::plugins::extension::ExtensionEvents> =
-            Arc::new(WasmHookDispatcher::new(activations));
-        (Some(wasm_tools), Some(wasm_hooks))
+        servers
     }
 
-    /// Extend `mcp_servers` with the MCP servers of every enabled,
-    /// connector-capable plugin (`registries.plugins`). A DB-configured
-    /// server (already in `mcp_servers`) wins over a plugin server with the
-    /// same name — the plugin's entry is dropped rather than overriding it.
-    /// A connector that fails to enable, fails `ensure_auth` (e.g. missing
-    /// credential — logged with its friendly, secret-free message), or
-    /// fails to resolve its servers is logged via `tracing::warn!` and
-    /// skipped: a broken plugin integration must never prevent a session
-    /// from starting.
+    /// Every installed, ENABLED plugin's declarative-content roots (Tasks
+    /// 8/9): `commands/` and `skills/`, discovered by directory convention
+    /// under each plugin's installed release directory — the exact root
+    /// [`Self::build_component_mcp_servers`] compiles components from. Built
+    /// ONCE here and shared by both the commands and skills surfaces, so a
+    /// session start walks installed plugin bundles exactly one time.
     ///
-    /// Each plugin's outcome (`"ok"`/`"failed"`, plus a secret-free reason on
-    /// failure) is also recorded via [`Self::record_attach`] for
-    /// `plugin_doctor` to surface later — recording is best-effort and never
-    /// changes this loop's control flow or its warn-and-continue discipline.
+    /// Enablement reuses [`crate::plugins::host::component_plugin_enabled`]
+    /// — the same `plugin.<id>.enabled` convention every other capability
+    /// axis uses — rather than `PluginHost::is_enabled`, matching
+    /// `build_component_mcp_servers`'s precedent: a plugin bundle need not
+    /// have a registered `CorePlugin` (e.g. a third-party, non-catalog
+    /// install) to be discovered and attached here. `commands`/`skills`
+    /// point at directories that may not exist on disk; callers already
+    /// treat a missing directory as "no commands"/"no skills" (matching
+    /// `read_command_dir`/`read_skills`'s existing not-found handling), so
+    /// this never checks for their presence itself.
     ///
-    /// Returns the `McpServerSpec.name` → owning-plugin [`Principal`] binding
-    /// for every server this call actually attached — resolved HERE, at the
-    /// only place a server name is definitively known to belong to a given
-    /// `CorePlugin`, rather than reconstructed later from a substring match
-    /// on the server/tool name. A server that lost the `names.insert` race
-    /// (a DB-configured or earlier plugin's same-named server won) gets no
-    /// entry, mirroring its exclusion from `mcp_servers` itself.
+    /// # Union, not swap (Task 11 fix)
     ///
-    /// [`Principal`]: crate::domain::Principal
-    async fn attach_plugin_mcp_servers(
-        &self,
-        project_id: &str,
-        work_dir: &Path,
-        settings: &SettingsStore,
-        mcp_servers: &mut Vec<crate::domain::McpServerSpec>,
-    ) -> std::collections::HashMap<String, crate::domain::Principal> {
-        let mut names: std::collections::HashSet<String> =
-            mcp_servers.iter().map(|s| s.name.clone()).collect();
-        let mut principals: std::collections::HashMap<String, crate::domain::Principal> =
-            std::collections::HashMap::new();
+    /// [`crate::plugins::bundle::load_active_bundles`] hard-rejects any
+    /// manifest without `[component]` — it exists to discover WASM component
+    /// bundles, not every installed plugin. A DECLARATIVE-ONLY plugin
+    /// installed via `plugins::install_sources` (commands/skills, no wasm)
+    /// would therefore never appear in that walk, and its commands/skills
+    /// would be silently invisible in every session and in "/" autocomplete.
+    ///
+    /// Fixed by UNION rather than by swapping to `PluginHost::list()`
+    /// outright: a pure `PluginHost::list()` walk would break
+    /// github/atlassian/bitbucket/discord, whose `CorePlugin.source ==
+    /// Builtin` and whose real on-disk root is only knowable via the active
+    /// bundle pointer (`bundle.root`) — `PluginSource::Builtin` carries no
+    /// directory at all. So: keep the bundle walk for every component-backed
+    /// plugin (covers first-party embedded AND signed-catalog component
+    /// installs), and additionally fall back to `PluginHost::list()`'s
+    /// `Installed { dir, .. }` entries for any id the bundle walk didn't
+    /// already cover — using `dir` (the resolved version directory,
+    /// `install_sources::confirm_plugin_install`'s exact `bundle.root`
+    /// equivalent) as the commands/skills root. A component-backed id is
+    /// never double-added: it's always covered by the bundle walk first.
+    pub(crate) async fn enabled_plugin_content_roots(&self) -> Vec<PluginContentRoots> {
+        let settings = SettingsStore::new(self.store.clone());
+        let mut roots = Vec::new();
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let root = crate::plugins::bundle::installed_bundle_root();
+        if root.exists() {
+            match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
+                Ok(bundles) => {
+                    for bundle in bundles {
+                        let id = bundle.manifest.id.clone();
+                        covered.insert(id.clone());
+                        match crate::plugins::host::component_plugin_enabled(&settings, &id).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => {
+                                tracing::warn!(plugin = %id, "plugins: enablement check for content roots failed: {error}");
+                                continue;
+                            }
+                        }
+                        roots.push(PluginContentRoots {
+                            commands: bundle.root.join("commands"),
+                            skills: bundle.root.join("skills"),
+                            id,
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "plugins: discovering installed bundles for content roots failed: {error}"
+                    );
+                }
+            }
+        }
+
         for plugin in self.registries.plugins.list() {
-            let Some(connector) = &plugin.connector else {
+            let id = plugin.manifest.id.clone();
+            if covered.contains(&id) {
+                continue;
+            }
+            let crate::plugins::PluginSource::Installed { dir, .. } = &plugin.source else {
                 continue;
             };
-            let id = &plugin.manifest.id;
-            match self.registries.plugins.is_enabled(settings, id).await {
+            match self.registries.plugins.is_enabled(&settings, &id).await {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!(plugin = %id, "plugin connector failed: {e}");
-                    let reason = safe_attach_reason(id, AttachStage::Enable, &e);
-                    self.record_attach(id, "failed", Some(&reason)).await;
+                Err(error) => {
+                    tracing::warn!(plugin = %id, "plugins: enablement check for content roots failed: {error}");
                     continue;
                 }
             }
-            let ctx = ConnectorCtx {
-                project_id: project_id.to_string(),
-                work_dir: work_dir.to_path_buf(),
-                settings: settings.clone(),
-            };
-            if let Err(e) = connector.ensure_auth(&ctx).await {
-                tracing::warn!(plugin = %id, "plugin connector not ready: {e}");
-                let reason = safe_attach_reason(id, AttachStage::Auth, &e);
-                self.record_attach(id, "failed", Some(&reason)).await;
-                continue;
-            }
-            match connector.mcp_servers(&ctx).await {
-                Ok(specs) => {
-                    for spec in specs {
-                        if !names.insert(spec.name.clone()) {
-                            continue; // a DB-configured (or earlier plugin's) server wins
-                        }
-                        principals.insert(
-                            spec.name.clone(),
-                            crate::domain::Principal {
-                                plugin_id: id.clone(),
-                                plugin_name: plugin.manifest.name.clone(),
-                            },
-                        );
-                        mcp_servers.push(spec);
-                    }
-                    self.record_attach(id, "ok", None).await;
-                }
-                Err(e) => {
-                    tracing::warn!(plugin = %id, "plugin connector failed: {e}");
-                    let reason = safe_attach_reason(id, AttachStage::McpServers, &e);
-                    self.record_attach(id, "failed", Some(&reason)).await;
-                }
-            }
+            roots.push(PluginContentRoots {
+                commands: dir.join("commands"),
+                skills: dir.join("skills"),
+                id,
+            });
         }
-        principals
+
+        // `read_dir` order is filesystem-dependent, and both collision rules
+        // downstream (commands: last plugin wins the bare name; skills:
+        // first-listed plugin wins) would otherwise resolve differently on
+        // different machines. Sort by plugin id so the winner is deterministic.
+        roots.sort_by(|a, b| a.id.cmp(&b.id));
+        roots
     }
 
-    /// Best-effort record of a plugin's session-attach outcome into
-    /// `plugin_attach_status`, for `plugin_doctor` to read back later. Never
-    /// surfaces its own failure — a store write failing here must not turn
-    /// into a session-start error, mirroring the warn-and-continue discipline
-    /// of the loop that calls it.
+    /// The `McpServerSpec.name` → owning-plugin [`Principal`] binding for
+    /// every server in `mcp_servers` that Task 7's plugin-mcp sync
+    /// (`crate::plugins::mcp_sync::sync_plugin_mcp`) created — i.e. every row
+    /// with a non-null `mcp_servers.plugin_id`. Attribution now flows
+    /// straight from that column (re-read here via a fresh
+    /// `crate::mcp::list_servers`, since `McpServerSpec` itself carries no
+    /// plugin identity) rather than from a connector-scan loop resolving it
+    /// at discovery time — the deleted `attach_plugin_mcp_servers` used to do
+    /// that at every session start; the sync/session split means the fact
+    /// only needs to be written once, at sync time.
     ///
-    /// `reason` must already be secret-free (see [`safe_attach_reason`]): the
-    /// persisted value is doctor/UI-visible, so raw connector error text must
-    /// never reach it.
-    async fn record_attach(&self, id: &str, outcome: &str, reason: Option<&str>) {
-        let _ = self
-            .store
-            .record_plugin_attach(&crate::store::PluginAttachStatus {
-                plugin_id: id.to_string(),
-                last_attach_at: crate::paths::now_ms(),
-                outcome: outcome.to_string(),
-                reason: reason.map(str::to_string),
-            })
-            .await;
+    /// A row whose `plugin_id` the host doesn't currently know (an
+    /// uninstalled or renamed plugin, or a stale row) still gets a
+    /// `Principal` — the tool-card attribution should degrade to the raw id,
+    /// not vanish, since the row's own existence already proves *some*
+    /// plugin owns it; only the human-friendly `plugin_name` is best-effort.
+    ///
+    /// [`Principal`]: crate::domain::Principal
+    async fn mcp_principals_for(
+        &self,
+        mcp_servers: &[crate::domain::McpServerSpec],
+    ) -> std::collections::HashMap<String, crate::domain::Principal> {
+        let rows = crate::mcp::list_servers(&self.store)
+            .await
+            .unwrap_or_default();
+        let plugin_id_by_row: std::collections::HashMap<&str, &str> = rows
+            .iter()
+            .filter_map(|r| r.plugin_id.as_deref().map(|pid| (r.id.as_str(), pid)))
+            .collect();
+        let mut principals = std::collections::HashMap::new();
+        for spec in mcp_servers {
+            let Some(plugin_id) = plugin_id_by_row.get(spec.name.as_str()) else {
+                continue;
+            };
+            let plugin_name = self
+                .registries
+                .plugins
+                .get(plugin_id)
+                .map(|p| p.manifest.name.clone())
+                .unwrap_or_else(|| plugin_id.to_string());
+            principals.insert(
+                spec.name.clone(),
+                crate::domain::Principal {
+                    plugin_id: plugin_id.to_string(),
+                    plugin_name,
+                },
+            );
+        }
+        principals
     }
 
     fn dispatch_turn(
@@ -2571,86 +2640,4 @@ async fn coordinator_cancelled(
             )
         });
     root_cancelled || session_cancelled
-}
-
-/// The stage of `attach_plugin_mcp_servers` at which a connector failed —
-/// used only to pick a generic fallback message for [`safe_attach_reason`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachStage {
-    /// `PluginHost::is_enabled` itself errored (internal, secret-free).
-    Enable,
-    /// `Connector::ensure_auth` errored — the one stage whose error text can
-    /// carry a raw token-endpoint response body (HTTP-OAuth refresh path).
-    Auth,
-    /// `Connector::mcp_servers` errored while resolving specs.
-    McpServers,
-}
-
-/// Map a connector-attach failure to a secret-free reason safe to PERSIST
-/// into `plugin_attach_status` (which `plugin_doctor` reads back and later
-/// surfaces in the UI). The full error still reaches `tracing::warn!` at the
-/// call site — only the persisted reason is sanitized here.
-///
-/// Only the friendly `"configure {id}: ..."` messages that `ensure_auth`
-/// (and the HTTP-OAuth `auth_required` path) raise for a missing/expired
-/// credential are known to be secret-free: they name a setting key or a help
-/// URL, never a value. Those pass through verbatim. Every other error — in
-/// particular `refresh_http_oauth_token`'s `"{id} OAuth token refresh failed
-/// with HTTP {status}: {detail}"`, where `detail` is the raw token-endpoint
-/// response body and the refresh POST carried the real
-/// `refresh_token`/`client_secret` — is collapsed to a generic per-stage
-/// message so no connector error body is ever written to the DB.
-fn safe_attach_reason(id: &str, stage: AttachStage, err: &anyhow::Error) -> String {
-    let msg = err.to_string();
-    if msg.starts_with(&format!("configure {id}:")) {
-        return msg;
-    }
-    match stage {
-        AttachStage::Enable => format!("{id}: could not determine whether the plugin is enabled"),
-        AttachStage::Auth => format!("{id}: authentication failed"),
-        AttachStage::McpServers => format!("{id}: could not resolve MCP servers"),
-    }
-}
-
-#[cfg(test)]
-mod safe_attach_reason_tests {
-    use super::{safe_attach_reason, AttachStage};
-
-    #[test]
-    fn friendly_configure_message_passes_through_verbatim() {
-        // The secret-free `ensure_auth` missing-credential message (names a
-        // setting key / help URL, never a value) is preserved as-is.
-        let err = anyhow::anyhow!("configure acme: see https://acme.test/help");
-        assert_eq!(
-            safe_attach_reason("acme", AttachStage::Auth, &err),
-            "configure acme: see https://acme.test/help"
-        );
-    }
-
-    #[test]
-    fn oauth_refresh_body_never_reaches_the_persisted_reason() {
-        // Simulate the raw HTTP-OAuth token-refresh error whose `detail` is
-        // an untruncated response body echoing the refresh POST's form
-        // fields — the exact leak the sanitizer must stop.
-        let err = anyhow::anyhow!(
-            "acme OAuth token refresh failed with HTTP 400: \
-             {{\"echo\":\"refresh_token=leaked-secret-token&client_secret=leaked-client-secret\"}}"
-        );
-        let reason = safe_attach_reason("acme", AttachStage::Auth, &err);
-        assert_eq!(reason, "acme: authentication failed");
-        assert!(!reason.contains("leaked-secret-token"));
-        assert!(!reason.contains("leaked-client-secret"));
-        assert!(!reason.contains("refresh_token"));
-    }
-
-    #[test]
-    fn enable_and_mcp_stage_errors_are_generic_and_drop_raw_text() {
-        let err = anyhow::anyhow!("some internal detail with a token=abc123 in it");
-        let enable = safe_attach_reason("acme", AttachStage::Enable, &err);
-        let mcp = safe_attach_reason("acme", AttachStage::McpServers, &err);
-        assert!(!enable.contains("abc123"));
-        assert!(!mcp.contains("abc123"));
-        assert!(enable.starts_with("acme:"));
-        assert!(mcp.starts_with("acme:"));
-    }
 }

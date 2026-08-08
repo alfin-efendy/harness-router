@@ -23,7 +23,7 @@
 //! 1. **Authorize the caller.** The requested provider id must be one the
 //!    installed bundle declared in its manifest `provider-ids`
 //!    (`PluginCapabilityContext::provider_ids`, from
-//!    `PluginBundleManifest::resolved_provider_ids`); anything else is
+//!    `PluginManifest::resolved_provider_ids`); anything else is
 //!    [`ProviderAuthErr::Denied`], exactly like `ensure_declared_profile` in
 //!    `oauth`.
 //! 2. **Resolve the provider descriptor** from the router's catalog

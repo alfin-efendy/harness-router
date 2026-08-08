@@ -24,7 +24,7 @@ use crate::plugins::capabilities::wit_bindings::ryuzi::settings::settings as set
 use crate::plugins::capabilities::wit_bindings::ryuzi::storage::storage as storage_iface;
 use crate::plugins::capabilities::wit_bindings::websocket::ryuzi::websocket::websocket as websocket_iface;
 use crate::plugins::capabilities::PluginCapabilityContext;
-use ryuzi_plugin_sdk::PluginBundleManifest;
+use ryuzi_plugin_sdk::PluginManifest;
 use std::sync::Arc;
 use wasmtime::{
     component::{Component, HasSelf, Instance, Linker},
@@ -52,8 +52,11 @@ const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
 /// The `ryuzi:connector/connector` export interface name — the single source
 /// of truth shared by `ALLOWED_EXPORTS` and [`CompiledComponent::exports_connector`].
 pub(crate) const CONNECTOR_EXPORT: &str = "ryuzi:connector/connector@0.1.0";
-/// The `ryuzi:hooks/hooks` export interface name — shared by `ALLOWED_EXPORTS`
-/// and [`CompiledComponent::exports_hooks`].
+/// The `ryuzi:hooks/hooks` export interface name — permitted in
+/// `ALLOWED_EXPORTS` so a component may structurally export it, even though
+/// no host-side dispatcher currently consumes it (Task 3 deleted the
+/// subprocess-extension-era WASM hooks dispatcher; nothing reads this export
+/// today).
 pub(crate) const HOOKS_EXPORT: &str = "ryuzi:hooks/hooks@0.1.0";
 /// The `ryuzi:provider/provider` export interface name — shared by
 /// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_provider`] (Task 10).
@@ -137,6 +140,17 @@ pub struct HostPolicy {
     /// self-set bearer is dropped on every redirect and never coexists with a
     /// host-injected OAuth bearer.
     pub allow_self_auth: bool,
+    /// Grants the `ryuzi:gateway/gateway` EXPORT: a component that structurally
+    /// exports it is only permitted to link/instantiate as a gateway when this
+    /// is `true`. Like `allow_self_auth`, this is derived SOLELY from the
+    /// installed release's verified provenance — `signing_key_id ==
+    /// first_party_key::FIRST_PARTY_KEY_ID` — NEVER from the bundle's own
+    /// manifest `gateway = true` declaration, which only controls discovery
+    /// (whether a bundle is even worth compiling to look for the export), not
+    /// permission (whether the export is allowed to exist). This keeps the
+    /// gateway surface first-party-only: a third-party component may still
+    /// export the interface structurally, but validation denies it.
+    pub allow_gateway: bool,
     pub limits: ResourceLimits,
 }
 
@@ -151,6 +165,7 @@ impl HostPolicy {
             allow_websocket: false,
             allow_provider_auth: false,
             allow_self_auth: false,
+            allow_gateway: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -177,6 +192,11 @@ impl HostPolicy {
     ///   by `verify_bundle` from the trusted-key match, NEVER from manifest
     ///   content or anything a component can forge. Every other bundle keeps the
     ///   strict Task 8 `Authorization` stripping.
+    /// - `allow_gateway` (permit the `ryuzi:gateway/gateway` export to
+    ///   validate) — derived EXACTLY like `allow_self_auth`, off the same
+    ///   verified `signing_key_id == first_party_key::FIRST_PARTY_KEY_ID`
+    ///   check, never off the manifest's own `gateway = true` declaration
+    ///   (which only decides discovery, not permission).
     pub fn for_installed_bundle(bundle: &InstalledBundle) -> Self {
         Self {
             allow_network: !bundle.manifest.permissions.network.is_empty(),
@@ -192,9 +212,15 @@ impl HostPolicy {
             // credential authorization) and declare at least one outbound host,
             // since an injected credential is only ever useful on a real
             // request and `AllowedHttpClient` refuses every host otherwise.
-            allow_provider_auth: !bundle.manifest.provider_ids.is_empty()
+            allow_provider_auth: bundle
+                .manifest
+                .provider
+                .as_ref()
+                .is_some_and(|p| !p.ids.is_empty())
                 && !bundle.manifest.permissions.network.is_empty(),
             allow_self_auth: bundle.release_record.signing_key_id
+                == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
+            allow_gateway: bundle.release_record.signing_key_id
                 == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
             limits: ResourceLimits::default(),
         }
@@ -268,7 +294,7 @@ fn build_component_engine() -> Result<Engine, PluginRuntimeError> {
 /// export — IMP-2). `component` must have been compiled against `engine`.
 fn validate_component_interfaces(
     engine: &Engine,
-    manifest: &PluginBundleManifest,
+    manifest: &PluginManifest,
     component: &Component,
     policy: &HostPolicy,
 ) -> Result<Vec<String>, PluginRuntimeError> {
@@ -326,6 +352,16 @@ fn validate_component_interfaces(
                 reason: "not declared by the ryuzi:plugin@0.1.0 world".to_string(),
             });
         }
+        // The gateway export is structurally allowed by the world (any
+        // component may declare it), but PERMITTED only under a first-party-
+        // signed host policy — see `HostPolicy::allow_gateway`'s doc for why
+        // this is never derived from the manifest's own `gateway = true`.
+        if name == GATEWAY_EXPORT && !policy.allow_gateway {
+            return Err(PluginRuntimeError::DeniedExport {
+                name: name.to_string(),
+                reason: "gateway export requires a first-party-signed release".to_string(),
+            });
+        }
         exports.push(name.to_string());
     }
     Ok(exports)
@@ -350,7 +386,7 @@ impl ComponentRuntime {
     /// [`Self::compile`]).
     fn validate_component_bytes(
         &self,
-        manifest: &PluginBundleManifest,
+        manifest: &PluginManifest,
         bytes: &[u8],
         policy: &HostPolicy,
     ) -> Result<Component, PluginRuntimeError> {
@@ -362,7 +398,12 @@ impl ComponentRuntime {
 
     /// Validates the component staged by a signed bundle under deny-all policy.
     pub fn validate_component(&self, bundle: &VerifiedBundle) -> Result<(), PluginRuntimeError> {
-        let bytes = std::fs::read(bundle.staging_dir.join(&bundle.manifest.component))
+        let component = bundle
+            .manifest
+            .component
+            .as_ref()
+            .expect("verified bundle has a component");
+        let bytes = std::fs::read(bundle.staging_dir.join(&component.file))
             .map_err(|error| PluginRuntimeError::ComponentRead(error.to_string()))?;
         self.validate_component_bytes(&bundle.manifest, &bytes, &HostPolicy::deny_all())
             .map(|_| ())
@@ -414,12 +455,17 @@ impl ComponentRuntime {
             .collect();
         // The router provider ids this bundle is authorized to borrow a stored
         // user API key for. ONE rule governs that authorization: the EXPLICIT
-        // manifest `provider-ids`, read from the same field
+        // manifest `[provider] ids`, read from the same field
         // `HostPolicy::allow_provider_auth` gates the capability grant on. The
         // `[id]` fallback of `resolved_provider_ids` exists for transport
         // registration and must never widen a credential grant, so it is
         // deliberately not used here.
-        let provider_ids = bundle.manifest.provider_ids.clone();
+        let provider_ids = bundle
+            .manifest
+            .provider
+            .as_ref()
+            .map(|p| p.ids.clone())
+            .unwrap_or_default();
         Ok(CompiledComponent {
             engine,
             component,
@@ -530,13 +576,6 @@ impl CompiledComponent {
     /// (e.g. a hooks-only plugin) without instantiating them (IMP-2).
     pub(crate) fn exports_connector(&self) -> bool {
         self.exports.iter().any(|name| name == CONNECTOR_EXPORT)
-    }
-
-    /// Whether this component exports `ryuzi:hooks/hooks` — used by the hook
-    /// dispatcher to skip components with no hooks (e.g. a connector-only
-    /// plugin) without instantiating them or logging a warning (IMP-2).
-    pub(crate) fn exports_hooks(&self) -> bool {
-        self.exports.iter().any(|name| name == HOOKS_EXPORT)
     }
 
     /// Whether this component exports `ryuzi:provider/provider` — used by the
@@ -1358,16 +1397,27 @@ mod tests {
         )
     }
 
-    fn manifest(network: Vec<&str>) -> PluginBundleManifest {
-        PluginBundleManifest {
+    fn manifest(network: Vec<&str>) -> PluginManifest {
+        PluginManifest {
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: "acme".to_string(),
             name: "Acme".to_string(),
             version: "0.1.0".to_string(),
-            wit_api: "^0.1.0".to_string(),
-            lifecycle: PluginLifecycle::Singleton,
-            component: "plugin.wasm".to_string(),
             publisher: String::new(),
             description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            component: Some(ryuzi_plugin_sdk::ComponentSpec {
+                file: "plugin.wasm".to_string(),
+                wit_api: "^0.1.0".to_string(),
+                lifecycle: PluginLifecycle::Singleton,
+            }),
             permissions: PluginPermissions {
                 network: network
                     .into_iter()
@@ -1375,9 +1425,12 @@ mod tests {
                     .collect(),
             },
             oauth: vec![],
-            provider_ids: vec![],
+            provider: None,
             tools: vec![],
-            settings: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         }
     }
 
@@ -1409,7 +1462,6 @@ mod tests {
                 "component-http-import" => "ryuzi_component_http_fixture.wasm",
                 "component-connector" => "ryuzi_component_connector_fixture.wasm",
                 "component-hooks" => "ryuzi_component_hooks_fixture.wasm",
-                "component-hooks-loop" => "ryuzi_component_hooks_loop_fixture.wasm",
                 "component-provider" => "ryuzi_component_provider_fixture.wasm",
                 "component-gateway" => "ryuzi_component_gateway_fixture.wasm",
                 "component-websocket-import" => "ryuzi_component_websocket_fixture.wasm",
@@ -1420,7 +1472,7 @@ mod tests {
 
     fn build_fixture_components() {
         // Shared process-once build so concurrent fixture tests (here and in
-        // `wasm_connector`/`wasm_hooks`) never race `build-components.sh`'s
+        // `wasm_connector`) never race `build-components.sh`'s
         // non-atomic `wit/deps/` rewrite.
         crate::plugins::build_fixture_components_once();
     }
@@ -1542,6 +1594,23 @@ mod tests {
         assert!(
             !third_party.allow_self_auth,
             "a non-first-party key must NOT grant self-auth"
+        );
+
+        // The gateway export is gated on the SAME verified-provenance signal.
+        // Asserted here, at the derivation, because the export-loop test flips
+        // `allow_gateway` by hand and so would not catch a regression that
+        // granted it unconditionally.
+        assert!(
+            first_party.allow_gateway,
+            "the first-party key must grant the gateway export"
+        );
+        assert!(
+            !third_party.allow_gateway,
+            "a non-first-party key must NOT grant the gateway export"
+        );
+        assert!(
+            !HostPolicy::deny_all().allow_gateway,
+            "deny_all must not grant the gateway export"
         );
 
         // The rest of the derivation is manifest-driven and independent of the
@@ -1862,6 +1931,38 @@ mod tests {
         assert!(matches!(error, PluginRuntimeError::MalformedComponent(_)));
     }
 
+    /// The `ryuzi:gateway/gateway` export is a first-party-only surface: a
+    /// component that genuinely exports it must still be REJECTED at
+    /// validation unless `HostPolicy::allow_gateway` is granted — the
+    /// signing-key-derived flag `HostPolicy::for_installed_bundle` sets, never
+    /// anything a component or its manifest can claim for itself. Drives the
+    /// real `component-gateway` fixture (not a hand-written WAT stub) so a
+    /// wit-bindgen-retained export edge is what's actually being gated.
+    #[test]
+    fn gateway_export_requires_first_party_policy() {
+        build_fixture_components();
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let bytes = std::fs::read(fixture_artifact("component-gateway"))
+            .expect("gateway fixture component should be built");
+        let manifest = manifest(vec![]);
+        let mut policy = HostPolicy {
+            allow_gateway: false,
+            ..HostPolicy::deny_all()
+        };
+        let result = runtime.validate_component_bytes(&manifest, &bytes, &policy);
+        let Err(err) = result else {
+            panic!("an unsigned/non-first-party policy must deny the gateway export");
+        };
+        assert!(
+            matches!(err, PluginRuntimeError::DeniedExport { ref name, .. } if name.contains("gateway")),
+            "expected a DeniedExport naming the gateway interface, got {err:?}"
+        );
+        policy.allow_gateway = true;
+        runtime
+            .validate_component_bytes(&manifest, &bytes, &policy)
+            .expect("gateway export must validate once policy.allow_gateway is granted");
+    }
+
     #[test]
     fn http_import_without_network_permission_is_denied() {
         let runtime = ComponentRuntime::new().expect("runtime should configure");
@@ -1939,7 +2040,10 @@ mod tests {
         const FIXTURE: &str = "component-provider-auth-import";
         build_fixture_components();
         let mut bundle = installed_fixture_bundle_with_network(FIXTURE, vec!["api.openai.com"]);
-        bundle.manifest.provider_ids = vec!["openai".to_string()];
+        bundle.manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec {
+            ids: vec!["openai".to_string()],
+            ..Default::default()
+        });
         let policy = HostPolicy::for_installed_bundle(&bundle);
         assert!(
             policy.allow_provider_auth,
@@ -2037,7 +2141,10 @@ mod tests {
     fn host_policy_grants_provider_auth_only_with_declared_provider_ids_and_network() {
         fn bundle_with(provider_ids: Vec<&str>, network: Vec<&str>) -> InstalledBundle {
             let mut manifest = manifest(network);
-            manifest.provider_ids = provider_ids.into_iter().map(str::to_string).collect();
+            manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec {
+                ids: provider_ids.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            });
             InstalledBundle {
                 manifest,
                 release: release(),
@@ -2075,7 +2182,10 @@ mod tests {
     async fn compile_carries_declared_provider_ids_into_the_capability_context() {
         build_fixture_components();
         let mut bundle = installed_fixture_bundle("component-noop");
-        bundle.manifest.provider_ids = vec!["mimo-free".to_string()];
+        bundle.manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec {
+            ids: vec!["mimo-free".to_string()],
+            ..Default::default()
+        });
         let runtime = ComponentRuntime::new().expect("runtime should configure");
         let compiled = runtime
             .compile(&bundle, HostPolicy::for_installed_bundle(&bundle))
@@ -2083,11 +2193,13 @@ mod tests {
         assert_eq!(compiled.provider_ids, vec!["mimo-free".to_string()]);
 
         // ONE rule governs the credential grant: the EXPLICIT manifest
-        // `provider-ids`. A bundle that declares none gets none — the
-        // `resolved_provider_ids` `[id]` fallback (for transport registration)
-        // must never seed a credential authorization set.
-        let undeclared = installed_fixture_bundle("component-noop");
-        assert!(undeclared.manifest.provider_ids.is_empty());
+        // `provider.ids`. A bundle that declares a `[provider]` block but no
+        // explicit ids (the mimo/opencode shape, exercised by
+        // `resolved_provider_ids` — see `plugin-sdk::manifest`) gets none —
+        // the `resolved_provider_ids` `[id]` fallback (for transport
+        // registration) must never seed a credential authorization set.
+        let mut undeclared = installed_fixture_bundle("component-noop");
+        undeclared.manifest.provider = Some(ryuzi_plugin_sdk::ProviderSpec::default());
         assert_eq!(
             undeclared.manifest.resolved_provider_ids(),
             vec![undeclared.manifest.id.clone()],
@@ -2098,7 +2210,7 @@ mod tests {
             .expect("noop fixture should compile");
         assert!(
             compiled.provider_ids.is_empty(),
-            "an undeclared bundle must carry no provider credential authorization"
+            "a bundle with no explicit provider.ids must carry no provider credential authorization"
         );
     }
 

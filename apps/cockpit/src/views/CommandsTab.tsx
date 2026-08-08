@@ -1,12 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Edit3, Plus, Search, Trash2 } from "lucide-react";
 import { Button, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, SettingsCard } from "@ryuzi/ui";
-import type { CommandFileInfo, CommandFileInputDto, CommandFileMutationDto, SlashEntryInfo } from "@/bindings";
+import type { CommandFileInfo, CommandFileInputDto, CommandFileMutationDto, PluginInfo, SlashEntryInfo } from "@/bindings";
 import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
+import { PluginBadge } from "@/components/common/bits";
 import { TemplateTextarea } from "@/components/composer/TemplateTextarea";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { catalogKey, useNative, type ProjectCommandMutationResult } from "@/store-native";
+import { usePlugins } from "@/store-plugins";
 import { useStore } from "@/store";
+
+/** Best-effort plugin id for a `"plugin"`-origin catalog entry. A plugin
+ *  command only carries its owner's id IN THE NAME, and only when it lost a
+ *  bare-name contest to another plugin — `CommandRegistry::load_from_dirs_with_plugins`
+ *  namespaces the loser as `"<plugin-id>/<name>"`; the winner keeps its bare
+ *  name with no id recorded anywhere in `SlashEntryInfo`. Returns `null` for
+ *  the unresolvable bare-name case, and the row falls back to a generic
+ *  "Plugin" badge rather than guessing. */
+export function pluginIdForCommand(name: string, plugins: Pick<PluginInfo, "id">[]): string | null {
+  const slash = name.indexOf("/");
+  if (slash === -1) return null;
+  const candidate = name.slice(0, slash);
+  return plugins.some((p) => p.id === candidate) ? candidate : null;
+}
 
 const NAME_ALLOWED = /^[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/;
 
@@ -196,6 +212,27 @@ function BuiltinCommandRow({ entry }: { entry: SlashEntryInfo }) {
   );
 }
 
+// Read-only, like `BuiltinCommandRow` — a plugin's `commands/` directory owns
+// these files (Task 8), so there's no edit/delete surface here (Task 16).
+function PluginCommandRow({ entry, plugins }: { entry: SlashEntryInfo; plugins: PluginInfo[] }) {
+  const pluginId = pluginIdForCommand(entry.name, plugins);
+  return (
+    <SettingsCard className="flex min-h-[88px] items-stretch">
+      <div className="min-w-0 flex-1 px-[18px] py-3">
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[13px] font-semibold">/{entry.name}</span>
+          {pluginId !== null ? (
+            <PluginBadge pluginId={pluginId} plugins={plugins} />
+          ) : (
+            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Plugin</span>
+          )}
+        </div>
+        {entry.description ? <p className="mt-1 truncate text-xs text-muted-foreground">{entry.description}</p> : null}
+      </div>
+    </SettingsCard>
+  );
+}
+
 export function CommandsTab() {
   // Global commands have no project of their own — `selectedProjectId` is
   // read only as an authoring hint for the template editor's @-mention and
@@ -206,6 +243,7 @@ export function CommandsTab() {
   const [deleting, setDeleting] = useState<{ command: CommandFileInfo; trigger: HTMLButtonElement } | null>(null);
   const globalCommands = useNative((state) => state.globalCommands);
   const catalog = useNative((state) => state.slashCatalogByKey[catalogKey(null, null)]);
+  const plugins = usePlugins((state) => state.plugins);
 
   useEffect(() => {
     void useNative.getState().loadGlobalCommands(LOCAL_RUNNER);
@@ -214,6 +252,7 @@ export function CommandsTab() {
 
   const reservedNames = useMemo(() => deriveReservedCommandNames(catalog), [catalog]);
   const builtinEntries = useMemo(() => (catalog ?? []).filter((entry) => entry.origin === "builtin"), [catalog]);
+  const pluginEntries = useMemo(() => (catalog ?? []).filter((entry) => entry.origin === "plugin"), [catalog]);
 
   const filteredCommands = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -307,6 +346,14 @@ export function CommandsTab() {
             <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">No built-in commands.</SettingsCard>
           )}
         </div>
+        {pluginEntries.length > 0 && (
+          <div className="flex flex-col gap-2">
+            <div className="text-xs font-semibold text-muted-foreground">Plugin commands</div>
+            {pluginEntries.map((entry) => (
+              <PluginCommandRow key={entry.name} entry={entry} plugins={plugins} />
+            ))}
+          </div>
+        )}
       </div>
       {editing !== undefined && (
         <CommandEditor

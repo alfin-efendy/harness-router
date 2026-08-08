@@ -295,7 +295,7 @@ pub fn unregister_wasm_providers_for_plugin(plugin_id: &str) {
 /// ENABLED ones that export `ryuzi:provider/provider`, compile each once, and
 /// register a live [`WasmProviderTransport`] into the process-wide
 /// [`register_wasm_provider`] registry under EACH router provider id the bundle
-/// declares (`PluginBundleManifest::resolved_provider_ids`, which falls back to
+/// declares (`PluginManifest::resolved_provider_ids`, which falls back to
 /// the bundle id when none are declared) — the provider analogue of
 /// [`crate::plugins::wasm_gateway::discover_gateway_components`]. Returns the
 /// provider ids registered (for logging / test cleanup); the daemon consumes no
@@ -369,6 +369,19 @@ pub(crate) async fn discover_provider_components(
                 tracing::warn!(plugin = %id, "wasm provider: configured-settings check failed: {error}");
                 continue;
             }
+        }
+        // Task 11 tiered trust: belt-and-braces over the Task 4 signing gate
+        // (`HostPolicy::for_installed_bundle`'s `allow_self_auth` derivation)
+        // — an unsigned (local-folder/git-URL) component provider must not
+        // register a live transport at all until the user has explicitly
+        // accepted the trust prompt.
+        let provenance = crate::plugins::install_sources::read_install_provenance(&bundle.root);
+        if !crate::plugins::host::component_surfaces_trusted_for(settings, &id, &provenance).await {
+            tracing::info!(
+                plugin = %id,
+                "wasm provider: skipping {id}: unsigned component requires explicit trust acceptance"
+            );
+            continue;
         }
         // Single source of truth for the installed-bundle capability policy
         // (incl. the first-party-only `allow_self_auth` gate that keeps mimo's
@@ -466,6 +479,31 @@ pub(crate) async fn install_bundle_on_disk(
     component_artifact: &std::path::Path,
     provider_ids: &[&str],
 ) {
+    install_bundle_on_disk_signed(
+        root,
+        store,
+        plugin_id,
+        component_artifact,
+        provider_ids,
+        crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
+    )
+    .await
+}
+
+/// [`install_bundle_on_disk`] with a caller-chosen `signing_key_id` — used by
+/// the Task 11 tiered-trust tests to stage an UNSIGNED (non-first-party)
+/// component bundle, the shape `install_sources::confirm_plugin_install`
+/// actually produces for a local-folder/git-URL install
+/// (`install_sources::UNSIGNED_SIGNING_KEY_ID`).
+#[cfg(test)]
+pub(crate) async fn install_bundle_on_disk_signed(
+    root: &std::path::Path,
+    store: &Store,
+    plugin_id: &str,
+    component_artifact: &std::path::Path,
+    provider_ids: &[&str],
+    signing_key_id: &str,
+) {
     use crate::store::ComponentPluginReleaseRecord;
     use sha2::{Digest, Sha256};
 
@@ -477,24 +515,29 @@ pub(crate) async fn install_bundle_on_disk(
     std::fs::write(version_dir.join(component_name), &bytes).unwrap();
     let sha = format!("{:x}", Sha256::digest(&bytes));
 
-    let provider_ids_line = if provider_ids.is_empty() {
-        String::new()
+    let provider_block = if provider_ids.is_empty() {
+        // An empty `[provider]` block still exists (so `resolved_provider_ids()`
+        // falls back to the manifest id) but declares no explicit ids.
+        "\n[provider]\n".to_string()
     } else {
         let quoted = provider_ids
             .iter()
             .map(|p| format!("\"{p}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("provider-ids = [{quoted}]\n")
+        format!("\n[provider]\nids = [{quoted}]\n")
     };
     let manifest = format!(
-        "id = \"{plugin_id}\"\n\
+        "contract = 2\n\
+         id = \"{plugin_id}\"\n\
          name = \"{plugin_id}\"\n\
          version = \"{version}\"\n\
+         \n\
+         [component]\n\
+         file = \"{component_name}\"\n\
          wit-api = \"^0.1.0\"\n\
          lifecycle = \"per-call\"\n\
-         component = \"{component_name}\"\n\
-         {provider_ids_line}"
+         {provider_block}"
     );
     std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
 
@@ -517,7 +560,7 @@ pub(crate) async fn install_bundle_on_disk(
         version: version.to_string(),
         source_url: "https://example.invalid/x.wasm".to_string(),
         sha256: sha,
-        signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
+        signing_key_id: signing_key_id.to_string(),
         installed_at: 0,
         active: false,
         revoked: false,
@@ -615,8 +658,8 @@ pub(crate) async fn build_test_transport_with_grants(
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        NetworkPermission, OAuthProfile, PluginBundleManifest, PluginLifecycle, PluginPermissions,
-        PluginRelease,
+        ComponentSpec, NetworkPermission, OAuthProfile, PluginLifecycle, PluginManifest,
+        PluginPermissions, PluginRelease, ProviderSpec,
     };
 
     let mut policy = HostPolicy::deny_all();
@@ -707,15 +750,26 @@ pub(crate) async fn build_test_transport_with_grants(
         provider_ids: grants.provider_ids.clone(),
     });
     let bundle = InstalledBundle {
-        manifest: PluginBundleManifest {
+        manifest: PluginManifest {
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
             id: provider_id.to_string(),
             name: provider_id.to_string(),
             version: "0.1.0".to_string(),
-            wit_api: "^0.1.0".to_string(),
-            lifecycle: PluginLifecycle::Singleton,
-            component: "plugin.wasm".to_string(),
             publisher: String::new(),
             description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            component: Some(ComponentSpec {
+                file: "plugin.wasm".to_string(),
+                wit_api: "^0.1.0".to_string(),
+                lifecycle: PluginLifecycle::Singleton,
+            }),
             permissions: PluginPermissions {
                 network: grants
                     .network_allowlist
@@ -745,9 +799,15 @@ pub(crate) async fn build_test_transport_with_grants(
                     extra_authorize_params: Default::default(),
                 })
                 .collect(),
-            provider_ids: grants.provider_ids.clone(),
+            provider: Some(ProviderSpec {
+                ids: grants.provider_ids.clone(),
+                ..Default::default()
+            }),
             tools: vec![],
-            settings: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
         },
         release: PluginRelease {
             id: provider_id.to_string(),
@@ -967,6 +1027,85 @@ mod tests {
             .set_setting_raw(&format!("plugin.{plugin_id}.enabled"), "true")
             .await
             .unwrap();
+    }
+
+    // ---------- Task 11: tiered trust gate ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsigned_component_without_trust_is_skipped() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        install_bundle_on_disk_signed(
+            root.path(),
+            &store,
+            "disc-prov-unsigned",
+            &provider_artifact(),
+            &["disc-prov-unsigned-served"],
+            crate::plugins::install_sources::UNSIGNED_SIGNING_KEY_ID,
+        )
+        .await;
+        // Unsigned provenance, but no trust acceptance stamped/settings —
+        // stays untrusted.
+        crate::plugins::install_sources::write_install_stamp(
+            &root.path().join("disc-prov-unsigned").join("0.1.0"),
+            &crate::plugins::host::InstallProvenance::LocalPath,
+            0,
+        )
+        .unwrap();
+        enable(&store, "disc-prov-unsigned").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert!(
+            registered.is_empty(),
+            "an unsigned, untrusted component must not register any transport"
+        );
+        assert!(wasm_provider("disc-prov-unsigned-served").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsigned_component_with_accepted_trust_registers() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        install_bundle_on_disk_signed(
+            root.path(),
+            &store,
+            "disc-prov-trusted",
+            &provider_artifact(),
+            &["disc-prov-trusted-served"],
+            crate::plugins::install_sources::UNSIGNED_SIGNING_KEY_ID,
+        )
+        .await;
+        crate::plugins::install_sources::write_install_stamp(
+            &root.path().join("disc-prov-trusted").join("0.1.0"),
+            &crate::plugins::host::InstallProvenance::LocalPath,
+            0,
+        )
+        .unwrap();
+        enable(&store, "disc-prov-trusted").await;
+        store
+            .set_setting_raw("plugin.disc-prov-trusted.trusted", "true")
+            .await
+            .unwrap();
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(registered, vec!["disc-prov-trusted-served".to_string()]);
+        for id in registered {
+            unregister_wasm_provider(&id);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

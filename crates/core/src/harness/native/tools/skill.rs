@@ -41,7 +41,7 @@ impl Tool for SkillTool {
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("skill: `name` is required"))?;
-        let reg = SkillRegistry::load_with(&ctx.work_dir, &ctx.extra_skill_dirs);
+        let reg = SkillRegistry::load_with_plugin_roots(&ctx.work_dir, &ctx.plugin_skill_roots);
         match reg.get(name) {
             Some(skill) => Ok(ToolOutput::ok(truncate(
                 &format!("# Skill: {}\n\n{}", skill.name, skill.body),

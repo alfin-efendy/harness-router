@@ -33,6 +33,13 @@ const rowLabel = "w-[120px] shrink-0 text-[13px] font-medium";
 const TAB_LABEL: Record<DetailTab, string> = {
   overview: "Overview",
   tools: "Tools",
+  // An MCP app never has its own commands/skills/hooks/jobs surface (Task
+  // 14's Contents/Automations tabs are plugin-detail-only) — these two
+  // entries exist purely so this `Record<DetailTab, string>` stays
+  // exhaustive; `visibleTabs`'s `hasContents`/`hasAutomations: false` below
+  // means neither ever appears in `tabs`.
+  contents: "Contents",
+  automations: "Automations",
   settings: "Settings",
   versions: "Versions",
   health: "Health",
@@ -63,6 +70,8 @@ export function AppDetailView({ id }: { id: string }) {
   const tabs = visibleTabs({
     installed: true,
     hasTools: app.tools.length > 0,
+    hasContents: false,
+    hasAutomations: false,
     hasAuth: false,
     hasSettings: true,
     hasVersions: false,

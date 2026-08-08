@@ -17,10 +17,11 @@ pub struct McpTool {
     description: String,
     schema: Value,
     caller: Arc<dyn McpCaller>,
-    /// The plugin that attached this tool's MCP server, if any — resolved by
-    /// the caller from the mcp-server→plugin binding built in
-    /// `ControlPlane::attach_plugin_mcp_servers`, never parsed from
-    /// `full_name`/`server`. `None` for a DB-configured (non-plugin) server.
+    /// The plugin that owns this tool's MCP server, if any — resolved by the
+    /// caller from `mcp_servers.plugin_id` (Task 7's
+    /// `crate::plugins::mcp_sync::sync_plugin_mcp`, re-derived per session by
+    /// `ControlPlane::mcp_principals_for`), never parsed from
+    /// `full_name`/`server`. `None` for a user-added (non-plugin) server.
     principal: Option<Principal>,
 }
 

@@ -11,6 +11,7 @@ import { useApps } from "@/store-apps";
 import { summarizeUpdateAll, usePlugins } from "@/store-plugins";
 import { useSkills } from "@/store-skills";
 import { AddAppModal } from "@/components/modals/AddAppModal";
+import { InstallFromSourceModal } from "@/components/modals/InstallFromSourceModal";
 import { SkillInstallModal } from "@/components/modals/SkillInstallModal";
 import { UniversalInstallWizard } from "@/components/modals/wizard/UniversalInstallWizard";
 import { useNav } from "@/store-nav";
@@ -49,8 +50,9 @@ export function PluginsView() {
   const refreshSkills = useSkills((s) => s.refresh);
 
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<RailFilter>({ state: "all", kind: null, category: null });
+  const [filter, setFilter] = useState<RailFilter>({ state: "all", surface: null, category: null });
   const [addAppOpen, setAddAppOpen] = useState(false);
+  const [installFromSourceOpen, setInstallFromSourceOpen] = useState(false);
   const [skillInstall, setSkillInstall] = useState<{ initialSource?: string } | null>(null);
   const [updatingAll, setUpdatingAll] = useState(false);
   const [doctorOpen, setDoctorOpen] = useState(false);
@@ -79,7 +81,7 @@ export function PluginsView() {
   const items = useMemo(() => buildHubItems({ plugins, apps, skills }), [plugins, apps, skills]);
   const rows = useMemo(() => filterHubItems(items, filter, query), [items, filter, query]);
   const updateAllEnabled = useMemo(
-    () => items.some((i) => i.status === "update-available") || items.some((i) => i.kind === "skill-pack" && i.installed),
+    () => items.some((i) => i.status === "update-available") || items.some((i) => i.surfaces.includes("skills") && i.installed),
     [items],
   );
 
@@ -155,6 +157,9 @@ export function PluginsView() {
               <MenuItem onClick={() => setSkillInstall({})}>Add skill source</MenuItem>
             </MenuContent>
           </Menu>
+          <Button variant="outline" onClick={() => setInstallFromSourceOpen(true)}>
+            Install from source…
+          </Button>
         </div>
 
         {bootstrapBannerMessage(componentBootstrapStatus) && (
@@ -199,6 +204,14 @@ export function PluginsView() {
         </div>
       </div>
       {addAppOpen && <AddAppModal onClose={() => setAddAppOpen(false)} />}
+      {installFromSourceOpen && (
+        <InstallFromSourceModal
+          onClose={() => {
+            setInstallFromSourceOpen(false);
+            void loadPlugins();
+          }}
+        />
+      )}
       {skillInstall && (
         <SkillInstallModal
           initialSource={skillInstall.initialSource}

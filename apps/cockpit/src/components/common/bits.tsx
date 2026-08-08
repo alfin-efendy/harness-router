@@ -1,6 +1,7 @@
 import type { CSSProperties, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import { Badge, Button, cn } from "@ryuzi/ui";
+import type { PluginInfo } from "@/bindings";
 
 // Muted icon avatar — the `Chip` sibling for rows identified by a lucide icon
 // rather than a colored initial (plugin manifests only ever carry an icon
@@ -103,6 +104,33 @@ export function Pill({
   if (variant === "mono")
     return <span className={cn(base, "bg-secondary font-mono font-normal text-secondary-foreground", className)}>{children}</span>;
   return <span className={cn(base, "bg-secondary text-secondary-foreground", className)}>{children}</span>;
+}
+
+// Task 16: resolve a plugin id to its manifest display name, falling back to
+// the raw id when the plugins store hasn't loaded it (or it was uninstalled
+// after installing the automation row it still owns). Pure so the Automations
+// screens' badges can be unit-tested without mounting `usePlugins`.
+export function pluginDisplayName(plugins: Pick<PluginInfo, "id" | "name">[], pluginId: string): string {
+  return plugins.find((p) => p.id === pluginId)?.name ?? pluginId;
+}
+
+// "Plugin: <name>" badge for an automation row (hook, job, or slash command)
+// a plugin installed — the Automations screens' read-only-row marker (Task
+// 16), sharing the exact `Pill` styling every other origin/status badge uses.
+export function PluginBadge({
+  pluginId,
+  plugins,
+  className,
+}: {
+  pluginId: string;
+  plugins: Pick<PluginInfo, "id" | "name">[];
+  className?: string;
+}) {
+  return (
+    <Pill variant="secondary" className={className}>
+      Plugin: {pluginDisplayName(plugins, pluginId)}
+    </Pill>
+  );
 }
 
 // Red "Blocked" badge for a plugin the remote catalog's signed feed revoked
