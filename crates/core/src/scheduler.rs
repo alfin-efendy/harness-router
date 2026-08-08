@@ -278,6 +278,41 @@ pub async fn delete_jobs_and_runs_for_plugin(store: &Store, plugin_id: &str) -> 
         .await
 }
 
+/// Delete every job `plugin_id` owns whose `id` is NOT in `keep_ids`, and
+/// their run history — the orphan-pruning counterpart of
+/// [`delete_jobs_and_runs_for_plugin`], used when a plugin update's
+/// manifest no longer declares a job it previously synced (F3: without
+/// this, a removed job kept firing forever with its stale config). Scoped
+/// to `plugin_id` only — a row with a different `plugin_id` (including a
+/// user's own jobs, where `plugin_id IS NULL`) is never touched regardless
+/// of an id collision. Returns the number of rows pruned.
+pub async fn prune_jobs_and_runs_for_plugin(
+    store: &Store,
+    plugin_id: &str,
+    keep_ids: &[String],
+) -> anyhow::Result<usize> {
+    let plugin_id = plugin_id.to_string();
+    let keep_ids = keep_ids.to_vec();
+    store
+        .with_conn(move |c| {
+            let mut stmt = c.prepare("SELECT id FROM jobs WHERE plugin_id=?1")?;
+            let ids = stmt
+                .query_map(params![plugin_id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut pruned = 0usize;
+            for id in ids {
+                if keep_ids.iter().any(|kept| kept == &id) {
+                    continue;
+                }
+                c.execute("DELETE FROM job_runs WHERE job_id=?1", params![id])?;
+                c.execute("DELETE FROM jobs WHERE id=?1", params![id])?;
+                pruned += 1;
+            }
+            Ok(pruned)
+        })
+        .await
+}
+
 /// Flip a job's `enabled` flag. Enabling is refused with a clear,
 /// user-facing message when the job has no `project_id` yet — a
 /// plugin-installed job lands exactly in this state on first sync (no

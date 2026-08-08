@@ -1329,14 +1329,39 @@ pub async fn list_hooks(store: &Store) -> anyhow::Result<Vec<HookRow>> {
         .await
 }
 
+/// Look up the `webhook.inbound` hook for `path`, EXCLUDING a plugin-owned
+/// row whose owning plugin is currently disabled.
+///
+/// Same fix as `list_enabled_hooks`, applied to the RPC-facing lookup the
+/// HTTP server (`llm_router/server.rs::invoke_webhook`) calls before
+/// dispatching an inbound webhook. It only ever checked `hook.enabled` (which
+/// the caller still checks itself, to return 409 CONFLICT rather than 404 NOT
+/// FOUND for a hook the user disabled directly) — so a plugin-shipped
+/// `webhook.inbound` hook stayed network-triggerable after the user disabled
+/// the OWNING PLUGIN. Joins against the `settings` table's
+/// `plugin.<plugin_id>.enabled` row for a plugin-owned hook; a row with no
+/// `plugin_id` (user-created) is unaffected. Deliberately does NOT filter on
+/// `h.enabled` here — that stays the caller's job so it can keep
+/// distinguishing "hook disabled" (409) from "hook not found" (404); a
+/// plugin-disabled hook falls into "not found", matching every other
+/// disabled-plugin content-visibility rule in this crate.
 pub async fn find_inbound_hook(store: &Store, path: &str) -> anyhow::Result<Option<HookRow>> {
     let path = path.to_string();
     store
         .with_conn(move |c| {
+            let cols: String = HOOK_COLUMNS
+                .split(',')
+                .map(|col| format!("h.{col}"))
+                .collect::<Vec<_>>()
+                .join(",");
             c.query_row(
                 &format!(
-                    "SELECT {HOOK_COLUMNS} FROM automation_hooks \
-                     WHERE trigger_kind='webhook.inbound' AND inbound_path=?1"
+                    "SELECT {cols} FROM automation_hooks h \
+                     LEFT JOIN settings s \
+                       ON h.plugin_id IS NOT NULL \
+                       AND s.key = 'plugin.' || h.plugin_id || '.enabled' \
+                     WHERE h.trigger_kind='webhook.inbound' AND h.inbound_path=?1 \
+                       AND (h.plugin_id IS NULL OR s.value='true')"
                 ),
                 params![path],
                 hook_from,
@@ -1479,6 +1504,51 @@ pub async fn delete_hook(store: &Store, id: &str) -> anyhow::Result<()> {
         .with_conn(move |c| {
             c.execute("DELETE FROM automation_hooks WHERE id=?1", params![id])?;
             Ok(())
+        })
+        .await
+}
+
+/// Delete every hook `plugin_id` owns whose `name` is NOT in `keep_names`,
+/// and their run history — the orphan-pruning counterpart of
+/// [`delete_hooks_and_runs_for_plugin`], used when a plugin update's
+/// manifest no longer declares a hook it previously synced (F3: without
+/// this, a removed hook kept firing forever with its stale config). Scoped
+/// to `plugin_id` only — a row with a different `plugin_id` (including a
+/// user's own hooks, where `plugin_id IS NULL`) is never touched regardless
+/// of a name collision. Returns the number of rows pruned.
+pub async fn prune_hooks_and_runs_for_plugin(
+    store: &Store,
+    plugin_id: &str,
+    keep_names: &[String],
+) -> anyhow::Result<usize> {
+    let plugin_id = plugin_id.to_string();
+    let keep_names = keep_names.to_vec();
+    store
+        .with_conn(move |c| {
+            let mut stmt = c.prepare("SELECT id, name FROM automation_hooks WHERE plugin_id=?1")?;
+            let rows = stmt
+                .query_map(params![plugin_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut pruned = 0usize;
+            for (id, name) in rows {
+                if keep_names.iter().any(|kept| kept == &name) {
+                    continue;
+                }
+                c.execute(
+                    "DELETE FROM automation_hook_attempts WHERE run_id IN \
+                     (SELECT id FROM automation_hook_runs WHERE hook_id=?1)",
+                    params![id],
+                )?;
+                c.execute(
+                    "DELETE FROM automation_hook_runs WHERE hook_id=?1",
+                    params![id],
+                )?;
+                c.execute("DELETE FROM automation_hooks WHERE id=?1", params![id])?;
+                pruned += 1;
+            }
+            Ok(pruned)
         })
         .await
 }
@@ -3152,6 +3222,100 @@ mod tests {
             "an enabled plugin's hook must fire again, got: {names:?}"
         );
         assert!(names.contains(&user_hook.name.as_str()));
+    }
+
+    // F2: `find_inbound_hook` is the RPC-facing lookup `invoke_webhook` calls
+    // before dispatching a POST — it must exclude a plugin-owned
+    // `webhook.inbound` hook whose owning plugin is disabled, same as
+    // `list_enabled_hooks` above, so a disabled plugin's hook stops being
+    // network-triggerable. A user-created hook (no `plugin_id`) must be
+    // unaffected.
+    #[tokio::test]
+    async fn find_inbound_hook_excludes_a_disabled_plugins_hook_but_keeps_user_hooks() {
+        let (store, _db) = mem_store().await;
+        let plugin_hook = HookRow {
+            id: new_id(),
+            name: "acme/inbound".into(),
+            trigger_kind: TriggerKind::WebhookInbound,
+            action_kind: ActionKind::AgentRun,
+            enabled: true,
+            inbound_path: Some("wh_acmeplugininbound00000000000000".into()),
+            action: HookActionInput::AgentRun(AgentRunAction {
+                project_id: "project-1".into(),
+                branch: String::new(),
+                gateway_id: "local".into(),
+                prompt: "handle inbound".into(),
+                agent_id: None,
+                model_override: None,
+                subtask: false,
+            }),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            plugin_id: Some("acme".into()),
+        };
+        put_hook_row(&store, plugin_hook.clone()).await.unwrap();
+        // `put_hook_row` mints its OWN `inbound_path` for a fresh
+        // `webhook.inbound` row on insert (see its doc comment) rather than
+        // trusting whatever the caller's `HookRow` carried — look up the
+        // real, persisted path.
+        let plugin_path = find_hook_by_name(&store, "acme/inbound")
+            .await
+            .unwrap()
+            .expect("plugin hook row inserted")
+            .inbound_path
+            .expect("webhook.inbound row must get a path");
+
+        let user_hook = create_hook(
+            &store,
+            HookInput::agent_run(
+                "User inbound",
+                TriggerKind::WebhookInbound,
+                "project-1",
+                "",
+                "local",
+                "handle inbound",
+            ),
+        )
+        .await
+        .unwrap();
+        let user_path = user_hook.inbound_path.clone().unwrap();
+
+        // No `plugin.acme.enabled` setting yet — default-to-disabled.
+        assert!(
+            find_inbound_hook(&store, &plugin_path)
+                .await
+                .unwrap()
+                .is_none(),
+            "a plugin hook must not be found while its plugin is disabled (no setting)"
+        );
+        assert!(
+            find_inbound_hook(&store, &user_path)
+                .await
+                .unwrap()
+                .is_some(),
+            "a user-created hook (no plugin_id) must be unaffected"
+        );
+
+        // Explicit "false" — same exclusion.
+        store
+            .set_setting_raw("plugin.acme.enabled", "false")
+            .await
+            .unwrap();
+        assert!(find_inbound_hook(&store, &plugin_path)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Enabling the plugin makes its hook findable again.
+        store
+            .set_setting_raw("plugin.acme.enabled", "true")
+            .await
+            .unwrap();
+        let found = find_inbound_hook(&store, &plugin_path)
+            .await
+            .unwrap()
+            .expect("an enabled plugin's hook must be found again");
+        assert_eq!(found.id, plugin_hook.id);
     }
 
     #[tokio::test]

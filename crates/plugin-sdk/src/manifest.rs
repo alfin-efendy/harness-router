@@ -334,6 +334,10 @@ pub enum ManifestError {
     AuthPlaceholderWithoutAuth(String),
     #[error("duplicate settings field key: {0}")]
     DuplicateSettingKey(String),
+    #[error("settings field key must not be empty")]
+    EmptySettingKey,
+    #[error("settings key \"{0}\" is a host-owned control key and cannot be declared by a plugin")]
+    SettingKeyReserved(String),
     #[error("settings field \"{0}\" declares non-empty `options` but `kind` is not `string`")]
     SettingOptionsRequireStringKind(String),
     #[error("settings field \"{0}\"'s `default` is not a member of its `options`")]
@@ -454,8 +458,11 @@ impl PluginManifest {
     /// fields, unique MCP server names, transport-specific requirements,
     /// the `${auth}` placeholder requiring an `[auth]` block, the network
     /// allowlist grammar, OAuth profile shape, declared-tool uniqueness,
-    /// bare settings keys, component-backed surface requirements, provider
-    /// id shape, and hook/job shape.
+    /// bare settings keys (non-empty, unique, not `plugin.`-prefixed, and
+    /// not one of the host-owned control keys `enabled`/`trusted` — see
+    /// `crate::plugins::capabilities::settings::ScopedSettings::effective_key`
+    /// in `ryuzi-core` for the matching guest-write-time guard), component-
+    /// backed surface requirements, provider id shape, and hook/job shape.
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.contract != CONTRACT_VERSION {
             return Err(ManifestError::ContractUnsupported {
@@ -471,6 +478,12 @@ impl PluginManifest {
 
         let mut seen_setting_keys: HashSet<&str> = HashSet::new();
         for field in &self.settings {
+            if field.key.is_empty() {
+                return Err(ManifestError::EmptySettingKey);
+            }
+            if field.key == "enabled" || field.key == "trusted" {
+                return Err(ManifestError::SettingKeyReserved(field.key.clone()));
+            }
             if !seen_setting_keys.insert(field.key.as_str()) {
                 return Err(ManifestError::DuplicateSettingKey(field.key.clone()));
             }
@@ -1163,6 +1176,46 @@ label = "Bot token"
         assert!(
             matches!(err, ManifestError::SettingKeyPrefixForbidden(key) if key == "plugin.acme.token")
         );
+    }
+
+    // F8: an empty settings key silently validated during the v1/v2 merge —
+    // restore the guard.
+    #[test]
+    fn rejects_empty_setting_key() {
+        let toml_str = minimal_manifest(
+            r#"
+[[settings]]
+key = ""
+label = "Nothing"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("an empty settings key should fail validation");
+        assert!(matches!(err, ManifestError::EmptySettingKey));
+    }
+
+    // F8: `enabled`/`trusted` are host-owned control keys — the settings
+    // capability already refuses a WASM guest write to either
+    // (`crate::plugins::capabilities::settings::ScopedSettings::effective_key`
+    // in `ryuzi-core`); a manifest must not be able to declare either as its
+    // own `[[settings]]` key.
+    #[test]
+    fn rejects_reserved_setting_keys() {
+        for reserved in ["enabled", "trusted"] {
+            let toml_str = minimal_manifest(&format!(
+                r#"
+[[settings]]
+key = "{reserved}"
+label = "Reserved"
+"#
+            ));
+            let err = PluginManifest::from_toml(&toml_str)
+                .expect_err("host-owned setting key should fail validation");
+            assert!(
+                matches!(&err, ManifestError::SettingKeyReserved(key) if key == reserved),
+                "{reserved}: unexpected error {err:?}"
+            );
+        }
     }
 
     // ---------- slot ----------

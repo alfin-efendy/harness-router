@@ -180,6 +180,34 @@ pub async fn remove_plugin_servers(store: &Store, plugin_id: &str) -> anyhow::Re
     Ok(())
 }
 
+/// Delete every row `plugin_id` owns whose `id` is NOT in `keep_ids` — the
+/// orphan-pruning counterpart of [`remove_plugin_servers`], used when a
+/// plugin update's manifest no longer declares an `[[mcp]]` entry it
+/// previously synced (F3: without this, a removed server's stale row —
+/// perms, tools, agent-access — stuck around forever). Scoped to
+/// `plugin_id` only — a row with a different `plugin_id` (including a
+/// user-added server, where `plugin_id IS NULL`) is never touched
+/// regardless of an id collision. Reuses [`remove_server`] per pruned row
+/// so tools/agent-access rows go with it, identically to
+/// [`remove_plugin_servers`].
+pub async fn prune_plugin_servers(
+    store: &Store,
+    plugin_id: &str,
+    keep_ids: &[String],
+) -> anyhow::Result<usize> {
+    let ids: Vec<String> = list_servers(store)
+        .await?
+        .into_iter()
+        .filter(|r| r.plugin_id.as_deref() == Some(plugin_id) && !keep_ids.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    let pruned = ids.len();
+    for id in ids {
+        remove_server(store, &id).await?;
+    }
+    Ok(pruned)
+}
+
 pub async fn list_tools(store: &Store, server_id: &str) -> anyhow::Result<Vec<McpToolRow>> {
     let server_id = server_id.to_string();
     store

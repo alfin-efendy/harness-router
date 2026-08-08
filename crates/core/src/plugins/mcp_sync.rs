@@ -84,7 +84,21 @@ pub async fn sync_plugin_mcp(
     settings: &SettingsStore,
     plugin: &CorePlugin,
 ) -> anyhow::Result<()> {
+    let id = plugin.manifest.id.clone();
+    // F3: the current manifest's own row ids — computed up front so both the
+    // early-empty-manifest path and the end-of-successful-sync path below
+    // prune against the SAME set, regardless of which one fires.
+    let keep_ids: Vec<String> = plugin
+        .manifest
+        .mcp
+        .iter()
+        .map(|def| format!("{id}-{}", def.name))
+        .collect();
+
     if plugin.manifest.mcp.is_empty() {
+        // A plugin update that dropped every `[[mcp]]` entry: prune all of
+        // this plugin's rows now, since nothing below will run to do it.
+        mcp::prune_plugin_servers(store, &id, &keep_ids).await?;
         return Ok(());
     }
     let Some(connector) = &plugin.connector else {
@@ -104,7 +118,6 @@ pub async fn sync_plugin_mcp(
         );
         return Ok(());
     }
-    let id = plugin.manifest.id.clone();
     let ctx = ConnectorCtx {
         project_id: id.clone(),
         work_dir: std::env::temp_dir(),
@@ -219,6 +232,16 @@ pub async fn sync_plugin_mcp(
             mcp::replace_tools(store, &row_id, tools).await?;
         }
     }
+
+    // F3: every entry the manifest currently declares was just
+    // upserted above (this point is only reached when auth + resolution +
+    // every upsert succeeded), so anything else this plugin owns is a row a
+    // prior manifest declared and this one dropped — prune it and its
+    // tools/agent-access rows. Not run on any of the early-return paths
+    // above (auth failure, unresolvable, untrusted) — a transient failure
+    // must never delete a working row that just failed to refresh this
+    // round.
+    mcp::prune_plugin_servers(store, &id, &keep_ids).await?;
 
     record_attach(store, &id, "ok", None).await;
     Ok(())
@@ -606,6 +629,74 @@ env = { TOKEN = "${auth}" }
             1,
             "a signed-catalog install must sync without any trust setting"
         );
+    }
+
+    // F3: a plugin update whose manifest drops a previously-synced `[[mcp]]`
+    // entry must prune that server row (and its tools) on re-sync, while
+    // leaving entries the manifest still declares — and another plugin's
+    // rows — untouched.
+    #[tokio::test]
+    async fn resync_prunes_a_server_the_new_manifest_no_longer_declares() {
+        let (store, settings) = mem_store().await;
+        let other = plugin_with_mcp("other", &[("main", "stdio", "other-mcp")]);
+        sync_plugin_mcp(&store, &settings, &other).await.unwrap();
+
+        let v1 = plugin_with_mcp(
+            "acme",
+            &[
+                ("keep", "stdio", "acme-keep"),
+                ("drop", "stdio", "acme-drop"),
+            ],
+        );
+        sync_plugin_mcp(&store, &settings, &v1).await.unwrap();
+        assert_eq!(mcp::list_servers(&store).await.unwrap().len(), 3);
+        mcp::replace_tools(&store, "acme-drop", vec![("some_tool".into(), "".into())])
+            .await
+            .unwrap();
+
+        // v2 drops the "drop" entry, keeps "keep".
+        let v2 = plugin_with_mcp("acme", &[("keep", "stdio", "acme-keep")]);
+        sync_plugin_mcp(&store, &settings, &v2).await.unwrap();
+
+        let rows = mcp::list_servers(&store).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"acme-drop"),
+            "the dropped mcp entry must be pruned, got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"acme-keep"),
+            "an entry the new manifest still declares must survive"
+        );
+        assert!(
+            ids.contains(&"other-main"),
+            "another plugin's row must never be pruned"
+        );
+        assert!(
+            mcp::list_tools(&store, "acme-drop")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the pruned server's tools must be gone too"
+        );
+    }
+
+    // F3: a manifest update that drops EVERY `[[mcp]]` entry must prune all
+    // of that plugin's server rows, even though the early-return path never
+    // reaches the connector/auth machinery.
+    #[tokio::test]
+    async fn resync_with_no_mcp_entries_prunes_every_row_for_that_plugin() {
+        let (store, settings) = mem_store().await;
+        let v1 = plugin_with_mcp("acme", &[("main", "stdio", "acme-mcp")]);
+        sync_plugin_mcp(&store, &settings, &v1).await.unwrap();
+        assert_eq!(mcp::list_servers(&store).await.unwrap().len(), 1);
+
+        let toml = "contract = 2\nid = \"acme\"\nname = \"acme\"\n";
+        let manifest = PluginManifest::from_toml(toml).unwrap();
+        let v2 = declarative::declarative_plugin(manifest, PluginSource::Builtin).unwrap();
+        sync_plugin_mcp(&store, &settings, &v2).await.unwrap();
+
+        assert!(mcp::list_servers(&store).await.unwrap().is_empty());
     }
 
     #[tokio::test]

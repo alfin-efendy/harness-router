@@ -254,6 +254,52 @@ fn trust_required_for(manifest: &PluginManifest) -> bool {
     !manifest.mcp.is_empty() || manifest.component.is_some()
 }
 
+/// F4: move a staged install directory into its final destination, falling
+/// back to copy+remove when a plain rename can't cross filesystems.
+///
+/// `source` (a `begin_plugin_install_from_source` staging dir) lives under
+/// the SYSTEM temp dir, which is very commonly a separate filesystem from
+/// `dest` (under the plugins root, e.g. `~/.config/ryuzi/plugins/...`) — a
+/// systemd-managed Linux desktop's `/tmp` is a tmpfs by default. A plain
+/// `rename` across filesystems fails with EXDEV
+/// (`ErrorKind::CrossesDevices`), which would otherwise turn every
+/// install-from-source into a hard failure on such a setup. `dest` must not
+/// already exist (the caller is responsible for clearing any prior
+/// directory first, as `confirm_plugin_install_at` does).
+///
+/// On the fallback path, `dest` is removed if the copy itself fails
+/// partway — a partially-copied directory is never left behind in the
+/// plugins root. `source` is removed only once the copy has fully
+/// succeeded; if that best-effort removal itself fails, `source` is not a
+/// leak — the caller's `TempDir` reclaims it via `Drop`.
+fn move_staged_dir(source: &Path, dest: &Path) -> Result<()> {
+    match std::fs::rename(source, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_staged_dir_fallback(source, dest)
+        }
+        Err(e) => Err(e).with_context(|| format!("moving staged plugin into {}", dest.display())),
+    }
+}
+
+/// The EXDEV fallback body of [`move_staged_dir`], split out so a test can
+/// exercise it directly — forcing a genuine cross-device `rename` failure
+/// isn't portable in a unit test, but this copy+cleanup logic is the part
+/// that actually needs coverage.
+fn copy_staged_dir_fallback(source: &Path, dest: &Path) -> Result<()> {
+    if let Err(copy_err) = crate::install_common::copy_dir_recursive(source, dest) {
+        let _ = std::fs::remove_dir_all(dest);
+        return Err(copy_err).with_context(|| {
+            format!(
+                "copying staged plugin into {} (cross-device fallback)",
+                dest.display()
+            )
+        });
+    }
+    let _ = std::fs::remove_dir_all(source);
+    Ok(())
+}
+
 /// Phase 1: stage `source` (cloning a git URL or copying a local folder into
 /// a temp dir — the ORIGINAL local folder is never mutated or moved),
 /// parse+validate its `ryuzi-plugin.toml` (v2), and build the
@@ -447,8 +493,7 @@ async fn confirm_plugin_install_at(
             )
         })?;
     }
-    std::fs::rename(&staged.staging_dir, &version_dir)
-        .with_context(|| format!("moving staged plugin into {}", version_dir.display()))?;
+    move_staged_dir(&staged.staging_dir, &version_dir)?;
 
     let provenance = match &staged.parsed {
         ParsedPluginSource::LocalPath(_) => InstallProvenance::LocalPath,
@@ -1017,6 +1062,69 @@ writes = true
         assert_eq!(
             read_install_provenance(dir.path()),
             InstallProvenance::Catalog
+        );
+    }
+
+    // ---------- F4: cross-device staging fallback ----------
+
+    #[test]
+    fn copy_staged_dir_fallback_copies_content_and_removes_the_source() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("ryuzi-plugin.toml"), "id = \"acme\"").unwrap();
+        std::fs::create_dir_all(source.path().join("commands")).unwrap();
+        std::fs::write(source.path().join("commands").join("go.md"), "# go").unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+
+        copy_staged_dir_fallback(source.path(), &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("ryuzi-plugin.toml")).unwrap(),
+            "id = \"acme\""
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("commands").join("go.md")).unwrap(),
+            "# go"
+        );
+        assert!(
+            !source.path().exists(),
+            "the staged source dir must be removed once the copy succeeds"
+        );
+    }
+
+    #[test]
+    fn copy_staged_dir_fallback_cleans_up_dest_and_keeps_source_on_a_failed_copy() {
+        // A source path that doesn't exist makes `copy_dir_recursive` fail on
+        // its own `read_dir` — after `create_dir_all(dest)` already ran, so
+        // `dest` exists (empty) at the point of failure. The fallback must
+        // not leave that partial directory behind.
+        let root = tempfile::tempdir().unwrap();
+        let missing_source = root.path().join("does-not-exist");
+        let dest = root.path().join("dest");
+
+        let err = copy_staged_dir_fallback(&missing_source, &dest).unwrap_err();
+        assert!(err.to_string().contains("cross-device fallback"));
+        assert!(
+            !dest.exists(),
+            "a partially-copied destination must not be left behind on failure"
+        );
+    }
+
+    #[test]
+    fn move_staged_dir_uses_a_plain_rename_on_the_same_filesystem() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("marker"), "here").unwrap();
+        let dest = root.path().join("dest");
+
+        move_staged_dir(&source, &dest).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("marker")).unwrap(),
+            "here"
         );
     }
 

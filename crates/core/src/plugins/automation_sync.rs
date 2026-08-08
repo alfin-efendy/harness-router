@@ -111,6 +111,33 @@ pub async fn sync_plugin_automations(
         }
     }
 
+    // F3: prune rows for THIS plugin's hooks/jobs that a previous sync wrote
+    // but the manifest just synced no longer declares at all — otherwise a
+    // hook/job removed in a plugin update keeps firing forever with its
+    // stale config. Keyed by the same `{plugin_id}/{name}` identity every
+    // row is written under (see module doc's "Row identity"). `keep_*` is
+    // built from EVERY name the manifest declares, not just the ones that
+    // synced successfully this round — so a hook/job that exists from a
+    // prior successful sync but fails validation on this pass (a recorded
+    // per-row error above) is protected from pruning, matching "one
+    // malformed row must never block every other hook/job": pruning only
+    // ever fires when the manifest stops declaring a name outright.
+    let keep_hook_names: Vec<String> = plugin
+        .manifest
+        .hooks
+        .iter()
+        .map(|def| format!("{plugin_id}/{}", def.name))
+        .collect();
+    automation::prune_hooks_and_runs_for_plugin(store, plugin_id, &keep_hook_names).await?;
+
+    let keep_job_ids: Vec<String> = plugin
+        .manifest
+        .jobs
+        .iter()
+        .map(|def| format!("{plugin_id}/{}", def.name))
+        .collect();
+    scheduler::prune_jobs_and_runs_for_plugin(store, plugin_id, &keep_job_ids).await?;
+
     Ok(report)
 }
 
@@ -567,6 +594,160 @@ subtask = false
         assert_eq!(
             agent_run_after.id, agent_run.id,
             "row id stable across re-sync"
+        );
+    }
+
+    // F3: a plugin update whose manifest drops a previously-declared hook
+    // must prune that hook (and its run history) on re-sync, while leaving
+    // hooks the manifest still declares — and another plugin's rows, and a
+    // user's own rows — untouched.
+    #[tokio::test]
+    async fn resync_prunes_a_hook_the_new_manifest_no_longer_declares() {
+        let store = mem_store().await;
+        let v1 = plugin_with_hooks_and_jobs("acme");
+        sync_plugin_automations(&store, &v1).await.unwrap();
+
+        // A user's own hook, unrelated to any plugin.
+        automation::create_hook(
+            &store,
+            automation::HookInput::outbound(
+                "User hook",
+                TriggerKind::SessionEnd,
+                "https://example.org",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let notify = automation::find_hook_by_name(&store, "acme/notify")
+            .await
+            .unwrap()
+            .expect("notify hook synced");
+        automation::create_run(
+            &store,
+            &notify.id,
+            serde_json::json!({ "event": "session.end" }),
+        )
+        .await
+        .unwrap();
+
+        // v2 of the plugin drops the "notify" hook entirely (keeps "triage").
+        let v2 = plugin_with_one_hook(
+            "acme",
+            r#"
+[[hooks]]
+name = "triage"
+trigger = "tool.before"
+action = "agent.run"
+
+[hooks.config]
+projectId = ""
+branch = ""
+gatewayId = ""
+prompt = "Triage this tool call"
+subtask = false
+"#,
+        );
+        sync_plugin_automations(&store, &v2).await.unwrap();
+
+        let hooks = automation::list_hooks(&store).await.unwrap();
+        assert!(
+            !hooks.iter().any(|h| h.name == "acme/notify"),
+            "the dropped hook must be pruned, got: {hooks:?}"
+        );
+        assert!(
+            hooks.iter().any(|h| h.name == "acme/triage"),
+            "a hook the new manifest still declares must survive"
+        );
+        assert!(
+            hooks.iter().any(|h| h.plugin_id.is_none()),
+            "a user-created hook must never be pruned"
+        );
+        assert!(
+            automation::list_runs(&store, &notify.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the pruned hook's run history must be gone too"
+        );
+    }
+
+    // F3: same property for jobs — a job the new manifest drops is pruned
+    // (with its run history), a user's own job is untouched.
+    #[tokio::test]
+    async fn resync_prunes_a_job_the_new_manifest_no_longer_declares() {
+        let store = mem_store().await;
+        let v1 = plugin_with_hooks_and_jobs("acme");
+        sync_plugin_automations(&store, &v1).await.unwrap();
+
+        scheduler::upsert_job(
+            &store,
+            JobRow {
+                id: "user-job".into(),
+                name: "User job".into(),
+                cron: "0 0 * * *".into(),
+                mode: "cron".into(),
+                natural_text: String::new(),
+                project_id: String::new(),
+                branch: "main".into(),
+                gateway: "local".into(),
+                enabled: false,
+                prompt: "do the thing".into(),
+                notify_success: false,
+                notify_fail: false,
+                pre_check: String::new(),
+                model_override: None,
+                plugin_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        scheduler::insert_run(
+            &store,
+            scheduler::RunRow {
+                id: "r-nightly".into(),
+                job_id: "acme/nightly".into(),
+                status: "success".into(),
+                started_at: crate::paths::now_ms(),
+                finished_at: None,
+                session_pk: None,
+                error: None,
+                add_lines: None,
+                del_lines: None,
+                note: None,
+                log: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // v2 of the plugin drops the "nightly" job (declares no jobs at all).
+        let toml = r#"
+contract = 2
+id = "acme"
+name = "acme"
+"#;
+        let manifest = PluginManifest::from_toml(toml).unwrap();
+        let v2 = declarative::declarative_plugin(manifest, PluginSource::Builtin).unwrap();
+        sync_plugin_automations(&store, &v2).await.unwrap();
+
+        let jobs = scheduler::list_jobs(&store).await.unwrap();
+        assert!(
+            !jobs.iter().any(|j| j.id == "acme/nightly"),
+            "the dropped job must be pruned, got: {jobs:?}"
+        );
+        assert!(
+            jobs.iter().any(|j| j.id == "user-job"),
+            "a user-created job must never be pruned"
+        );
+        assert!(
+            scheduler::list_runs(&store, "acme/nightly", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the pruned job's run history must be gone too"
         );
     }
 

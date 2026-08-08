@@ -1167,13 +1167,17 @@ pub struct PluginDetail {
     pub models: Vec<String>,
     pub homepage: Option<String>,
     pub publisher: String,
-    /// Command names (`.md` file stems) found under an installed plugin's
-    /// `commands/` directory. Empty for a `Builtin` plugin or one with no
-    /// commands surface.
+    /// Command names (`.md` file stems) found under a plugin's `commands/`
+    /// directory — an `Installed` plugin's own directory, or (F7) a
+    /// `Builtin` plugin's directory when it's ALSO backed by an active,
+    /// installed component bundle (the component-catalog placeholders:
+    /// github/atlassian/bitbucket/discord/mimo/opencode). Empty for a
+    /// `Builtin` plugin with no matching installed bundle, or any plugin
+    /// with no commands surface.
     pub commands: Vec<String>,
-    /// Skill directory names found under an installed plugin's `skills/`
-    /// directory (each carries a `SKILL.md`). Empty for a `Builtin` plugin
-    /// or one with no skills surface.
+    /// Skill directory names found under a plugin's `skills/` directory
+    /// (each carries a `SKILL.md`) — same resolution as `commands` above,
+    /// including the F7 `Builtin`-with-an-active-bundle case.
     pub skills: Vec<String>,
     pub hooks: Vec<PluginHookInfo>,
     pub jobs: Vec<PluginJobInfo>,

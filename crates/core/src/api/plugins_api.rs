@@ -50,7 +50,7 @@ use ryuzi_plugin_sdk::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) const HANDLES: &[&str] = &[
@@ -537,6 +537,9 @@ async fn plugin_info_for_freshly_installed(
             active_version: active_release.as_ref().map(|r| r.version.as_str()),
             skill_count,
             trusted: host::component_surfaces_trusted(settings, &plugin).await,
+            // Always `PluginSource::Installed` here (see `host.add` above) —
+            // its own `dir` already resolves content, no bundle lookup needed.
+            builtin_content_root: None,
         },
     ))
 }
@@ -751,6 +754,43 @@ struct PluginInfoContext<'a> {
     /// (an async settings read) rather than inside `plugin_info` itself,
     /// which stays a plain sync function.
     trusted: bool,
+    /// F7: the on-disk root of this plugin's ACTIVE, verified component
+    /// bundle, when one exists — `None` for a `PluginSource::Installed` row
+    /// (which already carries its own `dir`) and for a
+    /// `PluginSource::Builtin` row with no matching installed bundle (the
+    /// native runtime, provider builtins, or a component-catalog manifest
+    /// never actually installed). Lets a `Builtin`-sourced plugin that IS
+    /// backed by an installed bundle (github/atlassian/bitbucket/discord/
+    /// mimo/opencode) resolve its `commands`/`skills` content the same way
+    /// `control::lifecycle::ControlPlane::enabled_plugin_content_roots`
+    /// already does for the runtime — see [`builtin_bundle_roots`].
+    builtin_content_root: Option<&'a Path>,
+}
+
+/// The on-disk root for every plugin id currently resolvable as an ACTIVE,
+/// verified component bundle (pointer + release ledger + manifest all
+/// agree) — the same set of bundles
+/// `control::lifecycle::ControlPlane::enabled_plugin_content_roots` scans,
+/// minus its enablement filter: the UI wants to show what's actually on
+/// disk (a badge, a Contents tab) regardless of whether the plugin is
+/// currently enabled, exactly like an `Installed`-sourced plugin's content
+/// names already do. F7: without this, `plugin_content_names` had no way to
+/// find a `PluginSource::Builtin` plugin's directory at all — a first-party
+/// plugin registered as `Builtin` (the component catalog's placeholder
+/// manifests: github/atlassian/bitbucket/discord/mimo/opencode) but ALSO
+/// installed as a real component bundle would work correctly at runtime
+/// (`enabled_plugin_content_roots` finds it) while the API reported empty
+/// commands/skills — no badge, an empty Contents tab.
+async fn builtin_bundle_roots(store: &Store) -> anyhow::Result<HashMap<String, PathBuf>> {
+    let root = crate::plugins::bundle::installed_bundle_root();
+    if !root.exists() {
+        return Ok(HashMap::new());
+    }
+    Ok(crate::plugins::bundle::load_active_bundles(&root, store)
+        .await?
+        .into_iter()
+        .map(|bundle| (bundle.manifest.id.clone(), bundle.root))
+        .collect())
 }
 
 /// Command names (`.md` file stems, non-recursive) directly under `dir` —
@@ -791,10 +831,13 @@ fn list_skill_names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Command/skill names discoverable on disk for `source` — only an
-/// `Installed` plugin carries a directory of its own; a `Builtin` plugin
-/// (native runtime or an embedded catalog manifest, no directory) always
-/// reports both empty. Shared by `plugin_info`'s `surfaces` derivation and
+/// Command/skill names discoverable on disk for `source` — an `Installed`
+/// plugin carries a directory of its own; a `Builtin` plugin has one too
+/// exactly when `builtin_root` resolves it (F7: an active, installed
+/// component bundle backing this same plugin id — see
+/// [`builtin_bundle_roots`]), and otherwise reports both empty (the native
+/// runtime, provider builtins, or a component-catalog manifest never
+/// actually installed). Shared by `plugin_info`'s `surfaces` derivation and
 /// `assemble_detail`'s `PluginDetail.commands`/`.skills` fields so the two
 /// never disagree.
 struct PluginContentNames {
@@ -802,13 +845,17 @@ struct PluginContentNames {
     skills: Vec<String>,
 }
 
-fn plugin_content_names(source: &PluginSource) -> PluginContentNames {
-    match source {
-        PluginSource::Installed { dir, .. } => PluginContentNames {
+fn plugin_content_names(source: &PluginSource, builtin_root: Option<&Path>) -> PluginContentNames {
+    let dir = match source {
+        PluginSource::Installed { dir, .. } => Some(dir.as_path()),
+        PluginSource::Builtin => builtin_root,
+    };
+    match dir {
+        Some(dir) => PluginContentNames {
             commands: list_command_names(&dir.join("commands")),
             skills: list_skill_names(&dir.join("skills")),
         },
-        PluginSource::Builtin => PluginContentNames {
+        None => PluginContentNames {
             commands: Vec::new(),
             skills: Vec::new(),
         },
@@ -819,9 +866,9 @@ fn plugin_content_names(source: &PluginSource) -> PluginContentNames {
 /// `PluginInfo.surfaces` documents: `provider, tools, mcp, skills, commands,
 /// hooks, jobs`. Gateway is deliberately never considered — it is an
 /// internal-only surface (see `PluginInfo.surfaces`'s doc).
-fn plugin_surfaces(plugin: &CorePlugin) -> Vec<String> {
+fn plugin_surfaces(plugin: &CorePlugin, builtin_root: Option<&Path>) -> Vec<String> {
     let m = &plugin.manifest;
-    let content = plugin_content_names(&plugin.source);
+    let content = plugin_content_names(&plugin.source, builtin_root);
     let mut surfaces = Vec::new();
     if m.provider.is_some() {
         surfaces.push("provider".to_string());
@@ -928,7 +975,7 @@ fn plugin_info(
             .then(|| crate::plugins::component_catalog::declared_tool_count(&m.id))
             .flatten(),
         skill_count: (kind == "skill-pack").then_some(ctx.skill_count).flatten(),
-        surfaces: plugin_surfaces(plugin),
+        surfaces: plugin_surfaces(plugin, ctx.builtin_content_root),
         provenance: plugin_provenance(&plugin.source),
         trusted: ctx.trusted,
     }
@@ -1731,6 +1778,7 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let remote = remote_catalog_index(cp.store()).await?;
     let attach_failed = attach_failed_index(cp.store()).await?;
     let active_releases = active_release_version_index(cp.store()).await?;
+    let builtin_roots = builtin_bundle_roots(cp.store()).await?;
     let mut out = Vec::new();
     for plugin in cp.plugins().list() {
         let Some(kind) = derive_kind(&plugin) else {
@@ -1788,6 +1836,7 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
                 active_version: active_releases.get(&plugin.manifest.id).map(String::as_str),
                 skill_count,
                 trusted: host::component_surfaces_trusted(&settings, &plugin).await,
+                builtin_content_root: builtin_roots.get(&plugin.manifest.id).map(PathBuf::as_path),
             },
         ));
     }
@@ -1947,7 +1996,9 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
                 .map(|s| s.skill_count as u32)
         })
         .flatten();
-    let content = plugin_content_names(&plugin.source);
+    let builtin_roots = builtin_bundle_roots(cp.store()).await?;
+    let builtin_content_root = builtin_roots.get(id).map(PathBuf::as_path);
+    let content = plugin_content_names(&plugin.source, builtin_content_root);
     let hooks = automation::list_hooks(cp.store())
         .await?
         .into_iter()
@@ -1976,6 +2027,7 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
                 active_version: active_release.as_ref().map(|r| r.version.as_str()),
                 skill_count,
                 trusted: host::component_surfaces_trusted(&settings, &plugin).await,
+                builtin_content_root,
             },
         ),
         auth,
@@ -2227,14 +2279,20 @@ async fn hot_reload_provider_transports(cp: &ControlPlane) {
 /// `root` is a parameter (rather than always
 /// [`crate::plugins::bundle::installed_bundle_root`] internally) for the
 /// same reason [`crate::plugins::wasm_provider::discover_provider_components`]
-/// takes one: it lets a unit test point this at a hermetic temp dir instead
-/// of this machine's real, possibly-populated per-user install root —
-/// `installed_bundle_root()` has no env-var test seam of its own (see
-/// `InstalledBundleFixture`'s doc in this module's tests), and `load_active_
-/// bundles` fails closed (this fn's own contract) on ANY mismatch anywhere
-/// under the root, so a real root with unrelated real installs would make a
-/// hermetic-root-less test of this function flaky on a machine that has
-/// ever manually installed a component bundle.
+/// takes one: it lets this function's OWN unit tests point it at a hermetic
+/// temp dir as an ordinary parameter — no process-global env var involved —
+/// instead of this machine's real, possibly-populated per-user install
+/// root, and `load_active_bundles` fails closed (this fn's own contract) on
+/// ANY mismatch anywhere under the root, so a real root with unrelated real
+/// installs would make a hermetic-root-less test of this function flaky on
+/// a machine that has ever manually installed a component bundle.
+/// `installed_bundle_root()` ALSO has its own env-var test seam now
+/// (`RYUZI_PLUGINS_ROOT`, I9 fix — see its doc in `plugins::bundle`, and
+/// `InstalledBundleFixture`'s doc in this module's tests for how the two
+/// callers below use it), so a redundant explicit root parameter is not
+/// needed to make any OTHER caller of `installed_bundle_root()` hermetic —
+/// this function keeps its own parameter purely for the local unit-test
+/// convenience above, not because no other seam exists.
 async fn installed_bundle_is_gateway(
     store: &std::sync::Arc<Store>,
     root: &std::path::Path,
@@ -3746,6 +3804,7 @@ mod tests {
             active_version: None,
             skill_count: None,
             trusted: false,
+            builtin_content_root: None,
         }
     }
 
@@ -5424,18 +5483,23 @@ description = "does a thing"
     }
 
     // No end-to-end test of `uninstall_and_reconcile`/`install_component_plugin`/
-    // `rollback_component_plugin`'s "integration" arm through the REAL
-    // `installed_bundle_root()` is added here, deliberately: those call
-    // sites always pass the real root (by design — see their own comments),
-    // and `load_active_bundles`'s fail-closed contract means ANY mismatch
-    // between that real root's contents and a test's fresh, unrelated store
-    // trips the conservative "true" path — not a bug, but a mismatch that
-    // can ONLY occur in a test harness (production always pairs the real
-    // root with the SAME real store the install pipeline wrote both
-    // through). `installed_bundle_is_gateway_is_false_without_active_bundle`
+    // `rollback_component_plugin`'s "integration" arm through
+    // `installed_bundle_root()` is added here — a scope/cost call, NOT
+    // because there is no way to do it hermetically. `installed_bundle_root()`
+    // now honors the process-global `RYUZI_PLUGINS_ROOT` test seam (I9 fix,
+    // see its own doc in `plugins::bundle`) exactly like `InstalledBundleFixture`
+    // and the other `#[serial]` fixtures elsewhere in this module use to
+    // redirect it to a hermetic tempdir — so a future end-to-end test of
+    // these three call sites does NOT need (and must not add) its own
+    // explicit `root: &Path` parameter threaded down from the API layer;
+    // set `RYUZI_PLUGINS_ROOT` before the call instead, same as every other
+    // fixture here. `installed_bundle_is_gateway_is_false_without_active_bundle`
     // and its bundle-root-missing sibling above already pin that function's
-    // own correctness hermetically (root injected); the three call sites'
-    // wiring onto it is a single `if` one-liner each, verified by reading.
+    // own correctness hermetically (root injected as an ordinary parameter,
+    // which `installed_bundle_is_gateway` itself still takes so its OWN unit
+    // tests can inject a root without touching the env seam at all); the
+    // three call sites' wiring onto it is a single `if` one-liner each,
+    // verified by reading.
 
     // The positive skill-pack uninstall path (a real pack on disk removed via
     // `remove_installed_skill`) resolves through `InstallRoots::for_user()`,
@@ -6757,6 +6821,114 @@ writes = true
             "the active installed release's manifest must win over the embedded one, \
              got {names:?}"
         );
+    }
+
+    // F7: `github` registers as `PluginSource::Builtin` in `Registries`
+    // (`component_catalog::component_catalog_plugins`'s embedded placeholder
+    // manifest), but is ALSO backed here by a real, `load_active_bundles`-
+    // verifiable installed bundle (same fixture shape as
+    // `InstalledBundleFixture::stage`, plus `commands/`/`skills/`
+    // directories the base fixture doesn't need). Before this fix,
+    // `plugin_content_names` hard-coded empty commands/skills for every
+    // `Builtin` source — this pins that a `Builtin` plugin's Contents tab
+    // and `surfaces` now resolve from the active bundle's on-disk root, the
+    // same root `control::lifecycle::ControlPlane::enabled_plugin_content_roots`
+    // already reads for the live runtime.
+    #[tokio::test]
+    #[serial]
+    async fn assemble_detail_resolves_builtin_content_from_an_active_installed_bundle() {
+        use sha2::{Digest, Sha256};
+
+        let cp = test_cp().await;
+
+        let root_dir = tempfile::tempdir().expect("tempdir for RYUZI_PLUGINS_ROOT fixture");
+        std::env::set_var("RYUZI_PLUGINS_ROOT", root_dir.path());
+        let plugin_root = root_dir.path().join("github");
+        let version = "9.9.9-f7-fixture";
+        let version_dir = plugin_root.join(version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+
+        let component_bytes = b"f7 builtin-content-resolution fixture component";
+        std::fs::write(version_dir.join("plugin.wasm"), component_bytes).unwrap();
+        let sha = format!("{:x}", Sha256::digest(component_bytes));
+
+        std::fs::write(
+            version_dir.join("ryuzi-plugin.toml"),
+            format!(
+                "contract = 2\nid = \"github\"\nname = \"github\"\nversion = \"{version}\"\n\n\
+                 [component]\nfile = \"plugin.wasm\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            version_dir.join("release.json"),
+            format!(
+                "{{\"id\":\"github\",\"version\":\"{version}\",\"wit-api\":\"0.1.0\",\
+                 \"component_url\":\"https://registry.example.test/github\",\"component_sha256\":\"{sha}\"}}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin_root.join("current"), version).unwrap();
+
+        let commands_dir = version_dir.join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("hello.md"),
+            "---\ndescription: Hi\n---\nHi",
+        )
+        .unwrap();
+
+        let skill_dir = version_dir.join("skills").join("greet");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: greet\n---\nGreet").unwrap();
+
+        cp.store()
+            .upsert_component_release(&crate::store::ComponentPluginReleaseRecord {
+                plugin_id: "github".into(),
+                version: version.into(),
+                source_url: "https://registry.example.test/github".into(),
+                sha256: sha,
+                signing_key_id: "first-party".into(),
+                installed_at: crate::paths::now_ms(),
+                active: false,
+                revoked: false,
+                revocation_reason: None,
+            })
+            .await
+            .unwrap();
+        cp.store()
+            .set_active_component_release("github", version)
+            .await
+            .unwrap();
+
+        let detail = assemble_detail(&cp, "github").await.unwrap();
+        assert_eq!(
+            detail.commands,
+            vec!["hello".to_string()],
+            "a Builtin plugin's active bundle commands/ must resolve"
+        );
+        assert_eq!(
+            detail.skills,
+            vec!["greet".to_string()],
+            "a Builtin plugin's active bundle skills/ must resolve"
+        );
+        assert!(
+            detail.info.surfaces.contains(&"commands".to_string()),
+            "surfaces: {:?}",
+            detail.info.surfaces
+        );
+        assert!(
+            detail.info.surfaces.contains(&"skills".to_string()),
+            "surfaces: {:?}",
+            detail.info.surfaces
+        );
+
+        // `assemble_list` must agree with `assemble_detail` (same resolution
+        // path, both fed by `builtin_bundle_roots`).
+        let list = assemble_list(&cp).await.unwrap();
+        let github_info = list.iter().find(|p| p.id == "github").unwrap();
+        assert!(github_info.surfaces.contains(&"commands".to_string()));
+        assert!(github_info.surfaces.contains(&"skills".to_string()));
     }
 
     /// Like `api::tests_support::state`, but with `install_builtins` run

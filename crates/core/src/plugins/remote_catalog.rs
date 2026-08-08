@@ -116,7 +116,7 @@ fn parse_and_check_with(
     }
     let feed: CatalogFeed = serde_json::from_slice(feed_bytes)
         .map_err(|e| CatalogFeedError::ParseError(e.to_string()))?;
-    if feed.schema_version != 2 {
+    if feed.schema_version != 1 {
         return Err(CatalogFeedError::UnsupportedSchema(feed.schema_version));
     }
     if feed.sequence < last_sequence {
@@ -1390,7 +1390,7 @@ mod tests {
 
     fn feed_json(seq: u64) -> String {
         format!(
-            r#"{{"schemaVersion":2,"sequence":{seq},"generatedAt":0,
+            r#"{{"schemaVersion":1,"sequence":{seq},"generatedAt":0,
                 "entries":[{{"id":"acme","manifestToml":"contract=2\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}}],
                 "blocked":[]}}"#
         )
@@ -1419,23 +1419,62 @@ mod tests {
         ));
     }
 
-    // A feed still declaring the pre-Task-17 schema (`schemaVersion: 1`) must
-    // be rejected outright — accepting it would let a stale/rolled-back feed
-    // (which could carry contract-1 manifest bodies) slip past signature
-    // verification into the store.
+    // `schemaVersion` versions the feed ENVELOPE, not the embedded manifest
+    // contract — a schemaVersion-1 envelope carrying contract-2 manifest
+    // bodies is a perfectly normal feed (every shipped feed looks like this)
+    // and must parse+verify fine. Manifest contract compatibility is
+    // enforced per-entry by `PluginManifest::from_toml`, not by the envelope
+    // schema check.
     #[test]
-    fn schema_version_1_rejected() {
-        let bytes = r#"{"schemaVersion":1,"sequence":5,"generatedAt":0,
-                "entries":[{"id":"acme","manifestToml":"contract=2\nid=\"acme\"\nname=\"Acme\"\nversion=\"1.0.0\""}],
-                "blocked":[]}"#
-            .as_bytes()
-            .to_vec();
+    fn schema_version_1_envelope_with_contract_2_entries_accepted() {
+        let bytes = feed_json(5).into_bytes();
         let sig = sign(&bytes);
         let pubkey = test_keypair().verifying_key().to_bytes();
-        assert!(matches!(
-            parse_and_check_with(&bytes, &sig, 0, &pubkey),
-            Err(CatalogFeedError::UnsupportedSchema(1))
-        ));
+        let feed = parse_and_check_with(&bytes, &sig, 0, &pubkey).unwrap();
+        assert_eq!(feed.schema_version, 1);
+        assert_eq!(feed.entries[0].id, "acme");
+    }
+
+    // The property that keeps revocation working for old/un-upgraded
+    // clients: even when EVERY entry's manifest fails to parse (e.g. all
+    // carry a manifest contract this client predates), the feed must still
+    // be accepted at the envelope level and its `blocked[]` list must still
+    // be applied. Rejecting the whole envelope on a contract mismatch would
+    // sever the revocation channel for every already-shipped client — this
+    // is exactly what F1 restores by keeping `schemaVersion` at 1.
+    #[tokio::test]
+    async fn unparseable_entries_still_apply_blocked_list() {
+        let bytes = concat!(
+            r#"{"schemaVersion":1,"sequence":9,"generatedAt":0,"#,
+            r#""entries":[{"id":"acme","manifestToml":"contract=999\nid=\"acme\""}],"#,
+            r#""blocked":[{"id":"evil","reason":"malware","sinceSequence":9}]}"#,
+        )
+        .as_bytes()
+        .to_vec();
+        let sig = sign(&bytes);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let http = FakeHttp {
+            feed: (200, bytes),
+            sig: (200, sig),
+        };
+        let outcome = fetch_and_cache_with(
+            &store,
+            &http,
+            "http://x/catalog.json",
+            &test_keypair().verifying_key().to_bytes(),
+        )
+        .await;
+        assert!(
+            outcome.applied,
+            "an envelope with only unparseable entries must still apply"
+        );
+        assert_eq!(outcome.entries, 0, "the unparseable entry must be dropped");
+        assert_eq!(outcome.blocked, 1, "the blocked list must still land");
+        let rows = store.list_remote_catalog().await.unwrap();
+        let blocked_row = rows.iter().find(|r| r.id == "evil").unwrap();
+        assert!(blocked_row.blocked);
+        assert_eq!(blocked_row.blocked_reason.as_deref(), Some("malware"));
     }
 
     #[test]
@@ -1760,7 +1799,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_drops_invalid_entry_but_applies_valid_ones() {
         let feed = concat!(
-            r#"{"schemaVersion":2,"sequence":8,"generatedAt":0,"#,
+            r#"{"schemaVersion":1,"sequence":8,"generatedAt":0,"#,
             r#""entries":["#,
             r#"{"id":"bad","manifestToml":"contract=2\nid=\"bad\"\nname=\"\"\nversion=\"1.0.0\""},"#,
             r#"{"id":"good","manifestToml":"contract=2\nid=\"good\"\nname=\"Good\"\nversion=\"2.0.0\""}"#,

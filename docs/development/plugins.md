@@ -1,11 +1,14 @@
 # Plugin SDK
 
-Ryuzi's extension points — model providers, chat gateways, connectors
-(GitHub, Atlassian, Bitbucket...), and automation presets — are all
-**plugins**: one manifest each, surfaced identically through the daemon's
-`list_plugins` RPC and Cockpit's Plugins hub. There is no CLI surface for
-plugin management — Cockpit (backed by the daemon's RPCs) is the only
-management surface.
+Ryuzi's extension points — model providers, connectors (GitHub, Atlassian,
+Bitbucket...), automation presets, custom slash commands, and skills — are
+all **plugins**: one manifest each, surfaced identically through the
+daemon's `list_plugins` RPC and Cockpit's Plugins hub. There is no CLI
+surface for plugin management — Cockpit (backed by the daemon's RPCs) is the
+only management surface. (Chat-platform gateways are ALSO plugins under the
+hood, but that surface is internal and first-party-only — see
+[Internal surfaces: gateway](#internal-surfaces-gateway) — not something a
+third-party plugin author can build.)
 
 This guide documents **manifest contract 2** — the ONE schema every plugin
 (first-party built-in, signed catalog, or a hand-installed local/git source)
@@ -300,7 +303,7 @@ them directly. `status` is `verified` when `verified = true`; otherwise
 
 ---
 
-## The five public surfaces
+## The five public manifest surfaces
 
 A manifest can carry any combination of five surfaces a plugin author can
 target (the SDK's own doc comments call these out explicitly on
@@ -320,6 +323,60 @@ target (the SDK's own doc comments call these out explicitly on
 Both (2) and (3) end up as ordinary
 [`mcp__<id>__<tool>`](#mcp-tool-naming-and-per-tool-perms) tools in a
 session's tool registry, governed by the exact same permission model.
+
+### Directory-convention surfaces: commands and skills
+
+Beyond the five manifest FIELD surfaces above, an installed plugin gets two
+more surfaces purely from directory convention — neither is a manifest
+field, and nothing in `ryuzi-plugin.toml` turns them on or off.
+`PluginTrustPrompt.surfaces.commands`/`.skills` (the trust-prompt summary
+`install_sources::begin_plugin_install_from_source` shows before install)
+are just counts of what's already sitting in the staged directory
+(`count_markdown_files`/`count_skill_dirs`). Both are discovered LIVE from
+an ENABLED, installed plugin's directory — never copied into
+`~/.config/ryuzi/...` — via the same source:
+`crate::control::ControlPlane::enabled_plugin_content_roots`'s union of
+every currently-enabled plugin's `commands/`/`skills/` subdirectories,
+re-scanned fresh on every session/catalog load. Disabling or uninstalling
+the plugin makes its commands/skills vanish immediately, no cleanup step
+needed.
+
+- **`commands/*.md`** — one custom slash command per markdown file, same
+  format project/global commands use
+  (`crates/core/src/harness/native/commands.rs`): a `---`-delimited
+  frontmatter block (`description`, `agent`, `model`, `subtask`,
+  `surfaces: home,session`, `requires-project: true`) followed by the
+  prompt template body (`$ARGUMENTS` / `$1`..`$9` placeholders).
+  Loaded via `CommandRegistry::load_with_plugins` /
+  `load_without_project_with_plugins`.
+  - **Precedence: builtin > project > global > plugin.** A plugin command
+    is read FIRST and inserted into the collapse map before every other
+    origin, so a same-name project/global/builtin command always wins over
+    it — but a displaced plugin command is never silently dropped: it's
+    re-registered as `<plugin-id>/<name>` (e.g. `/github/review`), so it
+    stays reachable under its namespaced form. The same rule applies when
+    two different plugins collide on a name — the loser is namespaced too.
+- **`skills/<name>/SKILL.md`** — progressive-disclosure capability docs
+  (mirrors opencode/Claude skills, `crates/core/src/harness/native/skills.rs`):
+  `name`/`description` frontmatter plus a markdown body fetched on demand
+  via the `skill` tool. A plugin may ship either a skills ROOT
+  (`skills/<name>/SKILL.md`, several skills) or a single-skill LEAF bundle
+  (`skills/SKILL.md` directly) — both shapes auto-detect exactly like a
+  project/global skills directory. Loaded via
+  `SkillRegistry::load_with_plugin_roots` /
+  `load_global_with_plugin_roots`.
+  - **Precedence: Project > Global > Plugin, first-wins.** A plugin skill
+    never displaces a same-name project or global one — unlike commands,
+    there is no namespaced fallback route for a displaced skill. Two
+    DIFFERENT plugins colliding on the same skill name: the first one
+    registered keeps it (a `tracing::warn!` logs the collision so it's not
+    silently invisible); the losing plugin's skill is simply unavailable
+    under that name.
+  - **Listing:** a plugin skill is attributed `SkillOrigin::Plugin`, which
+    behaves exactly like `SkillOrigin::Global` for listing/binding — it
+    appears in "/" (or the skill catalog) only once explicitly BOUND to the
+    agent, but is always reachable through the `skill` tool's index
+    regardless of binding.
 
 ### Internal surfaces: gateway
 
@@ -647,19 +704,34 @@ shipped and tested with this app version. A versioned fetch (an
 update the catalog feed advertises) and every unstamped dev/fork build stay
 on the rolling `latest` release.
 
-### Remote catalog feed (schema 2)
+### Remote catalog feed (schema 1)
 
 The signed `catalog.json`/`catalog.json.sig` feed
 (`scripts/catalog/build-feed.ts`, verified by
-`crates/core/src/plugins/remote_catalog.rs`) declares `schemaVersion: 2`
-(`SCHEMA_VERSION` in the script; `CatalogFeed::schema_version` in Rust) —
-bumped from `1` alongside the manifest-v2 rollout, since a v1-schema feed
-could in principle carry contract-1 manifest bodies. `parse_and_check_with`
-rejects any feed whose `schema_version != 2` with `UnsupportedSchema`,
-checked BEFORE the anti-rollback `sequence` comparison. `sequence` itself is
-untouched by this bump — it keeps strictly increasing release over release
-(`CATALOG_FEED_SEQUENCE` in CI, `scripts/catalog/sequence.txt` for local
-builds); the schema bump does not reset it.
+`crates/core/src/plugins/remote_catalog.rs`) declares `schemaVersion: 1`
+(`SCHEMA_VERSION` in the script; `CatalogFeed::schema_version` in Rust).
+`schemaVersion` versions the feed ENVELOPE — `{schemaVersion, sequence,
+generatedAt, entries[{id, manifestToml}], blocked[]}` — which has not
+changed since it was introduced; it does NOT version the manifest contract
+embedded in each entry's `manifestToml` string (that is the manifest's own
+`contract` key, enforced per-entry by `PluginManifest::from_toml`). The
+manifest-v2 rollout (Task 17) therefore did NOT bump `SCHEMA_VERSION`: a
+schemaVersion-1 envelope carrying contract-2 manifest bodies is normal and
+accepted. `parse_and_check_with` rejects any feed whose `schema_version !=
+1` with `UnsupportedSchema`, checked BEFORE the anti-rollback `sequence`
+comparison.
+
+This matters for revocation. A client that predates a manifest contract
+bump can't use the new entries, but it must still receive the feed's
+`blocked[]` list — that's the security-relevant channel. `fetch_and_cache_with`
+drops (with a warning) any entry whose `manifest_toml` it can't parse, but
+still applies the envelope and the blocked list, even when every entry was
+dropped. Rejecting the whole envelope on a manifest contract mismatch (by
+bumping `schemaVersion` alongside a contract bump) would sever revocation
+for every already-shipped client — anti-rollback already prevents a stale
+feed from replaying an old sequence, and per-entry parsing already drops
+manifest bodies a client can't use, so the envelope schema check is
+reserved for actual envelope shape changes.
 
 ---
 

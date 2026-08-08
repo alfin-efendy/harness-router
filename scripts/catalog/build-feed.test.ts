@@ -123,7 +123,7 @@ test("serializeFeed emits the camelCase field names the engine's CatalogFeed des
   const bytes = serializeFeed(feed);
   const parsed = JSON.parse(new TextDecoder().decode(bytes));
   expect(parsed).toEqual({
-    schemaVersion: 2,
+    schemaVersion: 1,
     sequence: 9,
     generatedAt: 42,
     entries: [{ id: "acme", manifestToml: "contract=1" }],

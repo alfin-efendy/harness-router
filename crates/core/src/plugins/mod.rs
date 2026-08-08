@@ -409,13 +409,16 @@ pub fn plugin_kind(plugin: &CorePlugin) -> &'static str {
     if plugin.harness.is_some() {
         return "runtime";
     }
-    if plugin.gateway.is_some()
-        || plugin
-            .manifest
-            .categories
-            .iter()
-            .any(|category| category == "chat-gateway")
-    {
+    // F5: `kind = "gateway"` is reserved for a plugin that actually carries a
+    // live `Gateway` factory (`plugin.gateway.is_some()`) — gateways are
+    // internal, first-party-only (see docs/development/plugins.md). A
+    // manifest-declared `categories = ["chat-gateway"]` clause used to be
+    // able to promote ANY third-party plugin to this kind on its own say-so,
+    // changing UI/uninstall behavior for content the host never vetted as a
+    // gateway. No first-party manifest ever declared this category, so
+    // dropping the clause is a pure hardening — it never changes any
+    // shipped plugin's classification.
+    if plugin.gateway.is_some() {
         return "gateway";
     }
     "integration"
@@ -1463,6 +1466,33 @@ mod install_builtins_tests {
                 component.manifest.id
             );
         }
+    }
+
+    // F5: a manifest-declared `categories = ["chat-gateway"]` must NOT be
+    // able to promote a plugin to `kind = "gateway"` on its own — that kind
+    // is reserved for a plugin that actually carries a live `Gateway`
+    // factory (`plugin.gateway.is_some()`), a host-vetted, first-party-only
+    // property. A third-party plugin self-declaring this category must
+    // still classify as an ordinary "integration".
+    #[test]
+    fn a_self_declared_chat_gateway_category_does_not_promote_kind() {
+        let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(
+            "contract = 2\nid = \"acme\"\nname = \"Acme\"\ncategories = [\"chat-gateway\"]\n",
+        )
+        .unwrap();
+        let plugin = CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            provider: None,
+            source: PluginSource::Builtin,
+        };
+        assert_eq!(
+            plugin_kind(&plugin),
+            "integration",
+            "a manifest-only chat-gateway category claim must not promote kind"
+        );
     }
 }
 
