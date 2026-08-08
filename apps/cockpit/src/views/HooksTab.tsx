@@ -770,12 +770,7 @@ export function HooksTab({
         )}
       </div>
       {editing !== undefined && (
-        <HookEditor
-          hook={editing}
-          initialDraft={editing === null ? duplicateSeed : undefined}
-          projects={projects}
-          onClose={closeEditor}
-        />
+        <HookEditor hook={editing} initialDraft={editing === null ? duplicateSeed : undefined} projects={projects} onClose={closeEditor} />
       )}
     </div>
   );

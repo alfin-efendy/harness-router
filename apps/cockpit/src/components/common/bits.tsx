@@ -117,7 +117,15 @@ export function pluginDisplayName(plugins: Pick<PluginInfo, "id" | "name">[], pl
 // "Plugin: <name>" badge for an automation row (hook, job, or slash command)
 // a plugin installed — the Automations screens' read-only-row marker (Task
 // 16), sharing the exact `Pill` styling every other origin/status badge uses.
-export function PluginBadge({ pluginId, plugins, className }: { pluginId: string; plugins: Pick<PluginInfo, "id" | "name">[]; className?: string }) {
+export function PluginBadge({
+  pluginId,
+  plugins,
+  className,
+}: {
+  pluginId: string;
+  plugins: Pick<PluginInfo, "id" | "name">[];
+  className?: string;
+}) {
   return (
     <Pill variant="secondary" className={className}>
       Plugin: {pluginDisplayName(plugins, pluginId)}

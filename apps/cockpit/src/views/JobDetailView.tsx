@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
 import { ArrowUpRight, Check, CircleAlert, Clock, Copy, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
 import { commands } from "@/bindings";
-import { duplicateJobInput, formatDuration, formatNextRun, formatStarted, jobById, jobNeedsTarget, toInput, useScheduler } from "@/store-scheduler";
+import {
+  duplicateJobInput,
+  formatDuration,
+  formatNextRun,
+  formatStarted,
+  jobById,
+  jobNeedsTarget,
+  toInput,
+  useScheduler,
+} from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
@@ -185,7 +194,12 @@ export function ScheduleCard({
           </div>
         )}
         {value.mode === "cron" && (
-          <Input value={value.cron} disabled={readOnly} onChange={(e) => onPatch({ cron: e.target.value })} className="h-9 w-[200px] font-mono" />
+          <Input
+            value={value.cron}
+            disabled={readOnly}
+            onChange={(e) => onPatch({ cron: e.target.value })}
+            className="h-9 w-[200px] font-mono"
+          />
         )}
         <div className="flex items-center gap-[7px] text-xs text-muted-foreground">
           <Check aria-hidden size={12} strokeWidth={2.5} className="shrink-0" style={{ color: "#22C55E" }} />
