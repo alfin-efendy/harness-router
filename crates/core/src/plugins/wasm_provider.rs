@@ -708,8 +708,15 @@ pub(crate) async fn discover_provider_components(
             }
         };
         // Only provider bundles are registered; a gateway/connector/hooks-only
-        // bundle is skipped before any instantiation (IMP-2).
-        if !compiled.exports_provider() {
+        // bundle is skipped before any instantiation (IMP-2). A bundle
+        // implementing EITHER the 0.1.0 or the 0.2.0 provider interface (or
+        // both) counts — a component that exports only the structured 0.2.0
+        // interface is exactly what Task 4's capability negotiation exists to
+        // support, so gating on the 0.1.0 export alone would make a pure-v2,
+        // tool-capable-only component permanently undiscoverable (proven by
+        // `discovered_v2_bundle_registers_a_tool_capable_transport`, which
+        // fails without this OR).
+        if !compiled.exports_provider() && !compiled.exports_provider_v2() {
             continue;
         }
         let ctx = Arc::new(PluginCapabilityContext {
@@ -1185,6 +1192,106 @@ pub(crate) async fn build_test_transport(
         TestTransportGrants::default(),
     )
     .await
+}
+
+/// Build a [`WasmProviderTransport`] exactly like the zero-grants case of
+/// [`build_test_transport_with_grants`], EXCEPT it deliberately never calls
+/// `resolve_capabilities()` — the one test construction path that leaves the
+/// transport's `capabilities` `OnceLock` unresolved, so a test built on it
+/// can observe [`WasmProviderRuntime::capabilities`]'s fail-closed
+/// `unwrap_or_default()` fallback directly.
+///
+/// This is a standalone twin of `build_test_transport_with_grants` rather
+/// than a flag on it: every OTHER test in this module relies on that helper
+/// resolving capabilities immediately after construction (mirroring
+/// production discovery), so that behavior must not change.
+#[cfg(test)]
+pub(crate) async fn build_unresolved_test_transport(
+    component_path: std::path::PathBuf,
+    provider_id: &str,
+) -> (Arc<WasmProviderTransport>, tempfile::NamedTempFile) {
+    use crate::plugins::bundle::InstalledBundle;
+    use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
+    use crate::settings::SettingsStore;
+    use crate::store::ComponentPluginReleaseRecord;
+    use crate::telemetry::NoopTelemetry;
+    use ryuzi_plugin_sdk::{
+        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
+    };
+
+    let policy = HostPolicy::deny_all();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+    let ctx = Arc::new(PluginCapabilityContext {
+        plugin_id: provider_id.to_string(),
+        version: "0.1.0".to_string(),
+        settings: SettingsStore::new(store.clone()),
+        store,
+        telemetry: Arc::new(NoopTelemetry),
+        network_allowlist: vec![],
+        oauth_profile_ids: vec![],
+        provider_ids: vec![],
+    });
+    let bundle = InstalledBundle {
+        manifest: PluginManifest {
+            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
+            id: provider_id.to_string(),
+            name: provider_id.to_string(),
+            version: "0.1.0".to_string(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            component: Some(ComponentSpec {
+                file: "plugin.wasm".to_string(),
+                wit_api: "^0.1.0".to_string(),
+                lifecycle: PluginLifecycle::Singleton,
+            }),
+            permissions: PluginPermissions { network: vec![] },
+            oauth: vec![],
+            provider: None,
+            tools: vec![],
+            mcp: vec![],
+            hooks: vec![],
+            jobs: vec![],
+            gateway: false,
+        },
+        release: PluginRelease {
+            id: provider_id.to_string(),
+            version: "0.1.0".to_string(),
+            wit_api: "0.1.0".to_string(),
+            component_url: "https://example.invalid/x.wasm".to_string(),
+            component_sha256: "0".repeat(64),
+            size_bytes: None,
+            published_at: None,
+        },
+        release_record: ComponentPluginReleaseRecord {
+            plugin_id: provider_id.to_string(),
+            version: "0.1.0".to_string(),
+            source_url: "https://example.invalid/x.wasm".to_string(),
+            sha256: "0".repeat(64),
+            signing_key_id: "test".to_string(),
+            installed_at: 0,
+            active: true,
+            revoked: false,
+            revocation_reason: None,
+        },
+        root: component_path.parent().unwrap().to_path_buf(),
+        component_path,
+    };
+    let runtime = ComponentRuntime::new().unwrap();
+    let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
+    // Deliberately NOT calling `resolve_capabilities().await` here — leaving
+    // the `capabilities` `OnceLock` unresolved is the entire point of this
+    // helper.
+    let transport = WasmProviderTransport::new(compiled, ctx, provider_id.to_string());
+    (Arc::new(transport), tmp)
 }
 
 #[cfg(test)]
@@ -1715,6 +1822,81 @@ mod tests {
         assert_eq!(last.stop_reason, Some(WasmStopReason::ToolUse));
         assert_eq!(last.tool_calls.len(), 1);
         assert_eq!(last.tool_calls[0].name, "echo");
+    }
+
+    /// Pins the fail-closed default itself: a freshly constructed transport
+    /// whose `capabilities` `OnceLock` has NEVER been resolved must report
+    /// toolless, not optimistically tool-capable. Every other test in this
+    /// module goes through `build_test_transport`/`build_test_transport_with_grants`,
+    /// which resolve immediately after construction — so without this test,
+    /// the `unwrap_or_default()` fallback in `WasmProviderRuntime::capabilities`
+    /// is dead code as far as the suite is concerned. If that fallback were
+    /// ever changed to default to tool-capable (or dropped in favor of an
+    /// `.unwrap()`), this is the only test that would catch it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capabilities_reports_toolless_before_resolve_capabilities_runs() {
+        build_fixtures();
+        let (transport, _tmp) =
+            build_unresolved_test_transport(provider_v2_fixture_artifact(), "wasm-prov-unresolved")
+                .await;
+        assert_eq!(
+            transport.capabilities(),
+            WasmProviderCapabilities {
+                tools: false,
+                parallel_tool_calls: false
+            },
+            "an unresolved transport must fail CLOSED (report toolless) even though the \
+             underlying component is the tool-capable v2 fixture — capabilities() must never \
+             read as tool-capable before resolve_capabilities() has actually run, or the \
+             router could route tool calls into a component that never declared support"
+        );
+    }
+
+    /// Pins the real production ordering in `discover_provider_components`:
+    /// `resolve_capabilities()` must run on a freshly built transport BEFORE
+    /// `register_wasm_provider` publishes it into the process-wide registry.
+    /// Unlike `a_v2_component_declares_tool_support_and_echoes_the_transcript`
+    /// above (which goes through the test helper's OWN, separately patched
+    /// resolve-then-return sequence), this test drives the real
+    /// `discover_provider_components` discovery path with the 0.2.0 fixture
+    /// staged on disk, then reads the transport back out of the registry —
+    /// so it would catch someone swapping the resolve/register lines (or
+    /// otherwise widening the window where the router could observe a
+    /// tool-capable component as toolless).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovered_v2_bundle_registers_a_tool_capable_transport() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "disc-prov-v2",
+            &provider_v2_fixture_artifact(),
+            &["disc-prov-v2-served"],
+        )
+        .await;
+        enable(&store, "disc-prov-v2").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(registered, vec!["disc-prov-v2-served".to_string()]);
+        let transport = wasm_provider("disc-prov-v2-served")
+            .expect("a discovered v2 provider bundle must register a live transport");
+        assert!(
+            transport.capabilities().tools,
+            "discover_provider_components must call resolve_capabilities() on the transport \
+             BEFORE register_wasm_provider() publishes it — if those two lines were ever \
+             swapped, the router would observe this real tool-capable component as toolless \
+             for a window (or permanently, for a cache-only read) and silently drop its tools"
+        );
+
+        unregister_wasm_provider("disc-prov-v2-served");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
