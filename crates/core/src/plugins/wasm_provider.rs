@@ -315,6 +315,26 @@ impl WasmProviderRuntime for WasmProviderTransport {
     }
 
     async fn list_models(&self) -> Result<Vec<WasmModelInfo>, String> {
+        // Prefer the structured 0.2.0 export when the component has it — a
+        // pure-v2 component (no 0.1.0 export at all) must still advertise its
+        // models, exactly like `discover_provider_components`'s OR-gate
+        // already requires for discovery itself. Fall back to the 0.1.0
+        // export, and only error when the component exports neither.
+        if self.exports_provider_v2() {
+            let mut instance = self.instantiate().await.map_err(|e| e.to_string())?;
+            let result = instance
+                .call(|inst, store| {
+                    let pre = inst.instance_pre(&*store);
+                    let guest = wit_v2::GuestIndices::new(&pre)?.load(&mut *store, &inst)?;
+                    guest.call_list_models(&mut *store)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            return match result {
+                Ok(models) => Ok(models.into_iter().map(model_from_wit_v2).collect()),
+                Err(provider_error) => Err(describe_provider_error_v2(&provider_error)),
+            };
+        }
         if !self.exports_provider() {
             return Err("component does not export ryuzi:provider/provider".to_string());
         }
@@ -389,6 +409,14 @@ impl WasmProviderRuntime for WasmProviderTransport {
 }
 
 fn model_from_wit(model: wit::ModelInfo) -> WasmModelInfo {
+    WasmModelInfo {
+        id: model.id,
+        display_name: model.display_name,
+        context_window: model.context_window,
+    }
+}
+
+fn model_from_wit_v2(model: wit_v2::ModelInfo) -> WasmModelInfo {
     WasmModelInfo {
         id: model.id,
         display_name: model.display_name,
@@ -1334,6 +1362,34 @@ mod tests {
             .list_models()
             .await
             .expect("list-models must succeed");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "fixture-model");
+        assert_eq!(models[0].context_window, 8192);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_models_returns_the_v2_only_fixture_model() {
+        // A pure-v2 component (exports ONLY `ryuzi:provider/provider@0.2.0`,
+        // no 0.1.0 export at all) must still advertise its models through
+        // `list_models`. A regression here — gating `list_models` on the
+        // 0.1.0 export alone, as it once did — silently strips EVERY
+        // provider of its model list the moment it moves to 0.2.0-only,
+        // since `list_models` results are exactly what the router registers
+        // as that provider's `ProviderDescriptor` models.
+        build_fixtures();
+        let (transport, _tmp) = build_test_transport(
+            provider_v2_fixture_artifact(),
+            "wasm-prov-list-v2",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(!transport.exports_provider());
+        assert!(transport.exports_provider_v2());
+        let models = transport.list_models().await.expect(
+            "a 0.2.0-only component must still advertise its models via list_models; \
+             gating list_models on the 0.1.0 export alone regresses every provider's \
+             model list the moment it moves to 0.2.0-only",
+        );
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "fixture-model");
         assert_eq!(models[0].context_window, 8192);
