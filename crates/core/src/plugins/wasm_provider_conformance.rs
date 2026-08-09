@@ -5,8 +5,10 @@
 //! onto that seam, it must prove — against MOCKED, allowlisted HTTP — that it
 //! behaves like a provider: it lists models, completes in order, never leaks a
 //! host/forged credential onto the wire, maps upstream HTTP errors onto the
-//! right `provider-error`, and lets the host budget catch a stalled upstream
-//! instead of hanging.
+//! right `provider-error`, lets the host budget catch a stalled upstream
+//! instead of hanging, and — for a tool-capable (`capabilities().tools`)
+//! component — round-trips a bound tool definition into a tool call surfaced
+//! with the model's own id/name/arguments and the tool-use stop reason.
 //!
 //! This module is that proof harness, and it is DECOUPLED from any one
 //! fixture's wire format or expected values: [`ProviderConformance`] is
@@ -14,7 +16,7 @@
 //! + provider id, the mock upstream's per-endpoint response bodies (whatever
 //! bytes THIS component's own `list-models`/`complete` parses; the harness
 //! never parses them itself), and a [`ProviderExpectations`] struct describing
-//! what the six checks should observe. Each check stands up a mock HTTP
+//! what the seven checks should observe. Each check stands up a mock HTTP
 //! upstream ([`MockUpstream`]) on the fixture's own endpoint paths and seeded
 //! with its wire bodies, points a real [`WasmProviderTransport`] at it (via
 //! [`crate::plugins::wasm_provider::build_test_transport_with_grants`],
@@ -25,12 +27,18 @@
 //! override" channel a real provider component would read too), and drives the
 //! actual host seam.
 //!
-//! Every fixture below shares the SAME six checks: the synthetic
+//! Every fixture below shares the SAME seven checks: the synthetic
 //! `component-provider-http` fixture (plain `ryuzi:http`, tab-separated wire
 //! format), plus one per real OpenAI-chat provider component (`plugins/openai`,
 //! `plugins/groq`, … — host-mediated `ryuzi:provider-auth`, OpenAI JSON), built
 //! through [`OpenAiFormatFixture`]. A later per-provider slice adds one more
-//! [`ConformanceFixture`] — never another copy of the checks.
+//! [`ConformanceFixture`] — never another copy of the checks. The seventh
+//! check ([`ProviderConformance::assert_tool_round_trip`]) SKIPS (rather than
+//! fails) for a fixture whose component reports `capabilities().tools ==
+//! false` — the synthetic fixture (0.1.0-only, no tool channel at all) and any
+//! real component that legitimately ships toolless (e.g. `mimo`'s free-tier
+//! gate, which is not one of the fixtures below but is the same shape of
+//! component this skip exists for).
 //!
 //! Everything here is `#[cfg(test)]` lib-test code (the integration-test build
 //! OOMs on the dev box); the module is gated behind `#[cfg(test)]` in
@@ -47,13 +55,26 @@ use axum::Router;
 use crate::plugins::wasm_provider::{
     build_test_transport_with_grants, TestTransportGrants, WasmCompletionChunk,
     WasmCompletionRequest, WasmCompletionRequestV2, WasmContentBlock, WasmMessage, WasmModelInfo,
-    WasmProviderRuntime, WasmProviderTransport, WasmRole, WasmTokenUsage, WasmToolChoice,
+    WasmProviderRuntime, WasmProviderTransport, WasmRole, WasmStopReason, WasmTokenUsage,
+    WasmToolChoice, WasmToolDef,
 };
 
 /// The single loopback host every mock upstream binds to and every
 /// conformance run allowlists (a bare host: the allowlist matches on host,
 /// not port).
 const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The one tool bound on every [`ProviderConformance::assert_tool_round_trip`]
+/// request. Only the REQUEST side is generic across fixtures — a `WasmToolDef`
+/// maps into the WIT `tool-def` the same way for every 0.2.0 component,
+/// regardless of wire format, and the mock upstream never inspects the
+/// request body — so one fixed tool name/schema suffices; what varies per
+/// fixture is the mocked RESPONSE ([`ToolRoundTripCase`]).
+const TOOL_ROUND_TRIP_TOOL_NAME: &str = "get_weather";
+
+/// JSON-Schema `input_schema` for [`TOOL_ROUND_TRIP_TOOL_NAME`].
+const TOOL_ROUND_TRIP_TOOL_SCHEMA: &str =
+    r#"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"#;
 
 /// How the mock `/complete` endpoint should respond, per conformance
 /// scenario. `Body`/`Status` bodies are caller-supplied (see
@@ -200,7 +221,36 @@ pub(crate) struct HttpErrorCase {
     pub expected_substring: &'static str,
 }
 
-/// What the six-point battery expects THIS provider component to produce over
+/// The tool-round-trip scenario check (7) drives: a mock completion-endpoint
+/// response, in THIS fixture's own wire format, that encodes exactly one tool
+/// call — and the id/name/arguments a human transcribed independently from
+/// that body, which the component's own mapping glue must reproduce exactly.
+/// `None` on a fixture whose component reports `capabilities().tools ==
+/// false` (see [`ProviderConformance::assert_tool_round_trip`]), which has no
+/// tool channel to round-trip anything through.
+pub(crate) struct ToolRoundTripCase {
+    /// The completion-endpoint response body serving ONE tool call, in this
+    /// fixture's own wire format (an OpenAI-style `tool_calls` array with
+    /// `finish_reason: "tool_calls"` for an OpenAI-format fixture; an
+    /// Anthropic `content` block of `type: "tool_use"` with `stop_reason:
+    /// "tool_use"` for an Anthropic-format one). Parsed only by the
+    /// fixture's own compiled guest — the harness never parses it.
+    pub response_body: String,
+    /// The tool call's `id`, exactly as `response_body` encodes it.
+    pub expected_id: &'static str,
+    /// The tool call's `name`, exactly as `response_body` encodes it.
+    pub expected_name: &'static str,
+    /// The tool call's `arguments` — a serialized JSON object string — exactly
+    /// as the component is expected to hand it back (for an OpenAI-format
+    /// fixture this is copied verbatim from the wire body's own JSON-string
+    /// `arguments` field; for an Anthropic-format one it is the RE-serialized
+    /// form of the wire body's `input` object, which is why every Anthropic
+    /// scenario below sticks to a single-key object — with more than one key,
+    /// re-serialization order is not this test's to pin down).
+    pub expected_arguments: &'static str,
+}
+
+/// What the seven-point battery expects THIS provider component to produce over
 /// the same mocked host seam. One instance is one fixture's worth of expected
 /// values; the checks themselves stay fixture-agnostic.
 pub(crate) struct ProviderExpectations {
@@ -247,6 +297,10 @@ pub(crate) struct ProviderExpectations {
     /// stated the other way round: nothing a guest could contribute ever
     /// appears.
     pub expected_authorization: Option<&'static str>,
+    /// The tool-round-trip scenario check (7) drives against this fixture, or
+    /// `None` when the component has no tool channel to round-trip anything
+    /// through — see [`ToolRoundTripCase`].
+    pub tool_round_trip: Option<ToolRoundTripCase>,
 }
 
 /// How an OAuth provider fixture authenticates: the `[[oauth]]` profile the
@@ -262,7 +316,7 @@ pub(crate) struct OAuthProfileSeed {
 
 /// Everything [`ProviderConformance`] needs for one battery run: the compiled
 /// component + provider id under test, the mock's wire-level response
-/// bodies, and the expected outputs the six checks assert against. The
+/// bodies, and the expected outputs the seven checks assert against. The
 /// synthetic `component-provider-http` fixture
 /// ([`synthetic_fixture_conformance`]) is exactly one instance of this; a
 /// later slice builds one per REAL provider component instead.
@@ -336,7 +390,7 @@ impl ProviderConformance {
         // An OAuth fixture grants `ryuzi:oauth` + a seeded profile token instead
         // of `ryuzi:provider-auth` + a stored API key. The two are mutually
         // exclusive (a fixture is one or the other), so this reuses the SAME
-        // builder and the SAME six checks — only the grant + seeded credential
+        // builder and the SAME seven checks — only the grant + seeded credential
         // differ.
         let (oauth_profile_ids, oauth_tokens) = match &self.fixture.oauth_profile {
             Some(seed) => (
@@ -384,10 +438,14 @@ impl ProviderConformance {
 
     /// The structured 0.2.0 equivalent of [`Self::completion_request`]: the
     /// same model, budget and temperature, carried as a one-message
-    /// transcript instead of a flat string. No tools are bound — the battery
-    /// exercises model listing/completion/auth/error/timeout behaviour, not
-    /// tool-calling itself — so `tools` stays empty and `tool_choice` stays
-    /// the harmless default.
+    /// transcript instead of a flat string. No tools are bound — this request
+    /// drives checks (1)-(6) below (model listing, completion order, auth
+    /// stripping, error/timeout mapping), none of which needs a tool
+    /// definition, so `tools` stays empty and `tool_choice` stays the
+    /// harmless default. Check (7), [`Self::assert_tool_round_trip`], sends
+    /// its OWN request — [`Self::completion_request_v2_with_tools`] — which
+    /// DOES carry a real tool definition; that is what proves a component can
+    /// round-trip one, which this toolless request cannot.
     fn completion_request_v2(&self) -> WasmCompletionRequestV2 {
         WasmCompletionRequestV2 {
             model: self.fixture.request_model.clone(),
@@ -402,6 +460,34 @@ impl ProviderConformance {
         }
     }
 
+    /// The request [`Self::assert_tool_round_trip`] drives: the same shape as
+    /// [`Self::completion_request_v2`], but carrying ONE real tool definition
+    /// so a tool-capable component has something to call. The tool's own
+    /// name/description/schema are inert as far as the mock upstream is
+    /// concerned (the mock ignores the request body entirely and always
+    /// serves the fixture's configured [`ToolRoundTripCase::response_body`]),
+    /// so one fixed tool suffices for every fixture — what varies per fixture
+    /// is the RESPONSE, not this request.
+    fn completion_request_v2_with_tools(&self) -> WasmCompletionRequestV2 {
+        WasmCompletionRequestV2 {
+            model: self.fixture.request_model.clone(),
+            messages: vec![WasmMessage {
+                role: WasmRole::User,
+                content: vec![WasmContentBlock::Text(
+                    "what's the weather in that city?".to_string(),
+                )],
+            }],
+            tools: vec![WasmToolDef {
+                name: TOOL_ROUND_TRIP_TOOL_NAME.to_string(),
+                description: "Get the current weather for a named city".to_string(),
+                input_schema: TOOL_ROUND_TRIP_TOOL_SCHEMA.to_string(),
+            }],
+            tool_choice: WasmToolChoice::Auto,
+            max_tokens: Some(64),
+            temperature: Some(0.2),
+        }
+    }
+
     /// Drive one completion against `transport`, choosing the 0.1.0 flat
     /// `complete` or the structured 0.2.0 `complete_v2` the SAME way the real
     /// router does (`llm_router::client::wasm_provider_stream`): on
@@ -410,7 +496,7 @@ impl ProviderConformance {
     /// 0.2.0-only export (`ryuzi:provider/provider@0.2.0`, `tools: true`), so
     /// calling the 0.1.0 `complete` against one fails closed with "component
     /// does not export ryuzi:provider/provider" — this is what lets the SAME
-    /// six checks below keep exercising a 0.1.0-only fixture (the synthetic
+    /// checks below keep exercising a 0.1.0-only fixture (the synthetic
     /// `component-provider-http` one) and every migrated real component
     /// without knowing which is which.
     async fn drive_completion(
@@ -424,13 +510,14 @@ impl ProviderConformance {
         }
     }
 
-    /// Run the whole six-point battery in sequence.
+    /// Run the whole seven-point battery in sequence.
     pub(crate) async fn run_full_battery(&self) {
         self.assert_lists_models().await;
         self.assert_completes_in_order().await;
         self.assert_strips_guest_authorization().await;
         self.assert_maps_http_errors().await;
         self.assert_maps_timeouts().await;
+        self.assert_tool_round_trip().await;
     }
 
     /// (1) Model listing: `list-models` returns exactly the models the mock
@@ -614,6 +701,114 @@ impl ProviderConformance {
             "a caught stall must read as a timeout/failure provider-error, got: {error}",
         );
     }
+
+    /// (7) Tool round trip: given a request carrying a real tool definition,
+    /// and a mock upstream answering with a `tool_calls` response in this
+    /// fixture's own wire format, the component surfaces a completion chunk
+    /// carrying a tool call whose id/name/arguments match the mock's response
+    /// EXACTLY, and reports the tool-use stop reason. This is the only check
+    /// in the battery that exercises the guest's tool-call mapping glue —
+    /// every other check sends an empty `tools` list (see
+    /// [`Self::completion_request_v2`]'s own doc comment) — so it is the sole
+    /// evidence in this file that a component can round-trip a bound tool
+    /// into a tool call, not merely dispatch a toolless completion.
+    ///
+    /// SKIPS (does not fail) when the component reports
+    /// `capabilities().tools == false` — a 0.1.0-only component has no tool
+    /// channel to round-trip anything through, and a 0.2.0 component may
+    /// honestly report no proven tool support (e.g. `mimo`'s free-tier gate,
+    /// not one of the fixtures below but the same shape of component this
+    /// skip exists for). The skip is never assumed from which fixture is
+    /// under test: it reads the SAME `capabilities().tools` the production
+    /// router dispatches on (see [`Self::drive_completion`]), and is
+    /// cross-checked both ways below against
+    /// [`ProviderExpectations::tool_round_trip`] — a fixture whose declared
+    /// case disagrees with the component's actual capability is a hard
+    /// failure, not a silently-skipped one, precisely so a regression on a
+    /// component that SHOULD support tools cannot hide behind this skip.
+    pub(crate) async fn assert_tool_round_trip(&self) {
+        match &self.fixture.expect.tool_round_trip {
+            None => {
+                // Build a transport (over a throwaway, never-hit mock — this
+                // branch never calls `complete_v2`) purely to read the
+                // component's OWN `capabilities()` answer, so the skip below
+                // is verified against live behaviour rather than trusted
+                // blindly from the fixture declaring no case.
+                let mock = MockUpstream::start(
+                    &self.fixture.wire,
+                    CompleteBehavior::Body(self.fixture.wire.complete_success_body.clone()),
+                    &self.fixture.credential_header,
+                )
+                .await;
+                let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
+                assert!(
+                    !transport.capabilities().tools,
+                    "{} reports capabilities().tools == true but its ConformanceFixture \
+                     declares no `tool_round_trip` case — every tool-capable fixture must \
+                     exercise the tool round trip; add a ToolRoundTripCase rather than \
+                     leaving this component's tool-call mapping unproven",
+                    self.fixture.provider_id,
+                );
+                eprintln!(
+                    "SKIP assert_tool_round_trip for {}: capabilities().tools is false \
+                     (no tool channel to round-trip through)",
+                    self.fixture.provider_id,
+                );
+            }
+            Some(case) => {
+                let mock = MockUpstream::start(
+                    &self.fixture.wire,
+                    CompleteBehavior::Body(case.response_body.clone()),
+                    &self.fixture.credential_header,
+                )
+                .await;
+                let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
+                assert!(
+                    transport.capabilities().tools,
+                    "{} declares a `tool_round_trip` case but the component reports \
+                     capabilities().tools == false",
+                    self.fixture.provider_id,
+                );
+
+                let chunks = transport
+                    .complete_v2(self.completion_request_v2_with_tools())
+                    .await
+                    .expect("a tool-call completion over mocked HTTP must succeed");
+
+                let tool_calls: Vec<_> = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.tool_calls.iter())
+                    .collect();
+                assert_eq!(
+                    tool_calls.len(),
+                    1,
+                    "expected exactly one tool call surfaced from the mock's tool_calls \
+                     response, got: {tool_calls:?}",
+                );
+                let call = tool_calls[0];
+                assert_eq!(
+                    call.id, case.expected_id,
+                    "the tool call's id must match what the mock upstream returned",
+                );
+                assert_eq!(
+                    call.name, case.expected_name,
+                    "the tool call's name must match what the mock upstream returned",
+                );
+                assert_eq!(
+                    call.arguments, case.expected_arguments,
+                    "the tool call's arguments must match what the mock upstream returned",
+                );
+
+                let stop_reason = chunks.iter().rev().find_map(|chunk| chunk.stop_reason);
+                assert_eq!(
+                    stop_reason,
+                    Some(WasmStopReason::ToolUse),
+                    "a tool_calls completion must report the tool-use stop reason, got: \
+                     {stop_reason:?}",
+                );
+            }
+        }
+    }
 }
 
 /// The model table the synthetic fixture's mock `/models` endpoint serves
@@ -645,7 +840,7 @@ fn provider_http_fixture_artifact() -> PathBuf {
 /// The synthetic `component-provider-http` fixture's own conformance config:
 /// exactly what its tab-separated wire format and hand-written guest logic
 /// produce. A later slice builds a [`ConformanceFixture`] per REAL provider
-/// component instead — same six checks, different wire bodies + expectations.
+/// component instead — same seven checks, different wire bodies + expectations.
 fn synthetic_fixture_conformance() -> ConformanceFixture {
     ConformanceFixture {
         artifact: provider_http_fixture_artifact(),
@@ -705,6 +900,11 @@ fn synthetic_fixture_conformance() -> ConformanceFixture {
             // Plain `ryuzi:http`: the host strips the guest's forged header
             // and injects nothing, so the upstream must see NO Authorization.
             expected_authorization: None,
+            // This fixture exports ONLY `ryuzi:provider/provider@0.1.0` — no
+            // `capabilities()`, no tool channel at all — so
+            // `assert_tool_round_trip` must SKIP for it, never fabricate a
+            // tool completion it has no ABI to carry.
+            tool_round_trip: None,
         },
     }
 }
@@ -719,7 +919,7 @@ async fn provider_component_passes_the_full_conformance_battery() {
 // ---------------------------------------------------------------------------
 // The REAL OpenAI-CHAT provider components (plan Task 16, Steps 2 + 3)
 //
-// Same six checks, real components, and OpenAI's actual wire format. Nothing
+// Same seven checks, real components, and OpenAI's actual wire format. Nothing
 // below touches the harness itself — each provider is one more
 // [`ConformanceFixture`], which is the point of the Step 1 parameterization.
 //
@@ -777,6 +977,17 @@ struct OpenAiFormatFixture {
     expected_text: &'static str,
     /// Usage the terminal chunk must carry, from `completion_body`'s `usage`.
     expected_usage: WasmTokenUsage,
+    /// Literal `POST /chat/completions` body the mock serves for the
+    /// tool-round-trip check (7): an OpenAI-style `tool_calls` response
+    /// (`finish_reason: "tool_calls"`, one entry in `message.tool_calls`).
+    tool_call_body: &'static str,
+    /// The tool call's `id`/`name`/`arguments` `tool_call_body` encodes,
+    /// transcribed independently of it — `arguments` is copied verbatim from
+    /// the wire body's JSON-string `arguments` field, since OpenAI-format
+    /// parsing never re-serializes it.
+    tool_call_id: &'static str,
+    tool_call_name: &'static str,
+    tool_call_arguments: &'static str,
 }
 
 impl OpenAiFormatFixture {
@@ -859,12 +1070,21 @@ impl OpenAiFormatFixture {
                 guest_forged_secret: None,
                 // ...and the ONLY credential on the wire is the host-injected one.
                 expected_authorization: Some(self.expected_authorization),
+                // Every OpenAI-format guest declares `capabilities() ->
+                // tools: true` (see `__openai_provider_guest_core!`), so
+                // check (7) must exercise it rather than skip.
+                tool_round_trip: Some(ToolRoundTripCase {
+                    response_body: self.tool_call_body.to_string(),
+                    expected_id: self.tool_call_id,
+                    expected_name: self.tool_call_name,
+                    expected_arguments: self.tool_call_arguments,
+                }),
             },
         }
     }
 }
 
-/// Build the component under test, then run the whole six-point battery against
+/// Build the component under test, then run the whole seven-point battery against
 /// it. One line per provider below.
 async fn run_openai_format_battery(fixture: OpenAiFormatFixture) {
     crate::plugins::build_provider_component_once(fixture.provider_id);
@@ -947,6 +1167,10 @@ const OPENAI_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 11,
         output: 3,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_openai_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Jakarta\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_openai_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Jakarta"}"#,
 };
 
 const OPENROUTER_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
@@ -962,6 +1186,10 @@ const OPENROUTER_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 21,
         output: 5,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_or_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Bandung\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_or_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Bandung"}"#,
 };
 
 const GROQ_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
@@ -977,6 +1205,10 @@ const GROQ_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 13,
         output: 7,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_groq_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Surabaya\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_groq_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Surabaya"}"#,
 };
 
 /// `deepseek` is the one non-`openai` descriptor here that SEEDS a model list
@@ -998,6 +1230,10 @@ const DEEPSEEK_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 17,
         output: 9,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_ds_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Bali\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_ds_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Bali"}"#,
 };
 
 const MISTRAL_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
@@ -1013,6 +1249,10 @@ const MISTRAL_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 23,
         output: 11,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_mi_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_mi_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Paris"}"#,
 };
 
 const XAI_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
@@ -1028,6 +1268,10 @@ const XAI_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 29,
         output: 13,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_xai_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Austin\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_xai_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Austin"}"#,
 };
 
 const NVIDIA_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
@@ -1043,6 +1287,10 @@ const NVIDIA_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 31,
         output: 17,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_nv_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Santa Clara\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_nv_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Santa Clara"}"#,
 };
 
 /// `google` points at Gemini's OpenAI-COMPATIBILITY endpoint, and its
@@ -1065,6 +1313,10 @@ const GOOGLE_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 41,
         output: 23,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_goog_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Mountain View\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_goog_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Mountain View"}"#,
 };
 
 const HUGGINGFACE_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
@@ -1080,6 +1332,10 @@ const HUGGINGFACE_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
         input: 37,
         output: 19,
     },
+    tool_call_body: r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_hf_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Berlin\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    tool_call_id: "call_hf_1",
+    tool_call_name: "get_weather",
+    tool_call_arguments: r#"{"city":"Berlin"}"#,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1309,7 +1565,7 @@ fn every_ported_provider_bundle_declares_provider_auth_and_only_its_own_host() {
 // ---------------------------------------------------------------------------
 // The `anthropic` provider component (plan Task 16c4, Step C)
 //
-// The SAME six checks, driven through the SAME `ProviderConformance` harness —
+// The SAME seven checks, driven through the SAME `ProviderConformance` harness —
 // but Anthropic's `/messages` wire format, not OpenAI-chat. That is the point
 // of the Step 1 parameterization: a different format is a different
 // `ConformanceFixture` (different wire bodies, `/messages` path, `x-api-key`
@@ -1348,6 +1604,25 @@ const ANTHROPIC_MESSAGE_BODY: &str = r#"{
   ],
   "stop_reason":"end_turn",
   "usage":{"input_tokens":43,"output_tokens":29}
+}"#;
+
+/// The literal `POST /messages` body Anthropic serves for the tool-round-trip
+/// check (7): a `tool_use` content block plus `stop_reason: "tool_use"`. The
+/// `input` object sticks to a SINGLE key (`city`) — Anthropic's parser
+/// RE-serializes it into the WIT `arguments` string
+/// (`ryuzi_anthropic_format::parse_message_response`), so with more than one
+/// key the serialized key order is not this test's to pin down.
+const ANTHROPIC_TOOL_CALL_BODY: &str = r#"{
+  "id":"msg_conformance_tool",
+  "type":"message",
+  "role":"assistant",
+  "model":"claude-opus-4-5",
+  "content":[
+    {"type":"text","text":"Let me check."},
+    {"type":"tool_use","id":"toolu_ant_1","name":"get_weather","input":{"city":"Jakarta"}}
+  ],
+  "stop_reason":"tool_use",
+  "usage":{"input_tokens":12,"output_tokens":6}
 }"#;
 
 /// The `anthropic` component's built artifact. Like every `plugins/<id>`, a
@@ -1435,6 +1710,14 @@ fn anthropic_conformance() -> ConformanceFixture {
             // ...and the ONLY value the mock may see for `x-api-key` is the
             // host-injected bare key.
             expected_authorization: Some(ANTHROPIC_STORED_API_KEY),
+            // Anthropic's descriptor supports native tool use, and the
+            // component reports `capabilities().tools == true`.
+            tool_round_trip: Some(ToolRoundTripCase {
+                response_body: ANTHROPIC_TOOL_CALL_BODY.to_string(),
+                expected_id: "toolu_ant_1",
+                expected_name: "get_weather",
+                expected_arguments: r#"{"city":"Jakarta"}"#,
+            }),
         },
     }
 }
@@ -1450,7 +1733,7 @@ async fn anthropic_component_passes_the_full_conformance_battery() {
 // ---------------------------------------------------------------------------
 // The `anthropic-oauth` provider component (plan Task 16c5, Step C)
 //
-// The SAME six checks, driven through the SAME `ProviderConformance` harness —
+// The SAME seven checks, driven through the SAME `ProviderConformance` harness —
 // but the OAUTH egress path, not `ryuzi:provider-auth`. That is the point of
 // the Step 1 parameterization AND the Step-C harness extension: an OAuth
 // provider is a `ConformanceFixture` whose `oauth_profile` is `Some` (granting
@@ -1493,6 +1776,23 @@ const ANTHROPIC_OAUTH_MESSAGE_BODY: &str = r#"{
   ],
   "stop_reason":"end_turn",
   "usage":{"input_tokens":51,"output_tokens":37}
+}"#;
+
+/// The literal `POST /messages` body the OAuth endpoint serves for the
+/// tool-round-trip check (7), distinct from [`ANTHROPIC_TOOL_CALL_BODY`]'s
+/// id/city so a cross-wired fixture cannot pass. Single-key `input` object for
+/// the same re-serialization reason as its x-api-key sibling.
+const ANTHROPIC_OAUTH_TOOL_CALL_BODY: &str = r#"{
+  "id":"msg_oauth_conformance_tool",
+  "type":"message",
+  "role":"assistant",
+  "model":"claude-opus-4-8",
+  "content":[
+    {"type":"text","text":"Let me check."},
+    {"type":"tool_use","id":"toolu_ant_oauth_1","name":"get_weather","input":{"city":"Bandung"}}
+  ],
+  "stop_reason":"tool_use",
+  "usage":{"input_tokens":14,"output_tokens":8}
 }"#;
 
 /// The `anthropic-oauth` component's built artifact — a standalone workspace
@@ -1592,6 +1892,15 @@ fn anthropic_oauth_conformance() -> ConformanceFixture {
             // auth-absence guarantee for the OAuth path: the guest never sets or
             // sees the bearer; the mock receives only what the host injected.
             expected_authorization: Some("Bearer oauth-access-token-conformance"),
+            // The OAuth sibling shares the same Anthropic-format guest glue as
+            // the x-api-key `anthropic` component, so it reports
+            // `capabilities().tools == true` too.
+            tool_round_trip: Some(ToolRoundTripCase {
+                response_body: ANTHROPIC_OAUTH_TOOL_CALL_BODY.to_string(),
+                expected_id: "toolu_ant_oauth_1",
+                expected_name: "get_weather",
+                expected_arguments: r#"{"city":"Bandung"}"#,
+            }),
         },
     }
 }
@@ -1724,7 +2033,7 @@ fn anthropic_oauth_bundle_is_declared_like_its_oauth_provider() {
 // ---------------------------------------------------------------------------
 // The `qwen` provider component (plan Task 16c6, Step C)
 //
-// The SAME six checks, driven through the SAME `ProviderConformance` harness —
+// The SAME seven checks, driven through the SAME `ProviderConformance` harness —
 // the OAUTH egress path (like `anthropic-oauth`), but OpenAI-chat wire (like the
 // API-key components), and a SEEDED model list rather than a `/models` fetch
 // (`qwen`'s descriptor sets `has_models_endpoint: false`). Nothing below touches
@@ -1747,6 +2056,12 @@ const QWEN_OAUTH_SEEDED_TOKEN: &str = "qwen-oauth-access-token-conformance";
 /// seed here.
 const QWEN_DECOY_MODELS_BODY: &str =
     r#"{"object":"list","data":[{"id":"decoy-should-not-be-fetched","object":"model"}]}"#;
+
+/// The `POST /chat/completions` body qwen's endpoint serves for the
+/// tool-round-trip check (7): the SAME `ryuzi_openai_format::guest_macro`
+/// glue as every API-key OpenAI-format component, so its wire shape is
+/// identical — an OpenAI-style `tool_calls` response.
+const QWEN_TOOL_CALL_BODY: &str = r#"{"id":"chatcmpl-conformance-tool","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_qwen_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Hangzhou\"}"}}]},"finish_reason":"tool_calls"}]}"#;
 
 /// The `qwen` component's built artifact — a standalone workspace crate whose
 /// cargo output is the crate name with `-` replaced by `_`.
@@ -1853,6 +2168,14 @@ fn qwen_conformance() -> ConformanceFixture {
             // ...and the ONLY value the mock may see for `authorization` is the
             // HOST-injected bearer built from the seeded OAuth token.
             expected_authorization: Some("Bearer qwen-oauth-access-token-conformance"),
+            // qwen is built on the shared `ryuzi_openai_format` guest macro,
+            // which always reports `capabilities().tools == true`.
+            tool_round_trip: Some(ToolRoundTripCase {
+                response_body: QWEN_TOOL_CALL_BODY.to_string(),
+                expected_id: "call_qwen_1",
+                expected_name: "get_weather",
+                expected_arguments: r#"{"city":"Hangzhou"}"#,
+            }),
         },
     }
 }
