@@ -191,6 +191,49 @@ itself never drives PKCE/device-flow and never sees a token.
 else `[self.id]` when a `[provider]` block exists at all (even metadata-only,
 `ids = []`), else empty (not a provider plugin at all).
 
+#### Two provider WIT interfaces: 0.1.0 (flat) and 0.2.0 (tool-carrying)
+
+A component-backed provider (`[component]` + non-empty `provider.ids`) exports
+one of two versions of `ryuzi:provider/provider`, declared implicitly by
+whichever the component's `wit/world.wit` actually `export`s and covered by
+its manifest's `wit-api` range:
+
+- **`ryuzi:provider/provider@0.1.0`** — the original, flat-prompt interface.
+  Its `complete` takes a single string `prompt` and returns chunks with no
+  tool channel at all; a 0.1.0-only component can never carry tools.
+- **`ryuzi:provider/provider@0.2.0`** — the structured, tool-carrying
+  interface. Its own `complete` (same function name — the two are
+  disambiguated by package version, not a different function name) takes a
+  full transcript (`messages`, each with typed content blocks — text,
+  tool-use, tool-result) plus a `tools` list and a `tool-choice`, and can
+  return tool calls the router turns into `tool_use` events.
+
+The host implements **both simultaneously** — see `HOST_WIT_API_VERSIONS` in
+`crates/core/src/plugins/doctor.rs`, which lists `["0.1.0", "0.2.0"]` and
+accepts a component whose `wit-api` range matches either. A component may
+export only 0.1.0, only 0.2.0, or (in principle) both; the host **prefers
+0.2.0** and negotiates per component, at discovery time, by reading which
+export(s) the compiled component actually has
+(`WasmProviderTransport::exports_provider` /
+`exports_provider_v2` in `crates/core/src/plugins/wasm_provider.rs`) — this is
+a per-component decision, not a global host setting, so a mixed fleet (some
+providers still 0.1.0-only, some migrated to 0.2.0) is fully supported.
+
+Discovery then resolves the component's own `capabilities()` export **once**
+and caches it (`WasmProviderTransport::new_resolved`). **`capabilities().tools`
+is the field the router actually keys on** to decide which request shape to
+send (`llm_router::client::wasm_provider_stream`): `true` routes through the
+structured `complete_v2`, `false` falls back to the flat `complete` — not
+which WIT version the component exports. In practice, a real 0.2.0 component
+should answer `capabilities().tools = true` only if it genuinely forwards the
+bound tool list to its upstream and can return tool-use content back; a
+component that exports 0.2.0 but never forwards tools (or whose upstream
+doesn't support tool-calling) must still report `tools: false`, or the router
+will hand it tool definitions it silently drops. `capabilities()` fails
+closed: an error, trap, or timeout while resolving it — and a transport that
+has never been resolved at all — is always treated as `tools: false`, never
+optimistically tool-capable.
+
 ### `[[tools]]`
 
 See the top-level table above; full field shape:
