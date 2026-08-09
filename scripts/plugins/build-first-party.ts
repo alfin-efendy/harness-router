@@ -57,12 +57,36 @@ export function signingKeyId(): string {
 }
 
 /**
- * The concrete WIT contract version each component is built against. Unlike the
- * manifest's `wit-api` RANGE (`>=0.1.0, <0.2.0`), a `PluginRelease.wit-api` is a
- * single semver (`plugins::bundle::PluginRelease::validate`). Bump this when the
- * shipped `ryuzi:*` WIT contracts move to a new concrete version.
+ * Derive the concrete WIT contract version a component was built against from
+ * its OWN manifest `[component] wit-api` RANGE. Unlike the manifest's range
+ * (e.g. `>=0.1.0, <0.2.0`), a `PluginRelease.wit-api` must be a single semver
+ * (`plugins::bundle::PluginRelease::validate`) — the host now supports MORE
+ * THAN ONE contract version simultaneously (0.1.0 and the newer tool-carrying
+ * 0.2.0), so there is no single shared constant to stamp into every release
+ * the way there used to be when the host spoke exactly one ABI.
+ *
+ * Every `wit-api` range that ships in this repo (`plugins/*\/ryuzi-plugin.toml`)
+ * has the shape `>=X.Y.Z, <X.Y'.Z'` — an inclusive lower bound and an
+ * exclusive upper bound, produced by the manifest tooling as `>=<minor
+ * floor>, <next minor>`. The lower bound IS the concrete version the
+ * component was built and tested against (the range only exists to admit
+ * future patch/compatible releases of that same contract), so it is the
+ * correct `wit-api` to publish. Any other shape (no bound, a `^`/`~`
+ * shorthand, an open-ended range, multiple comma-separated clauses beyond the
+ * two this parses, ...) is NOT guessed at — it throws, so a manifest range
+ * this derivation can't interpret fails the release build loudly instead of
+ * silently publishing a wrong version.
  */
-export const WIT_API_VERSION = "0.1.0";
+export function deriveWitApiVersion(range: string): string {
+  const match = /^>=(\d+\.\d+\.\d+),\s*<\d+\.\d+\.\d+$/.exec(range.trim());
+  if (match === null) {
+    throw new Error(
+      `cannot derive a concrete wit-api version from manifest range ${JSON.stringify(range)}: ` +
+        `expected the shape ">=X.Y.Z, <X.Y'.Z'" (an inclusive lower bound + exclusive upper bound)`,
+    );
+  }
+  return match[1];
+}
 
 /**
  * Base URL the seven release artifacts (3 descriptors × 2 stems + 1 wasm —
@@ -212,30 +236,38 @@ interface ManifestFields {
   id: string;
   version: string;
   component: string;
+  /** The `[component] wit-api` RANGE (e.g. `>=0.2.0, <0.3.0`) — see `deriveWitApiVersion`. */
+  witApiRange: string;
 }
 
-/** Read + minimally validate `<dir>/ryuzi-plugin.toml`, returning the id/version/component the release descriptor mirrors. */
+/** Read + minimally validate `<dir>/ryuzi-plugin.toml`, returning the id/version/component/wit-api-range the release descriptor mirrors. */
 export async function readManifest(dir: string): Promise<ManifestFields> {
   const path = `${dir}/ryuzi-plugin.toml`;
   const parsed = Bun.TOML.parse(await Bun.file(path).text()) as Record<string, unknown>;
   const id = parsed.id;
   const version = parsed.version;
-  // v2 manifests nest the wasm filename under `[component].file` (the top-level
-  // `component = "<name>.wasm"` string was a v1-only field — see Task 2/17's
-  // manifest-v2 conversion).
-  const component = (parsed.component as Record<string, unknown> | undefined)?.file;
+  // v2 manifests nest the wasm filename + wit-api range under `[component]`
+  // (the top-level `component = "<name>.wasm"` string was a v1-only field —
+  // see Task 2/17's manifest-v2 conversion).
+  const componentTable = parsed.component as Record<string, unknown> | undefined;
+  const component = componentTable?.file;
+  const witApiRange = componentTable?.["wit-api"];
   const contract = parsed.contract;
   if (typeof id !== "string" || id.length === 0) throw new Error(`${path}: missing 'id'`);
   if (typeof version !== "string" || version.length === 0) throw new Error(`${path}: missing 'version'`);
   if (contract !== 2) throw new Error(`${path}: 'contract' must be 2`);
   if (typeof component !== "string" || component.length === 0) throw new Error(`${path}: missing '[component].file'`);
-  return { id, version, component };
+  if (typeof witApiRange !== "string" || witApiRange.length === 0) {
+    throw new Error(`${path}: missing '[component].wit-api'`);
+  }
+  return { id, version, component, witApiRange };
 }
 
-/** Assemble the `PluginRelease` object — pure, no I/O. `published_at` is only set when given (omitted keeps release.json byte-reproducible for a given wasm). */
+/** Assemble the `PluginRelease` object — pure, no I/O. `published_at` is only set when given (omitted keeps release.json byte-reproducible for a given wasm). `witApi` is the CONCRETE version (see `deriveWitApiVersion`), not the manifest's range. */
 export function buildReleaseObject(args: {
   id: string;
   version: string;
+  witApi: string;
   componentUrl: string;
   sha256: string;
   sizeBytes: number;
@@ -244,7 +276,7 @@ export function buildReleaseObject(args: {
   const release: PluginReleaseJson = {
     id: args.id,
     version: args.version,
-    "wit-api": WIT_API_VERSION,
+    "wit-api": args.witApi,
     component_url: args.componentUrl,
     component_sha256: args.sha256,
     size_bytes: args.sizeBytes,
@@ -304,6 +336,7 @@ async function processComponent(
   const release = buildReleaseObject({
     id: manifest.id,
     version: manifest.version,
+    witApi: deriveWitApiVersion(manifest.witApiRange),
     componentUrl: `${baseUrl}/${manifest.component}`,
     sha256,
     sizeBytes: wasmBytes.byteLength,
