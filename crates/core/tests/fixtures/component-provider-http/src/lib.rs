@@ -29,7 +29,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use exports::ryuzi::provider::provider::{
+use exports::ryuzi::provider0_1_0::provider::{
     CompletionChunk, CompletionRequest, Guest, ModelInfo, ProviderError, TokenUsage,
 };
 use ryuzi::http::http::{self, Header, HttpRequest};

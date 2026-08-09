@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use async_trait::async_trait;
 
-use crate::plugins::capabilities::wit_bindings::exports::ryuzi::provider::provider as wit;
+use crate::plugins::capabilities::wit_bindings::exports::ryuzi::provider0_1_0::provider as wit;
 use crate::plugins::capabilities::PluginCapabilityContext;
 use crate::plugins::runtime::{CompiledComponent, ComponentInstance, PluginRuntimeError};
 use crate::settings::SettingsStore;
@@ -136,6 +136,11 @@ impl WasmProviderTransport {
     /// instantiating it (mirrors the connector/hooks IMP-2 gating).
     pub fn exports_provider(&self) -> bool {
         self.compiled.exports_provider()
+    }
+
+    /// Whether this component exports the structured 0.2.0 provider interface.
+    pub fn exports_provider_v2(&self) -> bool {
+        self.compiled.exports_provider_v2()
     }
 
     async fn instantiate(&self) -> Result<ComponentInstance, PluginRuntimeError> {
@@ -874,6 +879,22 @@ mod tests {
 
     fn provider_artifact() -> std::path::PathBuf {
         provider_fixture_artifact()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_v1_fixture_reports_v1_only() {
+        build_fixtures();
+        let (transport, _tmp) = build_test_transport(
+            provider_artifact(),
+            "wasm-prov-v1probe",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(transport.exports_provider());
+        assert!(
+            !transport.exports_provider_v2(),
+            "the 0.1.0 fixture must not be mistaken for a v2 component"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

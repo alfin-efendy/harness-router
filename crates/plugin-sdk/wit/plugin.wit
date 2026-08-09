@@ -38,5 +38,6 @@ world plugin {
   export ryuzi:gateway/gateway@0.1.0;
   export ryuzi:connector/connector@0.1.0;
   export ryuzi:provider/provider@0.1.0;
+  export ryuzi:provider/provider@0.2.0;
   export ryuzi:hooks/hooks@0.1.0;
 }

@@ -61,6 +61,11 @@ pub(crate) const HOOKS_EXPORT: &str = "ryuzi:hooks/hooks@0.1.0";
 /// The `ryuzi:provider/provider` export interface name — shared by
 /// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_provider`] (Task 10).
 pub(crate) const PROVIDER_EXPORT: &str = "ryuzi:provider/provider@0.1.0";
+/// The `ryuzi:provider/provider@0.2.0` export interface name — the structured,
+/// tool-carrying provider interface. Shared by `ALLOWED_EXPORTS` and
+/// [`CompiledComponent::exports_provider_v2`]. A component may export this,
+/// `PROVIDER_EXPORT`, or both; the transport prefers this one.
+pub(crate) const PROVIDER_V2_EXPORT: &str = "ryuzi:provider/provider@0.2.0";
 /// The `ryuzi:gateway/gateway` export interface name — shared by
 /// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_gateway`] (Task 10).
 pub(crate) const GATEWAY_EXPORT: &str = "ryuzi:gateway/gateway@0.1.0";
@@ -70,6 +75,7 @@ const ALLOWED_EXPORTS: &[&str] = &[
     GATEWAY_EXPORT,
     CONNECTOR_EXPORT,
     PROVIDER_EXPORT,
+    PROVIDER_V2_EXPORT,
     HOOKS_EXPORT,
 ];
 
@@ -583,6 +589,14 @@ impl CompiledComponent {
     /// instantiation (Task 10, mirrors the IMP-2 connector/hooks gating).
     pub(crate) fn exports_provider(&self) -> bool {
         self.exports.iter().any(|name| name == PROVIDER_EXPORT)
+    }
+
+    /// Whether this component exports `ryuzi:provider/provider@0.2.0` — the
+    /// structured interface that can carry tools. Checked before
+    /// `exports_provider`, so a component implementing both takes the
+    /// tool-capable path.
+    pub(crate) fn exports_provider_v2(&self) -> bool {
+        self.exports.iter().any(|name| name == PROVIDER_V2_EXPORT)
     }
 
     /// Whether this component exports `ryuzi:gateway/gateway` — used by the
@@ -1372,6 +1386,16 @@ mod tests {
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{NetworkPermission, PluginLifecycle, PluginPermissions, PluginRelease};
+
+    #[test]
+    fn provider_v2_export_id_is_registered_and_distinct_from_v1() {
+        assert_eq!(PROVIDER_EXPORT, "ryuzi:provider/provider@0.1.0");
+        assert_eq!(PROVIDER_V2_EXPORT, "ryuzi:provider/provider@0.2.0");
+        assert!(
+            ALLOWED_EXPORTS.contains(&PROVIDER_V2_EXPORT),
+            "a component must be structurally allowed to export provider v2"
+        );
+    }
 
     /// A throwaway [`PluginCapabilityContext`] over a fresh on-disk `Store` —
     /// enough for `instantiate` tests that don't exercise the settings/
