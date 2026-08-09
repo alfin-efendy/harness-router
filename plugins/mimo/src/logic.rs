@@ -3,9 +3,36 @@
 //! (no network, no clock, no storage), so the whole module is covered by
 //! native `cargo test`. The wasm `guest` glue supplies the live effects
 //! (HTTP, storage, the current time) and maps these plain types to WIT.
+//!
+//! MiMo's free chat endpoint is OpenAI-compatible (`/openai/chat`), so its
+//! request/response mapping is byte-for-byte what `ryuzi_openai_format`
+//! already implements and tests — [`build_chat_body`] and
+//! [`parse_chat_response`] are thin delegations to [`CONFIG`] rather than a
+//! second implementation of that mapping. What stays genuinely local: the
+//! bootstrap/JWT dance and its expiry handling, the device-id/session-affinity
+//! derivation, the anti-abuse gate headers ([`CHROME_UA`]/[`X_MIMO_SOURCE`]),
+//! and [`classify_chat_error`] (MiMo's transient-block protocol has no
+//! counterpart in the shared crate's generic `classify_error`).
+//!
+//! # The gate marker (`SYSTEM_MARKER`)
+//! The free chat endpoint 403s any request whose FIRST message is not this
+//! exact MiMoCode signature string. `ryuzi_openai_format::ChatRequest` carries
+//! a `leading_system` field specifically for this: the `guest` glue always
+//! passes `Some(SYSTEM_MARKER)`, which the shared builder prepends as
+//! `messages[0]` ahead of the real transcript. See
+//! `tests::the_gate_marker_stays_messages_zero_ahead_of_the_transcript`, which
+//! pins this ordering — a regression here would silently 403 every request in
+//! production.
+
+use ryuzi_openai_format::{OpenAiFormat, DEFAULT_CONTEXT_WINDOW};
+use serde_json::{Map, Value};
+
+pub use ryuzi_openai_format::{
+    BlockIn, ChatRequest, ChunkOut, MessageIn, ProviderFail, RoleIn, StopOut, ToolCallOut,
+    ToolChoiceIn, ToolIn, UsageOut,
+};
 
 use base64::Engine as _;
-use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Bootstrap endpoint that mints the free-tier JWT (keyed by a device
@@ -48,34 +75,24 @@ pub struct ModelOut {
     pub context_window: u32,
 }
 
-/// Token usage a chunk may report (host-free mirror of WIT `token-usage`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UsageOut {
-    pub input: u32,
-    pub output: u32,
-}
-
-/// One completion chunk (host-free mirror of WIT `completion-chunk`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkOut {
-    pub text: String,
-    pub finished: bool,
-    pub usage: Option<UsageOut>,
-}
-
-/// A provider failure (host-free mirror of WIT `provider-error`). The
-/// payload-free variants match the WIT exactly; a transient MiMo block maps to
-/// [`ProviderFail::RateLimited`]/[`ProviderFail::Unavailable`] rather than
-/// [`ProviderFail::ModelNotFound`] so the router never persists a misleading
-/// "bad model" verdict for the always-valid `mimo-auto`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderFail {
-    InvalidRequest(String),
-    ModelNotFound,
-    RateLimited,
-    Unavailable,
-    Failed(String),
-}
+/// This provider's OpenAI-format wire configuration — everything
+/// [`build_chat_body`] and [`parse_chat_response`] delegate to.
+///
+/// `models_path`/`chat_path`/`default_base_url` are unused in practice:
+/// [`CHAT_URL`] is a fixed constant (no base-URL override, no `/models`
+/// fetch — see [`models`]), so nothing here ever calls
+/// `CONFIG.chat_url()`/`CONFIG.models_url()`. `context_windows` is empty and
+/// `default_context_window` mirrors [`models`]'s single static entry — kept
+/// populated purely so `CONFIG` stays a complete, honest `OpenAiFormat` value.
+const CONFIG: OpenAiFormat = OpenAiFormat {
+    provider_label: "MiMo",
+    default_base_url: "https://api.xiaomimimo.com/api/free-ai",
+    models_path: "/openai/models",
+    chat_path: "/openai/chat",
+    max_tokens_field: "max_tokens",
+    context_windows: &[],
+    default_context_window: DEFAULT_CONTEXT_WINDOW,
+};
 
 /// The static model list. MiMo's free host has no `/models` endpoint (see
 /// `llm_router::registry`'s `has_models_endpoint: false`), so `list-models`
@@ -146,34 +163,16 @@ pub fn jwt_is_fresh(exp_ms: i64, now_ms: i64) -> bool {
     now_ms < exp_ms - JWT_EXPIRY_BUFFER_MS
 }
 
-/// Build the OpenAI-format chat request body for a flat prompt, always
-/// prepending the MiMoCode marker as the system message (the gate rejects a
-/// request that lacks it). `stream` is false: the host `ryuzi:http` capability
-/// is a buffered request/response, so the guest asks for the whole completion
-/// and emits it as chunks.
-pub fn build_chat_body(
-    model: &str,
-    prompt: &str,
-    max_tokens: Option<u32>,
-    temperature: Option<f32>,
-) -> Vec<u8> {
-    let messages = Value::Array(vec![
-        message("system", SYSTEM_MARKER),
-        message("user", prompt),
-    ]);
-    let mut obj = Map::new();
-    obj.insert("model".to_string(), Value::String(model.to_string()));
-    obj.insert("messages".to_string(), messages);
-    obj.insert("stream".to_string(), Value::Bool(false));
-    if let Some(max) = max_tokens {
-        obj.insert("max_tokens".to_string(), Value::from(max));
-    }
-    if let Some(temp) = temperature {
-        if let Some(number) = serde_json::Number::from_f64(temp as f64) {
-            obj.insert("temperature".to_string(), Value::Number(number));
-        }
-    }
-    serde_json::to_vec(&Value::Object(obj)).expect("chat body always serializes")
+/// Build the OpenAI-format chat request body for a full transcript. A thin
+/// delegation to [`CONFIG`] — MiMo's `/openai/chat` shape is exactly
+/// `ryuzi_openai_format::OpenAiFormat::build_chat_body`'s, so the mapping is
+/// never reimplemented here. The `guest` glue is responsible for always
+/// passing `leading_system: Some(SYSTEM_MARKER)` — the gate 403s any request
+/// whose first message is not that marker, and this function does not enforce
+/// it; see the module docs and
+/// `tests::the_gate_marker_stays_messages_zero_ahead_of_the_transcript`.
+pub fn build_chat_body(request: ChatRequest<'_>) -> Vec<u8> {
+    CONFIG.build_chat_body(request)
 }
 
 /// The gate headers for a chat request, including the bootstrap bearer. The
@@ -216,7 +215,25 @@ pub fn transient_block_message(model: &str, body: &str) -> Option<String> {
 
 /// Map a non-2xx chat response to a [`ProviderFail`]: a transient block becomes
 /// a soft rate-limit/unavailable (never `model-not-found`); anything else is a
-/// generic failure carrying the status.
+/// generic failure carrying the status. Kept LOCAL rather than delegated to
+/// `ryuzi_openai_format::OpenAiFormat::classify_error`: MiMo's transient-block
+/// protocol (`risk_control`/`illegal_access`) has no counterpart in the shared
+/// classifier, and MiMo must never emit `ModelNotFound` for the always-valid
+/// `mimo-auto` even on a permanent-looking 4xx.
+///
+/// # Task C5 Step 1 probe result (2026-08-09)
+/// Live-probed via the throwaway `plugins/mimo/tests/probe_tools_gate.rs`
+/// (bootstrap succeeded, HTTP 200) — BOTH a toolless baseline request and a
+/// one-tool request against `CHAT_URL` came back identically:
+/// `HTTP 400 {"error":{"code":"400","message":"Unsupported model mimo-auto"}}`.
+/// Because the toolless baseline fails the exact same way, this is not a
+/// tools rejection: the entire `mimo-auto` free channel is gone. Upstream's
+/// own `XiaomiMiMo/MiMo-Code` (`packages/opencode/src/util/free-api-sunset.ts`,
+/// commit as of 2026-08-07) sets `FREE_API_SUNSET_AT =
+/// 2026-07-26T10:00:00.000Z`, already past at probe time. There is therefore
+/// no live evidence that the gate accepts a `tools` array, so
+/// `capabilities()` in `guest.rs` reports `tools: false` rather than assuming
+/// it from the thirteen already-migrated OpenAI-format siblings.
 pub fn classify_chat_error(status: u16, body: &[u8]) -> ProviderFail {
     let text = String::from_utf8_lossy(body);
     if transient_block_message(MODEL_ID, &text).is_some() {
@@ -229,38 +246,12 @@ pub fn classify_chat_error(status: u16, body: &[u8]) -> ProviderFail {
 }
 
 /// Convert a buffered (non-stream) OpenAI chat completion into ordered
-/// completion chunks. The assistant message content becomes a single finished
-/// chunk carrying the response's token usage when present.
+/// completion chunks. A thin delegation to [`CONFIG`] — same reasoning as
+/// [`build_chat_body`]: the response shape is exactly what
+/// `ryuzi_openai_format::OpenAiFormat::parse_chat_response` already parses and
+/// tests.
 pub fn parse_chat_response(body: &[u8]) -> Result<Vec<ChunkOut>, ProviderFail> {
-    let value: Value = serde_json::from_slice(body)
-        .map_err(|e| ProviderFail::Failed(format!("MiMo chat response is not JSON: {e}")))?;
-    let content = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| ProviderFail::Failed("MiMo chat response carried no content".to_string()))?;
-    Ok(vec![ChunkOut {
-        text: content.to_string(),
-        finished: true,
-        usage: parse_usage(&value),
-    }])
-}
-
-fn parse_usage(value: &Value) -> Option<UsageOut> {
-    let usage = value.get("usage")?;
-    let input = usage.get("prompt_tokens").and_then(Value::as_u64)? as u32;
-    let output = usage.get("completion_tokens").and_then(Value::as_u64)? as u32;
-    Some(UsageOut { input, output })
-}
-
-fn message(role: &str, content: &str) -> Value {
-    let mut obj = Map::new();
-    obj.insert("role".to_string(), Value::String(role.to_string()));
-    obj.insert("content".to_string(), Value::String(content.to_string()));
-    Value::Object(obj)
+    CONFIG.parse_chat_response(body)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -359,26 +350,47 @@ mod tests {
         assert!(!jwt_is_fresh(now + JWT_EXPIRY_BUFFER_MS - 10_000, now));
     }
 
+    fn chat_request<'a>(messages: &'a [MessageIn]) -> ChatRequest<'a> {
+        ChatRequest {
+            model: MODEL_ID,
+            messages,
+            tools: &[],
+            tool_choice: ToolChoiceIn::Auto,
+            max_tokens: None,
+            temperature: None,
+            leading_system: Some(SYSTEM_MARKER),
+        }
+    }
+
     #[test]
     fn chat_body_injects_the_marker_system_message_and_the_prompt() {
-        let body: Value =
-            serde_json::from_slice(&build_chat_body("mimo-auto", "ping", Some(64), Some(0.2)))
-                .unwrap();
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("ping".into())],
+        }];
+        let mut request = chat_request(&messages);
+        request.max_tokens = Some(64);
+        request.temperature = Some(0.2);
+        let body: Value = serde_json::from_slice(&build_chat_body(request)).unwrap();
         assert_eq!(body["model"], "mimo-auto");
         assert_eq!(body["stream"], false);
         assert_eq!(body["max_tokens"], 64);
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], SYSTEM_MARKER);
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], "ping");
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], SYSTEM_MARKER);
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "ping");
     }
 
     #[test]
     fn chat_body_omits_optional_fields_when_absent() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
         let body: Value =
-            serde_json::from_slice(&build_chat_body("mimo-auto", "hi", None, None)).unwrap();
+            serde_json::from_slice(&build_chat_body(chat_request(&messages))).unwrap();
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("temperature").is_none());
     }
@@ -468,5 +480,39 @@ mod tests {
             parse_chat_response(b"not json"),
             Err(ProviderFail::Failed(_))
         ));
+    }
+
+    #[test]
+    fn the_gate_marker_stays_messages_zero_ahead_of_the_transcript() {
+        use ryuzi_openai_format::{BlockIn, ChatRequest, MessageIn, RoleIn, ToolChoiceIn};
+
+        let messages = vec![
+            MessageIn {
+                role: RoleIn::System,
+                content: vec![BlockIn::Text("agent sys".into())],
+            },
+            MessageIn {
+                role: RoleIn::User,
+                content: vec![BlockIn::Text("hi".into())],
+            },
+        ];
+        let body: Value = serde_json::from_slice(&build_chat_body(ChatRequest {
+            model: MODEL_ID,
+            messages: &messages,
+            tools: &[],
+            tool_choice: ToolChoiceIn::Auto,
+            max_tokens: None,
+            temperature: None,
+            leading_system: Some(SYSTEM_MARKER),
+        }))
+        .unwrap();
+
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(
+            out[0]["content"], SYSTEM_MARKER,
+            "the gate rejects any request whose first message is not the marker"
+        );
+        assert_eq!(out[1]["content"], "agent sys");
+        assert_eq!(out[2]["role"], "user");
     }
 }
