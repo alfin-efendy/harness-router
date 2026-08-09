@@ -2954,13 +2954,24 @@ async fn wasm_provider_stream(
     let model = target.upstream_model.clone();
     // The whole completion is produced up front. A trap/provider-error surfaces
     // here (before any events are yielded) as a route-scoped failure, so the
-    // dispatch loop can fail over to the next target. The request shape is
-    // chosen by what the component actually declares: a tool-capable
-    // component gets the structured 0.2.0 `complete_v2` request built from the
-    // Anthropic body (tools included); a toolless component falls back to the
-    // flat-text 0.1.0 `complete` request.
-    let chunks = if transport.capabilities().tools {
-        let request = crate::llm_router::wasm_bridge::request_from_anthropic_body(body, &model);
+    // dispatch loop can fail over to the next target. WHICH ABI to call is
+    // decided by `speaks_structured_abi()` (== `exports_provider_v2()`),
+    // never by `capabilities().tools` — those answer different questions.
+    // Three cases:
+    //   - 0.2.0 export + `tools: true`: structured `complete_v2` with the
+    //     request's tools forwarded.
+    //   - 0.2.0 export + `tools: false` (mimo: its live probe found no
+    //     evidence the upstream accepts a tools array): STILL `complete_v2`,
+    //     with an empty tools list and `tool_choice: none` — never the flat
+    //     `complete` below, which a 0.2.0-only component doesn't export at
+    //     all and which would fail outright.
+    //   - no 0.2.0 export (0.1.0-only): flat-text `complete`.
+    let chunks = if transport.speaks_structured_abi() {
+        let mut request = crate::llm_router::wasm_bridge::request_from_anthropic_body(body, &model);
+        if !transport.capabilities().tools {
+            request.tools = Vec::new();
+            request.tool_choice = crate::plugins::wasm_provider::WasmToolChoice::None;
+        }
         transport.complete_v2(request).await
     } else {
         transport
@@ -3777,6 +3788,19 @@ mod tests {
     struct FakeWasmProvider {
         id: String,
         tools: bool,
+        /// Independent of `tools` — a real 0.2.0-only component can honestly
+        /// report `tools: false` while still speaking the structured ABI
+        /// (mimo does). Defaults to `false` (0.1.0-only) so existing callers
+        /// of `FakeWasmProvider::new`/`with_tools` keep testing the same
+        /// `complete` path they always have; only
+        /// `with_structured_abi(true)` opts a test into the 0.2.0 path.
+        structured_abi: bool,
+        /// Records which of `complete`/`complete_v2` the dispatch actually
+        /// called, so a test can assert on the ABI the router chose without
+        /// needing a real component. Shared via `Arc` so a test can hold its
+        /// own handle after the provider is moved into the registry as
+        /// `Arc<dyn WasmProviderRuntime>`.
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     impl FakeWasmProvider {
@@ -3784,12 +3808,23 @@ mod tests {
             Self {
                 id: id.to_string(),
                 tools: false,
+                structured_abi: false,
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
         fn with_tools(mut self, tools: bool) -> Self {
             self.tools = tools;
             self
+        }
+
+        fn with_structured_abi(mut self, structured_abi: bool) -> Self {
+            self.structured_abi = structured_abi;
+            self
+        }
+
+        fn call_log(&self) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+            self.calls.clone()
         }
     }
 
@@ -3813,6 +3848,7 @@ mod tests {
             &self,
             _request: crate::plugins::wasm_provider::WasmCompletionRequest,
         ) -> Result<Vec<crate::plugins::wasm_provider::WasmCompletionChunk>, String> {
+            self.calls.lock().unwrap().push("complete");
             Ok(Vec::new())
         }
 
@@ -3823,10 +3859,15 @@ mod tests {
             }
         }
 
+        fn speaks_structured_abi(&self) -> bool {
+            self.structured_abi
+        }
+
         async fn complete_v2(
             &self,
             _request: crate::plugins::wasm_provider::WasmCompletionRequestV2,
         ) -> Result<Vec<crate::plugins::wasm_provider::WasmCompletionChunk>, String> {
+            self.calls.lock().unwrap().push("complete_v2");
             Ok(Vec::new())
         }
     }
@@ -3972,6 +4013,75 @@ mod tests {
         assert!(
             note.contains("can't use tools"),
             "unexpected wording: {note}"
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
+    }
+
+    /// Critical review fix: which ABI `wasm_provider_stream` calls is decided
+    /// by `speaks_structured_abi()` (== `exports_provider_v2()`), NEVER by
+    /// `capabilities().tools` — a component can speak the structured 0.2.0
+    /// ABI while honestly reporting `tools: false` (mimo does exactly this:
+    /// it exports only 0.2.0 and its live probe found no evidence the
+    /// upstream accepts a tools array). Before this fix, this exact
+    /// combination fell into the `else` branch and called the flat 0.1.0
+    /// `complete` — which a 0.2.0-only component never exports — failing
+    /// every `mimo` turn outright. Uses `FakeWasmProvider`'s two independent
+    /// axes to set `structured_abi: true` and `tools: false` simultaneously,
+    /// something a single `capabilities().tools`-only double could never
+    /// represent, and asserts on its call log that `complete_v2` — not
+    /// `complete` — is what actually got invoked, even though the request
+    /// body carries a tool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_structured_abi_toolless_target_calls_complete_v2_never_complete() {
+        const PROVIDER_ID: &str = "wasm-structured-toolless-fixture";
+        register_wasm_descriptor(PROVIDER_ID);
+        let fake = FakeWasmProvider::new(PROVIDER_ID)
+            .with_tools(false)
+            .with_structured_abi(true);
+        let calls = fake.call_log();
+        crate::plugins::wasm_provider::register_wasm_provider(Arc::new(fake));
+
+        let ctx = test_ctx().await;
+        let mut target = RouteTarget {
+            conn: mk_conn(
+                "wasm-conn",
+                PROVIDER_ID,
+                "api_key",
+                ConnectionData::default(),
+            ),
+            desc: registry::descriptor(PROVIDER_ID).unwrap(),
+            upstream_model: "fixture-model".into(),
+            route_target_key: None,
+        };
+        let transport = crate::plugins::wasm_provider::wasm_provider(PROVIDER_ID)
+            .expect("the fake transport must be registered under its provider id");
+
+        let mut rx = wasm_provider_stream(
+            &ctx,
+            &mut target,
+            &json!({
+                "model": format!("{PROVIDER_ID}/fixture-model"),
+                "messages": [{"role": "user", "content": "list my repos"}],
+                "tools": [{
+                    "name": "bash",
+                    "description": "run a shell command",
+                    "input_schema": {"type": "object"}
+                }]
+            }),
+            transport,
+            0,
+        )
+        .await
+        .expect("a fake transport must not fail");
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["complete_v2"],
+            "a component exporting 0.2.0 but reporting tools:false must be dispatched \
+             through complete_v2 (with an empty tools list), never through complete"
         );
 
         crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);

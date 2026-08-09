@@ -209,8 +209,19 @@ pub trait WasmProviderRuntime: Send + Sync {
     /// reports `tools: false`.
     fn capabilities(&self) -> WasmProviderCapabilities;
 
-    /// Run a structured completion. Only called when `capabilities().tools`;
-    /// a 0.1.0-only component never reaches it. Same failure contract as
+    /// Whether this transport speaks the structured 0.2.0 ABI. Which ABI to
+    /// call is decided by THIS, never by `capabilities().tools` — a
+    /// 0.2.0-only component may honestly report `tools: false` (mimo does,
+    /// because its live probe found no evidence the upstream accepts a tools
+    /// array), and calling the 0.1.0 `complete` on a component that never
+    /// exports `ryuzi:provider/provider@0.1.0` fails outright instead of
+    /// returning a toolless completion. The router must call `complete_v2`
+    /// with an empty tools list in that case, never fall back to `complete`.
+    fn speaks_structured_abi(&self) -> bool;
+
+    /// Run a structured completion. Called whenever [`Self::speaks_structured_abi`]
+    /// is true, with an empty `tools` list and `tool_choice: None` when
+    /// [`Self::capabilities`] reports `tools: false`. Same failure contract as
     /// [`WasmProviderRuntime::complete`].
     async fn complete_v2(
         &self,
@@ -413,6 +424,10 @@ impl WasmProviderRuntime for WasmProviderTransport {
         // guards the deliberately-unresolved transport a test builds via the
         // private synchronous `new`.
         self.capabilities.get().copied().unwrap_or_default()
+    }
+
+    fn speaks_structured_abi(&self) -> bool {
+        self.exports_provider_v2()
     }
 
     async fn complete_v2(
@@ -839,6 +854,19 @@ pub(crate) fn provider_v2_fixture_artifact() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/component-provider-v2/target/wasm32-wasip2/release")
         .join("ryuzi_component_provider_v2_fixture.wasm")
+}
+
+/// The prebuilt 0.2.0-only, `tools: false` provider fixture artifact (caller
+/// must build fixtures first). This is the real-compiled-component analog of
+/// mimo's shape — exports ONLY `ryuzi:provider/provider@0.2.0` and honestly
+/// reports no proven tool support — the exact combination the Critical
+/// review finding is about (see the fixture's own doc comment). Module-level
+/// for the same reason the other fixture accessors are.
+#[cfg(test)]
+pub(crate) fn provider_v2_toolless_fixture_artifact() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/component-provider-v2-toolless/target/wasm32-wasip2/release")
+        .join("ryuzi_component_provider_v2_toolless_fixture.wasm")
 }
 
 /// The prebuilt gateway fixture artifact (caller must build fixtures first via
@@ -1912,6 +1940,107 @@ mod tests {
              underlying component is the tool-capable v2 fixture — capabilities() must never \
              read as tool-capable before resolve_capabilities() has actually run, or the \
              router could route tool calls into a component that never declared support"
+        );
+    }
+
+    /// Critical review fix: a REAL compiled component shaped exactly like
+    /// mimo — exports ONLY `ryuzi:provider/provider@0.2.0`, no 0.1.0 export
+    /// at all, and honestly reports `tools: false` — must still answer a
+    /// `complete_v2` call successfully, with no tool calls (never a fabricated
+    /// one). Before the router fix, this exact combination was invisible to
+    /// every test in the branch and fell into the buggy `else` branch of
+    /// `wasm_provider_stream`, which calls `complete` — an interface this
+    /// component doesn't export at all, so the guard at the top of `complete`
+    /// below would reject it outright. This test proves the CORRECT path
+    /// (`complete_v2`, which this component does export) actually works.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_v2_only_toolless_component_completes_successfully_via_complete_v2() {
+        build_fixtures();
+        let (transport, _tmp) = build_test_transport(
+            provider_v2_toolless_fixture_artifact(),
+            "wasm-prov-v2-toolless",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            transport.exports_provider_v2(),
+            "the toolless v2 fixture must still export the structured 0.2.0 interface"
+        );
+        assert!(
+            !transport.exports_provider(),
+            "the toolless v2 fixture must not export the 0.1.0 interface — mirroring mimo, \
+             which has no 0.1.0 fallback at all"
+        );
+        assert!(
+            !transport.capabilities().tools,
+            "the fixture must honestly report tools: false, mirroring mimo's live-probed \
+             capability declaration"
+        );
+        assert!(
+            transport.speaks_structured_abi(),
+            "speaks_structured_abi must read the export, not capabilities().tools — this is \
+             the exact predicate that decides which ABI the router calls"
+        );
+
+        // Driven with a tools-bearing request, exactly like a real turn the
+        // router would (after the fix) still send through complete_v2 with an
+        // empty tools list — proving the completion succeeds and carries no
+        // tool calls, never that it silently fails or fabricates a call.
+        let chunks = transport
+            .complete_v2(WasmCompletionRequestV2 {
+                model: "fixture-model".to_string(),
+                messages: vec![WasmMessage {
+                    role: WasmRole::User,
+                    content: vec![WasmContentBlock::Text("hello".to_string())],
+                }],
+                tools: Vec::new(),
+                tool_choice: WasmToolChoice::None,
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .expect("complete_v2 must succeed against a real 0.2.0-only, tools:false component");
+
+        assert!(
+            chunks.iter().all(|chunk| chunk.tool_calls.is_empty()),
+            "a toolless component must never surface a tool call: {chunks:?}"
+        );
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.finished);
+        assert_eq!(last.stop_reason, Some(WasmStopReason::EndTurn));
+    }
+
+    /// The mirror image of the test above: calling the 0.1.0 `complete`
+    /// against this same component — the path the router's pre-fix
+    /// `capabilities().tools`-keyed dispatch would have taken — fails,
+    /// because a 0.2.0-only component genuinely does not export that
+    /// interface. This is the failure `wasm_provider_stream`'s Critical bug
+    /// produced for every `mimo` turn; pinning it here documents exactly
+    /// what going through the wrong branch costs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_v2_only_toolless_component_rejects_the_flat_0_1_0_complete() {
+        build_fixtures();
+        let (transport, _tmp) = build_test_transport(
+            provider_v2_toolless_fixture_artifact(),
+            "wasm-prov-v2-toolless-reject",
+            Duration::from_secs(10),
+        )
+        .await;
+        let error = transport
+            .complete(WasmCompletionRequest {
+                model: "fixture-model".to_string(),
+                prompt: "hello".to_string(),
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .expect_err(
+                "a 0.2.0-only component must reject the 0.1.0 complete — this is exactly the \
+                 outright failure the Critical routing bug caused for every mimo turn",
+            );
+        assert!(
+            error.contains("does not export ryuzi:provider/provider"),
+            "unexpected error: {error}"
         );
     }
 

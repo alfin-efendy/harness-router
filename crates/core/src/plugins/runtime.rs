@@ -592,9 +592,17 @@ impl CompiledComponent {
     }
 
     /// Whether this component exports `ryuzi:provider/provider@0.2.0` — the
-    /// structured interface that can carry tools. Checked before
-    /// `exports_provider`, so a component implementing both takes the
-    /// tool-capable path.
+    /// structured interface that can carry tools. This alone decides which
+    /// ABI the router calls (`WasmProviderRuntime::speaks_structured_abi`): a
+    /// component exporting this takes the `complete_v2` path UNCONDITIONALLY,
+    /// even when its own `capabilities().tools` answer is `false` (mimo
+    /// exports only 0.2.0 and honestly reports `tools: false` — it still
+    /// goes through `complete_v2`, with an empty tools list, never through
+    /// `complete`, which a 0.2.0-only component doesn't export at all). Only
+    /// a component with NO 0.2.0 export falls back to `exports_provider`'s
+    /// 0.1.0 `complete`. `capabilities().tools` answers a different
+    /// question — whether tools may be forwarded — and must never be used to
+    /// pick the ABI.
     pub(crate) fn exports_provider_v2(&self) -> bool {
         self.exports.iter().any(|name| name == PROVIDER_V2_EXPORT)
     }

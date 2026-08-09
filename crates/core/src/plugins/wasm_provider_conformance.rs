@@ -491,20 +491,28 @@ impl ProviderConformance {
     /// Drive one completion against `transport`, choosing the 0.1.0 flat
     /// `complete` or the structured 0.2.0 `complete_v2` the SAME way the real
     /// router does (`llm_router::client::wasm_provider_stream`): on
-    /// `transport.capabilities().tools`, never on which fixture is under
-    /// test. Every real provider component ported so far has migrated to a
-    /// 0.2.0-only export (`ryuzi:provider/provider@0.2.0`, `tools: true`), so
-    /// calling the 0.1.0 `complete` against one fails closed with "component
-    /// does not export ryuzi:provider/provider" — this is what lets the SAME
-    /// checks below keep exercising a 0.1.0-only fixture (the synthetic
-    /// `component-provider-http` one) and every migrated real component
-    /// without knowing which is which.
+    /// `transport.speaks_structured_abi()` (== `exports_provider_v2()`),
+    /// never on `capabilities().tools` and never on which fixture is under
+    /// test. Those two questions diverge for a real 0.2.0-only component that
+    /// honestly reports `tools: false` (mimo does) — calling the 0.1.0
+    /// `complete` against one fails closed with "component does not export
+    /// ryuzi:provider/provider", because a 0.2.0-only component never exports
+    /// that interface at all. Every real provider component ported so far has
+    /// migrated to a 0.2.0-only export (`ryuzi:provider/provider@0.2.0`), so
+    /// this is what lets the SAME checks below keep exercising a 0.1.0-only
+    /// fixture (the synthetic `component-provider-http` one) and every
+    /// migrated real component without knowing which is which.
     async fn drive_completion(
         &self,
         transport: &WasmProviderTransport,
     ) -> Result<Vec<WasmCompletionChunk>, String> {
-        if transport.capabilities().tools {
-            transport.complete_v2(self.completion_request_v2()).await
+        if transport.speaks_structured_abi() {
+            let mut request = self.completion_request_v2();
+            if !transport.capabilities().tools {
+                request.tools = Vec::new();
+                request.tool_choice = WasmToolChoice::None;
+            }
+            transport.complete_v2(request).await
         } else {
             transport.complete(self.completion_request()).await
         }
@@ -719,9 +727,10 @@ impl ProviderConformance {
     /// honestly report no proven tool support (e.g. `mimo`'s free-tier gate,
     /// not one of the fixtures below but the same shape of component this
     /// skip exists for). The skip is never assumed from which fixture is
-    /// under test: it reads the SAME `capabilities().tools` the production
-    /// router dispatches on (see [`Self::drive_completion`]), and is
-    /// cross-checked both ways below against
+    /// under test: it reads the component's own `capabilities().tools`
+    /// answer — whether tools may be forwarded, distinct from
+    /// [`Self::drive_completion`]'s `speaks_structured_abi()`, which answers
+    /// which ABI to call — and is cross-checked both ways below against
     /// [`ProviderExpectations::tool_round_trip`] — a fixture whose declared
     /// case disagrees with the component's actual capability is a hard
     /// failure, not a silently-skipped one, precisely so a regression on a
