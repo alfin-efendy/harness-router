@@ -3917,7 +3917,7 @@ mod tests {
         let selection = selection_for_accepted_target(
             &target,
             "fixture-model",
-            &model_effort::TurnEffortPolicy::default(),
+            &empty_policy("fixture-model"),
             RouteSelectionReason::Initial,
             requirements,
             12,
@@ -3958,7 +3958,7 @@ mod tests {
         let selection = selection_for_accepted_target(
             &target,
             "fixture-model",
-            &model_effort::TurnEffortPolicy::default(),
+            &empty_policy("fixture-model"),
             RouteSelectionReason::Initial,
             capabilities::ToolTransportRequirements {
                 function_tools: true,

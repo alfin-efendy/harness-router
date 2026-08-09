@@ -99,7 +99,7 @@ pub struct RouteTargetEffortKey {
     pub target_index: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TurnEffortPolicy {
     pub requested_model: String,
     pub caller_override: Option<String>,
