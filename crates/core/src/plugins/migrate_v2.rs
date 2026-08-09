@@ -140,12 +140,20 @@ pub async fn run(
 }
 
 /// A v2 install has a readable `current` pointer whose named version
-/// directory holds a `ryuzi-plugin.toml` that
-/// [`ryuzi_plugin_sdk::PluginManifest::from_toml`] accepts. That parse
-/// already enforces the exact `contract = 2` match (no compat loader for
-/// contract 1), so this function does not re-implement contract detection —
-/// a v1 manifest (missing `contract`, or declaring `contract = 1`) simply
-/// fails to parse and this returns `false`.
+/// directory holds a `ryuzi-plugin.toml` that parses as a NATIVE contract-2
+/// manifest.
+///
+/// "Native" is load-bearing.
+/// [`ryuzi_plugin_sdk::PluginManifest::from_toml`] also accepts a contract-1
+/// bundle manifest through the compatibility shim (so a pre-v2 release feed
+/// stays installable), which means parse-success alone no longer distinguishes
+/// a v1 leftover from a v2 install. This classifier therefore reads the
+/// `upgraded` flag from
+/// [`ryuzi_plugin_sdk::PluginManifest::from_toml_detecting_legacy`] and treats
+/// an upgraded manifest as NOT v2: the migration is about the provenance of
+/// the on-disk tree — installed by the v1 installer, whose layout and ledger
+/// semantics v2 changed — not merely about whether the manifest text can be
+/// read today.
 /// What a directory under the plugins root looks like to the migration.
 #[derive(Debug)]
 enum InstallVerdict {
@@ -175,10 +183,11 @@ fn classify_install(plugin_dir: &Path) -> InstallVerdict {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return InstallVerdict::NotV2,
         Err(error) => return InstallVerdict::Indeterminate(error),
     };
-    if ryuzi_plugin_sdk::PluginManifest::from_toml(&text).is_ok() {
-        InstallVerdict::V2
-    } else {
-        InstallVerdict::NotV2
+    match ryuzi_plugin_sdk::PluginManifest::from_toml_detecting_legacy(&text) {
+        // Parsed only via the contract-1 shim — a v1 leftover, not a v2 install.
+        Ok((_, upgraded_from_contract_1)) if upgraded_from_contract_1 => InstallVerdict::NotV2,
+        Ok(_) => InstallVerdict::V2,
+        Err(_) => InstallVerdict::NotV2,
     }
 }
 
@@ -188,11 +197,13 @@ mod tests {
     use crate::store::ComponentPluginReleaseRecord;
     use std::sync::Arc;
 
-    /// A v1-shaped manifest: no `contract` field at all (the field is
-    /// required, so this fails to deserialize outright), a bare `component`
-    /// string instead of the v2 `[component]` table. It exists only to fail
-    /// `PluginManifest::from_toml` — its exact shape does not need to match
-    /// any real historical v1 schema.
+    /// A genuine contract-1 bundle manifest: no `contract` key at all, and a
+    /// bare `component` string instead of the v2 `[component]` table.
+    ///
+    /// This shape MATTERS. It is exactly what the contract-1 compatibility
+    /// shim accepts, so an install written with it is the case that would
+    /// silently survive the migration if `classify_install` went back to
+    /// treating parse-success as proof of v2-ness.
     fn v1_manifest_toml(id: &str, name: &str, version: &str) -> String {
         format!(
             "id = \"{id}\"\nname = \"{name}\"\nversion = \"{version}\"\n\

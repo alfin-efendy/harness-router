@@ -691,9 +691,73 @@ Verification (`crates/core/src/plugins/artifact_verify.rs::verify_artifacts_dir`
 consumed by the `verify-plugin-artifacts` CI binary) restages each
 `<stem>.release.json` set into the client-install layout and runs the exact
 same `plugins::bundle::verify_bundle` a real install uses — parsing the
-manifest via `PluginManifest::from_toml`, which rejects a `contract = 1`
-artifact outright (`ContractUnsupported`) before any hash/signature check
-even runs.
+manifest via `PluginManifest::from_toml`, which rejects an artifact declaring
+an unsupported `contract` outright (`ContractUnsupported`) before any
+hash/signature check even runs. A pre-v2 artifact that declares no `contract`
+key at all goes through the contract-1 compatibility shim instead (see below).
+
+### Contract-1 compatibility shim
+
+`PluginManifest::from_toml` accepts one legacy shape: the contract-1 WASM
+*bundle* manifest, which predates the `contract` key and kept the component's
+coordinates flat (`component = "x.wasm"`, `wit-api`, `lifecycle`) with router
+provider ids in a top-level `provider-ids`. It exists for exactly one reason —
+a release feed published before the v2 migration must stay installable, or
+every component install against it dies at `invalid type: string, expected
+struct ComponentSpec`.
+
+Rules, all enforced in `crates/plugin-sdk/src/manifest.rs`:
+
+- **Contract 2 is tried first**, and its error is what surfaces when the input
+  is neither shape — a v2 manifest with a real mistake reports that mistake.
+- **Only a document with NO `contract` key is a candidate.** An explicit
+  `contract = N` (N ≠ 2) is a deliberate claim and always fails with
+  `ContractUnsupported`, outranking whatever field-level type error the
+  document's shape would otherwise trip first.
+- **The shim reshapes, it never relaxes.** The upgraded manifest goes through
+  the same `validate()` as a natively-authored v2 one.
+- **`gateway` upgrades to `true`.** v1 had no gateway declaration — the host
+  compiled the component and read its exports. v2's flag is only a discovery
+  pre-filter (`exports_gateway()` is still the authority) and grants no
+  permission (`allow_gateway` derives from the verified first-party signing
+  key), so `true` restores v1 semantics exactly. `false` would silently strand
+  a v1 gateway (Discord) that had no way to declare itself one.
+- **`provider-ids` maps to `[provider] ids` only when non-empty**, so a v1
+  connector doesn't become a provider serving its own id.
+
+`PluginManifest::from_toml_detecting_legacy` returns whether the shim fired;
+`install_component_release` uses it to log a warning naming the feed URL.
+
+### Local dev feed
+
+Installs verify against the compiled-in first-party key, so a locally built
+bundle is untrusted by default. A **debug** build additionally trusts a key
+named by `RYUZI_DEV_PLUGIN_PUBKEY` (base64, 32 raw bytes) under the separate
+key id `dev` (`first_party_key::DEV_KEY_ID`). Release builds ignore the env var
+entirely.
+
+```sh
+bun scripts/plugins/build-first-party.ts keygen     # prints all three exports
+export FIRST_PARTY_PRIVATE_KEY='<seed>'             # signs
+export FIRST_PARTY_KEY_ID=dev                       # writes key_id "dev"
+export RYUZI_DEV_PLUGIN_PUBKEY='<pubkey base64>'    # the daemon trusts it
+export FIRST_PARTY_RELEASE_BASE_URL='http://127.0.0.1:8787'
+export FIRST_PARTY_OUT_DIR=dist/plugins
+bun scripts/plugins/build-first-party.ts            # build + sign every component
+# serve dist/plugins at that base, then set the daemon's
+# `component_release_base_url` setting to the same URL.
+```
+
+`component_url` must be same-origin with `component_release_base_url`
+(`require_same_origin`), so the two must name the same scheme+host+port.
+
+Two deliberate limits: the dev key is **additive under a distinct id**, so it
+can neither shadow nor impersonate the first-party signer; and because the
+first-party-only grants (`allow_self_auth`, `allow_gateway` — see
+`runtime::HostPolicy::for_installed_bundle`) key off the verified id being
+exactly `first-party`, a dev-signed bundle installs and runs but does not
+receive them. Gateway and self-auth components still need a real first-party
+release to exercise those paths.
 
 ### Pin + latest hybrid
 
@@ -742,8 +806,12 @@ longer exist:
 
 - **Both v1 schemas, unified.** Contract 1's declarative manifest
   (`ryuzi-plugin.toml`) and the separate WASM component bundle manifest
-  (`ryuzi-plugin-bundle.toml`) are now ONE schema — manifest contract 2.
-  There is no compat loader; a contract-1 manifest fails to parse.
+  (`ryuzi-plugin-bundle.toml`) are now ONE schema — manifest contract 2. v2 is
+  the only authoring contract; nothing writes v1. The one exception is a
+  read-only compat shim for the contract-1 *bundle* manifest, so release feeds
+  published before the migration stay installable — see
+  [Contract-1 compatibility shim](#contract-1-compatibility-shim). A contract-1
+  *declarative* manifest still fails to parse.
 - **Track D subprocess extensions** (`[[extension]]`, `ExtensionFactory`,
   the `ext__<extension>__<tool>` tool namespace, the supervised-subprocess
   "code plugin" mechanism) — deleted. A plugin that needs in-process tool

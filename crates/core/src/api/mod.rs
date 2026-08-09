@@ -117,7 +117,16 @@ impl From<anyhow::Error> for ApiError {
         }
         ApiError {
             status: 500,
-            message: e.to_string(),
+            // `{:#}`, not `{}`: anyhow's plain Display prints ONLY the
+            // outermost context, so a chain like
+            //   parsing fetched ryuzi-plugin.toml
+            //     <- invalid plugin manifest toml: invalid type: string ...
+            // reached the UI as the first line alone — a message that names
+            // the step and hides the reason. The alternate form joins the
+            // whole chain with ": ", so the actual cause survives the trip to
+            // a toast. Errors reaching here are already user-facing strings
+            // built by `context(..)`/`bail!(..)`; none carry secrets.
+            message: format!("{e:#}"),
         }
     }
 }

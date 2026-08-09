@@ -45,6 +45,18 @@ import {
 export const FIRST_PARTY_KEY_ID = "first-party";
 
 /**
+ * The `key_id` written into each `plugin.sig`. Defaults to the first-party id
+ * CI signs with; a LOCAL dev feed overrides it to `dev`
+ * (`first_party_key::DEV_KEY_ID`) so a debug build trusts the bundle through
+ * `RYUZI_DEV_PLUGIN_PUBKEY` without the dev key posing as the first-party
+ * signer. Read at call time, not module load, so tests and callers can set it.
+ */
+export function signingKeyId(): string {
+  const id = process.env.FIRST_PARTY_KEY_ID?.trim();
+  return id !== undefined && id.length > 0 ? id : FIRST_PARTY_KEY_ID;
+}
+
+/**
  * The concrete WIT contract version each component is built against. Unlike the
  * manifest's `wit-api` RANGE (`>=0.1.0, <0.2.0`), a `PluginRelease.wit-api` is a
  * single semver (`plugins::bundle::PluginRelease::validate`). Bump this when the
@@ -262,7 +274,7 @@ export function base64UrlNoPad(bytes: Uint8Array): string {
 export async function buildSignatureEnvelope(releaseBytes: Uint8Array, privateKeySeedBase64: string): Promise<string> {
   const signingKey = await importSigningKeyFromSeedBase64(privateKeySeedBase64);
   const signature = await signBytes(releaseBytes, signingKey);
-  return `${JSON.stringify({ key_id: FIRST_PARTY_KEY_ID, signature: base64UrlNoPad(signature) }, null, 2)}\n`;
+  return `${JSON.stringify({ key_id: signingKeyId(), signature: base64UrlNoPad(signature) }, null, 2)}\n`;
 }
 
 /** Build + sign one component, writing its seven artifacts (3 descriptors × 2 stems + 1 wasm) into `outDir`. Returns the release descriptor for logging. */
@@ -333,7 +345,15 @@ async function keygen(): Promise<void> {
   console.log("2) Store as the CI secret / local env var FIRST_PARTY_PRIVATE_KEY");
   console.log("   (a gitignored path or the shell env — NEVER commit it):\n");
   console.log(`    ${privateKeySeedBase64}\n`);
-  console.log("Run this exactly once per key (or rotation); a second run is an unrelated keypair.");
+  console.log("Run this exactly once per key (or rotation); a second run is an unrelated keypair.\n");
+  console.log("--- Local dev feed (DEBUG builds only) ---");
+  console.log("To install locally-signed bundles without touching the live first-party key,");
+  console.log("sign under the `dev` key id and let the debug build trust this pubkey:\n");
+  console.log(`    export FIRST_PARTY_PRIVATE_KEY='${privateKeySeedBase64}'`);
+  console.log("    export FIRST_PARTY_KEY_ID=dev");
+  console.log(`    export RYUZI_DEV_PLUGIN_PUBKEY='${Buffer.from(publicKeyRaw).toString("base64")}'\n`);
+  console.log("A dev-signed bundle installs and runs, but does NOT receive the first-party-only");
+  console.log("grants (allow_self_auth / allow_gateway) — those key off the first-party id.");
 }
 
 async function main(argv: string[]): Promise<void> {

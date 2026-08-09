@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { artifactNames, COMPONENTS, readManifest } from "./build-first-party.ts";
+import { artifactNames, buildSignatureEnvelope, COMPONENTS, FIRST_PARTY_KEY_ID, readManifest, signingKeyId } from "./build-first-party.ts";
 
 // Repo root relative to this file (scripts/plugins/), so the test is
 // cwd-independent — it resolves plugins/ the same way regardless of where
@@ -98,4 +98,33 @@ test("artifactNames publishes descriptors under both stems and the wasm once", (
     "github-0.1.1.release.json",
     "github-0.1.1.release.json.sig",
   ]);
+});
+
+// The default MUST stay `first-party` — CI signs real releases with this id and
+// `first_party_key::FIRST_PARTY_KEY_ID` is what the installer looks up. A local
+// dev feed opts out via FIRST_PARTY_KEY_ID=dev so the dev key can never pose as
+// the first-party signer.
+test("signingKeyId defaults to first-party and honors the dev override", async () => {
+  const previous = process.env.FIRST_PARTY_KEY_ID;
+  try {
+    delete process.env.FIRST_PARTY_KEY_ID;
+    expect(signingKeyId()).toBe(FIRST_PARTY_KEY_ID);
+    expect(signingKeyId()).toBe("first-party");
+
+    // Blank / whitespace is not an override — it falls back, so an exported-
+    // but-empty shell var can't silently produce an unverifiable `""` key id.
+    process.env.FIRST_PARTY_KEY_ID = "   ";
+    expect(signingKeyId()).toBe("first-party");
+
+    process.env.FIRST_PARTY_KEY_ID = "dev";
+    expect(signingKeyId()).toBe("dev");
+
+    // The id must actually reach the envelope the installer reads.
+    const seed = Buffer.alloc(32, 3).toString("base64");
+    const envelope = JSON.parse(await buildSignatureEnvelope(new TextEncoder().encode("{}\n"), seed));
+    expect(envelope.key_id).toBe("dev");
+  } finally {
+    if (previous === undefined) delete process.env.FIRST_PARTY_KEY_ID;
+    else process.env.FIRST_PARTY_KEY_ID = previous;
+  }
 });

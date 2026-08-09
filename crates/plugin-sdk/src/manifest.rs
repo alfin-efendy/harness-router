@@ -445,12 +445,172 @@ fn is_valid_network_host(host: &str) -> bool {
     })
 }
 
+/// The contract-1 WASM *bundle* manifest, retained ONLY as a read-only compat
+/// shim so a release feed published before the v2 migration stays installable
+/// (see [`PluginManifest::from_toml_detecting_legacy`]). Nothing writes this
+/// shape — v2 is the only authoring contract.
+///
+/// The v1 bundle manifest kept the component's coordinates flat
+/// (`component = "x.wasm"`, `wit-api`, `lifecycle`) and named router provider
+/// ids in a top-level `provider-ids`; v2 nests the former under `[component]`
+/// and the latter under `[provider] ids`. Every other field (`permissions`,
+/// `oauth`, `tools`, `settings`) is byte-identical between the two contracts,
+/// so it is reused verbatim rather than mirrored here.
+#[derive(Debug, Clone, Deserialize)]
+struct ContractOneBundleManifest {
+    id: String,
+    name: String,
+    version: String,
+    #[serde(rename = "wit-api")]
+    wit_api: String,
+    lifecycle: PluginLifecycle,
+    /// v1's flat component filename — v2's `[component] file`.
+    component: String,
+    #[serde(default)]
+    publisher: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    permissions: PluginPermissions,
+    #[serde(default)]
+    oauth: Vec<OAuthProfile>,
+    #[serde(default, rename = "provider-ids")]
+    provider_ids: Vec<String>,
+    #[serde(default)]
+    tools: Vec<DeclaredTool>,
+    #[serde(default)]
+    settings: Vec<SettingField>,
+}
+
+impl ContractOneBundleManifest {
+    /// Project a contract-1 bundle onto the v2 schema. The result is an
+    /// ordinary [`PluginManifest`] and is validated by the caller exactly like
+    /// a natively-authored v2 one — the shim only reshapes fields, it never
+    /// relaxes a rule.
+    fn upgrade(self) -> PluginManifest {
+        PluginManifest {
+            contract: CONTRACT_VERSION,
+            id: self.id,
+            name: self.name,
+            version: self.version,
+            publisher: self.publisher,
+            description: self.description,
+            homepage: None,
+            icon: None,
+            categories: Vec::new(),
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: self.settings,
+            component: Some(ComponentSpec {
+                file: self.component,
+                wit_api: self.wit_api,
+                lifecycle: self.lifecycle,
+            }),
+            permissions: self.permissions,
+            oauth: self.oauth,
+            // v1 had no `[provider]` block at all: a bundle was a provider iff
+            // it named router ids. A bundle that named none is not a provider,
+            // so it must NOT get an (empty, id-defaulting) ProviderSpec here —
+            // `resolved_provider_ids` treats `Some(_)` with no ids as "serves
+            // my own id", which would register a transport v1 never registered.
+            provider: (!self.provider_ids.is_empty()).then(|| ProviderSpec {
+                ids: self.provider_ids,
+                ..ProviderSpec::default()
+            }),
+            tools: self.tools,
+            mcp: Vec::new(),
+            hooks: Vec::new(),
+            jobs: Vec::new(),
+            // v1 had no gateway DECLARATION: the host discovered a gateway by
+            // compiling the component and checking whether it exported
+            // `ryuzi:gateway/gateway`. v2 added `gateway = true` purely as a
+            // cheap pre-filter so non-gateway bundles need not be compiled —
+            // the exports check remains the authority, and PERMISSION to serve
+            // a gateway is derived from the verified first-party signing key,
+            // never from this flag (see `HostPolicy::for_installed_bundle`).
+            // Declaring `true` for every upgraded v1 bundle therefore restores
+            // exactly v1's semantics at the cost of compiling legacy bundles
+            // during discovery; declaring `false` would silently strand a v1
+            // gateway (Discord) that has no way to say so.
+            gateway: true,
+        }
+    }
+}
+
+/// What a document's own `contract` key claims, read before any typed parse.
+enum DeclaredContract {
+    /// No `contract` key — a contract-1 candidate (v1 predates the key).
+    Absent,
+    /// `contract = N` for some `N != 2`.
+    Unsupported(u32),
+    /// `contract = 2`, or a `contract` key too malformed to read as one.
+    CurrentOrUnreadable,
+}
+
+/// Read a document's `contract` claim without deserializing the whole manifest.
+///
+/// A declared contract is authoritative over the document's SHAPE: a manifest
+/// that says `contract = 1` must be reported as an unsupported contract, not
+/// as whatever field-level type error its v1 layout happens to trip first.
+fn declared_contract(input: &str) -> DeclaredContract {
+    let Ok(document) = toml::from_str::<toml::Value>(input) else {
+        return DeclaredContract::CurrentOrUnreadable;
+    };
+    match document.get("contract") {
+        None => DeclaredContract::Absent,
+        Some(value) => match value.as_integer() {
+            Some(found) if found != i64::from(CONTRACT_VERSION) => {
+                DeclaredContract::Unsupported(u32::try_from(found).unwrap_or(u32::MAX))
+            }
+            _ => DeclaredContract::CurrentOrUnreadable,
+        },
+    }
+}
+
 impl PluginManifest {
     /// Parse TOML into a manifest and validate it in one step.
     pub fn from_toml(input: &str) -> Result<PluginManifest, ManifestError> {
-        let manifest: PluginManifest = toml::from_str(input)?;
+        Self::from_toml_detecting_legacy(input).map(|(manifest, _)| manifest)
+    }
+
+    /// [`Self::from_toml`], additionally reporting whether the input was a
+    /// contract-1 bundle manifest upgraded by the compat shim (`true`) rather
+    /// than a natively-authored contract-2 one (`false`).
+    ///
+    /// Callers that install from a remote feed use the flag to log that they
+    /// accepted a pre-v2 artifact; callers that don't care use
+    /// [`Self::from_toml`]. A contract-2 parse is always attempted first, and
+    /// its error is what surfaces when the input is neither — so a v2 manifest
+    /// with a genuine mistake still reports that mistake, not a confusing
+    /// "this isn't a v1 bundle either".
+    pub fn from_toml_detecting_legacy(
+        input: &str,
+    ) -> Result<(PluginManifest, bool), ManifestError> {
+        let (manifest, upgraded) = match toml::from_str::<PluginManifest>(input) {
+            Ok(manifest) => (manifest, false),
+            Err(contract_2_error) => match declared_contract(input) {
+                // A deliberate contract claim outranks the document's shape:
+                // report the contract, not the first field that fails to fit.
+                DeclaredContract::Unsupported(found) => {
+                    return Err(ManifestError::ContractUnsupported { found })
+                }
+                // No `contract` key at all — the one case the compat shim
+                // covers. If it isn't a v1 bundle either, the v2 error stands.
+                DeclaredContract::Absent => {
+                    match toml::from_str::<ContractOneBundleManifest>(input) {
+                        Ok(legacy) => (legacy.upgrade(), true),
+                        Err(_) => return Err(ManifestError::Toml(contract_2_error)),
+                    }
+                }
+                DeclaredContract::CurrentOrUnreadable => {
+                    return Err(ManifestError::Toml(contract_2_error))
+                }
+            },
+        };
         manifest.validate()?;
-        Ok(manifest)
+        Ok((manifest, upgraded))
     }
 
     /// Structural validation: contract version (exact match — big-bang
@@ -1965,5 +2125,222 @@ prompt = ""
         );
         let err = PluginManifest::from_toml(&toml_str).unwrap_err();
         assert!(matches!(err, ManifestError::EmptyJobPrompt(name) if name == "j"));
+    }
+
+    // ---------- contract-1 compat shim ----------
+    //
+    // The two fixtures below are verbatim excerpts of manifests actually
+    // published on the pre-v2 release feed (v0.8.0). They are the reason the
+    // shim exists: without it every component install from that feed dies at
+    // `component = "<name>.wasm"` with `invalid type: string, expected struct
+    // ComponentSpec`.
+
+    /// The published v1 `mimo.ryuzi-plugin.toml` — a PROVIDER bundle.
+    const CONTRACT_1_PROVIDER: &str = r#"
+id = "mimo"
+name = "MiMo (free)"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "mimo.wasm"
+publisher = "Ryuzi"
+description = "Xiaomi MiMo free-tier chat provider."
+provider-ids = ["mimo-free"]
+
+[permissions]
+network = ["api.xiaomimimo.com"]
+"#;
+
+    /// The published v1 `github.ryuzi-plugin.toml` — a CONNECTOR bundle with
+    /// an OAuth profile and declared tools.
+    const CONTRACT_1_CONNECTOR: &str = r#"
+id = "github"
+name = "GitHub"
+version = "0.1.1"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "github.wasm"
+publisher = "Ryuzi"
+description = "GitHub connector."
+
+[permissions]
+network = ["api.github.com", "github.com"]
+
+[[oauth]]
+id = "github"
+authorize-url = "https://github.com/login/oauth/authorize"
+device-authorization-url = "https://github.com/login/device/code"
+scopes = ["repo", "read:org", "user"]
+client-id = "Ov23lijhiwiIgxoH2VcV"
+dynamic-registration = false
+
+[[tools]]
+name = "repo_list"
+description = "List repositories."
+
+[[tools]]
+name = "issue_create"
+description = "Create an issue."
+writes = true
+"#;
+
+    /// The published v1 `discord.ryuzi-plugin.toml` — a GATEWAY bundle, which
+    /// v1 had no way to declare as one.
+    const CONTRACT_1_GATEWAY: &str = r#"
+id = "discord"
+name = "Discord"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "singleton"
+component = "discord.wasm"
+publisher = "Ryuzi"
+description = "Discord gateway."
+
+[permissions]
+network = ["gateway.discord.gg", "*.discord.gg", "discord.com"]
+"#;
+
+    #[test]
+    fn upgrades_a_contract_1_provider_bundle() {
+        let (m, upgraded) = PluginManifest::from_toml_detecting_legacy(CONTRACT_1_PROVIDER)
+            .expect("a published v1 provider bundle must stay installable");
+        assert!(upgraded, "must be reported as a contract-1 upgrade");
+        assert_eq!(m.contract, CONTRACT_VERSION);
+        assert_eq!(m.id, "mimo");
+        assert_eq!(m.name, "MiMo (free)");
+        assert_eq!(m.version, "0.1.0");
+        assert_eq!(m.publisher, "Ryuzi");
+
+        // The flat v1 component triple lands under [component] verbatim.
+        let component = m.component.as_ref().expect("component");
+        assert_eq!(component.file, "mimo.wasm");
+        assert_eq!(component.wit_api, ">=0.1.0, <0.2.0");
+        assert_eq!(component.lifecycle, PluginLifecycle::PerCall);
+
+        // `provider-ids` becomes [provider] ids — the router id a v1 provider
+        // bundle served must survive, or the transport registers under the
+        // wrong id (`mimo` instead of `mimo-free`).
+        assert_eq!(m.resolved_provider_ids(), vec!["mimo-free".to_string()]);
+        assert_eq!(m.permissions.network[0].0, "api.xiaomimimo.com");
+    }
+
+    #[test]
+    fn upgrades_a_contract_1_connector_bundle_with_oauth_and_tools() {
+        let (m, upgraded) = PluginManifest::from_toml_detecting_legacy(CONTRACT_1_CONNECTOR)
+            .expect("a published v1 connector bundle must stay installable");
+        assert!(upgraded);
+        assert_eq!(m.component.as_ref().unwrap().file, "github.wasm");
+
+        assert_eq!(m.oauth.len(), 1);
+        assert_eq!(m.oauth[0].id, "github");
+        assert_eq!(
+            m.oauth[0].client_id.as_deref(),
+            Some("Ov23lijhiwiIgxoH2VcV")
+        );
+        assert_eq!(
+            m.oauth[0].device_authorization_url.as_deref(),
+            Some("https://github.com/login/device/code")
+        );
+
+        assert_eq!(m.tools.len(), 2);
+        assert_eq!(m.tools[0].name, "repo_list");
+        assert!(!m.tools[0].writes);
+        assert!(m.tools[1].writes);
+
+        // A connector names no router ids, so it must not become a provider.
+        assert!(m.provider.is_none());
+        assert!(m.resolved_provider_ids().is_empty());
+    }
+
+    // A v1 gateway (Discord) could not declare itself one — the host compiled
+    // the component and read its exports. The upgrade must therefore leave the
+    // bundle eligible for gateway discovery, or Discord installs cleanly and
+    // then silently never attaches.
+    #[test]
+    fn upgraded_contract_1_bundles_stay_eligible_for_gateway_discovery() {
+        let (m, upgraded) = PluginManifest::from_toml_detecting_legacy(CONTRACT_1_GATEWAY).unwrap();
+        assert!(upgraded);
+        assert!(
+            m.gateway,
+            "a v1 bundle has no gateway declaration, so discovery must fall back to \
+             compiling it and checking `exports_gateway()` exactly as v1 did"
+        );
+        assert_eq!(
+            m.component.as_ref().unwrap().lifecycle,
+            PluginLifecycle::Singleton
+        );
+    }
+
+    // The shim reshapes; it must never relax a rule. A v1 manifest that would
+    // fail v2 validation still fails it.
+    #[test]
+    fn an_upgraded_contract_1_bundle_is_still_validated() {
+        let bad_host = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "acme.wasm"
+
+[permissions]
+network = ["https://api.acme.com/v1"]
+"#;
+        let err = PluginManifest::from_toml(bad_host)
+            .expect_err("the v2 network grammar still applies after an upgrade");
+        assert!(
+            matches!(err, ManifestError::InvalidNetworkHost(h) if h == "https://api.acme.com/v1")
+        );
+    }
+
+    // An explicit `contract = N` is a deliberate claim: it must keep failing
+    // loudly instead of being silently reinterpreted as a v1 bundle.
+    #[test]
+    fn an_explicit_unsupported_contract_is_never_treated_as_contract_1() {
+        let toml_str = r#"
+contract = 1
+id = "mimo"
+name = "MiMo"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "mimo.wasm"
+"#;
+        let err = PluginManifest::from_toml(toml_str).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::ContractUnsupported { found: 1 }
+        ));
+    }
+
+    // A v2-shaped manifest with a real mistake must report ITS OWN error. The
+    // shim must not swallow it and complain the input isn't a v1 bundle.
+    #[test]
+    fn a_broken_contract_2_manifest_reports_the_contract_2_error() {
+        let missing_contract = r#"
+id = "acme"
+name = "Acme"
+version = "0.1.0"
+
+[component]
+file = "acme.wasm"
+wit-api = "^0.1.0"
+lifecycle = "singleton"
+"#;
+        let err = PluginManifest::from_toml(missing_contract).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, ManifestError::Toml(_)) && message.contains("contract"),
+            "expected the v2 missing-field error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_native_contract_2_manifest_is_not_reported_as_upgraded() {
+        let (m, upgraded) =
+            PluginManifest::from_toml_detecting_legacy(&v2_component_fixture()).unwrap();
+        assert!(!upgraded);
+        assert_eq!(m.contract, 2);
+        assert!(!m.gateway, "the v1 gateway fallback must not leak into v2");
     }
 }

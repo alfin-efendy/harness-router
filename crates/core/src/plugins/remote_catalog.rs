@@ -595,6 +595,34 @@ async fn get_2xx(http: &dyn CatalogHttp, url: &str) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// Turn a fetched-manifest parse failure into an error that says what the
+/// operator can DO about it.
+///
+/// A contract mismatch is not a malformed file — it means the feed and the
+/// build disagree about which plugin standard is in play, which no retry
+/// fixes. It has exactly two remedies (move the build forward, or point it at
+/// a matching feed), so the error names both rather than surfacing a bare
+/// "manifest declares contract N". Every other parse failure keeps its own
+/// message and gains the URL it came from.
+fn describe_fetched_manifest_error(
+    manifest_url: &str,
+    error: ryuzi_plugin_sdk::ManifestError,
+) -> anyhow::Error {
+    use ryuzi_plugin_sdk::ManifestError;
+    match error {
+        ManifestError::ContractUnsupported { found } => anyhow::anyhow!(
+            "the release feed at {manifest_url} serves a contract-{found} plugin manifest, but \
+             this build understands contract {supported}. Update Ryuzi to a release built for \
+             contract {found}, or point the `component_release_base_url` setting at a feed that \
+             matches this build.",
+            supported = ryuzi_plugin_sdk::CONTRACT_VERSION,
+        ),
+        other => anyhow::Error::new(other).context(format!(
+            "parsing fetched ryuzi-plugin.toml from {manifest_url}"
+        )),
+    }
+}
+
 /// Reject a staged-component filename that is not a strictly-relative path
 /// contained in its staging dir. `manifest.component` is ATTACKER-NAMED — it
 /// comes from the fetched, still-UNVERIFIED `ryuzi-plugin.toml`, and is staged
@@ -679,10 +707,18 @@ pub async fn install_component_release(
     // (larger) wasm download — so a malformed feed fails fast, and to learn the
     // component filename to stage the wasm under. `verify_bundle` re-parses and
     // re-checks everything; this parse only drives staging.
-    let manifest = PluginManifest::from_toml(
+    let (manifest, upgraded_from_contract_1) = PluginManifest::from_toml_detecting_legacy(
         std::str::from_utf8(&manifest_bytes).context("fetched ryuzi-plugin.toml is not UTF-8")?,
     )
-    .context("parsing fetched ryuzi-plugin.toml")?;
+    .map_err(|error| describe_fetched_manifest_error(&manifest_url, error))?;
+    if upgraded_from_contract_1 {
+        tracing::warn!(
+            plugin = %plugin_id,
+            url = %manifest_url,
+            "installing a pre-v2 (contract 1) plugin manifest through the compatibility shim; \
+             the publishing feed predates the unified v2 manifest"
+        );
+    }
     let release =
         PluginRelease::from_json(&release_bytes).context("parsing fetched release.json")?;
     if manifest.id != plugin_id || release.id != plugin_id {
