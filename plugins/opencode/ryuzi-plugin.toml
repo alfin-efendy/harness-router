@@ -1,13 +1,13 @@
 contract = 2
 id = "opencode"
 name = "OpenCode (free)"
-version = "0.1.0"
+version = "0.2.0"
 publisher = "Ryuzi"
 description = "OpenCode Zen free-tier chat provider. Talks to opencode.ai/zen/v1 with the static `Bearer public` token and the x-opencode-client header."
 
 [component]
 file = "opencode.wasm"
-wit-api = ">=0.1.0, <0.2.0"
+wit-api = ">=0.2.0, <0.3.0"
 lifecycle = "per-call"
 
 # The LLM-router provider id(s) this bundle backs. The bundle id is `opencode`,

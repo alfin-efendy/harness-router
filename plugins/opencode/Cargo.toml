@@ -13,9 +13,21 @@ crate-type = ["cdylib"]
 # `wit-bindgen` is only invoked inside the `#[cfg(target_arch = "wasm32")]`
 # guest module; the pure `logic` module (and its native `cargo test`) never
 # touches the generated host bindings.
+#
+# `ryuzi-openai-format` is a path dependency on a sibling standalone workspace —
+# the mechanism for sharing code across the independently buildable
+# `plugins/<id>/` bundles. OpenCode Zen is an OpenAI-compatible
+# `/chat/completions` endpoint, so its request/response mapping is delegated to
+# this crate rather than reimplemented.
+#
+# `serde_json` stays a real (non-dev) dependency here, unlike the other
+# OpenAI-format components: `parse_models`'s per-entry `context_length` read
+# and `request_headers`/`classify_chat_error` are genuinely OpenCode-local and
+# still touch JSON directly in production code, not just in tests.
 [dependencies]
 wit-bindgen = "0.57"
 serde_json = "1"
+ryuzi-openai-format = { path = "../openai-format" }
 
 [profile.release]
 opt-level = "s"
