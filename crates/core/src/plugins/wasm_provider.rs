@@ -234,10 +234,37 @@ pub struct WasmProviderTransport {
 }
 
 impl WasmProviderTransport {
-    /// Build a transport for one enabled provider bundle. `compiled` is the
-    /// validated component; `ctx` carries the shared settings/store/telemetry
-    /// backends; `provider_id` is the id the router resolves connections to.
-    pub fn new(
+    /// Build a transport for one enabled provider bundle AND resolve its
+    /// capabilities before returning it. `compiled` is the validated
+    /// component; `ctx` carries the shared settings/store/telemetry backends;
+    /// `provider_id` is the id the router resolves connections to.
+    ///
+    /// This is the ONLY way to obtain a `WasmProviderTransport` outside this
+    /// module: the synchronous [`Self::new`] and [`Self::resolve_capabilities`]
+    /// are both private, so no caller can construct a transport, skip
+    /// resolution, and hand it to [`register_wasm_provider`] — the
+    /// resolve-before-register ordering this whole capability-negotiation
+    /// design depends on is a type-level invariant, not a convention a caller
+    /// (or a future refactor) could get backwards. See
+    /// `discovered_v2_bundle_registers_a_tool_capable_transport` for what is
+    /// (and, after this change, is NOT) actually tested about that ordering.
+    pub(crate) async fn new_resolved(
+        compiled: Arc<CompiledComponent>,
+        ctx: Arc<PluginCapabilityContext>,
+        provider_id: String,
+    ) -> Self {
+        let transport = Self::new(compiled, ctx, provider_id);
+        transport.resolve_capabilities().await;
+        transport
+    }
+
+    /// Build a transport WITHOUT resolving its capabilities. Private: the
+    /// only callers are [`Self::new_resolved`] and, in tests, the
+    /// deliberately-unresolved construction path
+    /// (`build_test_transport_inner` with `resolve = false`), which exists to
+    /// pin [`WasmProviderRuntime::capabilities`]'s fail-closed default. No
+    /// other caller may construct an unresolved transport.
+    fn new(
         compiled: Arc<CompiledComponent>,
         ctx: Arc<PluginCapabilityContext>,
         provider_id: String,
@@ -250,10 +277,11 @@ impl WasmProviderTransport {
         }
     }
 
-    /// Read the guest's own `capabilities()` once and cache it. Called by
-    /// discovery right after construction; a component that traps or times out
-    /// here is treated as toolless rather than failing discovery.
-    pub async fn resolve_capabilities(&self) {
+    /// Read the guest's own `capabilities()` once and cache it. Called ONLY
+    /// by [`Self::new_resolved`] as part of construction — never call this
+    /// directly; a component that traps or times out here is treated as
+    /// toolless rather than failing discovery.
+    async fn resolve_capabilities(&self) {
         if !self.exports_provider_v2() {
             let _ = self.capabilities.set(WasmProviderCapabilities::default());
             return;
@@ -378,9 +406,12 @@ impl WasmProviderRuntime for WasmProviderTransport {
 
     fn capabilities(&self) -> WasmProviderCapabilities {
         // Fail closed: an unresolved transport is toolless, never
-        // optimistically tool-capable. `resolve_capabilities` runs before the
-        // transport is ever registered, so this default is unreachable in
-        // production and only guards a hand-built transport in a test.
+        // optimistically tool-capable. Every transport reachable from
+        // production went through `WasmProviderTransport::new_resolved` (the
+        // only way to build one outside this module), which resolves before
+        // returning — so this default is unreachable in production and only
+        // guards the deliberately-unresolved transport a test builds via the
+        // private synchronous `new`.
         self.capabilities.get().copied().unwrap_or_default()
     }
 
@@ -773,12 +804,17 @@ pub(crate) async fn discover_provider_components(
         // bundle-id -> router-id mapping is data-driven from the manifest, so
         // there is NO plugin-id host branch here.
         for provider_id in bundle.manifest.resolved_provider_ids() {
-            let transport =
-                WasmProviderTransport::new(compiled.clone(), ctx.clone(), provider_id.clone());
-            // Resolve the guest's capability declaration ONCE, here, before the
-            // transport is ever handed to the router — `capabilities()` is
-            // synchronous and must never observe an unresolved transport.
-            transport.resolve_capabilities().await;
+            // `new_resolved` resolves the guest's capability declaration as
+            // part of construction, so there is no separate step here that
+            // could be reordered against `register_wasm_provider` —
+            // `capabilities()` is synchronous and must never observe an
+            // unresolved transport.
+            let transport = WasmProviderTransport::new_resolved(
+                compiled.clone(),
+                ctx.clone(),
+                provider_id.clone(),
+            )
+            .await;
             register_wasm_provider(Arc::new(transport));
             registered.push(provider_id);
         }
@@ -1004,12 +1040,37 @@ pub(crate) struct TestTransportGrants {
 /// placeholder; `allow_self_auth` stays `false` (from `deny_all()`) no matter
 /// what that field says, which is exactly what a strict-Authorization-
 /// stripping check depends on.
+///
+/// Goes through [`WasmProviderTransport::new_resolved`] (via
+/// `build_test_transport_inner`'s `resolve = true`), so the returned
+/// transport has already resolved its capabilities — every OTHER test in
+/// this module relies on that (mirroring production discovery); only
+/// [`build_unresolved_test_transport`] opts out.
 #[cfg(test)]
 pub(crate) async fn build_test_transport_with_grants(
     component_path: std::path::PathBuf,
     provider_id: &str,
     timeout: std::time::Duration,
     grants: TestTransportGrants,
+) -> (Arc<WasmProviderTransport>, tempfile::NamedTempFile) {
+    build_test_transport_inner(component_path, provider_id, timeout, grants, true).await
+}
+
+/// Shared boilerplate behind [`build_test_transport_with_grants`] and
+/// [`build_unresolved_test_transport`] — bundle/context/policy construction
+/// (~80 lines) is otherwise identical between the two, differing only in
+/// whether the returned transport has resolved its capabilities. `resolve =
+/// true` goes through [`WasmProviderTransport::new_resolved`] (the
+/// production-mirroring path every caller except `build_unresolved_test_transport`
+/// needs); `resolve = false` returns the raw, deliberately-unresolved
+/// transport via the private synchronous [`WasmProviderTransport::new`].
+#[cfg(test)]
+async fn build_test_transport_inner(
+    component_path: std::path::PathBuf,
+    provider_id: &str,
+    timeout: std::time::Duration,
+    grants: TestTransportGrants,
+    resolve: bool,
 ) -> (Arc<WasmProviderTransport>, tempfile::NamedTempFile) {
     use crate::plugins::bundle::InstalledBundle;
     use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
@@ -1196,11 +1257,24 @@ pub(crate) async fn build_test_transport_with_grants(
     };
     let runtime = ComponentRuntime::new().unwrap();
     let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
-    let transport = WasmProviderTransport::new(compiled, ctx, provider_id.to_string());
-    // Mirror production discovery: resolve the guest's capability declaration
-    // before handing the transport back, so a test never observes the
-    // fail-closed default for a real v2 fixture.
-    transport.resolve_capabilities().await;
+    // `manifest.version`/`component.wit_api`/`release.wit_api` above are all
+    // fixed at `"0.1.0"`/`"^0.1.0"` regardless of which artifact
+    // `component_path` actually points at (this helper backs BOTH the v1
+    // `provider_fixture_artifact()` and the v2 `provider_v2_fixture_artifact()`
+    // callers). That is harmless: export detection
+    // (`exports_provider`/`exports_provider_v2`) introspects the COMPILED
+    // component's actual WIT exports, never these manifest strings, so a v2
+    // fixture staged with v1-looking metadata here still resolves correctly.
+    let transport = if resolve {
+        // Mirror production discovery: resolve the guest's capability
+        // declaration before handing the transport back, so a test never
+        // observes the fail-closed default for a real v2 fixture.
+        WasmProviderTransport::new_resolved(compiled, ctx, provider_id.to_string()).await
+    } else {
+        // Deliberately skip resolution — leaving the `capabilities` `OnceLock`
+        // unresolved is the entire point of `build_unresolved_test_transport`.
+        WasmProviderTransport::new(compiled, ctx, provider_id.to_string())
+    };
     (Arc::new(transport), tmp)
 }
 
@@ -1223,103 +1297,36 @@ pub(crate) async fn build_test_transport(
 }
 
 /// Build a [`WasmProviderTransport`] exactly like the zero-grants case of
-/// [`build_test_transport_with_grants`], EXCEPT it deliberately never calls
-/// `resolve_capabilities()` — the one test construction path that leaves the
-/// transport's `capabilities` `OnceLock` unresolved, so a test built on it
-/// can observe [`WasmProviderRuntime::capabilities`]'s fail-closed
+/// [`build_test_transport_with_grants`], EXCEPT it deliberately never
+/// resolves capabilities — the one test construction path that leaves the
+/// transport's `capabilities` `OnceLock` unresolved (via the private
+/// synchronous [`WasmProviderTransport::new`], never
+/// [`WasmProviderTransport::new_resolved`]), so a test built on it can
+/// observe [`WasmProviderRuntime::capabilities`]'s fail-closed
 /// `unwrap_or_default()` fallback directly.
 ///
-/// This is a standalone twin of `build_test_transport_with_grants` rather
-/// than a flag on it: every OTHER test in this module relies on that helper
-/// resolving capabilities immediately after construction (mirroring
-/// production discovery), so that behavior must not change.
+/// Shares its ~80 lines of bundle/context/policy construction with
+/// `build_test_transport_with_grants` via `build_test_transport_inner`
+/// (`resolve = false`); every OTHER test in this module goes through the
+/// `resolve = true` path (mirroring production discovery), so that behavior
+/// is unchanged.
 #[cfg(test)]
 pub(crate) async fn build_unresolved_test_transport(
     component_path: std::path::PathBuf,
     provider_id: &str,
 ) -> (Arc<WasmProviderTransport>, tempfile::NamedTempFile) {
-    use crate::plugins::bundle::InstalledBundle;
-    use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
-    use crate::settings::SettingsStore;
-    use crate::store::ComponentPluginReleaseRecord;
-    use crate::telemetry::NoopTelemetry;
-    use ryuzi_plugin_sdk::{
-        ComponentSpec, PluginLifecycle, PluginManifest, PluginPermissions, PluginRelease,
-    };
-
-    let policy = HostPolicy::deny_all();
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
-    let ctx = Arc::new(PluginCapabilityContext {
-        plugin_id: provider_id.to_string(),
-        version: "0.1.0".to_string(),
-        settings: SettingsStore::new(store.clone()),
-        store,
-        telemetry: Arc::new(NoopTelemetry),
-        network_allowlist: vec![],
-        oauth_profile_ids: vec![],
-        provider_ids: vec![],
-    });
-    let bundle = InstalledBundle {
-        manifest: PluginManifest {
-            contract: ryuzi_plugin_sdk::CONTRACT_VERSION,
-            id: provider_id.to_string(),
-            name: provider_id.to_string(),
-            version: "0.1.0".to_string(),
-            publisher: String::new(),
-            description: String::new(),
-            homepage: None,
-            icon: None,
-            categories: vec![],
-            slot: None,
-            verified: false,
-            experimental: false,
-            auth: None,
-            settings: vec![],
-            component: Some(ComponentSpec {
-                file: "plugin.wasm".to_string(),
-                wit_api: "^0.1.0".to_string(),
-                lifecycle: PluginLifecycle::Singleton,
-            }),
-            permissions: PluginPermissions { network: vec![] },
-            oauth: vec![],
-            provider: None,
-            tools: vec![],
-            mcp: vec![],
-            hooks: vec![],
-            jobs: vec![],
-            gateway: false,
-        },
-        release: PluginRelease {
-            id: provider_id.to_string(),
-            version: "0.1.0".to_string(),
-            wit_api: "0.1.0".to_string(),
-            component_url: "https://example.invalid/x.wasm".to_string(),
-            component_sha256: "0".repeat(64),
-            size_bytes: None,
-            published_at: None,
-        },
-        release_record: ComponentPluginReleaseRecord {
-            plugin_id: provider_id.to_string(),
-            version: "0.1.0".to_string(),
-            source_url: "https://example.invalid/x.wasm".to_string(),
-            sha256: "0".repeat(64),
-            signing_key_id: "test".to_string(),
-            installed_at: 0,
-            active: true,
-            revoked: false,
-            revocation_reason: None,
-        },
-        root: component_path.parent().unwrap().to_path_buf(),
+    build_test_transport_inner(
         component_path,
-    };
-    let runtime = ComponentRuntime::new().unwrap();
-    let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
-    // Deliberately NOT calling `resolve_capabilities().await` here — leaving
-    // the `capabilities` `OnceLock` unresolved is the entire point of this
-    // helper.
-    let transport = WasmProviderTransport::new(compiled, ctx, provider_id.to_string());
-    (Arc::new(transport), tmp)
+        provider_id,
+        // Never consulted: `resolve = false` returns before the component is
+        // ever instantiated. 30s matches this helper's original bespoke
+        // policy (bare `HostPolicy::deny_all()`, whose default
+        // `limits.timeout` is also 30s — see `ResourceLimits::default`).
+        std::time::Duration::from_secs(30),
+        TestTransportGrants::default(),
+        false,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1908,17 +1915,31 @@ mod tests {
         );
     }
 
-    /// Pins the real production ordering in `discover_provider_components`:
-    /// `resolve_capabilities()` must run on a freshly built transport BEFORE
-    /// `register_wasm_provider` publishes it into the process-wide registry.
-    /// Unlike `a_v2_component_declares_tool_support_and_echoes_the_transcript`
-    /// above (which goes through the test helper's OWN, separately patched
-    /// resolve-then-return sequence), this test drives the real
-    /// `discover_provider_components` discovery path with the 0.2.0 fixture
-    /// staged on disk, then reads the transport back out of the registry —
-    /// so it would catch someone swapping the resolve/register lines (or
-    /// otherwise widening the window where the router could observe a
-    /// tool-capable component as toolless).
+    /// Drives the REAL `discover_provider_components` discovery path (not the
+    /// test helpers' own construction) for a bundle that exports ONLY the
+    /// 0.2.0 provider interface: installs the v2 fixture on disk, runs
+    /// discovery, then reads the resulting transport back out of the
+    /// process-wide registry and asserts it reports `tools: true`. This pins
+    /// two things: (1) the OR-gate in `discover_provider_components` — a
+    /// pure-v2 bundle with no 0.1.0 export at all is still discovered and
+    /// registered, not silently skipped; (2) that the transport discovery
+    /// registers has ACTUALLY resolved its capabilities from the real
+    /// component, rather than sitting at the fail-closed default.
+    ///
+    /// What this test does NOT pin: resolve-before-register ORDERING.
+    /// `discover_provider_components` awaits `WasmProviderTransport::new_resolved`
+    /// to completion before this function is ever called, so the read below
+    /// would observe the exact same result regardless of whether resolution
+    /// happened "before" or "after" registration inside that already-awaited
+    /// call — a semantically equivalent reorder (e.g. constructing with the
+    /// bare `new`, calling `register_wasm_provider`, then awaiting
+    /// `resolve_capabilities()`) would pass this test unchanged if such a
+    /// reorder could even be written. It can't: `new_resolved` is the ONLY
+    /// way to obtain a `WasmProviderTransport` outside this module, and it
+    /// resolves capabilities as an inseparable part of construction — see
+    /// its doc comment. The ordering guarantee is now a type-level invariant
+    /// enforced by that API shape, not something this (or any) test can
+    /// verify by inspecting timing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovered_v2_bundle_registers_a_tool_capable_transport() {
         build_fixtures();
@@ -1946,10 +1967,12 @@ mod tests {
             .expect("a discovered v2 provider bundle must register a live transport");
         assert!(
             transport.capabilities().tools,
-            "discover_provider_components must call resolve_capabilities() on the transport \
-             BEFORE register_wasm_provider() publishes it — if those two lines were ever \
-             swapped, the router would observe this real tool-capable component as toolless \
-             for a window (or permanently, for a cache-only read) and silently drop its tools"
+            "discover_provider_components must register a transport whose capabilities were \
+             actually resolved from the real v2-only component (via \
+             WasmProviderTransport::new_resolved), not one left at the capabilities() \
+             fail-closed default — otherwise the router would silently drop this component's \
+             tools even though the OR-gate in discover_provider_components did discover and \
+             register it"
         );
 
         unregister_wasm_provider("disc-prov-v2-served");
