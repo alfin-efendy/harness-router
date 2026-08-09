@@ -12,7 +12,12 @@ pub struct CmdError {
 impl From<anyhow::Error> for CmdError {
     fn from(e: anyhow::Error) -> Self {
         CmdError {
-            message: e.to_string(),
+            // `{:#}` so the whole context chain reaches the UI — plain Display
+            // prints only the outermost `context(..)`, which turns a specific
+            // failure into a bare "Install failed: parsing fetched
+            // ryuzi-plugin.toml". Mirrors `ryuzi_core::api::ApiError`'s own
+            // conversion; see the rationale there.
+            message: format!("{e:#}"),
         }
     }
 }
