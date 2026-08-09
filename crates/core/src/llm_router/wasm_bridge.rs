@@ -21,7 +21,6 @@ use crate::plugins::wasm_provider::{
 /// so a component sees it as an ordinary turn — the WIT `role` enum carries it,
 /// so nothing is lost the way `flatten_anthropic_prompt` loses it. An absent or
 /// empty `system` adds no message at all.
-#[allow(dead_code)] // Consumed by the transport wiring in Task 4.
 pub(crate) fn request_from_anthropic_body(body: &Value, model: &str) -> WasmCompletionRequestV2 {
     let mut messages = Vec::new();
     let system = join_text_blocks(&body["system"]);

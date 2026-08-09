@@ -489,23 +489,30 @@ fn is_toolless_wasm_fallback_candidate(
         )
 }
 
-/// Whether `target` is diverted to the flat-text toolless WASM component —
-/// the SAME predicate as the divert at the `wasm_provider(&target.conn.
-/// provider)` choke point below (search this file). Shared by
-/// `target_tool_capabilities` (runtime capability lookup),
+/// Whether `target` is diverted to a WASM component that CANNOT carry tools —
+/// not merely whether it is diverted to WASM at all. A component that
+/// declares `capabilities().tools` speaks the structured `complete_v2` ABI
+/// and keeps its tools; only a 0.1.0-only (or otherwise toolless) component
+/// falls into this predicate. This is the SAME predicate as the divert at the
+/// `wasm_provider(&target.conn.provider)` choke point below (search this
+/// file). Shared by `target_tool_capabilities` (runtime capability lookup),
 /// `is_toolless_wasm_fallback_candidate` (degrade eligibility), and
 /// `selection_for_accepted_target` (the user-visible warning) so the three
 /// can never drift apart on what counts as "toolless".
 fn target_is_toolless_wasm(target: &RouteTarget) -> bool {
-    crate::plugins::wasm_provider::wasm_provider(&target.conn.provider).is_some()
+    crate::plugins::wasm_provider::wasm_provider(&target.conn.provider)
+        .is_some_and(|transport| !transport.capabilities().tools)
 }
 
 /// Runtime-aware tool capability for a resolved target. A connection backed
-/// by an installed WASM provider bundle diverts to the in-process component
-/// and that ABI is flat text with no tools in or out, BY CONSTRUCTION, for
-/// every WASM-diverted provider (not just mimo/opencode). Runtime reality
-/// wins over the descriptor's HTTP-wire declaration, which only describes
-/// what the wire format WOULD support if spoken directly.
+/// by an installed WASM provider bundle diverts to the in-process component,
+/// and whether that carries tools now depends on what the component itself
+/// declares via `capabilities().tools` — NOT a blanket toolless assumption
+/// for every WASM-diverted provider. A component that declares tool support
+/// keeps the descriptor's function-tool capability; only a component that
+/// does not gets forced toolless. Runtime reality wins over the descriptor's
+/// HTTP-wire declaration, which only describes what the wire format WOULD
+/// support if spoken directly.
 fn target_tool_capabilities(target: &RouteTarget) -> TransportToolCapabilities {
     if target_is_toolless_wasm(target) {
         return TransportToolCapabilities::toolless(
@@ -2945,18 +2952,29 @@ async fn wasm_provider_stream(
 ) -> Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>, UpstreamAttemptFailure> {
     let provider = target.conn.provider.clone();
     let model = target.upstream_model.clone();
-    let request = crate::plugins::wasm_provider::WasmCompletionRequest {
-        model: model.clone(),
-        prompt: flatten_anthropic_prompt(body),
-        max_tokens: body["max_tokens"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok()),
-        temperature: body["temperature"].as_f64().map(|v| v as f32),
-    };
     // The whole completion is produced up front. A trap/provider-error surfaces
     // here (before any events are yielded) as a route-scoped failure, so the
-    // dispatch loop can fail over to the next target.
-    let chunks = transport.complete(request).await.map_err(|message| {
+    // dispatch loop can fail over to the next target. The request shape is
+    // chosen by what the component actually declares: a tool-capable
+    // component gets the structured 0.2.0 `complete_v2` request built from the
+    // Anthropic body (tools included); a toolless component falls back to the
+    // flat-text 0.1.0 `complete` request.
+    let chunks = if transport.capabilities().tools {
+        let request = crate::llm_router::wasm_bridge::request_from_anthropic_body(body, &model);
+        transport.complete_v2(request).await
+    } else {
+        transport
+            .complete(crate::plugins::wasm_provider::WasmCompletionRequest {
+                model: model.clone(),
+                prompt: flatten_anthropic_prompt(body),
+                max_tokens: body["max_tokens"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok()),
+                temperature: body["temperature"].as_f64().map(|v| v as f32),
+            })
+            .await
+    }
+    .map_err(|message| {
         UpstreamAttemptFailure::upstream(provider.clone(), format!("wasm provider: {message}"))
     })?;
     let (tx, rx) = mpsc::channel::<anyhow::Result<AnthropicEvent>>(64);
@@ -3039,9 +3057,11 @@ async fn pump_wasm_provider(
 
 /// Flatten an Anthropic-Messages body into the single `prompt` string the
 /// generic WASM `provider` ABI takes: the system text followed by each message's
-/// text content, in order. A generic provider gets a flattened prompt rather
-/// than a role-structured transcript — lossy but sufficient for the ABI's
-/// deliberately minimal shape.
+/// text content, in order. This now serves ONLY the 0.1.0 fallback path — a
+/// toolless component that never reaches `complete_v2` — where a flattened
+/// prompt rather than a role-structured transcript is lossy but sufficient
+/// for the ABI's deliberately minimal shape. A tool-capable component takes
+/// `wasm_bridge::request_from_anthropic_body` instead.
 fn flatten_anthropic_prompt(body: &Value) -> String {
     fn push_content(content: &Value, parts: &mut Vec<String>) {
         match content {
@@ -3756,11 +3776,20 @@ mod tests {
     /// router's "is this provider id WASM-backed" predicate.
     struct FakeWasmProvider {
         id: String,
+        tools: bool,
     }
 
     impl FakeWasmProvider {
         fn new(id: &str) -> Self {
-            Self { id: id.to_string() }
+            Self {
+                id: id.to_string(),
+                tools: false,
+            }
+        }
+
+        fn with_tools(mut self, tools: bool) -> Self {
+            self.tools = tools;
+            self
         }
     }
 
@@ -3788,7 +3817,10 @@ mod tests {
         }
 
         fn capabilities(&self) -> crate::plugins::wasm_provider::WasmProviderCapabilities {
-            crate::plugins::wasm_provider::WasmProviderCapabilities::default()
+            crate::plugins::wasm_provider::WasmProviderCapabilities {
+                tools: self.tools,
+                parallel_tool_calls: false,
+            }
         }
 
         async fn complete_v2(
@@ -3841,6 +3873,105 @@ mod tests {
         assert!(
             target_tool_capabilities(&http_target).supports_function_tools,
             "a connection with no registered WASM transport keeps the descriptor value"
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
+    }
+
+    /// A WASM provider that DECLARES tool support must not be degraded: the turn
+    /// keeps its tools and carries no "can't use tools" note.
+    #[test]
+    fn a_tool_capable_wasm_target_is_not_degraded_and_carries_no_note() {
+        const PROVIDER_ID: &str = "wasm-tools-capable-fixture";
+        register_wasm_descriptor(PROVIDER_ID);
+        crate::plugins::wasm_provider::register_wasm_provider(Arc::new(
+            FakeWasmProvider::new(PROVIDER_ID).with_tools(true),
+        ));
+
+        let target = RouteTarget {
+            conn: mk_conn(
+                "wasm-conn",
+                PROVIDER_ID,
+                "api_key",
+                ConnectionData::default(),
+            ),
+            desc: registry::descriptor(PROVIDER_ID).unwrap(),
+            upstream_model: "fixture-model".into(),
+            route_target_key: None,
+        };
+
+        assert!(
+            !target_is_toolless_wasm(&target),
+            "a component declaring tools must not be classified toolless"
+        );
+        assert!(
+            target_tool_capabilities(&target).supports_function_tools,
+            "its descriptor-derived function-tool support must survive"
+        );
+
+        let requirements = capabilities::ToolTransportRequirements {
+            function_tools: true,
+            ..Default::default()
+        };
+        let selection = selection_for_accepted_target(
+            &target,
+            "fixture-model",
+            &model_effort::TurnEffortPolicy::default(),
+            RouteSelectionReason::Initial,
+            requirements,
+            12,
+        );
+        assert!(
+            selection.tools_unavailable_note.is_none(),
+            "no degrade note for a tool-capable component: {:?}",
+            selection.tools_unavailable_note
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
+    }
+
+    /// The existing behavior must survive untouched for a component that does not
+    /// declare tool support.
+    #[test]
+    fn a_toolless_wasm_target_still_degrades_with_the_note() {
+        const PROVIDER_ID: &str = "wasm-toolless-fixture";
+        register_wasm_descriptor(PROVIDER_ID);
+        crate::plugins::wasm_provider::register_wasm_provider(Arc::new(
+            FakeWasmProvider::new(PROVIDER_ID).with_tools(false),
+        ));
+
+        let target = RouteTarget {
+            conn: mk_conn(
+                "wasm-conn2",
+                PROVIDER_ID,
+                "api_key",
+                ConnectionData::default(),
+            ),
+            desc: registry::descriptor(PROVIDER_ID).unwrap(),
+            upstream_model: "fixture-model".into(),
+            route_target_key: None,
+        };
+
+        assert!(target_is_toolless_wasm(&target));
+        let selection = selection_for_accepted_target(
+            &target,
+            "fixture-model",
+            &model_effort::TurnEffortPolicy::default(),
+            RouteSelectionReason::Initial,
+            capabilities::ToolTransportRequirements {
+                function_tools: true,
+                ..Default::default()
+            },
+            12,
+        );
+        let note = selection
+            .tools_unavailable_note
+            .expect("the note must still fire");
+        assert!(
+            note.contains("can't use tools"),
+            "unexpected wording: {note}"
         );
 
         crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
