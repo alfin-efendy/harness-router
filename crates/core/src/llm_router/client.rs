@@ -2993,15 +2993,10 @@ async fn pump_wasm_provider(
         }
     }
     'pump: for chunk in chunks {
-        let mut oai =
-            json!({"choices": [{"delta": {"content": chunk.text}, "finish_reason": null}]});
-        if chunk.finished {
-            oai["choices"][0]["finish_reason"] = json!("stop");
-        }
+        let oai = crate::llm_router::wasm_bridge::chunk_to_openai_delta(&chunk);
         if let Some(usage) = &chunk.usage {
             input = usage.input as i64;
             output = usage.output as i64;
-            oai["usage"] = json!({"prompt_tokens": usage.input, "completion_tokens": usage.output});
         }
         for event in tr.feed(&oai) {
             if tx.send(Ok(event)).await.is_err() {

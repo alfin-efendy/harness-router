@@ -8,11 +8,11 @@
 //! any wasmtime dependency, so every mapping rule is unit-testable without
 //! compiling or instantiating a component.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::plugins::wasm_provider::{
-    WasmCompletionRequestV2, WasmContentBlock, WasmMessage, WasmRole, WasmToolCall, WasmToolChoice,
-    WasmToolDef, WasmToolResult,
+    WasmCompletionChunk, WasmCompletionRequestV2, WasmContentBlock, WasmMessage, WasmRole,
+    WasmStopReason, WasmToolCall, WasmToolChoice, WasmToolDef, WasmToolResult,
 };
 
 /// Map an Anthropic-Messages body onto the structured 0.2.0 request.
@@ -137,11 +137,188 @@ fn tool_choice(value: &Value) -> WasmToolChoice {
     }
 }
 
+/// Render one structured chunk as the synthetic OpenAI streaming chunk
+/// `translate::OpenAiToAnthropicStream` consumes.
+///
+/// This is why the return path needs almost no new code: that translator
+/// already turns `delta.tool_calls` into `content_block_start`(`tool_use`) +
+/// `input_json_delta`, and maps `finish_reason` through
+/// `translate::oai_finish_to_anthropic` (`tool_calls` → `tool_use`,
+/// `length` → `max_tokens`). Emitting the OpenAI shape here therefore produces
+/// byte-identical events to the HTTP OpenAI pump's.
+pub(crate) fn chunk_to_openai_delta(chunk: &WasmCompletionChunk) -> Value {
+    let mut delta = serde_json::Map::new();
+    delta.insert("content".to_string(), Value::String(chunk.text.clone()));
+    if !chunk.tool_calls.is_empty() {
+        delta.insert(
+            "tool_calls".to_string(),
+            Value::Array(
+                chunk
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, call)| {
+                        json!({
+                            "index": index,
+                            "id": call.id,
+                            "type": "function",
+                            "function": {"name": call.name, "arguments": call.arguments},
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    let finish_reason = chunk.finished.then_some(match chunk.stop_reason {
+        Some(WasmStopReason::ToolUse) => "tool_calls",
+        Some(WasmStopReason::MaxTokens) => "length",
+        // `None` is the 0.1.0 path, which cannot report a reason: a finished
+        // chunk there is an ordinary end of turn.
+        _ => "stop",
+    });
+    let mut out = json!({"choices": [{"delta": Value::Object(delta),
+                                      "finish_reason": finish_reason}]});
+    if let Some(usage) = &chunk.usage {
+        out["usage"] = json!({"prompt_tokens": usage.input, "completion_tokens": usage.output});
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plugins::wasm_provider::{WasmContentBlock, WasmRole, WasmToolChoice};
     use serde_json::json;
+
+    use crate::plugins::wasm_provider::{
+        WasmCompletionChunk, WasmStopReason, WasmTokenUsage, WasmToolCall,
+    };
+
+    #[test]
+    fn a_text_chunk_becomes_a_content_delta_with_no_finish_reason() {
+        let delta = chunk_to_openai_delta(&WasmCompletionChunk {
+            text: "Hello".to_string(),
+            tool_calls: vec![],
+            finished: false,
+            stop_reason: None,
+            usage: None,
+        });
+
+        assert_eq!(delta["choices"][0]["delta"]["content"], "Hello");
+        assert!(delta["choices"][0]["finish_reason"].is_null());
+        assert!(delta["choices"][0]["delta"]["tool_calls"].is_null());
+    }
+
+    #[test]
+    fn a_tool_call_chunk_emits_an_openai_tool_call_delta_and_a_tool_calls_finish() {
+        let delta = chunk_to_openai_delta(&WasmCompletionChunk {
+            text: String::new(),
+            tool_calls: vec![WasmToolCall {
+                id: "call_1".to_string(),
+                name: "jira_search".to_string(),
+                arguments: r#"{"jql":"project = SFM"}"#.to_string(),
+            }],
+            finished: true,
+            stop_reason: Some(WasmStopReason::ToolUse),
+            usage: None,
+        });
+
+        let call = &delta["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "jira_search");
+        assert_eq!(call["function"]["arguments"], r#"{"jql":"project = SFM"}"#);
+        assert_eq!(
+            delta["choices"][0]["finish_reason"], "tool_calls",
+            "translate::oai_finish_to_anthropic maps this to stop_reason tool_use"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_keep_distinct_indices() {
+        let call = |id: &str, name: &str| WasmToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        };
+        let delta = chunk_to_openai_delta(&WasmCompletionChunk {
+            text: String::new(),
+            tool_calls: vec![call("a", "one"), call("b", "two")],
+            finished: true,
+            stop_reason: Some(WasmStopReason::ToolUse),
+            usage: None,
+        });
+
+        let calls = delta["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[1]["index"], 1);
+        assert_eq!(calls[1]["id"], "b");
+    }
+
+    #[test]
+    fn a_finished_chunk_without_tool_calls_reports_stop_and_carries_usage() {
+        let delta = chunk_to_openai_delta(&WasmCompletionChunk {
+            text: "done".to_string(),
+            tool_calls: vec![],
+            finished: true,
+            stop_reason: Some(WasmStopReason::EndTurn),
+            usage: Some(WasmTokenUsage {
+                input: 9,
+                output: 4,
+            }),
+        });
+
+        assert_eq!(delta["choices"][0]["finish_reason"], "stop");
+        assert_eq!(delta["usage"]["prompt_tokens"], 9);
+        assert_eq!(delta["usage"]["completion_tokens"], 4);
+    }
+
+    #[test]
+    fn max_tokens_stop_reason_maps_to_the_openai_length_finish() {
+        let delta = chunk_to_openai_delta(&WasmCompletionChunk {
+            text: String::new(),
+            tool_calls: vec![],
+            finished: true,
+            stop_reason: Some(WasmStopReason::MaxTokens),
+            usage: None,
+        });
+        assert_eq!(delta["choices"][0]["finish_reason"], "length");
+    }
+
+    /// The whole point of routing through the existing translator: a tool-call
+    /// chunk must come out the far side as real Anthropic `tool_use` events, so
+    /// the native harness, MCP tools and skills need no WASM-specific handling.
+    #[test]
+    fn the_delta_drives_the_shared_translator_into_anthropic_tool_use_events() {
+        let mut stream = crate::llm_router::translate::OpenAiToAnthropicStream::new("big-pickle");
+        let delta = chunk_to_openai_delta(&WasmCompletionChunk {
+            text: String::new(),
+            tool_calls: vec![WasmToolCall {
+                id: "call_1".to_string(),
+                name: "jira_search".to_string(),
+                arguments: r#"{"jql":"x"}"#.to_string(),
+            }],
+            finished: true,
+            stop_reason: Some(WasmStopReason::ToolUse),
+            usage: None,
+        });
+
+        let events = stream.feed(&delta);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"content_block_start"));
+        let start = events
+            .iter()
+            .find(|(name, _)| name == "content_block_start")
+            .map(|(_, value)| value)
+            .unwrap();
+        assert_eq!(start["content_block"]["type"], "tool_use");
+        assert_eq!(start["content_block"]["name"], "jira_search");
+        assert_eq!(start["content_block"]["id"], "call_1");
+    }
 
     #[test]
     fn system_becomes_a_leading_system_message_and_roles_are_preserved() {
