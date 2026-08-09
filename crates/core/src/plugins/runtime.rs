@@ -79,6 +79,43 @@ const ALLOWED_EXPORTS: &[&str] = &[
     HOOKS_EXPORT,
 ];
 
+/// The set of WIT contract (provider ABI) versions this host implements
+/// simultaneously — currently the original `ryuzi:provider/provider@0.1.0`
+/// export ([`PROVIDER_EXPORT`]) and the newer, tool-carrying
+/// `ryuzi:provider/provider@0.2.0` export ([`PROVIDER_V2_EXPORT`]), with the
+/// host picking whichever a given component actually exports (see
+/// [`CompiledComponent::exports_provider`]/[`CompiledComponent::exports_provider_v2`]).
+/// A component's manifest `wit-api` RANGE is compatible with this host as
+/// long as it matches AT LEAST ONE of these concrete versions — see
+/// [`host_satisfies_wit_api_range`], which is the single source of truth both
+/// the doctor's read-only `abi-incompatible` finding
+/// ([`crate::plugins::doctor`]) and the install-time gate
+/// ([`crate::plugins::remote_catalog::install_component_release`]) key off,
+/// so the two can never drift out of agreement about what this host
+/// supports.
+pub(crate) const HOST_WIT_API_VERSIONS: &[&str] = &["0.1.0", "0.2.0"];
+
+/// Whether a manifest's `[component] wit-api` semver RANGE is satisfied by AT
+/// LEAST ONE of [`HOST_WIT_API_VERSIONS`] — the single predicate both the
+/// doctor's `abi-incompatible` finding and `remote_catalog`'s pre-download
+/// install gate evaluate, so they can never disagree about what this host
+/// supports. An unparseable range is treated as compatible (`true`): by the
+/// time either caller has a `PluginManifest` in hand, `wit-api` has already
+/// been validated as a parseable [`semver::VersionReq`] by
+/// `PluginManifest::from_toml`/`from_toml_detecting_legacy` — this fallback
+/// exists only so a parse failure reads as "not this predicate's problem to
+/// reject", not as a silent false negative that blocks an otherwise-valid
+/// install for the wrong reason.
+pub(crate) fn host_satisfies_wit_api_range(wit_api_range: &str) -> bool {
+    let Ok(req) = semver::VersionReq::parse(wit_api_range) else {
+        return true;
+    };
+    HOST_WIT_API_VERSIONS
+        .iter()
+        .filter_map(|v| semver::Version::parse(v).ok())
+        .any(|host| req.matches(&host))
+}
+
 /// Default resource budget a plugin runtime may consume.
 ///
 /// **Enforcement note:** `max_memory_bytes` and `max_concurrency` are declared

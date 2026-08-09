@@ -15,16 +15,6 @@ use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The set of WIT contract (provider ABI) versions this host implements
-/// simultaneously — currently the original `ryuzi:provider/provider@0.1.0`
-/// export and the newer, tool-carrying `ryuzi:provider/provider@0.2.0` export
-/// (see `PROVIDER_EXPORT`/`PROVIDER_V2_EXPORT` in [`crate::plugins::runtime`]),
-/// with the host picking whichever a given component actually exports. A
-/// component's manifest `wit-api` RANGE is compatible with this host as long as
-/// it matches AT LEAST ONE of these concrete versions — see the
-/// `abi-incompatible` finding, which fires only when it matches none of them.
-const HOST_WIT_API_VERSIONS: &[&str] = &["0.1.0", "0.2.0"];
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorFinding {
@@ -387,27 +377,29 @@ fn append_signature_finding(
 
 /// Finding #3 — ABI compatibility. Check the installed release's manifest
 /// `wit-api` RANGE against the SET of WIT contract versions this host
-/// implements ([`HOST_WIT_API_VERSIONS`]) using [`semver::VersionReq`]/
-/// [`semver::Version`] — never a hand-rolled range parser. A release is
-/// compatible as soon as its accepted range matches ANY one of the host's
-/// supported versions; the finding fires only when it matches NONE of them
-/// (a range can't bind its imports/exports against this host at all).
+/// implements ([`crate::plugins::runtime::HOST_WIT_API_VERSIONS`]) via
+/// [`crate::plugins::runtime::host_satisfies_wit_api_range`] — the SAME
+/// predicate `remote_catalog::install_component_release`'s pre-download gate
+/// evaluates, so the two can never disagree about what this host supports. A
+/// release is compatible as soon as its accepted range matches ANY one of the
+/// host's supported versions; the finding fires only when it matches NONE of
+/// them (a range can't bind its imports/exports against this host at all).
 fn append_abi_finding(
     findings: &mut Vec<DoctorFinding>,
     record: &ComponentPluginReleaseRecord,
     manifest: &PluginManifest,
 ) {
+    use crate::plugins::runtime::{host_satisfies_wit_api_range, HOST_WIT_API_VERSIONS};
+
     let Some(component) = manifest.component.as_ref() else {
         return;
     };
-    let Ok(req) = semver::VersionReq::parse(&component.wit_api) else {
-        return;
-    };
-    let host_versions: Vec<semver::Version> = HOST_WIT_API_VERSIONS
-        .iter()
-        .filter_map(|v| semver::Version::parse(v).ok())
-        .collect();
-    if host_versions.iter().any(|host| req.matches(host)) {
+    // `host_satisfies_wit_api_range` treats an unparseable range as
+    // compatible (see its doc comment) — the same "not this predicate's
+    // problem to reject" behavior this finding always had (its own former
+    // `let Ok(req) = ... else { return }` skipped an unparseable range with
+    // no finding pushed).
+    if host_satisfies_wit_api_range(&component.wit_api) {
         return;
     }
     let supported = HOST_WIT_API_VERSIONS.join(", ");
