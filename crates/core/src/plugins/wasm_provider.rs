@@ -30,6 +30,7 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use async_trait::async_trait;
 
 use crate::plugins::capabilities::wit_bindings::exports::ryuzi::provider0_1_0::provider as wit;
+use crate::plugins::capabilities::wit_bindings::exports::ryuzi::provider0_2_0::provider as wit_v2;
 use crate::plugins::capabilities::PluginCapabilityContext;
 use crate::plugins::runtime::{CompiledComponent, ComponentInstance, PluginRuntimeError};
 use crate::settings::SettingsStore;
@@ -201,6 +202,20 @@ pub trait WasmProviderRuntime: Send + Sync {
         &self,
         request: WasmCompletionRequest,
     ) -> Result<Vec<WasmCompletionChunk>, String>;
+
+    /// What this transport can actually do. Infallible, side-effect free, and
+    /// consulted by the router on EVERY routing decision — so it must never
+    /// instantiate the component or touch the network. A 0.1.0-only component
+    /// reports `tools: false`.
+    fn capabilities(&self) -> WasmProviderCapabilities;
+
+    /// Run a structured completion. Only called when `capabilities().tools`;
+    /// a 0.1.0-only component never reaches it. Same failure contract as
+    /// [`WasmProviderRuntime::complete`].
+    async fn complete_v2(
+        &self,
+        request: WasmCompletionRequestV2,
+    ) -> Result<Vec<WasmCompletionChunk>, String>;
 }
 
 /// A generic provider backed by one enabled component bundle, compiled once and
@@ -210,6 +225,12 @@ pub struct WasmProviderTransport {
     compiled: Arc<CompiledComponent>,
     ctx: Arc<PluginCapabilityContext>,
     provider_id: String,
+    /// The guest's own `capabilities()` answer, resolved ONCE by
+    /// [`WasmProviderTransport::resolve_capabilities`] at discovery time and
+    /// read (never awaited) by the synchronous
+    /// [`WasmProviderRuntime::capabilities`] the router consults on every
+    /// routing decision.
+    capabilities: OnceLock<WasmProviderCapabilities>,
 }
 
 impl WasmProviderTransport {
@@ -225,7 +246,45 @@ impl WasmProviderTransport {
             compiled,
             ctx,
             provider_id,
+            capabilities: OnceLock::new(),
         }
+    }
+
+    /// Read the guest's own `capabilities()` once and cache it. Called by
+    /// discovery right after construction; a component that traps or times out
+    /// here is treated as toolless rather than failing discovery.
+    pub async fn resolve_capabilities(&self) {
+        if !self.exports_provider_v2() {
+            let _ = self.capabilities.set(WasmProviderCapabilities::default());
+            return;
+        }
+        let resolved = self
+            .call_guest_capabilities()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    plugin = %self.ctx.plugin_id,
+                    "wasm provider: capabilities() failed, treating as toolless: {error}"
+                );
+                WasmProviderCapabilities::default()
+            });
+        let _ = self.capabilities.set(resolved);
+    }
+
+    async fn call_guest_capabilities(&self) -> Result<WasmProviderCapabilities, String> {
+        let mut instance = self.instantiate().await.map_err(|e| e.to_string())?;
+        let declared = instance
+            .call(|inst, store| {
+                let pre = inst.instance_pre(&*store);
+                let guest = wit_v2::GuestIndices::new(&pre)?.load(&mut *store, &inst)?;
+                guest.call_capabilities(&mut *store)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(WasmProviderCapabilities {
+            tools: declared.tools,
+            parallel_tool_calls: declared.parallel_tool_calls,
+        })
     }
 
     /// Whether this component actually exports `ryuzi:provider/provider` — the
@@ -296,6 +355,37 @@ impl WasmProviderRuntime for WasmProviderTransport {
             Err(provider_error) => Err(describe_provider_error(&provider_error)),
         }
     }
+
+    fn capabilities(&self) -> WasmProviderCapabilities {
+        // Fail closed: an unresolved transport is toolless, never
+        // optimistically tool-capable. `resolve_capabilities` runs before the
+        // transport is ever registered, so this default is unreachable in
+        // production and only guards a hand-built transport in a test.
+        self.capabilities.get().copied().unwrap_or_default()
+    }
+
+    async fn complete_v2(
+        &self,
+        request: WasmCompletionRequestV2,
+    ) -> Result<Vec<WasmCompletionChunk>, String> {
+        if !self.exports_provider_v2() {
+            return Err("component does not export ryuzi:provider/provider@0.2.0".to_string());
+        }
+        let wit_request = request_to_wit_v2(request);
+        let mut instance = self.instantiate().await.map_err(|e| e.to_string())?;
+        let result = instance
+            .call(move |inst, store| {
+                let pre = inst.instance_pre(&*store);
+                let guest = wit_v2::GuestIndices::new(&pre)?.load(&mut *store, &inst)?;
+                guest.call_complete(&mut *store, &wit_request)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        match result {
+            Ok(chunks) => Ok(chunks.into_iter().map(chunk_from_wit_v2).collect()),
+            Err(provider_error) => Err(describe_provider_error_v2(&provider_error)),
+        }
+    }
 }
 
 fn model_from_wit(model: wit::ModelInfo) -> WasmModelInfo {
@@ -338,6 +428,125 @@ fn describe_provider_error(error: &wit::ProviderError) -> String {
         wit::ProviderError::RateLimited => "provider rate limited".to_string(),
         wit::ProviderError::Unavailable => "provider unavailable".to_string(),
         wit::ProviderError::Failed(message) => format!("provider failed: {message}"),
+    }
+}
+
+fn role_to_wit_v2(role: WasmRole) -> wit_v2::Role {
+    match role {
+        WasmRole::System => wit_v2::Role::System,
+        WasmRole::User => wit_v2::Role::User,
+        WasmRole::Assistant => wit_v2::Role::Assistant,
+    }
+}
+
+fn tool_call_to_wit_v2(call: WasmToolCall) -> wit_v2::ToolCall {
+    wit_v2::ToolCall {
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+    }
+}
+
+fn tool_call_from_wit_v2(call: wit_v2::ToolCall) -> WasmToolCall {
+    WasmToolCall {
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+    }
+}
+
+fn content_block_to_wit_v2(block: WasmContentBlock) -> wit_v2::ContentBlock {
+    match block {
+        WasmContentBlock::Text(text) => wit_v2::ContentBlock::Text(text),
+        WasmContentBlock::ToolUse(call) => wit_v2::ContentBlock::ToolUse(tool_call_to_wit_v2(call)),
+        WasmContentBlock::ToolResult(result) => {
+            wit_v2::ContentBlock::ToolResult(wit_v2::ToolResult {
+                tool_call_id: result.tool_call_id,
+                content: result.content,
+                is_error: result.is_error,
+            })
+        }
+    }
+}
+
+fn message_to_wit_v2(message: WasmMessage) -> wit_v2::Message {
+    wit_v2::Message {
+        role: role_to_wit_v2(message.role),
+        content: message
+            .content
+            .into_iter()
+            .map(content_block_to_wit_v2)
+            .collect(),
+    }
+}
+
+fn tool_def_to_wit_v2(tool: WasmToolDef) -> wit_v2::ToolDef {
+    wit_v2::ToolDef {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+    }
+}
+
+fn tool_choice_to_wit_v2(choice: WasmToolChoice) -> wit_v2::ToolChoice {
+    match choice {
+        WasmToolChoice::Auto => wit_v2::ToolChoice::Auto,
+        WasmToolChoice::None => wit_v2::ToolChoice::None,
+        WasmToolChoice::Required => wit_v2::ToolChoice::Required,
+    }
+}
+
+fn stop_reason_from_wit_v2(reason: wit_v2::StopReason) -> WasmStopReason {
+    match reason {
+        wit_v2::StopReason::EndTurn => WasmStopReason::EndTurn,
+        wit_v2::StopReason::ToolUse => WasmStopReason::ToolUse,
+        wit_v2::StopReason::MaxTokens => WasmStopReason::MaxTokens,
+        wit_v2::StopReason::Other => WasmStopReason::Other,
+    }
+}
+
+fn request_to_wit_v2(request: WasmCompletionRequestV2) -> wit_v2::CompletionRequest {
+    wit_v2::CompletionRequest {
+        model: request.model,
+        messages: request
+            .messages
+            .into_iter()
+            .map(message_to_wit_v2)
+            .collect(),
+        tools: request.tools.into_iter().map(tool_def_to_wit_v2).collect(),
+        tool_choice: tool_choice_to_wit_v2(request.tool_choice),
+        max_tokens: request.max_tokens,
+        temperature: request.temperature,
+    }
+}
+
+fn chunk_from_wit_v2(chunk: wit_v2::CompletionChunk) -> WasmCompletionChunk {
+    WasmCompletionChunk {
+        text: chunk.text,
+        tool_calls: chunk
+            .tool_calls
+            .into_iter()
+            .map(tool_call_from_wit_v2)
+            .collect(),
+        finished: chunk.finished,
+        stop_reason: chunk.stop_reason.map(stop_reason_from_wit_v2),
+        usage: chunk.usage.map(|usage| WasmTokenUsage {
+            input: usage.input,
+            output: usage.output,
+        }),
+    }
+}
+
+/// A human-readable, secret-free rendering of a WIT 0.2.0 `provider-error`.
+fn describe_provider_error_v2(error: &wit_v2::ProviderError) -> String {
+    match error {
+        wit_v2::ProviderError::InvalidRequest(message) => {
+            format!("invalid provider request: {message}")
+        }
+        wit_v2::ProviderError::ModelNotFound => "provider model not found".to_string(),
+        wit_v2::ProviderError::RateLimited => "provider rate limited".to_string(),
+        wit_v2::ProviderError::Unavailable => "provider unavailable".to_string(),
+        wit_v2::ProviderError::Failed(message) => format!("provider failed: {message}"),
     }
 }
 
@@ -529,11 +738,13 @@ pub(crate) async fn discover_provider_components(
         // bundle-id -> router-id mapping is data-driven from the manifest, so
         // there is NO plugin-id host branch here.
         for provider_id in bundle.manifest.resolved_provider_ids() {
-            register_wasm_provider(Arc::new(WasmProviderTransport::new(
-                compiled.clone(),
-                ctx.clone(),
-                provider_id.clone(),
-            )));
+            let transport =
+                WasmProviderTransport::new(compiled.clone(), ctx.clone(), provider_id.clone());
+            // Resolve the guest's capability declaration ONCE, here, before the
+            // transport is ever handed to the router — `capabilities()` is
+            // synchronous and must never observe an unresolved transport.
+            transport.resolve_capabilities().await;
+            register_wasm_provider(Arc::new(transport));
             registered.push(provider_id);
         }
     }
@@ -548,6 +759,15 @@ pub(crate) fn provider_fixture_artifact() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/component-provider/target/wasm32-wasip2/release")
         .join("ryuzi_component_provider_fixture.wasm")
+}
+
+/// The prebuilt 0.2.0 provider fixture artifact (caller must build fixtures
+/// first). Module-level for the same reason the v1 accessor is.
+#[cfg(test)]
+pub(crate) fn provider_v2_fixture_artifact() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/component-provider-v2/target/wasm32-wasip2/release")
+        .join("ryuzi_component_provider_v2_fixture.wasm")
 }
 
 /// The prebuilt gateway fixture artifact (caller must build fixtures first via
@@ -941,14 +1161,12 @@ pub(crate) async fn build_test_transport_with_grants(
     };
     let runtime = ComponentRuntime::new().unwrap();
     let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
-    (
-        Arc::new(WasmProviderTransport::new(
-            compiled,
-            ctx,
-            provider_id.to_string(),
-        )),
-        tmp,
-    )
+    let transport = WasmProviderTransport::new(compiled, ctx, provider_id.to_string());
+    // Mirror production discovery: resolve the guest's capability declaration
+    // before handing the transport back, so a test never observes the
+    // fail-closed default for a real v2 fixture.
+    transport.resolve_capabilities().await;
+    (Arc::new(transport), tmp)
 }
 
 /// Build a [`WasmProviderTransport`] over the prebuilt provider fixture, keyed
@@ -1436,6 +1654,67 @@ mod tests {
             wasm_provider("acme-free").is_none(),
             "unregister_wasm_providers_for_plugin must drop the aliased transport"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4: transport capability negotiation + complete_v2
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_v1_only_component_declares_no_tool_support() {
+        build_fixtures();
+        let (transport, _tmp) = build_test_transport(
+            provider_artifact(),
+            "wasm-prov-caps-v1",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(
+            transport.capabilities(),
+            WasmProviderCapabilities {
+                tools: false,
+                parallel_tool_calls: false
+            },
+            "a 0.1.0 component has no tool channel, so it must never claim one"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_v2_component_declares_tool_support_and_echoes_the_transcript() {
+        build_fixtures();
+        let (transport, _tmp) = build_test_transport(
+            provider_v2_fixture_artifact(),
+            "wasm-prov-caps-v2",
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(transport.capabilities().tools);
+
+        let chunks = transport
+            .complete_v2(WasmCompletionRequestV2 {
+                model: "fixture-model".to_string(),
+                messages: vec![WasmMessage {
+                    role: WasmRole::User,
+                    content: vec![WasmContentBlock::Text("call the tool".to_string())],
+                }],
+                tools: vec![WasmToolDef {
+                    name: "echo".to_string(),
+                    description: "echo".to_string(),
+                    input_schema: "{}".to_string(),
+                }],
+                tool_choice: WasmToolChoice::Auto,
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .expect("complete_v2 must succeed");
+
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.finished);
+        assert_eq!(last.stop_reason, Some(WasmStopReason::ToolUse));
+        assert_eq!(last.tool_calls.len(), 1);
+        assert_eq!(last.tool_calls[0].name, "echo");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -3786,6 +3786,17 @@ mod tests {
         ) -> Result<Vec<crate::plugins::wasm_provider::WasmCompletionChunk>, String> {
             Ok(Vec::new())
         }
+
+        fn capabilities(&self) -> crate::plugins::wasm_provider::WasmProviderCapabilities {
+            crate::plugins::wasm_provider::WasmProviderCapabilities::default()
+        }
+
+        async fn complete_v2(
+            &self,
+            _request: crate::plugins::wasm_provider::WasmCompletionRequestV2,
+        ) -> Result<Vec<crate::plugins::wasm_provider::WasmCompletionChunk>, String> {
+            Ok(Vec::new())
+        }
     }
 
     /// Test 1 (brief item): `target_tool_capabilities` must consult runtime
