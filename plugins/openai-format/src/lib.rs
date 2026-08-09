@@ -32,13 +32,16 @@
 //! [`error_tag`] exists specifically to keep upstream error PROSE (which can
 //! echo a submitted key) out of the guest-visible error string.
 //!
-//! # Accepted ABI limitation
-//! `ryuzi:provider/provider` is flat text: a `prompt` string in, text chunks
-//! out. Every component built on this crate therefore supports plain text
-//! completion only — no tool calling, no structured multi-turn messages, no
-//! multimodal content, and no true token streaming (the single buffered
-//! upstream response is returned as one terminal chunk). That is a deliberate,
-//! accepted tradeoff of the WASM provider migration, not an oversight.
+//! # Interface: `ryuzi:provider@0.2.0`
+//! Every component built on this crate exports the 0.2.0 interface: a full
+//! transcript (`messages`, each a role plus text/tool-use/tool-result blocks)
+//! and a bound `tools` list go in, and `capabilities()` reports `tools: true`
+//! for all ten — every OpenAI-format upstream behind this macro speaks native
+//! function calling. `parallel_tool_calls` is never claimed, since support
+//! varies per upstream and the host only treats it as a hint. What remains an
+//! accepted limitation is no true token streaming: the single buffered
+//! upstream response is still returned as one terminal
+//! [`ChunkOut`]/`completion-chunk`, not incremental deltas.
 
 use serde_json::{json, Map, Value};
 

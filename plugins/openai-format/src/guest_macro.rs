@@ -57,8 +57,10 @@
 #[doc(hidden)]
 macro_rules! __openai_provider_guest_core {
     (config: $config:expr $(,)?) => {
-        use exports::ryuzi::provider::provider::{
-            CompletionChunk, CompletionRequest, Guest, ModelInfo, ProviderError, TokenUsage,
+        use exports::ryuzi::provider0_2_0::provider::{
+            CompletionChunk, CompletionRequest, ContentBlock, Guest, ModelInfo,
+            ProviderCapabilities, ProviderError, Role, StopReason, TokenUsage, ToolCall,
+            ToolChoice,
         };
         use ryuzi::storage::storage;
 
@@ -68,6 +70,17 @@ macro_rules! __openai_provider_guest_core {
         struct ProviderComponent;
 
         impl Guest for ProviderComponent {
+            /// Every OpenAI-format upstream behind this macro speaks native
+            /// function calling, so tools are always available. Parallel tool
+            /// calls are NOT claimed: support varies per upstream and the host
+            /// only uses the flag as a hint.
+            fn capabilities() -> ProviderCapabilities {
+                ProviderCapabilities {
+                    tools: true,
+                    parallel_tool_calls: false,
+                }
+            }
+
             fn list_models() -> Result<Vec<ModelInfo>, ProviderError> {
                 __list_models_source()
                     .map(|list| list.into_iter().map(map_model).collect())
@@ -80,13 +93,29 @@ macro_rules! __openai_provider_guest_core {
                         "a completion request must name a model".to_string(),
                     ));
                 }
+                let messages: Vec<$crate::MessageIn> =
+                    request.messages.iter().map(map_message_in).collect();
+                let tools: Vec<$crate::ToolIn> = request
+                    .tools
+                    .iter()
+                    .map(|tool| $crate::ToolIn {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input_schema: tool.input_schema.clone(),
+                    })
+                    .collect();
                 let url = CONFIG.chat_url(&base_url());
-                let body = CONFIG.build_chat_body(
-                    &request.model,
-                    &request.prompt,
-                    request.max_tokens,
-                    request.temperature,
-                );
+                let body = CONFIG.build_chat_body($crate::ChatRequest {
+                    model: &request.model,
+                    messages: &messages,
+                    tools: &tools,
+                    tool_choice: map_tool_choice(request.tool_choice),
+                    max_tokens: request.max_tokens,
+                    temperature: request.temperature,
+                    // No OpenAI-format upstream here has an anti-abuse gate
+                    // marker; MiMo, which does, is not built on this macro.
+                    leading_system: None,
+                });
                 let (status, bytes) = __send_request("POST", &url, Some(body)).map_err(map_fail)?;
                 let chunks = if $crate::status_is_success(status) {
                     CONFIG.parse_chat_response(&bytes)
@@ -125,10 +154,62 @@ macro_rules! __openai_provider_guest_core {
             }
         }
 
+        fn map_message_in(
+            message: &exports::ryuzi::provider0_2_0::provider::Message,
+        ) -> $crate::MessageIn {
+            $crate::MessageIn {
+                role: match message.role {
+                    Role::System => $crate::RoleIn::System,
+                    Role::User => $crate::RoleIn::User,
+                    Role::Assistant => $crate::RoleIn::Assistant,
+                },
+                content: message
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        ContentBlock::Text(text) => $crate::BlockIn::Text(text.clone()),
+                        ContentBlock::ToolUse(call) => $crate::BlockIn::ToolUse {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                        ContentBlock::ToolResult(result) => $crate::BlockIn::ToolResult {
+                            tool_call_id: result.tool_call_id.clone(),
+                            content: result.content.clone(),
+                            is_error: result.is_error,
+                        },
+                    })
+                    .collect(),
+            }
+        }
+
+        fn map_tool_choice(choice: ToolChoice) -> $crate::ToolChoiceIn {
+            match choice {
+                ToolChoice::Auto => $crate::ToolChoiceIn::Auto,
+                ToolChoice::None => $crate::ToolChoiceIn::None,
+                ToolChoice::Required => $crate::ToolChoiceIn::Required,
+            }
+        }
+
         fn map_chunk(chunk: $crate::ChunkOut) -> CompletionChunk {
             CompletionChunk {
                 text: chunk.text,
+                tool_calls: chunk
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                    .collect(),
                 finished: chunk.finished,
+                stop_reason: chunk.stop_reason.map(|reason| match reason {
+                    $crate::StopOut::EndTurn => StopReason::EndTurn,
+                    $crate::StopOut::ToolUse => StopReason::ToolUse,
+                    $crate::StopOut::MaxTokens => StopReason::MaxTokens,
+                    $crate::StopOut::Other => StopReason::Other,
+                }),
                 usage: chunk.usage.map(|u| TokenUsage {
                     input: u.input,
                     output: u.output,

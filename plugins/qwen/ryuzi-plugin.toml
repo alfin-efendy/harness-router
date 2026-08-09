@@ -1,13 +1,13 @@
 contract = 2
 id = "qwen"
 name = "Qwen Code"
-version = "0.1.0"
+version = "0.2.0"
 publisher = "Ryuzi"
 description = "Qwen Code chat provider. Talks to portal.qwen.ai/v1 with the user's Qwen subscription, which the host injects through ryuzi:oauth as the Authorization bearer — the component never sees an access or refresh token."
 
 [component]
 file = "qwen.wasm"
-wit-api = ">=0.1.0, <0.2.0"
+wit-api = ">=0.2.0, <0.3.0"
 lifecycle = "per-call"
 
 # The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is

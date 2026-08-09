@@ -49,6 +49,7 @@ pub const CONFIG: OpenAiFormat = OpenAiFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryuzi_openai_format::{BlockIn, ChatRequest, MessageIn, RoleIn, ToolChoiceIn};
     use serde_json::Value;
 
     #[test]
@@ -72,9 +73,20 @@ mod tests {
         // The `openai` descriptor is the ONLY one declaring
         // `uses_max_completion_tokens: true`, so this component is the only one
         // that must put the newer field on the wire.
-        let body: Value =
-            serde_json::from_slice(&CONFIG.build_chat_body("gpt-5.2", "hi", Some(64), None))
-                .unwrap();
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".to_string())],
+        }];
+        let body: Value = serde_json::from_slice(&CONFIG.build_chat_body(ChatRequest {
+            model: "gpt-5.2",
+            messages: &messages,
+            tools: &[],
+            tool_choice: ToolChoiceIn::Auto,
+            max_tokens: Some(64),
+            temperature: None,
+            leading_system: None,
+        }))
+        .unwrap();
         assert_eq!(body["max_completion_tokens"], 64);
         assert!(
             body.get("max_tokens").is_none(),
