@@ -1,11 +1,15 @@
 //! First-party Xiaomi MiMo free-tier provider component.
 //!
-//! Exports `ryuzi:provider/provider@0.1.0` (the Task 10 adapter's contract:
-//! `list-models` + `complete`) and ports the MiMo free-tier wire protocol
-//! from `ryuzi-core`'s `llm_router::mimo` faithfully, behind the host-mediated
-//! `ryuzi:http/http` capability. See that module for the exact strings and the
-//! rationale behind the anti-abuse gate (bootstrap JWT, Chrome-like headers,
-//! `x-session-affinity`, and the MiMoCode system marker).
+//! Exports `ryuzi:provider/provider@0.2.0` (`list-models` + `complete` over a
+//! full transcript, plus `capabilities`) and ports the MiMo free-tier wire
+//! protocol from `ryuzi-core`'s `llm_router::mimo` faithfully, behind the
+//! host-mediated `ryuzi:http/http` capability. See [`logic`] for the exact
+//! strings and the rationale behind the anti-abuse gate (bootstrap JWT,
+//! Chrome-like headers, `x-session-affinity`, and the MiMoCode system
+//! marker). `capabilities()` reports `tools: false` — see [`logic`]'s module
+//! docs and the comment on `logic::classify_chat_error` for why: a live probe
+//! found no evidence the gate accepts a `tools` array (the whole free channel
+//! is sunset upstream), so no tools support is claimed.
 //!
 //! # Architecture: pure `logic` vs. wasm `guest`
 //! Every piece of behaviour that does not need a live host — request/response
