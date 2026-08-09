@@ -64,13 +64,110 @@ pub struct WasmTokenUsage {
     pub output: u32,
 }
 
+/// Who authored a message (host-side mirror of the WIT 0.2.0 `role`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmRole {
+    System,
+    User,
+    Assistant,
+}
+
+/// A tool the agent bound for this turn (mirror of WIT `tool-def`).
+/// `input_schema` is a serialized JSON Schema object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmToolDef {
+    pub name: String,
+    pub description: String,
+    pub input_schema: String,
+}
+
+/// One model-emitted tool call (mirror of WIT `tool-call`). `arguments` is a
+/// serialized JSON object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// The outcome of a previous tool call, replayed on the next turn (mirror of
+/// WIT `tool-result`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmToolResult {
+    pub tool_call_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// One piece of a message (mirror of WIT `content-block`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WasmContentBlock {
+    Text(String),
+    ToolUse(WasmToolCall),
+    ToolResult(WasmToolResult),
+}
+
+/// One turn of the transcript (mirror of WIT `message`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmMessage {
+    pub role: WasmRole,
+    pub content: Vec<WasmContentBlock>,
+}
+
+/// How hard the model should be pushed to call a tool (mirror of WIT
+/// `tool-choice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmToolChoice {
+    Auto,
+    None,
+    Required,
+}
+
+/// Why the model stopped (mirror of WIT `stop-reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmStopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    Other,
+}
+
+/// What a component can actually do (mirror of WIT `provider-capabilities`).
+/// `tools: false` is the correct answer for a 0.1.0-only component and for a
+/// 0.2.0 component whose upstream rejects a tools array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WasmProviderCapabilities {
+    pub tools: bool,
+    pub parallel_tool_calls: bool,
+}
+
+/// A structured completion request (mirror of the WIT 0.2.0
+/// `completion-request`). Unlike [`WasmCompletionRequest`], this preserves
+/// roles, tool calls and tool results instead of flattening them into one
+/// string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WasmCompletionRequestV2 {
+    pub model: String,
+    pub messages: Vec<WasmMessage>,
+    pub tools: Vec<WasmToolDef>,
+    pub tool_choice: WasmToolChoice,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
 /// One completion chunk from a WASM provider (host-side mirror of the WIT
 /// `completion-chunk`). `complete` returns these as an ORDERED list; the router
 /// presents them as an ordered stream, preserving this order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WasmCompletionChunk {
     pub text: String,
+    /// Tool calls the model emitted in this chunk. Always empty on the 0.1.0
+    /// path, which has no tool channel.
+    pub tool_calls: Vec<WasmToolCall>,
     pub finished: bool,
+    /// Why the model stopped. `None` on the 0.1.0 path (its ABI cannot say),
+    /// where a finished chunk is treated as `end-turn`.
+    pub stop_reason: Option<WasmStopReason>,
     pub usage: Option<WasmTokenUsage>,
 }
 
@@ -212,7 +309,9 @@ fn model_from_wit(model: wit::ModelInfo) -> WasmModelInfo {
 fn chunk_from_wit(chunk: wit::CompletionChunk) -> WasmCompletionChunk {
     WasmCompletionChunk {
         text: chunk.text,
+        tool_calls: Vec::new(),
         finished: chunk.finished,
+        stop_reason: None,
         usage: chunk.usage.map(|usage| WasmTokenUsage {
             input: usage.input,
             output: usage.output,
