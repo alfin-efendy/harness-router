@@ -45,8 +45,9 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use crate::plugins::wasm_provider::{
-    build_test_transport_with_grants, TestTransportGrants, WasmCompletionRequest, WasmModelInfo,
-    WasmProviderRuntime, WasmProviderTransport, WasmTokenUsage,
+    build_test_transport_with_grants, TestTransportGrants, WasmCompletionChunk,
+    WasmCompletionRequest, WasmCompletionRequestV2, WasmContentBlock, WasmMessage, WasmModelInfo,
+    WasmProviderRuntime, WasmProviderTransport, WasmRole, WasmTokenUsage, WasmToolChoice,
 };
 
 /// The single loopback host every mock upstream binds to and every
@@ -370,13 +371,56 @@ impl ProviderConformance {
     /// The request every check drives `complete` with (a real prompt; the
     /// fixture reads its upstream from storage, not from the prompt, so this
     /// stays a genuine provider request regardless of which fixture is under
-    /// test).
+    /// test). Only reached for a component the transport reports toolless —
+    /// see [`Self::drive_completion`].
     fn completion_request(&self) -> WasmCompletionRequest {
         WasmCompletionRequest {
             model: self.fixture.request_model.clone(),
             prompt: "hello".to_string(),
             max_tokens: Some(64),
             temperature: Some(0.2),
+        }
+    }
+
+    /// The structured 0.2.0 equivalent of [`Self::completion_request`]: the
+    /// same model, budget and temperature, carried as a one-message
+    /// transcript instead of a flat string. No tools are bound — the battery
+    /// exercises model listing/completion/auth/error/timeout behaviour, not
+    /// tool-calling itself — so `tools` stays empty and `tool_choice` stays
+    /// the harmless default.
+    fn completion_request_v2(&self) -> WasmCompletionRequestV2 {
+        WasmCompletionRequestV2 {
+            model: self.fixture.request_model.clone(),
+            messages: vec![WasmMessage {
+                role: WasmRole::User,
+                content: vec![WasmContentBlock::Text("hello".to_string())],
+            }],
+            tools: Vec::new(),
+            tool_choice: WasmToolChoice::Auto,
+            max_tokens: Some(64),
+            temperature: Some(0.2),
+        }
+    }
+
+    /// Drive one completion against `transport`, choosing the 0.1.0 flat
+    /// `complete` or the structured 0.2.0 `complete_v2` the SAME way the real
+    /// router does (`llm_router::client::wasm_provider_stream`): on
+    /// `transport.capabilities().tools`, never on which fixture is under
+    /// test. Every real provider component ported so far has migrated to a
+    /// 0.2.0-only export (`ryuzi:provider/provider@0.2.0`, `tools: true`), so
+    /// calling the 0.1.0 `complete` against one fails closed with "component
+    /// does not export ryuzi:provider/provider" — this is what lets the SAME
+    /// six checks below keep exercising a 0.1.0-only fixture (the synthetic
+    /// `component-provider-http` one) and every migrated real component
+    /// without knowing which is which.
+    async fn drive_completion(
+        &self,
+        transport: &WasmProviderTransport,
+    ) -> Result<Vec<WasmCompletionChunk>, String> {
+        if transport.capabilities().tools {
+            transport.complete_v2(self.completion_request_v2()).await
+        } else {
+            transport.complete(self.completion_request()).await
         }
     }
 
@@ -423,8 +467,8 @@ impl ProviderConformance {
         .await;
         let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
 
-        let chunks = transport
-            .complete(self.completion_request())
+        let chunks = self
+            .drive_completion(&transport)
             .await
             .expect("complete over mocked HTTP must succeed");
 
@@ -471,8 +515,8 @@ impl ProviderConformance {
         .await;
         let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
 
-        let chunks = transport
-            .complete(self.completion_request())
+        let chunks = self
+            .drive_completion(&transport)
             .await
             .expect("complete over mocked HTTP must succeed");
 
@@ -523,13 +567,10 @@ impl ProviderConformance {
             )
             .await;
             let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
-            let error = transport
-                .complete(self.completion_request())
-                .await
-                .expect_err(&format!(
-                    "a {} upstream must surface as Err, not a chunk list",
-                    case.status
-                ));
+            let error = self.drive_completion(&transport).await.expect_err(&format!(
+                "a {} upstream must surface as Err, not a chunk list",
+                case.status
+            ));
             assert!(
                 error.contains(case.expected_substring),
                 "a {} upstream must map to an error containing {:?}, got: {error}",
@@ -553,8 +594,8 @@ impl ProviderConformance {
         let (transport, _tmp) = self.transport(&mock, budget).await;
 
         let started = Instant::now();
-        let error = transport
-            .complete(self.completion_request())
+        let error = self
+            .drive_completion(&transport)
             .await
             .expect_err("a stalled upstream must be caught by the host budget, not hang");
         let elapsed = started.elapsed();
