@@ -12,7 +12,8 @@
 //! logic out without changing a single guest call site or its behaviour.
 
 pub use ryuzi_anthropic_format::{
-    status_is_success, AnthropicFormat, ChunkOut, ModelOut, ProviderFail, ANTHROPIC_VERSION,
+    status_is_success, AnthropicFormat, BlockIn, ChunkOut, MessageIn, MessagesRequest, ModelOut,
+    ProviderFail, RoleIn, StopOut, ToolCallOut, ToolChoiceIn, ToolIn, ANTHROPIC_VERSION,
     BASE_URL_STORAGE_KEY, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS,
 };
 
@@ -86,11 +87,22 @@ mod tests {
 
     #[test]
     fn config_x_api_key_request_carries_no_system_turn() {
-        // The API-key component passes `system: None`, so — unlike the OAuth
-        // variant — its request body must never carry a `system` field.
-        let body: Value =
-            serde_json::from_slice(&CONFIG.build_messages_body("m", "hi", None, None, None))
-                .unwrap();
+        // The API-key component passes `leading_system: None`, so — unlike the
+        // OAuth variant — its request body must never carry a `system` field.
+        let messages = [MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".to_string())],
+        }];
+        let body: Value = serde_json::from_slice(&CONFIG.build_messages_body(MessagesRequest {
+            model: "m",
+            messages: &messages,
+            tools: &[],
+            tool_choice: ToolChoiceIn::Auto,
+            max_tokens: None,
+            temperature: None,
+            leading_system: None,
+        }))
+        .unwrap();
         assert!(
             body.get("system").is_none(),
             "the x-api-key path sends no Claude-subscription system marker",

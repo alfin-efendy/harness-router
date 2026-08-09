@@ -17,7 +17,10 @@
 //! the endpoint also requires travels in the request BODY (see
 //! [`crate::logic::CLAUDE_CODE_SYSTEM_PROMPT`]), because the host owns headers.
 
-use crate::logic::{self, ChunkOut, ModelOut, OAuthFail, CONFIG};
+use crate::logic::{
+    self, BlockIn, ChunkOut, MessageIn, ModelOut, OAuthFail, RoleIn, StopOut, ToolCallOut,
+    ToolChoiceIn, ToolIn, CONFIG,
+};
 use ryuzi_anthropic_format::ProviderFail;
 
 wit_bindgen::generate!({
@@ -26,8 +29,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use exports::ryuzi::provider::provider::{
-    CompletionChunk, CompletionRequest, Guest, ModelInfo, ProviderError, TokenUsage,
+use exports::ryuzi::provider0_2_0::provider::{
+    CompletionChunk, CompletionRequest, ContentBlock, Guest, ModelInfo, ProviderCapabilities,
+    ProviderError, Role, StopReason, TokenUsage, ToolCall, ToolChoice,
 };
 use ryuzi::oauth::oauth::{self, AuthorizedResponse, Header, OauthError, OauthRequest};
 use ryuzi::storage::storage;
@@ -35,6 +39,17 @@ use ryuzi::storage::storage;
 struct ProviderComponent;
 
 impl Guest for ProviderComponent {
+    /// The Anthropic Messages API supports native tool use on every model this
+    /// component serves (a Claude subscription reaches the same `/messages`
+    /// endpoint as the x-api-key bundle). Parallel tool calls are NOT claimed:
+    /// the host only treats the flag as a hint.
+    fn capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            tools: true,
+            parallel_tool_calls: false,
+        }
+    }
+
     fn list_models() -> Result<Vec<ModelInfo>, ProviderError> {
         let url = logic::models_url(&base_url());
         let response = authorized_request("GET", &url, None).map_err(map_fail)?;
@@ -54,10 +69,14 @@ impl Guest for ProviderComponent {
                 "a completion request must name a model".to_string(),
             ));
         }
+        let messages: Vec<MessageIn> = request.messages.iter().map(map_message_in).collect();
+        let tools: Vec<ToolIn> = request.tools.iter().map(map_tool_def).collect();
         let url = logic::messages_url(&base_url());
         let body = logic::build_completion_body(
             &request.model,
-            &request.prompt,
+            &messages,
+            &tools,
+            map_tool_choice(request.tool_choice),
             request.max_tokens,
             request.temperature,
         );
@@ -70,6 +89,53 @@ impl Guest for ProviderComponent {
         chunks
             .map(|list| list.into_iter().map(map_chunk).collect())
             .map_err(map_fail)
+    }
+}
+
+/// Map a generated WIT `message` onto the host-free [`MessageIn`] the shared
+/// crate's `build_messages_body` consumes. Field-for-field, since the WIT
+/// `content-block` variant already carries Anthropic's exact three block
+/// shapes. Kept structurally identical to the `anthropic` bundle's own mapper.
+fn map_message_in(message: &exports::ryuzi::provider0_2_0::provider::Message) -> MessageIn {
+    MessageIn {
+        role: match message.role {
+            Role::System => RoleIn::System,
+            Role::User => RoleIn::User,
+            Role::Assistant => RoleIn::Assistant,
+        },
+        content: message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => BlockIn::Text(text.clone()),
+                ContentBlock::ToolUse(call) => BlockIn::ToolUse {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+                ContentBlock::ToolResult(result) => BlockIn::ToolResult {
+                    tool_call_id: result.tool_call_id.clone(),
+                    content: result.content.clone(),
+                    is_error: result.is_error,
+                },
+            })
+            .collect(),
+    }
+}
+
+fn map_tool_def(tool: &exports::ryuzi::provider0_2_0::provider::ToolDef) -> ToolIn {
+    ToolIn {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+    }
+}
+
+fn map_tool_choice(choice: ToolChoice) -> ToolChoiceIn {
+    match choice {
+        ToolChoice::Auto => ToolChoiceIn::Auto,
+        ToolChoice::None => ToolChoiceIn::None,
+        ToolChoice::Required => ToolChoiceIn::Required,
     }
 }
 
@@ -157,7 +223,22 @@ fn map_model(model: ModelOut) -> ModelInfo {
 fn map_chunk(chunk: ChunkOut) -> CompletionChunk {
     CompletionChunk {
         text: chunk.text,
+        tool_calls: chunk
+            .tool_calls
+            .into_iter()
+            .map(|call: ToolCallOut| ToolCall {
+                id: call.id,
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect(),
         finished: chunk.finished,
+        stop_reason: chunk.stop_reason.map(|reason| match reason {
+            StopOut::EndTurn => StopReason::EndTurn,
+            StopOut::ToolUse => StopReason::ToolUse,
+            StopOut::MaxTokens => StopReason::MaxTokens,
+            StopOut::Other => StopReason::Other,
+        }),
         usage: chunk.usage.map(|u| TokenUsage {
             input: u.input,
             output: u.output,

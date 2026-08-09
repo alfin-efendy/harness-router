@@ -1,13 +1,13 @@
 contract = 2
 id = "anthropic-oauth"
 name = "Anthropic (Claude subscription)"
-version = "0.1.0"
+version = "0.2.0"
 publisher = "Ryuzi"
 description = "Anthropic (Claude Pro/Max subscription) chat provider. Talks to api.anthropic.com with the user's Claude subscription, which the host injects through ryuzi:oauth as the Authorization bearer — the component never sees an access or refresh token."
 
 [component]
 file = "anthropic-oauth.wasm"
-wit-api = ">=0.1.0, <0.2.0"
+wit-api = ">=0.2.0, <0.3.0"
 lifecycle = "per-call"
 
 # The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is

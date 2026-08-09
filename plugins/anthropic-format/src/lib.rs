@@ -35,18 +35,23 @@
 //! specifically to keep upstream error PROSE (which can echo a submitted key)
 //! out of the guest-visible error string.
 //!
-//! # Accepted ABI limitation
-//! `ryuzi:provider/provider` is flat text: a `prompt` string in, text chunks
-//! out. Every component built on this crate therefore supports plain text
-//! completion only — no tool calling, no structured multi-turn messages, no
-//! multimodal content, and no true token streaming (the single buffered upstream
-//! response is returned as one terminal chunk). That is a deliberate, accepted
-//! tradeoff of the WASM provider migration, not an oversight. The OAuth variant's
-//! optional system prompt (its Claude-subscription auth marker) is the one
-//! structured field this flat ABI carries, injected by the component — see
-//! [`AnthropicFormat::build_messages_body`]'s `system` argument.
+//! # The 0.2.0 interface: transcript and tools in, tool calls out
+//! Every component built on this crate exports `ryuzi:provider/provider@0.2.0`
+//! and reports `capabilities().tools == true` — the Anthropic Messages API
+//! supports tool use natively on every model these components serve.
+//! [`AnthropicFormat::build_messages_body`] takes the full structured
+//! transcript (messages, tools, tool-choice) rather than a single flat prompt,
+//! and [`AnthropicFormat::parse_message_response`] reads tool-use blocks and
+//! the stop reason back out. Because the host already speaks Anthropic
+//! Messages, this mapping is close to an IDENTITY transform rather than a
+//! translation — see the doc comments on those two functions for exactly
+//! where it is not. The one remaining accepted limitation is no true token
+//! streaming: the single buffered upstream response is returned as one
+//! terminal chunk, never deltas. The OAuth variant's leading system prompt
+//! (its Claude-subscription auth marker) travels as
+//! [`MessagesRequest::leading_system`], injected by the component.
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 /// Key in a component's (host-scoped) `ryuzi:storage` slice holding an OPTIONAL
 /// base-URL override — the same product-level affordance every provider
@@ -151,11 +156,103 @@ pub struct UsageOut {
     pub output: u32,
 }
 
+/// Who authored a message (host-free mirror of the WIT 0.2.0 `role`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleIn {
+    System,
+    User,
+    Assistant,
+}
+
+/// One piece of a message (host-free mirror of WIT `content-block`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockIn {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        /// A serialized JSON object — Anthropic's wire `input` is the object
+        /// itself, so [`AnthropicFormat::build_messages_body`] parses this
+        /// back before emitting it.
+        arguments: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+/// One turn of the transcript (host-free mirror of WIT `message`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageIn {
+    pub role: RoleIn,
+    pub content: Vec<BlockIn>,
+}
+
+/// A tool the agent bound for this turn (host-free mirror of WIT `tool-def`).
+/// `input_schema` is a serialized JSON Schema object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolIn {
+    pub name: String,
+    pub description: String,
+    pub input_schema: String,
+}
+
+/// How hard to push the model to call a tool (mirror of WIT `tool-choice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoiceIn {
+    Auto,
+    None,
+    Required,
+}
+
+/// Why the model stopped (mirror of WIT `stop-reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOut {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    Other,
+}
+
+/// One model-emitted tool call (mirror of WIT `tool-call`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallOut {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Everything one `/messages` call needs.
+///
+/// A struct rather than a parameter list for the same reason as the
+/// OpenAI-format sibling: it grew past the point where positional arguments
+/// read safely, and `leading_system` is easy to pass in the wrong slot as a
+/// bare `Option<&str>`.
+pub struct MessagesRequest<'a> {
+    pub model: &'a str,
+    pub messages: &'a [MessageIn],
+    pub tools: &'a [ToolIn],
+    pub tool_choice: ToolChoiceIn,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    /// Emitted as the FIRST block of the request's top-level `system` array
+    /// when set, ahead of any `RoleIn::System` messages the transcript itself
+    /// carries. Exists for the OAuth variant's Claude-subscription auth
+    /// marker (see `plugins/anthropic-oauth`); the API-key variant passes
+    /// `None`.
+    pub leading_system: Option<&'a str>,
+}
+
 /// One completion chunk (host-free mirror of WIT `completion-chunk`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkOut {
     pub text: String,
+    /// Tool calls the model emitted. Empty for a plain text turn.
+    pub tool_calls: Vec<ToolCallOut>,
     pub finished: bool,
+    pub stop_reason: Option<StopOut>,
     pub usage: Option<UsageOut>,
 }
 
@@ -201,22 +298,46 @@ impl AnthropicFormat {
             .unwrap_or(self.default_context_window)
     }
 
-    /// Build the NON-STREAMING `/messages` body for a flat prompt.
+    /// Build the NON-STREAMING `/messages` body for a full transcript.
     ///
-    /// The `ryuzi:provider/provider` ABI carries a single `prompt` string, so
-    /// the request is one `user` turn with STRING content — no tools, no content
-    /// blocks. `stream` is false because the host capability is a buffered
+    /// # This is nearly an identity mapping
+    /// The host already speaks Anthropic Messages: `content-block` is
+    /// text/tool-use/tool-result (Anthropic's exact three shapes), `message` is
+    /// `{role, content}` (Anthropic's exact shape), and `tool-def.input-schema`
+    /// is meant to travel as the schema itself (Anthropic's `input_schema`,
+    /// unlike OpenAI's nested `function.parameters`). So a `User`/`Assistant`
+    /// message maps ONE-TO-ONE onto one Anthropic message — no splitting, no
+    /// synthesized turns, no reshaping beyond re-rendering field names — and a
+    /// bound tool maps onto one Anthropic tool definition the same way. The two
+    /// places this is genuinely NOT identity:
+    /// - Anthropic has no per-turn `system` role: a `RoleIn::System` message
+    ///   cannot appear in `messages` at all, so its `Text` blocks are pulled out
+    ///   into the top-level `system` array instead (see below). A `ToolUse`/
+    ///   `ToolResult` block inside a system message is a caller bug — a system
+    ///   turn only carries text — and is silently dropped rather than failing
+    ///   the whole request.
+    /// - `arguments`/`input_schema` are serialized JSON STRINGS in the WIT ABI
+    ///   (WIT has no JSON value type) but Anthropic wants the parsed OBJECT
+    ///   under `input`/`input_schema`; this function parses them back. A string
+    ///   that fails to parse is a host bug, not a reason to fail the turn, so it
+    ///   degrades to an empty/open object rather than erroring.
+    /// - `ToolChoiceIn::Required` (force SOME tool call) renders as Anthropic's
+    ///   `{"type":"any"}`, not a `"required"` tag — Anthropic's tool_choice
+    ///   vocabulary is `auto`/`any`/`tool`/`none`.
+    ///
+    /// `system` is an array of leading text blocks: [`MessagesRequest::leading_system`]
+    /// (if set) FIRST, then each `RoleIn::System` message's text blocks in
+    /// transcript order. The array is omitted entirely when both are absent —
+    /// the API-key path with no system messages carries no `system` key at all,
+    /// byte-for-byte as before this task.
+    ///
+    /// `stream` is false because the host capability is a buffered
     /// request/response: the component asks for the whole message and returns it
     /// as one terminal chunk.
     ///
-    /// `system` is the one structured field the flat ABI carries: when `Some`,
-    /// a single leading `text` block is emitted as the request's `system`
-    /// (`[{"type":"text","text":<system>}]`, the array form Anthropic accepts).
-    /// The `x-api-key` component passes `None`; the OAuth component passes its
-    /// Claude-subscription auth marker here, so the acceptance-required system
-    /// prompt is part of the request BODY the component builds rather than a
-    /// header the host would strip. When `None`, no `system` key is emitted at
-    /// all — the API-key path is byte-for-byte unchanged.
+    /// `tools`/`tool_choice` are omitted entirely when no tools are bound — the
+    /// same "no tools means no tools key" rule the OpenAI-format crate applies,
+    /// so a pure-chat turn's body is unchanged from before tool support existed.
     ///
     /// `max_tokens` is ALWAYS present, falling back to
     /// [`Self::default_max_tokens`] — Anthropic rejects a request without it.
@@ -226,34 +347,113 @@ impl AnthropicFormat {
     /// still goes out and the upstream applies its own default — failing an
     /// entire completion over an unrepresentable optional tuning knob would be
     /// the worse trade.
-    pub fn build_messages_body(
-        &self,
-        model: &str,
-        prompt: &str,
-        max_tokens: Option<u32>,
-        temperature: Option<f32>,
-        system: Option<&str>,
-    ) -> Vec<u8> {
-        let mut message = Map::new();
-        message.insert("role".to_string(), Value::String("user".to_string()));
-        message.insert("content".to_string(), Value::String(prompt.to_string()));
+    pub fn build_messages_body(&self, request: MessagesRequest<'_>) -> Vec<u8> {
+        let mut system_blocks: Vec<Value> = Vec::new();
+        if let Some(leading) = request.leading_system {
+            system_blocks.push(json!({"type": "text", "text": leading}));
+        }
+
+        let mut messages: Vec<Value> = Vec::new();
+        for message in request.messages {
+            if matches!(message.role, RoleIn::System) {
+                // No per-turn system role on the wire: pull this message's
+                // text out into the top-level `system` array instead of
+                // `messages`. Non-text blocks in a system message do not fit
+                // Anthropic's `system` shape and are dropped.
+                for block in &message.content {
+                    if let BlockIn::Text(text) = block {
+                        system_blocks.push(json!({"type": "text", "text": text}));
+                    }
+                }
+                continue;
+            }
+            if message.content.is_empty() {
+                continue;
+            }
+            let blocks: Vec<Value> = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    BlockIn::Text(text) => json!({"type": "text", "text": text}),
+                    BlockIn::ToolUse {
+                        id,
+                        name,
+                        arguments,
+                    } => json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": serde_json::from_str::<Value>(arguments)
+                            .unwrap_or_else(|_| json!({})),
+                    }),
+                    BlockIn::ToolResult {
+                        tool_call_id,
+                        content,
+                        is_error,
+                    } => json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": content,
+                        "is_error": is_error,
+                    }),
+                })
+                .collect();
+            messages.push(json!({
+                "role": role_name(message.role),
+                "content": blocks,
+            }));
+        }
 
         let mut obj = Map::new();
-        obj.insert("model".to_string(), Value::String(model.to_string()));
+        obj.insert(
+            "model".to_string(),
+            Value::String(request.model.to_string()),
+        );
         obj.insert(
             "max_tokens".to_string(),
-            Value::from(max_tokens.unwrap_or(self.default_max_tokens)),
+            Value::from(request.max_tokens.unwrap_or(self.default_max_tokens)),
         );
-        obj.insert(
-            "messages".to_string(),
-            Value::Array(vec![Value::Object(message)]),
-        );
+        obj.insert("messages".to_string(), Value::Array(messages));
         obj.insert("stream".to_string(), Value::Bool(false));
-        if let Some(system) = system {
-            let block = serde_json::json!({"type": "text", "text": system});
-            obj.insert("system".to_string(), Value::Array(vec![block]));
+        if !system_blocks.is_empty() {
+            obj.insert("system".to_string(), Value::Array(system_blocks));
         }
-        if let Some(temp) = temperature {
+        if !request.tools.is_empty() {
+            obj.insert(
+                "tools".to_string(),
+                Value::Array(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "name": tool.name,
+                                "description": tool.description,
+                                // Anthropic takes the schema DIRECTLY as
+                                // `input_schema` — no `function.parameters`
+                                // nesting the way OpenAI wants it. A schema
+                                // that does not parse degrades to the
+                                // permissive open object rather than failing
+                                // the turn.
+                                "input_schema": serde_json::from_str::<Value>(&tool.input_schema)
+                                    .unwrap_or_else(|_| json!({"type": "object"})),
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+            obj.insert(
+                "tool_choice".to_string(),
+                match request.tool_choice {
+                    ToolChoiceIn::Auto => json!({"type": "auto"}),
+                    ToolChoiceIn::None => json!({"type": "none"}),
+                    // WIT's "force some tool call" is Anthropic's `any`, not a
+                    // `"required"` tag.
+                    ToolChoiceIn::Required => json!({"type": "any"}),
+                },
+            );
+        }
+        if let Some(temp) = request.temperature {
             if let Some(number) = serde_json::Number::from_f64(temp as f64) {
                 obj.insert("temperature".to_string(), Value::Number(number));
             }
@@ -298,36 +498,78 @@ impl AnthropicFormat {
     }
 
     /// Convert a buffered (non-stream) `/messages` response into ordered
-    /// completion chunks: the FIRST `text` block of `content[]` becomes a single
-    /// terminal chunk carrying the response's token usage when present.
+    /// completion chunks: one terminal chunk carrying every `text` block's
+    /// prose (newline-joined), every `tool_use` block as a tool call, the
+    /// mapped stop reason, and the response's token usage when present.
     ///
-    /// Anthropic returns `content` as an array of typed blocks. Only `text`
-    /// blocks carry prose; a `thinking` or `tool_use` block that precedes one is
-    /// skipped rather than rendered, so a reasoning model's private thinking is
-    /// never surfaced as the completion. The flat ABI has no representation for
-    /// anything past the first text block, which is a known consequence of that
-    /// ABI (a plain, tool-free request returns exactly one text block).
+    /// Anthropic returns `content` as an array of typed blocks. `thinking`/
+    /// `redacted_thinking` (and any future block type this crate does not
+    /// recognize) are skipped rather than rendered, so a reasoning model's
+    /// private thinking is never surfaced as the completion.
+    ///
+    /// A response with NO text block is not an error — a tool-only turn
+    /// legitimately carries zero `text` blocks (just `tool_use`), and
+    /// rejecting it would fail every tool call the same way the pre-tools
+    /// OpenAI-format parser used to. Only a response with no `content` array
+    /// at all is malformed.
     pub fn parse_message_response(&self, body: &[u8]) -> Result<Vec<ChunkOut>, ProviderFail> {
         let label = self.provider_label;
         let value: Value = serde_json::from_slice(body).map_err(|e| {
             ProviderFail::Failed(format!("{label} message response is not JSON: {e}"))
         })?;
-        let text = value
+        let blocks = value
             .get("content")
             .and_then(Value::as_array)
-            .and_then(|blocks| {
-                blocks
-                    .iter()
-                    .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            })
-            .and_then(|block| block.get("text"))
-            .and_then(Value::as_str)
             .ok_or_else(|| {
-                ProviderFail::Failed(format!("{label} message response carried no text block"))
+                ProviderFail::Failed(format!("{label} message response carried no content array"))
             })?;
+
+        let mut text_parts: Vec<&str> = Vec::new();
+        let mut tool_calls: Vec<ToolCallOut> = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        text_parts.push(text);
+                    }
+                }
+                Some("tool_use") => {
+                    // A malformed tool_use entry (missing id/name) is skipped
+                    // rather than failing the whole response — mirrors how
+                    // `ryuzi_openai_format::parse_chat_response` treats a
+                    // malformed `tool_calls` entry.
+                    if let (Some(id), Some(name)) = (
+                        block.get("id").and_then(Value::as_str),
+                        block.get("name").and_then(Value::as_str),
+                    ) {
+                        // Anthropic's `input` is a JSON OBJECT; the WIT
+                        // `tool-call.arguments` is a serialized JSON string,
+                        // so it is re-serialized here.
+                        let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                        tool_calls.push(ToolCallOut {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            arguments: serde_json::to_string(&input)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        });
+                    }
+                }
+                // `thinking`, `redacted_thinking`, and anything else this
+                // crate does not recognize carry no completion content.
+                _ => {}
+            }
+        }
+
         Ok(vec![ChunkOut {
-            text: text.to_string(),
+            text: text_parts.join("\n"),
+            tool_calls,
             finished: true,
+            stop_reason: Some(match value.get("stop_reason").and_then(Value::as_str) {
+                Some("tool_use") => StopOut::ToolUse,
+                Some("max_tokens") => StopOut::MaxTokens,
+                Some("end_turn") | Some("stop_sequence") => StopOut::EndTurn,
+                _ => StopOut::Other,
+            }),
             usage: parse_usage(&value),
         }])
     }
@@ -358,6 +600,17 @@ impl AnthropicFormat {
             Some(tag) => format!("{label} rejected the request: HTTP {status} ({tag})"),
             None => format!("{label} rejected the request: HTTP {status}"),
         })
+    }
+}
+
+/// Anthropic's per-message `role` — only ever `"user"` or `"assistant"` on the
+/// wire (a `RoleIn::System` message never reaches this function; it is
+/// extracted into the top-level `system` array before this is called).
+fn role_name(role: RoleIn) -> &'static str {
+    match role {
+        RoleIn::System => "system",
+        RoleIn::User => "user",
+        RoleIn::Assistant => "assistant",
     }
 }
 
@@ -495,119 +748,300 @@ mod tests {
         );
     }
 
+    /// Build a [`MessagesRequest`] with every field at its "nothing bound" default
+    /// except `model`/`messages`/`tools`, exactly like the OpenAI-format
+    /// sibling's own `req()` test helper.
+    fn req<'a>(messages: &'a [MessageIn], tools: &'a [ToolIn]) -> MessagesRequest<'a> {
+        MessagesRequest {
+            model: "m",
+            messages,
+            tools,
+            tool_choice: ToolChoiceIn::Auto,
+            max_tokens: None,
+            temperature: None,
+            leading_system: None,
+        }
+    }
+
     #[test]
-    fn messages_body_maps_the_flat_prompt_to_a_single_user_turn() {
-        let body: Value = serde_json::from_slice(&ANTHROPIC.build_messages_body(
-            "claude-sonnet-4-5",
-            "ping",
-            None,
-            None,
-            None,
-        ))
-        .unwrap();
-        assert_eq!(body["model"], "claude-sonnet-4-5");
-        assert_eq!(body["stream"], false);
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1, "the flat ABI carries exactly one turn");
-        assert_eq!(messages[0]["role"], "user");
+    fn messages_body_carries_the_full_transcript_as_content_block_arrays() {
+        // The host already speaks Anthropic Messages, so a User/Assistant
+        // message maps ONE-TO-ONE onto one Anthropic message with a `content`
+        // BLOCK ARRAY — never collapsed to a bare string the way the old flat
+        // ABI's single turn was.
+        let messages = vec![
+            MessageIn {
+                role: RoleIn::User,
+                content: vec![BlockIn::Text("hi".into())],
+            },
+            MessageIn {
+                role: RoleIn::Assistant,
+                content: vec![BlockIn::Text("hello".into())],
+            },
+        ];
+        let body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(req(&messages, &[]))).unwrap();
+        let out = body["messages"].as_array().unwrap();
         assert_eq!(
-            messages[0]["content"], "ping",
-            "content is a plain string, not a block array",
+            out.len(),
+            2,
+            "no expansion, no collapsing — one in, one out"
+        );
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(
+            out[0]["content"],
+            serde_json::json!([{"type": "text", "text": "hi"}])
+        );
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(
+            out[1]["content"],
+            serde_json::json!([{"type": "text", "text": "hello"}])
         );
         assert!(body.get("temperature").is_none());
         assert!(
             body.get("system").is_none(),
-            "with no system argument the API-key request carries no system turn",
+            "no leading marker and no System-role message means no system key at all",
         );
     }
 
     #[test]
-    fn messages_body_emits_a_leading_system_text_block_only_when_asked() {
-        // The OAuth variant's Claude-subscription auth marker travels in the
-        // request BODY, as the array form Anthropic accepts. The API-key variant
-        // (system = None) must still emit no `system` key at all.
-        let with_system: Value = serde_json::from_slice(&ANTHROPIC.build_messages_body(
-            "claude-opus-4-5",
-            "ping",
-            None,
-            None,
-            Some("You are Claude Code, Anthropic's official CLI for Claude."),
-        ))
-        .unwrap();
+    fn a_system_role_message_is_pulled_out_of_messages_into_the_top_level_system_array() {
+        // Anthropic has NO per-turn system role, so unlike every other role a
+        // `RoleIn::System` message cannot map onto a `messages` entry at all —
+        // this is the one place the mapping is a real reshape, not identity.
+        let messages = vec![
+            MessageIn {
+                role: RoleIn::System,
+                content: vec![BlockIn::Text("sys".into())],
+            },
+            MessageIn {
+                role: RoleIn::User,
+                content: vec![BlockIn::Text("hi".into())],
+            },
+        ];
+        let body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(req(&messages, &[]))).unwrap();
         assert_eq!(
-            with_system["system"],
-            serde_json::json!([
-                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
-            ]),
-            "the system marker is a single leading text block, not a bare string",
+            body["system"],
+            serde_json::json!([{"type": "text", "text": "sys"}]),
         );
-        // The user turn is untouched by the system marker.
-        assert_eq!(with_system["messages"][0]["role"], "user");
-        assert_eq!(with_system["messages"][0]["content"], "ping");
-        assert_eq!(with_system["max_tokens"], DEFAULT_MAX_TOKENS);
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 1, "the system message never lands in messages");
+        assert_eq!(out[0]["role"], "user");
+    }
 
-        // An empty string is still a system block (it is a caller's explicit
-        // choice); only `None` omits the field.
-        let empty: Value =
-            serde_json::from_slice(&ANTHROPIC.build_messages_body("m", "hi", None, None, Some("")))
-                .unwrap();
+    #[test]
+    fn a_leading_system_marker_precedes_any_transcript_system_messages() {
+        // The OAuth variant's Claude-subscription auth marker
+        // (`leading_system`) must come FIRST, ahead of whatever System-role
+        // messages the transcript itself carries.
+        let messages = vec![
+            MessageIn {
+                role: RoleIn::System,
+                content: vec![BlockIn::Text("transcript sys".into())],
+            },
+            MessageIn {
+                role: RoleIn::User,
+                content: vec![BlockIn::Text("hi".into())],
+            },
+        ];
+        let mut request = req(&messages, &[]);
+        request.leading_system = Some("MARKER");
+        let body: Value = serde_json::from_slice(&ANTHROPIC.build_messages_body(request)).unwrap();
         assert_eq!(
-            empty["system"],
-            serde_json::json!([{"type": "text", "text": ""}])
+            body["system"],
+            serde_json::json!([
+                {"type": "text", "text": "MARKER"},
+                {"type": "text", "text": "transcript sys"},
+            ]),
         );
+    }
+
+    #[test]
+    fn tools_are_forwarded_with_input_schema_directly_not_nested_under_function() {
+        // Anthropic takes the schema AS the tool's `input_schema` — no
+        // `function.parameters` nesting the way OpenAI wants it.
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("w?".into())],
+        }];
+        let tools = vec![ToolIn {
+            name: "get_weather".into(),
+            description: "Get weather".into(),
+            input_schema: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
+        }];
+        let body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(req(&messages, &tools))).unwrap();
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert_eq!(body["tools"][0]["description"], "Get weather");
+        assert_eq!(
+            body["tools"][0]["input_schema"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert!(
+            body["tools"][0].get("function").is_none(),
+            "no function wrapper — Anthropic's tool shape has none",
+        );
+        assert_eq!(body["tool_choice"], serde_json::json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn no_tools_means_no_tools_or_tool_choice_key_at_all() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
+        let body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(req(&messages, &[]))).unwrap();
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn tool_choice_required_renders_as_anthropics_any_not_a_required_tag() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
+        let tools = vec![ToolIn {
+            name: "t".into(),
+            description: String::new(),
+            input_schema: "{}".into(),
+        }];
+        let mut request = req(&messages, &tools);
+        request.tool_choice = ToolChoiceIn::Required;
+        let body: Value = serde_json::from_slice(&ANTHROPIC.build_messages_body(request)).unwrap();
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type": "any"}),
+            "WIT's Required (force some tool) is Anthropic's `any`, not `required`",
+        );
+
+        let mut none_request = req(&messages, &tools);
+        none_request.tool_choice = ToolChoiceIn::None;
+        let none_body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(none_request)).unwrap();
+        assert_eq!(
+            none_body["tool_choice"],
+            serde_json::json!({"type": "none"})
+        );
+    }
+
+    #[test]
+    fn an_unparseable_tool_schema_degrades_to_an_open_object_instead_of_failing() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
+        let tools = vec![ToolIn {
+            name: "broken".into(),
+            description: String::new(),
+            input_schema: "not json".into(),
+        }];
+        let body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(req(&messages, &tools))).unwrap();
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn an_assistant_tool_use_and_its_result_stay_in_their_own_messages_content_array() {
+        // Unlike the OpenAI-format mapping (which SPLITS a tool result into a
+        // separate `role: "tool"` message), Anthropic's tool_use/tool_result
+        // blocks travel inside the SAME per-turn content array the transcript
+        // already puts them in — no expansion needed, because the wire and the
+        // ABI agree on where a tool block lives.
+        let messages = vec![
+            MessageIn {
+                role: RoleIn::Assistant,
+                content: vec![BlockIn::ToolUse {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"Jakarta"}"#.into(),
+                }],
+            },
+            MessageIn {
+                role: RoleIn::User,
+                content: vec![BlockIn::ToolResult {
+                    tool_call_id: "call_1".into(),
+                    content: "31C".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(req(&messages, &[]))).unwrap();
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(
+            out.len(),
+            2,
+            "one input message, one output message — no split"
+        );
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"][0]["type"], "tool_use");
+        assert_eq!(out[0]["content"][0]["id"], "call_1");
+        assert_eq!(out[0]["content"][0]["name"], "get_weather");
+        assert_eq!(
+            out[0]["content"][0]["input"],
+            serde_json::json!({"city": "Jakarta"}),
+            "arguments is a serialized string on the WIT ABI but Anthropic wants the object",
+        );
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][0]["type"], "tool_result");
+        assert_eq!(out[1]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(out[1]["content"][0]["content"], "31C");
+        assert_eq!(out[1]["content"][0]["is_error"], false);
     }
 
     #[test]
     fn messages_body_always_carries_max_tokens_defaulting_when_the_abi_omits_it() {
         // Anthropic REJECTS a request without max_tokens, so unlike the
         // OpenAI-format components this field can never be omitted.
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
         let defaulted: Value =
-            serde_json::from_slice(&ANTHROPIC.build_messages_body("m", "hi", None, None, None))
-                .unwrap();
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(req(&messages, &[]))).unwrap();
         assert_eq!(defaulted["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(DEFAULT_MAX_TOKENS, 4_096);
 
-        let requested: Value = serde_json::from_slice(&ANTHROPIC.build_messages_body(
-            "m",
-            "hi",
-            Some(64),
-            Some(0.2),
-            None,
-        ))
-        .unwrap();
+        let mut requested = req(&messages, &[]);
+        requested.max_tokens = Some(64);
+        requested.temperature = Some(0.2);
+        let requested_body: Value =
+            serde_json::from_slice(&ANTHROPIC.build_messages_body(requested)).unwrap();
         assert_eq!(
-            requested["max_tokens"], 64,
+            requested_body["max_tokens"], 64,
             "a caller-supplied cap must win over the default",
         );
         // The WIT temperature is an f32, so the JSON number is its widened
         // value — compare within f32 precision rather than bit-exactly.
-        assert!((requested["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+        assert!((requested_body["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
 
         // ...and the default is the config's, not a module-level constant baked
         // into the builder.
         let other: Value =
-            serde_json::from_slice(&OTHER.build_messages_body("m", "hi", None, None, None))
-                .unwrap();
+            serde_json::from_slice(&OTHER.build_messages_body(req(&messages, &[]))).unwrap();
         assert_eq!(other["max_tokens"], 77);
     }
 
     #[test]
     fn messages_body_drops_a_non_finite_temperature_rather_than_failing() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let body: Value = serde_json::from_slice(&ANTHROPIC.build_messages_body(
-                "m",
-                "hi",
-                None,
-                Some(bad),
-                None,
-            ))
-            .unwrap();
+            let mut request = req(&messages, &[]);
+            request.temperature = Some(bad);
+            let body: Value =
+                serde_json::from_slice(&ANTHROPIC.build_messages_body(request)).unwrap();
             assert!(
                 body.get("temperature").is_none(),
                 "a non-finite temperature ({bad}) must be omitted, not serialized",
             );
             assert_eq!(
-                body["messages"][0]["content"], "hi",
+                body["messages"][0]["content"][0]["text"], "hi",
                 "the request still goes"
             );
             assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
@@ -689,7 +1123,9 @@ mod tests {
         let chunks = ANTHROPIC.parse_message_response(body).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Hello, world!");
+        assert!(chunks[0].tool_calls.is_empty());
         assert!(chunks[0].finished);
+        assert_eq!(chunks[0].stop_reason, Some(StopOut::EndTurn));
         assert_eq!(
             chunks[0].usage,
             Some(UsageOut {
@@ -698,6 +1134,64 @@ mod tests {
             }),
             "usage is input_tokens/output_tokens, NOT prompt_/completion_tokens",
         );
+    }
+
+    #[test]
+    fn parse_message_response_reads_tool_use_blocks_and_the_tool_use_stop_reason() {
+        let body = br#"{
+            "content": [
+                {"type":"text","text":"Let me check."},
+                {"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Jakarta"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let chunks = ANTHROPIC.parse_message_response(body).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].finished);
+        assert_eq!(chunks[0].stop_reason, Some(StopOut::ToolUse));
+        assert_eq!(chunks[0].text, "Let me check.");
+        assert_eq!(chunks[0].tool_calls.len(), 1);
+        assert_eq!(chunks[0].tool_calls[0].id, "toolu_01");
+        assert_eq!(chunks[0].tool_calls[0].name, "get_weather");
+        // Anthropic's `input` is a JSON OBJECT; the WIT ABI wants a serialized
+        // string, so it must be re-serialized rather than passed through raw.
+        let parsed: Value = serde_json::from_str(&chunks[0].tool_calls[0].arguments).unwrap();
+        assert_eq!(parsed, serde_json::json!({"city": "Jakarta"}));
+    }
+
+    #[test]
+    fn a_tool_only_response_with_no_text_block_is_not_an_error() {
+        // The PREVIOUS parser required a text block and would have failed every
+        // single tool call — the same defect Task C1 fixed for OpenAI-format.
+        let chunks = ANTHROPIC
+            .parse_message_response(
+                br#"{"content":[{"type":"tool_use","id":"t1","name":"n","input":{}}],
+                     "stop_reason":"tool_use"}"#,
+            )
+            .unwrap();
+        assert_eq!(chunks[0].text, "");
+        assert_eq!(chunks[0].tool_calls.len(), 1);
+        assert_eq!(chunks[0].stop_reason, Some(StopOut::ToolUse));
+    }
+
+    #[test]
+    fn a_length_finish_maps_to_max_tokens_and_an_unknown_one_to_other() {
+        let stop = |reason: &str| {
+            ANTHROPIC
+                .parse_message_response(
+                    format!(
+                        r#"{{"content":[{{"type":"text","text":"x"}}],"stop_reason":"{reason}"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()[0]
+                .stop_reason
+        };
+        assert_eq!(stop("max_tokens"), Some(StopOut::MaxTokens));
+        assert_eq!(stop("stop_sequence"), Some(StopOut::EndTurn));
+        assert_eq!(stop("pause_turn"), Some(StopOut::Other));
+        assert_eq!(stop("refusal"), Some(StopOut::Other));
     }
 
     #[test]
@@ -759,13 +1253,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_message_response_rejects_a_body_with_no_text_block() {
+    fn parse_message_response_rejects_only_a_body_with_no_content_array_at_all() {
+        // An EMPTY content array is a well-formed (if unusual) success — no
+        // text, no tool calls. A malformed tool_use entry (missing id/name) is
+        // silently skipped, not a hard failure. Only a missing `content` key or
+        // invalid JSON is a parse error.
+        let empty = ANTHROPIC
+            .parse_message_response(br#"{"content":[]}"#)
+            .unwrap();
+        assert_eq!(empty[0].text, "");
+        assert!(empty[0].tool_calls.is_empty());
+
+        let malformed_tool_use = ANTHROPIC
+            .parse_message_response(br#"{"content":[{"type":"tool_use"}]}"#)
+            .unwrap();
+        assert!(
+            malformed_tool_use[0].tool_calls.is_empty(),
+            "a tool_use block with no id/name is skipped, not surfaced as a bogus call",
+        );
+
         assert!(matches!(
-            ANTHROPIC.parse_message_response(br#"{"content":[]}"#),
-            Err(ProviderFail::Failed(_))
-        ));
-        assert!(matches!(
-            ANTHROPIC.parse_message_response(br#"{"content":[{"type":"tool_use","id":"t1"}]}"#),
+            ANTHROPIC.parse_message_response(br#"{"id":"msg_01"}"#),
             Err(ProviderFail::Failed(_))
         ));
         assert!(matches!(
