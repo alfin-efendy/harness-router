@@ -11,6 +11,9 @@ description = "First-party Xiaomi MiMo free-tier provider component (ryuzi:provi
 # "rlib" (alongside "cdylib") is needed so the throwaway integration test in
 # `tests/probe_tools_gate.rs` can link `logic` as an ordinary dependency; only
 # the cdylib artifact is ever picked up by the wasm32-wasip2 component build.
+# Kept deliberately, not leftover scaffolding: MiMo's free tier is `#[ignore]`d
+# rather than deleted so it can be re-probed by hand if the gate ever accepts
+# tools again, and the probe needs `rlib` to compile at all.
 crate-type = ["cdylib", "rlib"]
 
 # `wit-bindgen` is only invoked inside the `#[cfg(target_arch = "wasm32")]`
