@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.4.0...core-v0.5.0) (2026-08-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **plugins:** any pre-existing catalog.json feed still declaring schemaVersion 1 is now rejected by the engine.
+
+### Features
+
+* **agents:** agents menu polish — avatars, petdex fix, apps filter ([#187](https://github.com/alfin-efendy/ryuzi/issues/187)) ([bfd742b](https://github.com/alfin-efendy/ryuzi/commit/bfd742beacd6e9134939c647849710b69fb40ffd))
+* **agents:** management restructure - per-tool permissions, Fresh Agent, pack-grouped capabilities, autosave ([#175](https://github.com/alfin-efendy/ryuzi/issues/175)) ([6fb85c5](https://github.com/alfin-efendy/ryuzi/commit/6fb85c546c7364b917d0f2c3fc470bd475d7bd45))
+* **agents:** pet identity and per-agent insight ([#181](https://github.com/alfin-efendy/ryuzi/issues/181)) ([ef81e72](https://github.com/alfin-efendy/ryuzi/commit/ef81e7292a6fa30930098c905600c89603087d28))
+* **oauth-proxy:** OAuth token relay worker for confidential-client providers ([#193](https://github.com/alfin-efendy/ryuzi/issues/193)) ([b6dedcf](https://github.com/alfin-efendy/ryuzi/commit/b6dedcfc581399abbfd6d04c14016d00ac27fff1))
+* **plugins:** agent binding fixes + component auth (PKCE, settings, needs-setup) ([#190](https://github.com/alfin-efendy/ryuzi/issues/190)) ([e84d2ed](https://github.com/alfin-efendy/ryuzi/commit/e84d2edbe6334805903705b646d4c8b138f97c62))
+* **plugins:** hot provider activation, PluginsChanged events, in-app engine restart ([#180](https://github.com/alfin-efendy/ryuzi/issues/180)) ([80fc7ce](https://github.com/alfin-efendy/ryuzi/commit/80fc7ce9ad176d29b88c2c431bc3651d69b5c62c))
+* **plugins:** pre-install trim, zero-config free tiers, one card per vendor ([#179](https://github.com/alfin-efendy/ryuzi/issues/179)) ([325c290](https://github.com/alfin-efendy/ryuzi/commit/325c29049055a3cdfe68a3d5a2afef27c59f471f))
+* **plugins:** route bitbucket token exchange through the oauth relay ([#195](https://github.com/alfin-efendy/ryuzi/issues/195)) ([346f641](https://github.com/alfin-efendy/ryuzi/commit/346f6411f4c1385f3d01f9683f716d0f213a3eb8))
+* **plugins:** unified v2 plugin standard — one manifest, five surfaces, all tools through MCP ([#199](https://github.com/alfin-efendy/ryuzi/issues/199)) ([7c9f8e7](https://github.com/alfin-efendy/ryuzi/commit/7c9f8e787e565dfd67007d3e5ff8674e8a783131))
+* slash command overhaul — unified catalog, skills as commands, global CRUD, dynamic template editor ([#176](https://github.com/alfin-efendy/ryuzi/issues/176)) ([47ee65d](https://github.com/alfin-efendy/ryuzi/commit/47ee65d6ad2268589185a5cf59806c5b062abfc3))
+
+
+### Bug Fixes
+
+* **plugins:** discord install wedge + hub UI cleanup (drop featured strip, sticky rail) ([#185](https://github.com/alfin-efendy/ryuzi/issues/185)) ([ead9564](https://github.com/alfin-efendy/ryuzi/commit/ead9564f02b0cdefc3d8b04c7e0b7018181a8b16))
+* **plugins:** show declared tools & permissions pre-install in the install wizard and detail page ([#188](https://github.com/alfin-efendy/ryuzi/issues/188)) ([b2dd958](https://github.com/alfin-efendy/ryuzi/commit/b2dd958eecc08d984f6c6ffdd4a03651516caa5e))
+* **plugins:** unblock installs from a pre-v2 release feed and make the failure legible ([#201](https://github.com/alfin-efendy/ryuzi/issues/201)) ([d15800a](https://github.com/alfin-efendy/ryuzi/commit/d15800ad1b9f38c5b30a183280bab78a7dfa21c1))
+* **router:** stop silently routing tool-bearing requests to toolless providers ([#196](https://github.com/alfin-efendy/ryuzi/issues/196)) ([d48f1be](https://github.com/alfin-efendy/ryuzi/commit/d48f1bee7389f4cce785abee6e5e922037d3d740))
+
 ## [0.4.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.3.0...core-v0.4.0) (2026-07-25)
 
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/alfin-efendy/ryuzi/compare/v0.8.0...v0.9.0) (2026-08-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **plugins:** any pre-existing catalog.json feed still declaring schemaVersion 1 is now rejected by the engine.
+
+### Features
+
+* **plugins:** unified v2 plugin standard — one manifest, five surfaces, all tools through MCP ([#199](https://github.com/alfin-efendy/ryuzi/issues/199)) ([7c9f8e7](https://github.com/alfin-efendy/ryuzi/commit/7c9f8e787e565dfd67007d3e5ff8674e8a783131))
+
 ## [0.8.0](https://github.com/alfin-efendy/ryuzi/compare/v0.7.0...v0.8.0) (2026-07-25)
 
 
