@@ -1,6 +1,6 @@
 //! First-party xAI provider component.
 //!
-//! Exports `ryuzi:provider/provider@0.1.0` (`list-models` + `complete`) over
+//! Exports `ryuzi:provider/provider@0.2.0` (`list-models` + `complete`) over
 //! xAI's OpenAI-compatible `/models` and `/chat/completions` endpoints.
 //!
 //! # The component never sees the user's API key

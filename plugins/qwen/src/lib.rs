@@ -1,6 +1,6 @@
 //! First-party Qwen Code (OAuth) provider component.
 //!
-//! Exports `ryuzi:provider/provider@0.1.0` (`list-models` + `complete`) over
+//! Exports `ryuzi:provider/provider@0.2.0` (`list-models` + `complete`) over
 //! Qwen's OpenAI-compatible `/chat/completions` endpoint — the SAME wire format
 //! as the OpenAI-chat API-key bundles, shared through the `ryuzi_openai_format`
 //! crate. This bundle differs from those in exactly what makes it the Qwen

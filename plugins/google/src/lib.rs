@@ -1,6 +1,6 @@
 //! First-party Google (Gemini) provider component.
 //!
-//! Exports `ryuzi:provider/provider@0.1.0` (`list-models` + `complete`) over
+//! Exports `ryuzi:provider/provider@0.2.0` (`list-models` + `complete`) over
 //! Gemini's OpenAI-COMPATIBILITY endpoint
 //! (`https://generativelanguage.googleapis.com/v1beta/openai`), whose `/models`
 //! and `/chat/completions` routes speak the same wire format every other
