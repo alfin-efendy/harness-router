@@ -285,37 +285,33 @@ test("clicking Connect starts the flow, opens the authorize URL, and shows a pen
   expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
 });
 
-test(
-  "the connect poll picks up a completed connection and reports success",
-  async () => {
-    appsFixture = [remoteApp];
-    useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
-    useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
-    // PROPERTY: the pending UI must actually resolve once the server reports
-    // connected, not spin forever — the first post-Connect `listApps` refresh
-    // still reports "not connected" (proving the loop doesn't just declare
-    // victory on the very next tick), the second reports connected.
-    let listAppsCalls = 0;
-    listApps.mockImplementation(async () => {
-      listAppsCalls += 1;
-      const connected = listAppsCalls >= 2; // 1st poll: still pending; 2nd poll: connected
-      return {
-        status: "ok" as const,
-        data: [{ ...remoteApp, oauthTokenStored: connected, oauthReconnectRequired: false }],
-      };
-    });
+test("the connect poll picks up a completed connection and reports success", async () => {
+  appsFixture = [remoteApp];
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+  // PROPERTY: the pending UI must actually resolve once the server reports
+  // connected, not spin forever — the first post-Connect `listApps` refresh
+  // still reports "not connected" (proving the loop doesn't just declare
+  // victory on the very next tick), the second reports connected.
+  let listAppsCalls = 0;
+  listApps.mockImplementation(async () => {
+    listAppsCalls += 1;
+    const connected = listAppsCalls >= 2; // 1st poll: still pending; 2nd poll: connected
+    return {
+      status: "ok" as const,
+      data: [{ ...remoteApp, oauthTokenStored: connected, oauthReconnectRequired: false }],
+    };
+  });
 
-    render(<AppDetailView id="remote" />);
-    await screen.findByText("Remote MCP");
-    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  render(<AppDetailView id="remote" />);
+  await screen.findByText("Remote MCP");
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
 
-    await screen.findByText(/Waiting for you to finish signing in in the browser/);
-    await waitFor(() => expect(screen.getByText("OAuth connected")).toBeTruthy(), { timeout: 12_000 });
-    expect(screen.queryByText(/Waiting for you to finish/)).toBeNull();
-    listApps.mockImplementation(async () => ({ status: "ok" as const, data: appsFixture }));
-  },
-  15_000,
-);
+  await screen.findByText(/Waiting for you to finish signing in in the browser/);
+  await waitFor(() => expect(screen.getByText("OAuth connected")).toBeTruthy(), { timeout: 12_000 });
+  expect(screen.queryByText(/Waiting for you to finish/)).toBeNull();
+  listApps.mockImplementation(async () => ({ status: "ok" as const, data: appsFixture }));
+}, 15_000);
 
 test("a reconnect-required remote server shows the warning pill and a Reconnect label", async () => {
   const tripped: AppInfo = { ...remoteApp, oauthTokenStored: true, oauthReconnectRequired: true };

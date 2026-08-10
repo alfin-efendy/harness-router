@@ -117,10 +117,7 @@ test("readManifest accepts every shipped plugins/<id>/ryuzi-plugin.toml as contr
 test("readManifest accepts a manifest with no [component] table", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ryuzi-first-party-readmanifest-test-"));
   try {
-    await Bun.write(
-      `${dir}/ryuzi-plugin.toml`,
-      'contract = 2\nid = "declarative-plugin"\nname = "Declarative"\nversion = "0.1.0"\n',
-    );
+    await Bun.write(`${dir}/ryuzi-plugin.toml`, 'contract = 2\nid = "declarative-plugin"\nname = "Declarative"\nversion = "0.1.0"\n');
     const manifest = await readManifest(dir);
     expect(manifest.id).toBe("declarative-plugin");
     expect(manifest.version).toBe("0.1.0");

@@ -195,11 +195,7 @@ export function artifactNames(id: string, version: string, component?: string): 
   if (component !== undefined) {
     names.push(component);
   }
-  names.push(
-    `${id}-${version}.ryuzi-plugin.toml`,
-    `${id}-${version}.release.json`,
-    `${id}-${version}.release.json.sig`,
-  );
+  names.push(`${id}-${version}.ryuzi-plugin.toml`, `${id}-${version}.release.json`, `${id}-${version}.release.json.sig`);
   return names;
 }
 

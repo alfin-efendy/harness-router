@@ -97,8 +97,6 @@ test("an https:// URL clears the rejection and lets the form submit with the ent
 
   fireEvent.click(submit);
   await waitFor(() =>
-    expect(addApp).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "Remote", transport: "http", url: "https://mcp.example.com" }),
-    ),
+    expect(addApp).toHaveBeenCalledWith(expect.objectContaining({ name: "Remote", transport: "http", url: "https://mcp.example.com" })),
   );
 });
