@@ -87,6 +87,26 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
 );
 ";
 
+/// v5 -> v6: a resolved HTTP header set (e.g. a plugin manifest's resolved
+/// `Authorization`) persisted alongside the `mcp_servers` row it belongs to,
+/// so it survives from plugin sync (`plugins::mcp_sync::sync_plugin_mcp`)
+/// through to session start (`mcp::servers_for_session`) instead of being
+/// silently dropped in between. That drop was a real, empirically-proven gap
+/// (Task 13, remote MCP OAuth plan): `servers_for_session` hardcoded
+/// `headers: vec![]` for every HTTP row, so Task 8's auth-precedence rule
+/// could never see a plugin-supplied credential and every such server fell
+/// through to the (empty, for an API-token plugin) stored-token path.
+///
+/// `headers_json` mirrors `mcp_oauth_tokens.token_json`'s shape and
+/// encryption discipline: `mcp::set_server_headers`/`get_server_headers`
+/// encrypt/decrypt each header VALUE with `encrypt_field`/`decrypt_field`
+/// (never the header name, which is not a secret, and never the blob as a
+/// whole) — see those functions' doc for why. `NULL` (every pre-existing row,
+/// and every stdio row, which never gets this column written) decodes to an
+/// empty header list, not an error.
+const MCP_SERVER_HEADERS_MIGRATION_SQL: &str =
+    "ALTER TABLE mcp_servers ADD COLUMN headers_json TEXT;";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -94,6 +114,7 @@ fn migrations() -> Migrations<'static> {
         M::up(OAUTH_CLIENT_SECRET_SETTING_MIGRATION_SQL),
         M::up(PLUGIN_ORIGIN_MIGRATION_SQL),
         M::up(MCP_OAUTH_MIGRATION_SQL),
+        M::up(MCP_SERVER_HEADERS_MIGRATION_SQL),
     ])
 }
 
@@ -758,9 +779,9 @@ impl Store {
         // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage, 3 =
         // + plugin_oauth_profile_clients.client_secret_setting, 4 =
         // + automation_hooks/jobs/mcp_servers.plugin_id origin columns, 5 =
-        // + mcp_oauth_tokens/mcp_oauth_clients.)
+        // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 5;
+        const LATEST_VERSION: i64 = 6;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -10303,12 +10324,12 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 5 database (v1 squashed baseline + v2
+    // produce a `user_version` 6 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
     // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
-    // mcp_oauth_tokens/mcp_oauth_clients) whose schema + seeded rows exactly
-    // match the golden fixture.
+    // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json)
+    // whose schema + seeded rows exactly match the golden fixture.
     //
     // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
     // version, messages_fts_data blocks), which are artifacts of the bundled
@@ -10321,8 +10342,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 5,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth migrations must be user_version 5"
+            user_version, 6,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers migrations must be user_version 6"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

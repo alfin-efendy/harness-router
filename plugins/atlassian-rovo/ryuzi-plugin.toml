@@ -25,10 +25,22 @@ network = ["mcp.atlassian.com"]
 # substitutes one literal setting value into a string — it cannot compute a
 # base64 join of two settings at fetch time — so the user pastes the
 # already-base64-encoded credential as a single secret setting.
+#
+# `required = true`: this plugin has no OAuth fallback (see the help text
+# below) — `declarative.rs::DeclarativeConnector::ensure_auth` checks
+# secret+required settings up front, so a blank credential now fails sync
+# with a friendly "configure atlassian-rovo: missing required setting ..."
+# message instead of the opaque "could not resolve MCP servers" a blank
+# `${setting:...}` placeholder would otherwise produce (Task 13). `secret =
+# true` masks the value in the settings UI, matching every other
+# credential-holding `[[settings]]` field in this repo (e.g.
+# `plugins/atlassian/ryuzi-plugin.toml`'s `oauth_client_secret`).
 [[settings]]
 key = "basic_credential"
 label = "Atlassian Basic auth credential"
-help = "Create an API token at id.atlassian.com/manage-profile/security/api-tokens, note the email address it belongs to, then base64-encode \"email:api_token\" (e.g. `echo -n \"you@example.com:YOUR_TOKEN\" | base64`) and paste the result here. Leave blank to connect with OAuth instead, once the generic remote-MCP OAuth connect flow (Tasks 1-9) is wired to a Connect button for this server."
+help = "Create an API token at id.atlassian.com/manage-profile/security/api-tokens, note the email address it belongs to, then base64-encode \"email:api_token\" (e.g. `echo -n \"you@example.com:YOUR_TOKEN\" | base64`) and paste the result here. Required — this plugin does not yet support connecting with OAuth instead; the generic remote-MCP OAuth connect flow (Tasks 1-9) is not wired to a Connect button for this server."
+secret = true
+required = true
 
 # `${setting:...}` substitution (`declarative.rs::resolver`/`build_spec`)
 # looks the key up verbatim in the settings store, and every `[[settings]]`

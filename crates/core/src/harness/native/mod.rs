@@ -2410,6 +2410,85 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Task 13: a persisted row's header reaches the wire, not just a
+    // hand-built spec
+    // -----------------------------------------------------------------
+
+    /// PROPERTY: everything above in this "Task 8" section proves the
+    /// precedence rule is correct once a spec already carries a header. This
+    /// test proves the header actually GETS there for a spec sourced from the
+    /// database — via `mcp::upsert_server` + `mcp::set_server_headers` (the
+    /// same calls `plugins::mcp_sync::sync_plugin_mcp` makes) and
+    /// `mcp::servers_for_session` (not a hand-built `McpServerSpec`, unlike
+    /// every test above). Before Task 13, `servers_for_session` hardcoded
+    /// `headers: vec![]`, so this scenario would have sent the STORED OAuth
+    /// token instead — the exact silent-auth-failure gap Task 11 found.
+    #[tokio::test]
+    async fn a_servers_for_session_header_reaches_the_wire_over_a_stored_token() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (url, seen_auth) = spawn_auth_echo_server().await;
+        let store = mcp_test_store().await;
+        store
+            .upsert_mcp_oauth_token("row-remote", &stored_mcp_token("stored-token"))
+            .await
+            .unwrap();
+        crate::mcp::upsert_server(
+            &store,
+            crate::mcp::McpServerRow {
+                id: "row-remote".into(),
+                name: "Row Remote".into(),
+                kind: "MCP server".into(),
+                color: "#8B8B8B".into(),
+                description: String::new(),
+                transport: "http".into(),
+                command: None,
+                args: vec![],
+                env: vec![],
+                url: Some(url),
+                scope: "global".into(),
+                scope_gateways: vec![],
+                version: None,
+                publisher: None,
+                status: "unchecked".into(),
+                status_detail: None,
+                auth_kind: "none".into(),
+                auth_detail: None,
+                plugin_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::mcp::set_server_headers(
+            &store,
+            "row-remote",
+            &[(
+                "Authorization".to_string(),
+                "Basic row-resolved-creds".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let specs = crate::mcp::servers_for_session(&store, "native")
+            .await
+            .unwrap();
+        assert_eq!(specs.len(), 1, "the http row must attach to the session");
+
+        let _ = connect_mcp_tools(&store, &specs, &Default::default()).await;
+
+        let requests = seen_auth.lock().unwrap().clone();
+        let init = requests
+            .first()
+            .expect("the initialize request must have reached the server");
+        assert_eq!(
+            init.as_slice(),
+            ["Basic row-resolved-creds".to_string()],
+            "the row's stored header must reach the wire and win over the stored OAuth token: \
+             {init:?}"
+        );
+    }
+
     #[test]
     fn connect_component_mcp_tools_is_a_no_op_with_no_components() {
         assert!(connect_component_mcp_tools(&[]).is_empty());

@@ -42,7 +42,13 @@
 //! `status = "unchecked"` instead of being probed or marked `"error"` — the
 //! existing Apps screen "Probe" button (`api::apps_api::probe_and_persist`)
 //! already runs a real HTTP reachability check independent of this sync, so
-//! the row is fully usable once a user clicks it.
+//! the row is fully usable once a user clicks it. The connector's resolved
+//! headers (a manifest `Authorization`, if any) ARE persisted regardless —
+//! `mcp::set_server_headers`, called right after the row upsert below — so
+//! `crate::mcp::servers_for_session` can hand them to a native HTTP session
+//! even though this sync path never itself opens an HTTP connection (Task 13;
+//! before it, the header was resolved here and then silently dropped, since
+//! `servers_for_session` hardcoded an empty header list).
 
 use crate::connector::ConnectorCtx;
 use crate::domain::McpTransport;
@@ -148,21 +154,28 @@ pub async fn sync_plugin_mcp(
         } else {
             plugin.manifest.name.clone()
         };
-        let (transport, command, args, env, url) = match &spec.transport {
+        let (transport, command, args, env, url, headers) = match &spec.transport {
             McpTransport::Stdio { command, args, env } => (
                 "stdio",
                 Some(command.clone()),
                 args.clone(),
                 env.clone(),
                 None,
+                Vec::new(),
             ),
-            // No `headers` column exists on `McpServerRow` yet — the same
-            // pre-existing gap `servers_for_session` already has for
-            // http-transport rows (it hardcodes `headers: vec![]`). Out of
-            // scope here; see this module's HTTP-transport doc section.
-            McpTransport::Http { url, .. } => {
-                ("http", None, Vec::new(), Vec::new(), Some(url.clone()))
-            }
+            // Task 13: carry the connector's resolved headers (e.g. a
+            // manifest `Authorization`) through to the row so
+            // `servers_for_session` can read them back instead of the
+            // `vec![]` it used to hardcode — see `mcp::set_server_headers`'s
+            // doc for the encryption-at-rest discipline.
+            McpTransport::Http { url, headers } => (
+                "http",
+                None,
+                Vec::new(),
+                Vec::new(),
+                Some(url.clone()),
+                headers.clone(),
+            ),
         };
         let (auth_kind, auth_detail) = if env.is_empty() {
             ("none".to_string(), None)
@@ -227,6 +240,10 @@ pub async fn sync_plugin_mcp(
             },
         )
         .await?;
+        // Written on EVERY sync (even an empty slice), same as
+        // `upsert_server` above — a header a manifest update drops must not
+        // linger from a prior sync (Task 13).
+        mcp::set_server_headers(store, &row_id, &headers).await?;
 
         if let Some(tools) = tools {
             mcp::replace_tools(store, &row_id, tools).await?;
@@ -422,6 +439,64 @@ url = "https://mcp.acme.example.com"
         assert_eq!(row.status, "unchecked");
         assert_eq!(row.transport, "http");
         assert_eq!(row.url.as_deref(), Some("https://mcp.acme.example.com"));
+        assert_eq!(
+            mcp::get_server_headers(&store, "acme-http-svc")
+                .await
+                .unwrap(),
+            Vec::<(String, String)>::new(),
+            "an entry with no [[mcp]] headers must persist an empty header list, not error"
+        );
+    }
+
+    /// PROPERTY (Task 13, sync-side half of the gap): a manifest's resolved
+    /// `Authorization` header — proven to resolve correctly at the connector
+    /// layer since Task 11 — must be PERSISTED onto the row, not just
+    /// computed and thrown away. Before this task nothing in this function
+    /// wrote the connector's resolved headers anywhere, so a plugin like
+    /// `atlassian-rovo` would sync a working row with no way for
+    /// `mcp::servers_for_session` (and, downstream, Task 8's auth-precedence
+    /// rule) to ever see the credential it resolved.
+    #[tokio::test]
+    async fn sync_persists_the_connectors_resolved_authorization_header() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (store, settings) = mem_store().await;
+        store
+            .set_setting_raw("plugin.acme-rovo.basic_credential", "dXNlcjpwYXNz")
+            .await
+            .unwrap();
+        let toml = r#"
+contract = 2
+id = "acme-rovo"
+name = "Acme Rovo"
+
+[[settings]]
+key = "basic_credential"
+label = "Basic auth credential"
+secret = true
+
+[[mcp]]
+name = "svc"
+transport = "http"
+url = "https://mcp.acme.example.com/v1/mcp"
+headers = { Authorization = "Basic ${setting:plugin.acme-rovo.basic_credential}" }
+"#;
+        let manifest = PluginManifest::from_toml(toml).unwrap();
+        let plugin = declarative::declarative_plugin(manifest, PluginSource::Builtin).unwrap();
+
+        sync_plugin_mcp(&store, &settings, &plugin).await.unwrap();
+
+        let headers = mcp::get_server_headers(&store, "acme-rovo-svc")
+            .await
+            .unwrap();
+        assert_eq!(
+            headers,
+            vec![(
+                "Authorization".to_string(),
+                "Basic dXNlcjpwYXNz".to_string()
+            )],
+            "the connector's resolved Authorization header must be persisted onto the row, \
+             got {headers:?}"
+        );
     }
 
     #[tokio::test]

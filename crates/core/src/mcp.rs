@@ -4,6 +4,7 @@
 //! agent sessions through `SessionCtx.mcp_servers`.
 
 use crate::domain::{McpServerSpec, McpTransport};
+use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::stdio_jsonrpc::{self, ReadError};
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension};
@@ -145,6 +146,102 @@ pub async fn upsert_server(store: &Store, row: McpServerRow) -> anyhow::Result<(
             .map(|_| ())
         })
         .await
+}
+
+/// Encode a resolved HTTP header set into the JSON `mcp_servers.headers_json`
+/// stores, encrypting each header VALUE with [`encrypt_field`] — never the
+/// header NAME (`Authorization`, `X-Api-Key`, ...), which is not a secret and
+/// stays greppable, and never the array as a single opaque blob (that would
+/// make it impossible to encrypt/decrypt values independently the way
+/// `store.rs`'s `upsert_mcp_oauth_token_json`/`decode_mcp_oauth_token` do for
+/// `mcp_oauth_tokens.token_json` — the pattern this mirrors).
+fn encode_server_headers(headers: &[(String, String)]) -> anyhow::Result<String> {
+    let array: Vec<serde_json::Value> = headers
+        .iter()
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": encrypt_field(value) }))
+        .collect();
+    Ok(serde_json::to_string(&serde_json::Value::Array(array))?)
+}
+
+/// Inverse of [`encode_server_headers`]: decrypt each header value back to
+/// plaintext. A malformed row (not an array, or a header missing a field)
+/// is a hard error — silently dropping a header a caller expects to reach the
+/// wire would recreate exactly the kind of silent-auth-failure gap this
+/// column exists to close.
+fn decode_server_headers(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("mcp server headers_json must be a JSON array"))?;
+    array
+        .iter()
+        .map(|item| {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("mcp server header missing name"))?;
+            let value = item
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("mcp server header missing value"))?;
+            Ok((name.to_string(), decrypt_field(value)?))
+        })
+        .collect()
+}
+
+/// Store the resolved HTTP header set for `server_id` — e.g. the
+/// `Authorization` a declarative plugin connector resolved at sync time
+/// (`plugins::mcp_sync::sync_plugin_mcp`), or headers a user typed by hand
+/// for a server added directly in Apps. A resolved header value is a
+/// credential exactly like an MCP OAuth access token, so it is encrypted at
+/// rest the same way (see [`encode_server_headers`]) — never written to
+/// `headers_json` in the clear.
+///
+/// Called with the CURRENT full header set on every sync/save, not just the
+/// changed entries, so a header a plugin update or user edit removes doesn't
+/// linger — an empty slice clears whatever was stored. A no-op (not an
+/// error) if `server_id` doesn't exist yet; callers upsert the row first.
+pub async fn set_server_headers(
+    store: &Store,
+    server_id: &str,
+    headers: &[(String, String)],
+) -> anyhow::Result<()> {
+    let server_id = server_id.to_string();
+    let headers_json = encode_server_headers(headers)?;
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE mcp_servers SET headers_json=?2 WHERE id=?1",
+                params![server_id, headers_json],
+            )
+            .map(|_| ())
+        })
+        .await
+}
+
+/// The decrypted HTTP headers stored for `server_id`. Empty for a stdio row,
+/// for a server with none stored, and for every row that existed before the
+/// `headers_json` column was added (`NULL` decodes to an empty list, not an
+/// error) — never an error just because nothing was ever set.
+pub async fn get_server_headers(
+    store: &Store,
+    server_id: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let server_id = server_id.to_string();
+    let raw: Option<Option<String>> = store
+        .with_conn(move |c| {
+            c.query_row(
+                "SELECT headers_json FROM mcp_servers WHERE id=?1",
+                params![server_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+        })
+        .await?;
+    match raw.flatten() {
+        Some(raw) => decode_server_headers(&raw),
+        None => Ok(Vec::new()),
+    }
 }
 
 pub async fn remove_server(store: &Store, id: &str) -> anyhow::Result<()> {
@@ -357,10 +454,17 @@ pub async fn servers_for_session(
             }
         }
         let transport = match row.transport.as_str() {
+            // Task 13: read back whatever `set_server_headers` persisted for
+            // this row (a plugin-resolved `Authorization`, or headers a user
+            // typed by hand) instead of hardcoding an empty list — the gap
+            // that made Task 8's manifest-auth precedence rule unreachable
+            // for every plugin-supplied HTTP server. A stdio row never calls
+            // this (no lookup, no cost) since only `McpTransport::Http`
+            // carries headers at all.
             "http" => match &row.url {
                 Some(url) => McpTransport::Http {
                     url: url.clone(),
-                    headers: vec![],
+                    headers: get_server_headers(store, &row.id).await?,
                 },
                 None => continue,
             },
@@ -817,5 +921,235 @@ mod tests {
 
         // The row itself survives the disable — only session attachment is gated.
         assert!(get_server(&store, "acme-main").await.unwrap().is_some());
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 13: resolved HTTP headers persisted on the mcp_servers row
+    // ---------------------------------------------------------------------
+
+    fn plugin_owned_http_row(id: &str, plugin_id: &str, url: &str) -> McpServerRow {
+        McpServerRow {
+            id: id.into(),
+            name: id.into(),
+            kind: "MCP server".into(),
+            color: "#8B8B8B".into(),
+            description: String::new(),
+            transport: "http".into(),
+            command: None,
+            args: vec![],
+            env: vec![],
+            url: Some(url.into()),
+            scope: "global".into(),
+            scope_gateways: vec![],
+            version: None,
+            publisher: None,
+            status: "unchecked".into(),
+            status_detail: None,
+            auth_kind: "none".into(),
+            auth_detail: None,
+            plugin_id: Some(plugin_id.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_and_get_server_headers_round_trip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row("acme-http", "acme", "https://acme.example.com/mcp"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get_server_headers(&store, "acme-http").await.unwrap(),
+            Vec::<(String, String)>::new(),
+            "a row with nothing stored yet must decode to an empty list, not error"
+        );
+
+        set_server_headers(
+            &store,
+            "acme-http",
+            &[("Authorization".to_string(), "Basic creds".to_string())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_server_headers(&store, "acme-http").await.unwrap(),
+            vec![("Authorization".to_string(), "Basic creds".to_string())]
+        );
+
+        // Re-setting (what a plugin re-sync does every time) replaces the
+        // full set rather than merging — a header a new manifest drops must
+        // not linger.
+        set_server_headers(&store, "acme-http", &[]).await.unwrap();
+        assert_eq!(
+            get_server_headers(&store, "acme-http").await.unwrap(),
+            Vec::<(String, String)>::new(),
+            "setting an empty header list must clear whatever was stored before"
+        );
+    }
+
+    /// PROPERTY (the test that would have caught Task 13's gap): a
+    /// plugin-resolved `Authorization` header, persisted the way
+    /// `plugins::mcp_sync::sync_plugin_mcp` persists one, must reach
+    /// `servers_for_session`'s output. Before this task `servers_for_session`
+    /// hardcoded `headers: vec![]` for every HTTP row, so this exact
+    /// assertion would have failed even though the header was sitting right
+    /// there in the row.
+    #[tokio::test]
+    async fn servers_for_session_carries_a_plugin_resolved_authorization_header() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row(
+                "rovo-main",
+                "atlassian-rovo",
+                "https://mcp.atlassian.com/v1/mcp",
+            ),
+        )
+        .await
+        .unwrap();
+        set_server_headers(
+            &store,
+            "rovo-main",
+            &[(
+                "Authorization".to_string(),
+                "Basic manifest-resolved-creds".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+        store
+            .set_setting_raw("plugin.atlassian-rovo.enabled", "true")
+            .await
+            .unwrap();
+
+        let specs = servers_for_session(&store, "native").await.unwrap();
+
+        assert_eq!(specs.len(), 1);
+        let McpTransport::Http { headers, .. } = &specs[0].transport else {
+            panic!("expected an Http transport, got {:?}", specs[0].transport);
+        };
+        assert_eq!(
+            headers,
+            &vec![(
+                "Authorization".to_string(),
+                "Basic manifest-resolved-creds".to_string()
+            )],
+            "the plugin-resolved Authorization header must reach the session spec, got {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_headers_are_encrypted_at_rest() {
+        // A regression that dropped the encrypt_field/decrypt_field calls
+        // from encode_server_headers would still pass a plain
+        // round-trip-equality test, because decode would simply hand back
+        // whatever was written. This test reads the raw column, bypassing
+        // the decode path, so a dropped encrypt call is caught directly —
+        // same shape as store.rs's mcp_oauth_token_roundtrip_encrypts_at_rest.
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row(
+                "rovo-main",
+                "atlassian-rovo",
+                "https://mcp.atlassian.com/v1/mcp",
+            ),
+        )
+        .await
+        .unwrap();
+        set_server_headers(
+            &store,
+            "rovo-main",
+            &[(
+                "Authorization".to_string(),
+                "Basic super-secret-credential".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let raw: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT headers_json FROM mcp_servers WHERE id='rovo-main'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            !raw.contains("super-secret-credential"),
+            "a resolved header value must not be written to disk in the clear: {raw}"
+        );
+        // The header NAME is not a secret and stays greppable/plain.
+        assert!(
+            raw.contains("Authorization"),
+            "the header name is not a secret and should stay in the clear: {raw}"
+        );
+
+        let roundtrip = get_server_headers(&store, "rovo-main").await.unwrap();
+        assert_eq!(
+            roundtrip,
+            vec![(
+                "Authorization".to_string(),
+                "Basic super-secret-credential".to_string()
+            )],
+            "decoding must still recover the original plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stdio_rows_headers_are_unaffected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            McpServerRow {
+                id: "github".into(),
+                name: "GitHub".into(),
+                kind: "MCP server".into(),
+                color: "#24292F".into(),
+                description: String::new(),
+                transport: "stdio".into(),
+                command: Some("npx".into()),
+                args: vec![],
+                env: vec![("GITHUB_TOKEN".into(), "x".into())],
+                url: None,
+                scope: "global".into(),
+                scope_gateways: vec![],
+                version: None,
+                publisher: None,
+                status: "unknown".into(),
+                status_detail: None,
+                auth_kind: "env".into(),
+                auth_detail: Some("GITHUB_TOKEN".into()),
+                plugin_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Nothing ever writes headers_json for a stdio row (mcp_sync only
+        // calls set_server_headers for http transport), so the column stays
+        // NULL and must decode to empty, not error.
+        assert_eq!(
+            get_server_headers(&store, "github").await.unwrap(),
+            Vec::<(String, String)>::new()
+        );
+
+        let specs = servers_for_session(&store, "native").await.unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            matches!(specs[0].transport, McpTransport::Stdio { .. }),
+            "a stdio row's transport shape must be unaffected by the headers_json column"
+        );
     }
 }
