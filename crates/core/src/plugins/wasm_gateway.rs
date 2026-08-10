@@ -677,6 +677,26 @@ pub(crate) async fn discover_gateway_components(
         if !bundle.manifest.gateway {
             continue;
         }
+        // Belt-and-braces sibling of the identical guard in
+        // `wasm_provider::discover_provider_components`,
+        // `control::lifecycle`'s session-tools attach, and
+        // `api::plugins_api::installed_bundle_is_gateway`: a declarative-only
+        // bundle has no wasm, so its `component_path` is the version DIRECTORY
+        // (see `bundle::load_active_bundles`) and `runtime.compile` below can
+        // only fail.
+        //
+        // Currently UNREACHABLE here, deliberately kept for symmetry with
+        // those three: `load_active_bundles` parses through
+        // `PluginManifest::from_toml`, which runs `validate()`, which rejects
+        // `gateway = true` with no `[component]`
+        // (`ManifestError::SurfaceRequiresComponent("gateway")`) — so the
+        // `manifest.gateway` pre-filter above already excludes every
+        // component-less bundle today. This guard is what keeps that true if
+        // that manifest rule is ever relaxed, rather than silently turning a
+        // relaxation into a `component compile failed` warning on every boot.
+        if bundle.manifest.component.is_none() {
+            continue;
+        }
         match crate::plugins::host::component_plugin_enabled(settings, &id).await {
             Ok(true) => {}
             Ok(false) => continue,
