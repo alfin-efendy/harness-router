@@ -78,14 +78,18 @@ export function signingKeyId(): string {
  * silently publishing a wrong version.
  */
 export function deriveWitApiVersion(range: string): string {
-  const match = /^>=(\d+\.\d+\.\d+),\s*<\d+\.\d+\.\d+$/.exec(range.trim());
-  if (match === null) {
+  // Read the captured lower bound through `?.[1]` and test THAT, rather than
+  // testing the match and asserting the group: under `noUncheckedIndexedAccess`
+  // an index read is `string | undefined`, and folding both cases into the one
+  // throw keeps the loud-failure contract without a non-null assertion.
+  const lowerBound = /^>=(\d+\.\d+\.\d+),\s*<\d+\.\d+\.\d+$/.exec(range.trim())?.[1];
+  if (lowerBound === undefined) {
     throw new Error(
       `cannot derive a concrete wit-api version from manifest range ${JSON.stringify(range)}: ` +
         `expected the shape ">=X.Y.Z, <X.Y'.Z'" (an inclusive lower bound + exclusive upper bound)`,
     );
   }
-  return match[1];
+  return lowerBound;
 }
 
 /**
