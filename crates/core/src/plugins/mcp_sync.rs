@@ -43,12 +43,16 @@
 //! existing Apps screen "Probe" button (`api::apps_api::probe_and_persist`)
 //! already runs a real HTTP reachability check independent of this sync, so
 //! the row is fully usable once a user clicks it. The connector's resolved
-//! headers (a manifest `Authorization`, if any) ARE persisted regardless —
-//! `mcp::set_server_headers`, called right after the row upsert below — so
+//! STATIC headers (a manifest `Authorization` from a `${setting:}`/`${env:}`
+//! value, if any) ARE persisted regardless — `mcp::set_server_headers`,
+//! called right after the row upsert below — so
 //! `crate::mcp::servers_for_session` can hand them to a native HTTP session
 //! even though this sync path never itself opens an HTTP connection (Task 13;
 //! before it, the header was resolved here and then silently dropped, since
-//! `servers_for_session` hardcoded an empty header list).
+//! `servers_for_session` hardcoded an empty header list). A header whose
+//! value is a plugin's live OAuth BEARER is the one thing deliberately not
+//! persisted — it is re-resolved per session instead; see
+//! [`persistable_headers`].
 
 use crate::connector::ConnectorCtx;
 use crate::domain::McpTransport;
@@ -56,6 +60,7 @@ use crate::mcp::{self, McpServerRow};
 use crate::plugins::host::CorePlugin;
 use crate::settings::SettingsStore;
 use crate::store::{PluginAttachStatus, Store};
+use ryuzi_plugin_sdk::AuthKind;
 
 /// Upsert one Apps row per `plugin.manifest.mcp` entry (resolving every
 /// `${auth}`/`${setting:KEY}`/`${env:VAR}` placeholder through the SAME
@@ -189,14 +194,16 @@ pub async fn sync_plugin_mcp(
             // manifest `Authorization`) through to the row so
             // `servers_for_session` can read them back instead of the
             // `vec![]` it used to hardcode — see `mcp::set_server_headers`'s
-            // doc for the encryption-at-rest discipline.
+            // doc for the encryption-at-rest discipline, and
+            // [`persistable_headers`] for the one header kind that is
+            // deliberately NOT persisted.
             McpTransport::Http { url, headers } => (
                 "http",
                 None,
                 Vec::new(),
                 Vec::new(),
                 Some(url.clone()),
-                headers.clone(),
+                persistable_headers(plugin, headers),
             ),
         };
         let (auth_kind, auth_detail) = if env.is_empty() {
@@ -284,6 +291,53 @@ pub async fn sync_plugin_mcp(
 
     record_attach(store, &id, "ok", None).await;
     Ok(())
+}
+
+/// The subset of a connector's resolved HTTP headers that may be PERSISTED
+/// onto the `mcp_servers` row.
+///
+/// Everything a manifest resolves statically — a `${setting:}` API token, a
+/// `${env:}` value, a plain constant — is persisted: it is exactly as durable
+/// as the row itself, and re-resolving it would need the connector this
+/// function's callers only have at sync time.
+///
+/// An `Authorization` header on an `[auth] kind = "oauth"` plugin is the one
+/// exception, and is dropped. `plugins::declarative`'s `build_spec` sets (or
+/// OVERWRITES) that header with the plugin's live OAuth bearer, so its value
+/// is a short-lived access token, and persisting it is wrong three ways:
+///
+/// - `sync_plugin_mcp` runs on plugin enable, install, and OAuth completion
+///   only — never at session start — so a session could mint its transport
+///   from a bearer captured days earlier;
+/// - a persisted `Authorization` reads as manifest auth to
+///   `harness::native`'s `connect_mcp_tools`, which then wires no `Store`, so
+///   the transport deliberately refuses to refresh it on a 401 and the
+///   plugin's own refresh path is never reached — an expired snapshot becomes
+///   an unrecoverable hard failure until someone toggles the plugin;
+/// - `plugins_api::disconnect_plugin_oauth` deletes `plugin_oauth_tokens` and
+///   nothing else, so a user who disconnected their account would keep
+///   sending the stale bearer from every new session — a local revocation
+///   bypass.
+///
+/// Dropping it makes all three structurally impossible rather than patching
+/// the third in a disconnect handler; `mcp::servers_for_session` re-resolves
+/// the bearer from `plugin_oauth_tokens` at session start instead (see
+/// `mcp::with_live_plugin_oauth_bearer`). Every other header on such a plugin
+/// (`Accept`, a tenant id, …) is still persisted.
+fn persistable_headers(plugin: &CorePlugin, headers: &[(String, String)]) -> Vec<(String, String)> {
+    let http_oauth = plugin
+        .manifest
+        .auth
+        .as_ref()
+        .is_some_and(|auth| auth.kind == AuthKind::Oauth);
+    if !http_oauth {
+        return headers.to_vec();
+    }
+    headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+        .cloned()
+        .collect()
 }
 
 /// Best-effort `plugin_attach_status` write — never surfaces its own
@@ -518,6 +572,115 @@ headers = { Authorization = "Basic ${setting:plugin.acme-rovo.basic_credential}"
             )],
             "the connector's resolved Authorization header must be persisted onto the row, \
              got {headers:?}"
+        );
+    }
+
+    /// PROPERTY: an `[auth] kind = "oauth"` plugin's resolved
+    /// `Authorization: Bearer …` — a short-lived access token — is NOT written
+    /// to `headers_json`, while its static headers still are.
+    ///
+    /// Non-vacuity is proven inside the test itself: it drives the very same
+    /// connector `sync_plugin_mcp` uses and asserts that connector DOES resolve
+    /// an `Authorization` header, so the header's absence from the row can only
+    /// mean [`persistable_headers`] dropped it — not that resolution failed, or
+    /// that the sync bailed before writing anything (the row and the `ok`
+    /// attach outcome are asserted too).
+    ///
+    /// Snapshotting it instead would make the bearer outlive the token: sync
+    /// runs on enable/install/OAuth-completion only, `connect_mcp_tools` treats
+    /// a persisted `Authorization` as unrefreshable manifest auth, and
+    /// `disconnect_plugin_oauth` clears `plugin_oauth_tokens` without touching
+    /// this column — see [`persistable_headers`] for the full argument.
+    #[tokio::test]
+    async fn an_oauth_plugins_live_bearer_is_never_persisted_onto_the_row() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (store, settings) = mem_store().await;
+        store
+            .upsert_plugin_oauth_token(&crate::plugins::oauth::PluginOauthToken {
+                plugin_id: "acme-oauth".into(),
+                access_token: "live-access-token".into(),
+                refresh_token: Some("refresh".into()),
+                token_type: "Bearer".into(),
+                // Outside `oauth::needs_refresh`'s window, so resolution
+                // returns the stored token instead of attempting a network
+                // refresh.
+                expires_at: Some(crate::paths::now_ms() + 3_600_000),
+                scopes: vec![],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+        let toml = r#"
+contract = 2
+id = "acme-oauth"
+name = "Acme OAuth"
+
+[auth]
+kind = "oauth"
+
+[[mcp]]
+name = "svc"
+transport = "http"
+url = "https://mcp.acme.example.com/v1/mcp"
+headers = { Accept = "application/json" }
+"#;
+        let manifest = PluginManifest::from_toml(toml).unwrap();
+        let plugin = declarative::declarative_plugin(manifest, PluginSource::Builtin).unwrap();
+
+        // Positive control: the connector this sync uses really does inject a
+        // bearer into the spec it resolves.
+        let resolved = crate::connector::Connector::mcp_servers(
+            plugin.connector.as_deref().expect("connector"),
+            &ConnectorCtx {
+                project_id: "acme-oauth".into(),
+                work_dir: std::env::temp_dir(),
+                settings: settings.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let McpTransport::Http { headers, .. } = &resolved[0].transport else {
+            panic!("expected an http spec, got {:?}", resolved[0].transport);
+        };
+        assert!(
+            headers.contains(&(
+                "Authorization".to_string(),
+                "Bearer live-access-token".into()
+            )),
+            "precondition: the connector must resolve a bearer for this manifest, got {headers:?}"
+        );
+
+        sync_plugin_mcp(&store, &settings, &plugin).await.unwrap();
+
+        assert!(
+            mcp::get_server(&store, "acme-oauth-svc")
+                .await
+                .unwrap()
+                .is_some(),
+            "the sync must have written the row (otherwise the header's absence proves nothing)"
+        );
+        assert_eq!(
+            store
+                .get_plugin_attach("acme-oauth")
+                .await
+                .unwrap()
+                .expect("attach outcome recorded")
+                .outcome,
+            "ok"
+        );
+        let persisted = mcp::get_server_headers(&store, "acme-oauth-svc")
+            .await
+            .unwrap();
+        assert!(
+            !persisted
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            "a live OAuth bearer must never be persisted onto the row, got {persisted:?}"
+        );
+        assert_eq!(
+            persisted,
+            vec![("Accept".to_string(), "application/json".to_string())],
+            "an oauth plugin's STATIC headers must still be persisted, got {persisted:?}"
         );
     }
 
