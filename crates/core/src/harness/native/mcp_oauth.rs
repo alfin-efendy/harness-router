@@ -20,7 +20,7 @@ pub fn canonical_resource_uri(url: &str) -> anyhow::Result<String> {
     if parsed.fragment().is_some() {
         anyhow::bail!("MCP server URL must not contain a fragment: {url}");
     }
-    if parsed.scheme().is_empty() || parsed.host_str().is_none() {
+    if parsed.host_str().is_none() {
         anyhow::bail!("MCP server URL must be absolute: {url}");
     }
     let mut canonical = format!(
@@ -271,11 +271,26 @@ mod tests {
             "both the PKCE verifier and the anti-CSRF state must be non-empty or the callback has \
              nothing to validate the response against"
         );
+        assert_eq!(
+            q.get("state").map(String::as_str),
+            Some(start.state.as_str()),
+            "the URL's `state` query parameter must equal the value returned in the struct — if a \
+             future edit stopped appending it to the URL, the OAuth callback would have nothing to \
+             match against and CSRF protection would be silently gone, while this struct field would \
+             still read as populated"
+        );
         assert_ne!(
             q.get("code_challenge").map(String::as_str),
             Some(start.verifier.as_str()),
             "the challenge sent to the AS must be the S256 hash of the verifier, never the raw \
              verifier itself — sending the verifier would defeat PKCE entirely"
+        );
+        assert_eq!(
+            q.get("code_challenge").map(String::as_str),
+            Some(crate::plugins::oauth::pkce_challenge_s256(&start.verifier)).as_deref(),
+            "the URL's `code_challenge` must be exactly the S256 hash of the returned verifier — a \
+             truncated hash, the wrong algorithm, or a double-encoding would still pass the weaker \
+             not-equal-to-the-verifier check above, but not this one"
         );
     }
 
@@ -318,6 +333,173 @@ mod tests {
             "RFC 8707 requires `resource` on the TOKEN request too, not just the authorize request — \
              this is the parameter half of implementers drop, and dropping it here mints an \
              unbound token that still looks like success"
+        );
+    }
+
+    /// Bind a loopback server that answers `GET /.well-known/oauth-authorization-server`
+    /// with `body` when `Some`, or 404s every request when `None` (an empty
+    /// `axum::Router` has no route and falls through to its default 404
+    /// handler). Same `axum::Router` + `tokio::net::TcpListener` + `axum::serve`
+    /// pattern `mcp_http.rs`'s `spawn_json_server` and
+    /// `wasm_provider_conformance.rs`'s `MockUpstream` already use — no new
+    /// dependency needed.
+    async fn spawn_as_metadata_server(body: Option<Value>) -> String {
+        use axum::routing::get;
+        use axum::Router;
+
+        let app = match body {
+            Some(body) => Router::new().route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            ),
+            None => Router::new(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn as_metadata_body(issuer: &str) -> Value {
+        serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+        })
+    }
+
+    /// Bind a loopback server for the protected-resource-metadata tests below.
+    /// `status` is returned verbatim; `body`, when `Some`, is served as the
+    /// JSON response body for a successful status.
+    async fn spawn_prm_server(status: axum::http::StatusCode, body: Option<Value>) -> String {
+        use axum::routing::get;
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/.well-known/oauth-protected-resource",
+            get(move || async move { (status, axum::Json(body.unwrap_or(Value::Null))) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/.well-known/oauth-protected-resource")
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_names_the_status_on_a_non_2xx_response() {
+        let url = spawn_prm_server(axum::http::StatusCode::NOT_FOUND, None).await;
+        let http = reqwest::Client::new();
+
+        let err = protected_resource_metadata(&http, &url)
+            .await
+            .expect_err("a non-2xx status must be an error, not an empty/default result");
+
+        assert!(
+            err.to_string().contains("404"),
+            "the error must name the HTTP status the server actually returned, so the user gets an \
+             actionable message instead of a generic failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_rejects_a_2xx_body_with_no_authorization_servers() {
+        let url = spawn_prm_server(
+            axum::http::StatusCode::OK,
+            Some(serde_json::json!({ "resource": "https://mcp.example.com", "authorization_servers": [] })),
+        )
+        .await;
+        let http = reqwest::Client::new();
+
+        let err = protected_resource_metadata(&http, &url).await.expect_err(
+            "the MCP spec requires at least one authorization server; a 2xx body naming none must \
+             be an actionable error, not a silent empty Vec the caller could mistake for success",
+        );
+        assert!(
+            err.to_string().contains("names no authorization server"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_authorization_server_tries_candidates_in_document_order() {
+        // The FIRST candidate's metadata fetch fails (no route on that
+        // server); the SECOND succeeds. A test where the first candidate
+        // also succeeds would prove nothing about ordering — it could pass
+        // even if the function picked candidates at random.
+        let failing = spawn_as_metadata_server(None).await;
+        let working =
+            spawn_as_metadata_server(Some(as_metadata_body("https://good-as.example"))).await;
+        let http = reqwest::Client::new();
+
+        let (issuer, metadata) =
+            select_authorization_server(&http, &[failing.clone(), working.clone()])
+                .await
+                .expect("the second candidate is usable, so selection must succeed overall");
+
+        assert_eq!(
+            issuer, working,
+            "document order means the first candidate whose RFC 8414 metadata fetches and parses \
+             wins — here that's the second URL, since the first 404s"
+        );
+        assert_eq!(
+            metadata.token_endpoint, "https://good-as.example/token",
+            "the metadata returned must be the SECOND candidate's, not some other document — \
+             pinning this rules out a bug that returns the right issuer string but the wrong metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_authorization_server_returns_the_first_candidates_metadata_when_multiple_succeed(
+    ) {
+        // Unlike the fallback test above, BOTH candidates are individually
+        // valid here. If selection preferred the last successful candidate,
+        // or otherwise ignored document order, this would pick the second
+        // server's metadata instead of the first's — the fallback-only test
+        // above cannot detect that, since it only ever has one viable answer.
+        let first =
+            spawn_as_metadata_server(Some(as_metadata_body("https://as-first.example"))).await;
+        let second =
+            spawn_as_metadata_server(Some(as_metadata_body("https://as-second.example"))).await;
+        let http = reqwest::Client::new();
+
+        let (issuer, metadata) =
+            select_authorization_server(&http, &[first.clone(), second.clone()])
+                .await
+                .expect("both candidates are individually valid");
+
+        assert_eq!(
+            issuer, first,
+            "the FIRST candidate must win when both succeed — document order decides, not any \
+             other rule (e.g. preferring the last one tried)"
+        );
+        assert_eq!(metadata.token_endpoint, "https://as-first.example/token");
+    }
+
+    #[tokio::test]
+    async fn select_authorization_server_names_every_issuer_tried_when_all_fail() {
+        let bad_one = spawn_as_metadata_server(None).await;
+        let bad_two = spawn_as_metadata_server(None).await;
+        let http = reqwest::Client::new();
+
+        let err = select_authorization_server(&http, &[bad_one.clone(), bad_two.clone()])
+            .await
+            .expect_err("every candidate failing must surface as one error, not a silent None");
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&bad_one),
+            "the error must name the FIRST issuer tried, not just the last: {message}"
+        );
+        assert!(
+            message.contains(&bad_two),
+            "the error must name the SECOND issuer tried too: {message}"
         );
     }
 }
