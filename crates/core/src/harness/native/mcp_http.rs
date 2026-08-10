@@ -127,7 +127,12 @@ impl McpHttpConnection {
     }
 
     /// POST one JSON-RPC message and return `(response, new session id)`.
-    /// Task 2 extends this to read an SSE response body.
+    ///
+    /// A Streamable HTTP server may answer either with a bare
+    /// `application/json` body (Task 1) or with a `text/event-stream` body
+    /// carrying one or more SSE events, of which at most one is the reply to
+    /// THIS message (Task 2) — `sse_message_for_id` picks that one out and
+    /// treats a stream that never carries it as a transport failure.
     async fn post(&self, message: &Value) -> anyhow::Result<(Value, Option<String>)> {
         let mut request = self
             .http
@@ -149,6 +154,12 @@ impl McpHttpConnection {
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
@@ -157,8 +168,39 @@ impl McpHttpConnection {
         if body.trim().is_empty() {
             return Ok((Value::Null, session));
         }
+        if content_type.contains("text/event-stream") {
+            let want = message.get("id").cloned();
+            return Ok((sse_message_for_id(&body, want.as_ref())?, session));
+        }
         Ok((serde_json::from_str(&body)?, session))
     }
+}
+
+/// Pull the JSON-RPC message whose `id` matches `want` out of an SSE body.
+///
+/// Any other message on the stream — a notification, or a server-initiated
+/// request this client does not implement — is skipped rather than mistaken
+/// for the answer. A stream that ends without the wanted id is a TRANSPORT
+/// ERROR, not an empty result: silently resolving to `Value::Null` here would
+/// make a truncated or broken upstream response indistinguishable from a tool
+/// that legitimately returned nothing.
+fn sse_message_for_id(body: &str, want: Option<&Value>) -> anyhow::Result<Value> {
+    let mut skipped = 0usize;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(message) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        match (want, message.get("id")) {
+            (Some(want), Some(got)) if want == got => return Ok(message),
+            _ => skipped += 1,
+        }
+    }
+    anyhow::bail!(
+        "mcp: event stream ended without a response for the pending request ({skipped} other message(s) seen)"
+    )
 }
 
 #[async_trait]
@@ -179,13 +221,19 @@ mod tests {
     use super::*;
     use crate::domain::{McpServerSpec, McpTransport};
 
+    use axum::extract::{Json, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::Router;
+
     /// One request the in-test MCP server received: the headers this file's
     /// assertions care about, plus the raw JSON-RPC body. A client that
-    /// dropped the version header, sent a too-narrow `Accept`, or lied about
-    /// its `clientInfo` would still get a JSON response back from
-    /// `spawn_json_server`'s handler — the only way to catch that is to
-    /// record what actually arrived and assert on it here, not on what the
-    /// server chose to reply.
+    /// dropped the version header, sent a too-narrow `Accept`, lied about
+    /// its `clientInfo`, or failed to echo back an issued session id would
+    /// still get a response from the handler below — the only way to catch
+    /// that is to record what actually arrived and assert on it here, not on
+    /// what the server chose to reply.
     #[derive(Debug, Clone)]
     struct SeenRequest {
         protocol_version: Option<String>,
@@ -195,84 +243,149 @@ mod tests {
         /// (rather than only the first, the way `HeaderMap::get` would) is
         /// what makes header duplication visible instead of silently hidden.
         authorization: Vec<String>,
+        /// The `Mcp-Session-Id` this request carried, or `None` if it had
+        /// none. Task 2's session-echo test reads this off every captured
+        /// request, in order.
+        session_id: Option<String>,
         body: Value,
     }
 
     type Seen = std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>;
 
+    /// Whether the in-test server encodes a JSON-RPC reply as a bare
+    /// `application/json` body (Task 1's path), or wraps it in a
+    /// `text/event-stream` body carrying a decoy notification and a decoy
+    /// unrelated-id message ahead of the real answer, and issues an
+    /// `Mcp-Session-Id` (Task 2's path). Same route, same `SeenRequest`
+    /// capture, same computed result either way — only the wire encoding
+    /// differs, so this is one server with a switch, not a second server.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ResponseMode {
+        Json,
+        Sse,
+    }
+
+    #[derive(Clone)]
+    struct ServerState {
+        sink: Seen,
+        mode: ResponseMode,
+    }
+
     /// Minimal in-test MCP server: answers `initialize`, `tools/list` and
-    /// `tools/call` with plain JSON (no SSE — Task 2 covers that path), and
-    /// records every request it receives so tests can assert on what the
-    /// client sent, not just what it got back.
+    /// `tools/call`, and records every request it receives so tests can
+    /// assert on what the client sent, not just what it got back.
     ///
     /// Built on `axum::Router` + `tokio::net::TcpListener` + `axum::serve` —
     /// the same in-process test-server pattern `MockUpstream` already uses in
     /// `plugins/wasm_provider_conformance.rs:164-178`, one file over from this
-    /// one, and the same header-capturing `Arc<Mutex<Vec<_>>>` sink shape the
-    /// plan's Task 2 `spawn_sse_server` uses. `axum` and `tokio`'s `net`
-    /// feature are already direct dependencies of `ryuzi-core` (Cargo.toml),
-    /// so this needs no new dependency — do NOT reach for
-    /// `hyper`/`hyper-util`/`http-body-util` directly, none of the three is
-    /// a direct dependency of this crate today.
-    async fn spawn_json_server() -> (String, Seen, tokio::task::JoinHandle<()>) {
-        use axum::extract::{Json, State};
-        use axum::http::{HeaderMap, StatusCode};
-        use axum::routing::post;
-        use axum::Router;
-
-        async fn handle(
-            State(sink): State<Seen>,
-            headers: HeaderMap,
-            Json(msg): Json<Value>,
-        ) -> (StatusCode, [(&'static str, &'static str); 1], String) {
-            sink.lock().unwrap().push(SeenRequest {
-                protocol_version: headers
-                    .get("mcp-protocol-version")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string),
-                accept: headers
-                    .get("accept")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string),
-                authorization: headers
-                    .get_all("authorization")
-                    .iter()
-                    .filter_map(|v| v.to_str().ok().map(str::to_string))
-                    .collect(),
-                body: msg.clone(),
-            });
-            let id = msg["id"].clone();
-            let result = match msg["method"].as_str().unwrap_or_default() {
-                "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
-                "tools/list" => json!({"tools": [{
-                    "name": "ping",
-                    "description": "ping it",
-                    "inputSchema": {"type": "object"}
-                }]}),
-                "tools/call" => json!({"content": [{"type": "text", "text": "pong"}]}),
-                // A notification: nothing to compute, and the client
-                // discards whatever comes back (see `handshake`'s `let _ =`).
-                "notifications/initialized" => Value::Null,
-                other => panic!("unexpected method {other}"),
-            };
-            let payload = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
-            (
+    /// one. `axum` and `tokio`'s `net` feature are already direct dependencies
+    /// of `ryuzi-core` (Cargo.toml), so this needs no new dependency — do NOT
+    /// reach for `hyper`/`hyper-util`/`http-body-util` directly, none of the
+    /// three is a direct dependency of this crate today.
+    async fn handle(
+        State(state): State<ServerState>,
+        headers: HeaderMap,
+        Json(msg): Json<Value>,
+    ) -> axum::response::Response {
+        state.sink.lock().unwrap().push(SeenRequest {
+            protocol_version: headers
+                .get("mcp-protocol-version")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            accept: headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            authorization: headers
+                .get_all("authorization")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect(),
+            session_id: headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            body: msg.clone(),
+        });
+        let id = msg["id"].clone();
+        let result = match msg["method"].as_str().unwrap_or_default() {
+            "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+            "tools/list" => json!({"tools": [{
+                "name": "ping",
+                "description": "ping it",
+                "inputSchema": {"type": "object"}
+            }]}),
+            "tools/call" => {
+                // A distinct string per mode makes it obvious, from the
+                // assertion text alone, which wire path actually produced a
+                // given result.
+                let text = if state.mode == ResponseMode::Sse {
+                    "ok"
+                } else {
+                    "pong"
+                };
+                json!({"content": [{"type": "text", "text": text}]})
+            }
+            // A notification: nothing to compute, and the client
+            // discards whatever comes back (see `handshake`'s `let _ =`).
+            "notifications/initialized" => Value::Null,
+            other => panic!("unexpected method {other}"),
+        };
+        match state.mode {
+            ResponseMode::Json => (
                 StatusCode::OK,
                 [("content-type", "application/json")],
-                payload,
+                json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
             )
+                .into_response(),
+            ResponseMode::Sse => {
+                // A notification, then an unrelated message, then the real
+                // answer — the client must skip the first two and take only
+                // the event whose id matches its own pending request.
+                let payload = format!(
+                    "event: message\ndata: {}\n\nevent: message\ndata: {}\n\nevent: message\ndata: {}\n\n",
+                    json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}),
+                    json!({"jsonrpc": "2.0", "id": 9999, "result": {"unrelated": true}}),
+                    json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                );
+                (
+                    StatusCode::OK,
+                    [
+                        ("content-type", "text/event-stream"),
+                        ("mcp-session-id", "sess-123"),
+                    ],
+                    payload,
+                )
+                    .into_response()
+            }
         }
+    }
 
+    async fn spawn_server(mode: ResponseMode) -> (String, Seen, tokio::task::JoinHandle<()>) {
         let sink: Seen = Default::default();
-        let app = Router::new()
-            .route("/", post(handle))
-            .with_state(sink.clone());
+        let state = ServerState {
+            sink: sink.clone(),
+            mode,
+        };
+        let app = Router::new().route("/", post(handle)).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle_task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), sink, handle_task)
+    }
+
+    /// Task 1's plain-JSON response path.
+    async fn spawn_json_server() -> (String, Seen, tokio::task::JoinHandle<()>) {
+        spawn_server(ResponseMode::Json).await
+    }
+
+    /// Task 2's SSE response path: every reply is wrapped in a
+    /// `text/event-stream` body ahead of decoy messages, and the server
+    /// issues session id `sess-123` at `initialize`.
+    async fn spawn_sse_server() -> (String, Seen, tokio::task::JoinHandle<()>) {
+        spawn_server(ResponseMode::Sse).await
     }
 
     fn spec(url: &str) -> McpServerSpec {
@@ -421,6 +534,108 @@ mod tests {
             init.authorization[0], "Bearer host-token",
             "the host-minted bearer must REPLACE the manifest's Authorization value, not just \
              happen to be the one the assertion above picked out"
+        );
+    }
+
+    /// The property Task 2 exists to protect: on an SSE response body the
+    /// client must skip a notification and a message carrying someone
+    /// else's id, and resolve the call using only the event whose id
+    /// matches the request it actually sent.
+    #[tokio::test]
+    async fn an_sse_body_yields_the_message_matching_the_pending_id() {
+        let (url, _seen, _server) = spawn_sse_server().await;
+        let conn = connect_http(&spec(&url), None)
+            .await
+            .expect("connect over SSE must succeed");
+
+        let result = conn.call("anything", json!({})).await.unwrap();
+
+        let (text, _) = crate::harness::native::mcp_client::render_tool_result(&result);
+        assert_eq!(
+            text, "ok",
+            "the client must skip the notification and the id-9999 message on the SSE stream and \
+             resolve the call using only the event matching its own pending id — a wrong value here \
+             means it grabbed the first or last event instead of the matching one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_session_id_is_echoed_on_every_request_after_initialize() {
+        let (url, seen, _server) = spawn_sse_server().await;
+        let conn = connect_http(&spec(&url), None)
+            .await
+            .expect("connect over SSE must succeed");
+        conn.call("anything", json!({})).await.unwrap();
+
+        let echoed: Vec<Option<String>> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.session_id.clone())
+            .collect();
+        assert_eq!(
+            echoed.first(),
+            Some(&None),
+            "the very first request (initialize) cannot echo a session id the server has not \
+             issued yet: {echoed:?}"
+        );
+        assert!(
+            echoed.len() >= 3,
+            "expected at least initialize, notifications/initialized and tools/call to have been \
+             captured, got {echoed:?}"
+        );
+        assert!(
+            echoed
+                .iter()
+                .skip(1)
+                .all(|v| v.as_deref() == Some("sess-123")),
+            "every request after initialize must carry the session id the server issued at \
+             initialize — a stdio-style client that never echoes it would send None here forever \
+             instead of sess-123: {echoed:?}"
+        );
+    }
+
+    /// The single hardest guarantee `sse_message_for_id` makes: a stream
+    /// that never carries the pending request's id must be a transport
+    /// error, not an empty/`Value::Null` result. Verified directly against
+    /// the parser (not through a full connection) so this stays exact and
+    /// fast: a body containing only a notification and an unrelated id
+    /// (id 7 is never present) must fail rather than resolve.
+    #[test]
+    fn sse_stream_without_the_pending_id_is_a_transport_error_not_an_empty_result() {
+        let pending = json!(7);
+        let body = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"unrelated\":true}}\n\n",
+        );
+
+        let result = sse_message_for_id(body, Some(&pending));
+
+        assert!(
+            result.is_err(),
+            "a stream that ends without id 7 must be reported as a transport error — resolving to \
+             Ok(Value::Null) here would make a truncated or broken upstream response \
+             indistinguishable from a tool call that legitimately returned nothing: {result:?}"
+        );
+    }
+
+    /// `post()` passes `want = None` for a notification (it has no `id` to
+    /// wait for). If `sse_message_for_id` ever treated a `None` pending id
+    /// as satisfied by ANY message — in particular one whose own `id` is
+    /// `null` — a notification post would silently grab that message as if
+    /// it were an answer nobody asked for.
+    #[test]
+    fn no_pending_id_never_opportunistically_matches_a_null_id_message() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{}}\n\n";
+
+        let result = sse_message_for_id(body, None);
+
+        assert!(
+            result.is_err(),
+            "with nothing pending, the stream must end in error rather than matching a null-id \
+             message: {result:?}"
         );
     }
 }
