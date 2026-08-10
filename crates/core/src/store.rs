@@ -8334,6 +8334,13 @@ mod tests {
         // round-trip-equality test, because decode would simply hand back
         // whatever was written. This test reads the raw column, bypassing
         // the decode path, so a dropped encrypt call is caught directly.
+        //
+        // "not stored verbatim" is NOT the property, though: swapping
+        // encrypt_field for base64, rot13, or any other reversible
+        // obfuscation satisfies it — and satisfies the decoding round-trip
+        // below too. So the stored values must additionally carry the real
+        // scheme's `enc:v1:` marker AND decrypt back under `decrypt_field`,
+        // which no non-encryption stand-in can fake.
         use_test_key_file();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -8357,6 +8364,30 @@ mod tests {
             !raw_json.contains("mcp-refresh-secret"),
             "MCP refresh tokens are being written to disk in the clear: {raw_json}"
         );
+
+        // `llm_router::secrets`'s ciphertext tag, duplicated rather than
+        // exported: this assertion must FAIL if that module's format changes,
+        // not silently follow it.
+        const ENC_PREFIX: &str = "enc:v1:";
+        let stored: Value = serde_json::from_str(&raw_json).unwrap();
+        for (field, plaintext) in [
+            ("access_token", "mcp-access-secret"),
+            ("refresh_token", "mcp-refresh-secret"),
+        ] {
+            let stored_value = stored[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be a stored string: {raw_json}"));
+            assert!(
+                stored_value.starts_with(ENC_PREFIX),
+                "{field} must be tagged with the real scheme's {ENC_PREFIX} marker, not merely \
+                 obfuscated: {stored_value}"
+            );
+            assert_eq!(
+                decrypt_field(stored_value).unwrap(),
+                plaintext,
+                "{field} must be this process cipher's ciphertext for the plaintext"
+            );
+        }
 
         let roundtrip = store.get_mcp_oauth_token("rovo").await.unwrap().unwrap();
         assert_eq!(roundtrip.access_token, "mcp-access-secret");
