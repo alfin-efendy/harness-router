@@ -490,10 +490,16 @@ fn is_toolless_wasm_fallback_candidate(
 }
 
 /// Whether `target` is diverted to a WASM component that CANNOT carry tools —
-/// not merely whether it is diverted to WASM at all. A component that
-/// declares `capabilities().tools` speaks the structured `complete_v2` ABI
-/// and keeps its tools; only a 0.1.0-only (or otherwise toolless) component
-/// falls into this predicate. This is the SAME predicate as the divert at the
+/// not merely whether it is diverted to WASM at all.
+///
+/// This asks ONLY about tool forwarding, never about which ABI the component
+/// speaks; those are separate axes and conflating them is what broke mimo
+/// once already (see `speaks_structured_abi`). A component reporting
+/// `capabilities().tools` keeps its tools; one reporting `false` lands here
+/// regardless of its ABI — mimo exports only `ryuzi:provider/provider@0.2.0`
+/// and is still toolless for routing purposes.
+///
+/// This is the SAME predicate as the divert at the
 /// `wasm_provider(&target.conn.provider)` choke point below (search this
 /// file). Shared by `target_tool_capabilities` (runtime capability lookup),
 /// `is_toolless_wasm_fallback_candidate` (degrade eligibility), and
