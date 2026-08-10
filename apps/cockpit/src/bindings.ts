@@ -792,6 +792,47 @@ async toggleAppAgent(runnerId: string | null, id: string, agentId: string, allow
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Begins a remote MCP server's OAuth connect flow. The daemon
+ * (`begin_mcp_connect`) discovers the server's authorization server via
+ * RFC 9728, registers (or reuses) a client id, and builds the authorize
+ * URL; this command then binds the fixed wizard port, spawns a one-shot
+ * callback server at the exact path the daemon's `mcp_redirect_uri` used
+ * when building that URL, and awaits the browser redirect in the
+ * background. On a captured callback it hands the code + the verifier
+ * (stashed from the daemon's response) to `complete_mcp_connect`.
+ */
+async beginMcpConnect(runnerId: string | null, id: string) : Promise<Result<McpConnectStart, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("begin_mcp_connect", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Exposed for symmetry with [`begin_mcp_connect`] (and for direct testing)
+ * — the loopback callback task above is the only production caller.
+ */
+async completeMcpConnect(runnerId: string | null, id: string, code: string, verifier: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("complete_mcp_connect", { runnerId, id, code, verifier }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop a remote MCP server's stored OAuth token.
+ */
+async disconnectMcp(runnerId: string | null, id: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("disconnect_mcp", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listDir(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_dir", { runnerId, sessionPk, rel }) };
@@ -2135,7 +2176,20 @@ builtin: boolean; skillCount: number; toolCount: number; knowledgeCount: number;
  */
 export type AgentToolUsageInfo = { tool: string; count: number; lastUsed: number }
 export type AgentValidationInfo = { field: string; message: string }
-export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[];
+export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null;
+/**
+ * A `mcp_oauth_tokens` row exists for this server's id — independent of
+ * `auth_kind`/`auth_detail` (those describe the manifest/env-derived
+ * credential, never an interactively-connected OAuth token). Only ever
+ * true for a `transport: "http"` row.
+ */
+oauthTokenStored: boolean;
+/**
+ * The stored token's `reconnect_required` flag (Task 8: set when a
+ * refreshed request still 401s). `false` whenever `oauth_token_stored`
+ * is `false` — there is nothing to reconnect.
+ */
+oauthReconnectRequired: boolean; tools: ToolInfo[]; agentAccess: AgentAccessInfo[];
 /**
  * The plugin that owns this server, when it was synced from a plugin's
  * `[[mcp]]` declaration rather than added by the user. Cockpit uses it
@@ -2392,7 +2446,7 @@ export type ComponentReleaseDetail = { pluginId: string; releases: ComponentRele
 activeManifest: ComponentManifestInfo | null;
 /**
  * PR-1 (pre-install metadata): the manifest `id`'s EMBEDDED first-party
- * bundle declares (`component_catalog::declared_bundle_manifest`) —
+ * bundle declares (`component_catalog::declared_manifest`) —
  * available before any release is fetched, because it is compiled into
  * the binary. `None` for non-component ids. UI reads
  * `activeManifest ?? declaredManifest` so the verified on-disk manifest
@@ -2541,9 +2595,9 @@ export type DoctorFinding = { pluginId: string;
 severity: string;
 /**
  * `reconnect-required` | `missing-binary` | `attach-failed` | `blocked` |
- * `slot-conflict` | `not-running` | `crashed` | `restart-exhausted` |
- * `init-failed` (the last four are Track D extension findings — DT8,
- * see `crate::plugins::doctor::plugin_doctor`'s extension section).
+ * `slot-conflict` | `signature-invalid` | `hash-mismatch` |
+ * `abi-incompatible` | `revoked` | `policy-violation` |
+ * `oauth-profile-unhealthy` | `gateway-restart-exhausted`.
  */
 kind: string; message: string; suggestedAction: string }
 export type EffectiveEffortSource = "project" | "session" | "routeTarget" | "configured" | "provider" | "none"
@@ -2627,6 +2681,16 @@ export type KnowledgeConceptInfo = { id: string; relativePath: string; conceptTy
 export type KnowledgeConceptMutationInfo = { title: string; description: string; body: string; scope: string; projectId: string | null; tags: string[] }
 export type LearningReviewInfo = { conceptId: string; title: string; description: string; timestamp: string }
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
+/**
+ * `begin_mcp_connect` RPC result — the daemon has already discovered the
+ * remote server's authorization server, registered (or reused) a client id,
+ * and built the authorize URL. Cockpit opens `authorize_url` in the browser
+ * and holds `state`/`verifier` locally until its loopback callback captures
+ * the redirect (see `mcp_oauth::mcp_redirect_uri` and the Task 9 plan
+ * correction on why the callback listener lives in Cockpit's own process,
+ * not the daemon's).
+ */
+export type McpConnectStart = { authorizeUrl: string; state: string; verifier: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry, one row per native-runtime event block.
@@ -2706,15 +2770,19 @@ kind: string; setting: string | null; env: string | null; helpUrl: string | null
 configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
 export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; homepage: string | null; publisher: string;
 /**
- * Command names (`.md` file stems) found under an installed plugin's
- * `commands/` directory. Empty for a `Builtin` plugin or one with no
- * commands surface.
+ * Command names (`.md` file stems) found under a plugin's `commands/`
+ * directory — an `Installed` plugin's own directory, or (F7) a
+ * `Builtin` plugin's directory when it's ALSO backed by an active,
+ * installed component bundle (the component-catalog placeholders:
+ * github/atlassian/bitbucket/discord/mimo/opencode). Empty for a
+ * `Builtin` plugin with no matching installed bundle, or any plugin
+ * with no commands surface.
  */
 commands: string[];
 /**
- * Skill directory names found under an installed plugin's `skills/`
- * directory (each carries a `SKILL.md`). Empty for a `Builtin` plugin
- * or one with no skills surface.
+ * Skill directory names found under a plugin's `skills/` directory
+ * (each carries a `SKILL.md`) — same resolution as `commands` above,
+ * including the F7 `Builtin`-with-an-active-bundle case.
  */
 skills: string[]; hooks: PluginHookInfo[]; jobs: PluginJobInfo[] }
 export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean;

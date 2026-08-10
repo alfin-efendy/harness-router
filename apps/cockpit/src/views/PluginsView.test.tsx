@@ -106,6 +106,8 @@ const slackApp: AppInfo = {
   publisher: "Acme",
   authKind: "none",
   authDetail: null,
+  oauthTokenStored: false,
+  oauthReconnectRequired: false,
   tools: [],
   agentAccess: [],
   pluginId: null,

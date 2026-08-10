@@ -45,6 +45,8 @@ const slackApp: AppInfo = {
   publisher: "Acme",
   authKind: "env",
   authDetail: "SLACK_BOT_TOKEN",
+  oauthTokenStored: false,
+  oauthReconnectRequired: false,
   tools: [{ name: "channels_list", desc: "List channels the bot can see", perm: "ask" }],
   agentAccess: [],
   pluginId: null,
@@ -61,6 +63,20 @@ const brokenApp: AppInfo = {
   status: "error",
   statusDetail: "Auth expired — reconnect required.",
   tools: [],
+};
+
+// Task 9: a remote (http) server, not yet connected — exercises the OAuth
+// Connect affordance on the Connection card.
+const remoteApp: AppInfo = {
+  ...slackApp,
+  id: "remote",
+  name: "Remote MCP",
+  transport: "http",
+  command: null,
+  args: [],
+  url: "https://mcp.example.com",
+  authKind: "none",
+  authDetail: null,
 };
 
 let appsFixture: AppInfo[] = [slackApp, brokenApp];
@@ -85,6 +101,19 @@ const toggleAppAgent = mock(async (_runnerId: string, id: string, agentId: strin
   );
   return { status: "ok" as const, data: appsFixture };
 });
+const beginMcpConnect = mock(async (_runnerId: string, _id: string) => ({
+  status: "ok" as const,
+  data: { authorizeUrl: "https://auth.example.com/authorize?state=abc", state: "abc", verifier: "verifier-xyz" },
+}));
+const completeMcpConnect = mock(async (_runnerId: string, _id: string, _code: string, _verifier: string) => ({
+  status: "ok" as const,
+  data: appsFixture,
+}));
+const disconnectMcp = mock(async (_runnerId: string, id: string) => {
+  appsFixture = appsFixture.map((a) => (a.id === id ? { ...a, oauthTokenStored: false, oauthReconnectRequired: false } : a));
+  return { status: "ok" as const, data: appsFixture };
+});
+const openUrl = mock(async (_u: string) => {});
 
 mock.module("@/bindings", () => ({
   // `useGateways` pulls in the shared `@/store` module (for its post-remove
@@ -94,8 +123,19 @@ mock.module("@/bindings", () => ({
   // is enough to keep the import graph linkable without wiring up every
   // event channel in Cockpit.
   events: {},
-  commands: { listApps, removeApp, probeApp, updateAppScope, setAppToolPerm, toggleAppAgent },
+  commands: {
+    listApps,
+    removeApp,
+    probeApp,
+    updateAppScope,
+    setAppToolPerm,
+    toggleAppAgent,
+    beginMcpConnect,
+    completeMcpConnect,
+    disconnectMcp,
+  },
 }));
+mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
 
 const { AppDetailView } = await import("@/views/AppDetailView");
 const { useApps } = await import("@/store-apps");
@@ -108,6 +148,10 @@ beforeEach(() => {
   updateAppScope.mockClear();
   setAppToolPerm.mockClear();
   toggleAppAgent.mockClear();
+  beginMcpConnect.mockClear();
+  completeMcpConnect.mockClear();
+  disconnectMcp.mockClear();
+  openUrl.mockClear();
   appsFixture = [slackApp, brokenApp];
   useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
   useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "slack" }, forward: [] } });
@@ -196,4 +240,99 @@ test("Remove in the overflow menu calls remove(id) then navigates back", async (
 
   await waitFor(() => expect(removeApp).toHaveBeenCalledWith(LOCAL_RUNNER, "slack"));
   expect(useNav.getState().history.current).toEqual({ kind: "plugins" });
+});
+
+// ---------- Task 9: remote MCP server OAuth connect ----------
+
+test("a not-yet-connected remote server shows a Connect button and no OAuth pill states leak in", async () => {
+  appsFixture = [remoteApp];
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+
+  render(<AppDetailView id="remote" />);
+  await screen.findByText("Remote MCP");
+
+  expect(screen.getByText("Not connected")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
+  expect(screen.queryByText("Reconnect required")).toBeNull();
+});
+
+test("clicking Connect starts the flow, opens the authorize URL, and shows a pending state (not idle/broken)", async () => {
+  appsFixture = [remoteApp];
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+
+  render(<AppDetailView id="remote" />);
+  await screen.findByText("Remote MCP");
+
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+  await waitFor(() => expect(beginMcpConnect).toHaveBeenCalledWith(LOCAL_RUNNER, "remote"));
+  await waitFor(() => expect(openUrl).toHaveBeenCalledWith("https://auth.example.com/authorize?state=abc"));
+  // The user leaves for the browser here — the UI must not look idle: a
+  // visible waiting message + a way out (Cancel), not a silently-disabled
+  // Connect button with no explanation.
+  expect(await screen.findByText(/Waiting for you to finish signing in in the browser/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+});
+
+test(
+  "the connect poll picks up a completed connection and reports success",
+  async () => {
+    appsFixture = [remoteApp];
+    useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+    useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+    // PROPERTY: the pending UI must actually resolve once the server reports
+    // connected, not spin forever — the first post-Connect `listApps` refresh
+    // still reports "not connected" (proving the loop doesn't just declare
+    // victory on the very next tick), the second reports connected.
+    let listAppsCalls = 0;
+    listApps.mockImplementation(async () => {
+      listAppsCalls += 1;
+      const connected = listAppsCalls >= 2; // 1st poll: still pending; 2nd poll: connected
+      return {
+        status: "ok" as const,
+        data: [{ ...remoteApp, oauthTokenStored: connected, oauthReconnectRequired: false }],
+      };
+    });
+
+    render(<AppDetailView id="remote" />);
+    await screen.findByText("Remote MCP");
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await screen.findByText(/Waiting for you to finish signing in in the browser/);
+    await waitFor(() => expect(screen.getByText("OAuth connected")).toBeTruthy(), { timeout: 12_000 });
+    expect(screen.queryByText(/Waiting for you to finish/)).toBeNull();
+    listApps.mockImplementation(async () => ({ status: "ok" as const, data: appsFixture }));
+  },
+  15_000,
+);
+
+test("a reconnect-required remote server shows the warning pill and a Reconnect label", async () => {
+  const tripped: AppInfo = { ...remoteApp, oauthTokenStored: true, oauthReconnectRequired: true };
+  appsFixture = [tripped];
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+
+  render(<AppDetailView id="remote" />);
+  await screen.findByText("Remote MCP");
+
+  expect(screen.getByText("Reconnect required")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Disconnect" })).toBeTruthy();
+});
+
+test("a connected remote server's Disconnect button calls disconnectMcp with the server id", async () => {
+  const connected: AppInfo = { ...remoteApp, oauthTokenStored: true, oauthReconnectRequired: false };
+  appsFixture = [connected];
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+
+  render(<AppDetailView id="remote" />);
+  await screen.findByText("Remote MCP");
+  expect(screen.getByText("OAuth connected")).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await waitFor(() => expect(disconnectMcp).toHaveBeenCalledWith(LOCAL_RUNNER, "remote"));
 });

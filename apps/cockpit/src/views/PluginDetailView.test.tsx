@@ -1998,6 +1998,8 @@ test("an installed + trusted plugin with a matching MCP app row shows full mcp__
       publisher: null,
       authKind: "none",
       authDetail: null,
+      oauthTokenStored: false,
+      oauthReconnectRequired: false,
       tools: [{ name: "create_issue", desc: "Open an issue", perm: "ask" }],
       agentAccess: [],
       pluginId: "acme-suite",

@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, type AddAppInput, type AppInfo, type CmdError, type Result } from "./bindings";
+import { commands, type AddAppInput, type AppInfo, type CmdError, type McpConnectStart, type Result } from "./bindings";
 
 // Apps (MCP servers) domain store. Definitions persist in the engine; probes
 // do a real MCP handshake; enabled servers attach to agent sessions for real.
@@ -18,6 +18,17 @@ type AppsState = {
   setToolPerm: (id: string, tool: string, perm: string) => Promise<void>;
   /** Allow/deny the (single, native) agent to use this app. */
   toggleAgent: (id: string, allowed: boolean) => Promise<void>;
+  /** Remote MCP server OAuth connect (Task 9). `beginMcpConnect` returns the
+   *  daemon's authorize URL/state/verifier (or `null` on error); the caller
+   *  opens the browser and holds `state`/`verifier` locally until its OWN
+   *  loopback callback captures the redirect (Cockpit's Rust side in
+   *  production — see `apps_cmd.rs`'s `begin_mcp_connect`; `completeMcpConnect`
+   *  is exposed here mainly for symmetry and direct testing). Both
+   *  complete/disconnect refresh `apps` from the RPC's returned list on
+   *  success, same as every other mutation in this store. */
+  beginMcpConnect: (id: string) => Promise<McpConnectStart | null>;
+  completeMcpConnect: (id: string, code: string, verifier: string) => Promise<boolean>;
+  disconnectMcp: (id: string) => Promise<boolean>;
 };
 
 function applyResult(set: (partial: Partial<AppsState>) => void, res: Result<AppInfo[], CmdError>, action: string): boolean {
@@ -79,6 +90,19 @@ export const useApps = create<AppsState>((set, get) => ({
     });
     applyResult(set, await commands.toggleAppAgent("local", id, "native", allowed), "Agent access");
   },
+
+  beginMcpConnect: async (id) => {
+    const res = await commands.beginMcpConnect("local", id);
+    if (res.status === "error") {
+      toast.error(`Couldn't start the connection: ${res.error.message}`);
+      return null;
+    }
+    return res.data;
+  },
+
+  completeMcpConnect: async (id, code, verifier) => applyResult(set, await commands.completeMcpConnect("local", id, code, verifier), "Connect"),
+
+  disconnectMcp: async (id) => applyResult(set, await commands.disconnectMcp("local", id), "Disconnect"),
 }));
 
 export function appById(apps: AppInfo[], id: string): AppInfo | undefined {

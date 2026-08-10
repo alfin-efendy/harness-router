@@ -71,6 +71,8 @@ function mkApp(overrides: Partial<AppInfo> = {}): AppInfo {
     publisher: null,
     authKind: "none",
     authDetail: null,
+    oauthTokenStored: false,
+    oauthReconnectRequired: false,
     tools: [],
     agentAccess: [],
     pluginId: null,

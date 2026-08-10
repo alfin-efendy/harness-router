@@ -1,5 +1,7 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { MoreHorizontal, RefreshCw, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import {
   Button,
   Menu,
@@ -16,7 +18,7 @@ import {
 } from "@ryuzi/ui";
 import type { PluginToolEntry } from "@/bindings";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Chip, StatusDot } from "@/components/common/bits";
+import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { NATIVE_AGENT } from "@/constants";
 import { appStatusToHubStatus, statusPresentation } from "@/lib/plugin-hub";
@@ -29,6 +31,17 @@ import { useNav } from "@/store-nav";
 import { visibleTabs, type DetailTab } from "./PluginDetailView";
 
 const rowLabel = "w-[120px] shrink-0 text-[13px] font-medium";
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// How long the post-Connect poll waits between refreshes, and the overall
+// deadline before it gives up and offers "Try again" — the loopback callback
+// server completes the token exchange out-of-band (Cockpit's own Rust
+// process, per the Task 9 plan correction), so this is purely "has the
+// server turned connected yet", not a provider-imposed interval. Mirrors
+// `OauthProfileConnections.tsx`'s PKCE poll constants.
+const CONNECT_POLL_INTERVAL_MS = 2000;
+const CONNECT_POLL_TIMEOUT_MS = 5 * 60_000;
 
 const TAB_LABEL: Record<DetailTab, string> = {
   overview: "Overview",
@@ -47,9 +60,17 @@ const TAB_LABEL: Record<DetailTab, string> = {
 
 export function AppDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent } = useApps();
+  const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent, beginMcpConnect, disconnectMcp } = useApps();
   const gateways = useGateways((s) => s.gateways);
   const [tab, setTab] = useState<DetailTab>("overview");
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [connectPending, setConnectPending] = useState(false);
+  const [connectExpired, setConnectExpired] = useState(false);
+  // Set on unmount so the async poll loop below stops touching state after
+  // teardown, and on Cancel so it stops early without waiting the full
+  // 5-minute timeout — same pattern `OauthProfileConnections.tsx` uses.
+  const connectCancelledRef = useRef(false);
+  useEffect(() => () => void (connectCancelledRef.current = true), []);
   const goApps = () => nav.navigate({ kind: "plugins" });
 
   useEffect(() => {
@@ -84,6 +105,55 @@ export function AppDetailView({ id }: { id: string }) {
   const onRemove = () => {
     void remove(app.id);
     nav.goBack();
+  };
+
+  // Remote MCP server OAuth connect (Task 9). `beginMcpConnect` returns the
+  // authorize URL immediately — the daemon has already discovered the
+  // server's authorization server and registered a client. Cockpit's own
+  // Rust process then captures the browser redirect in the background (the
+  // plan's Task 9 correction: the loopback listener lives there, not the
+  // daemon), so there is nothing more for this component to drive except
+  // poll `list_apps` until the server reports connected — same shape as
+  // `OauthProfileConnections.tsx`'s PKCE poll, just reading the refreshed
+  // Apps list instead of `pluginReleaseDetail`.
+  const startConnect = async () => {
+    connectCancelledRef.current = false;
+    setConnectExpired(false);
+    setConnectBusy(true);
+    const start = await beginMcpConnect(app.id);
+    setConnectBusy(false);
+    if (!start) return; // store already toasted the failure
+    void openUrl(start.authorizeUrl);
+    setConnectPending(true);
+
+    const deadline = Date.now() + CONNECT_POLL_TIMEOUT_MS;
+    while (!connectCancelledRef.current && Date.now() < deadline) {
+      await sleep(CONNECT_POLL_INTERVAL_MS);
+      if (connectCancelledRef.current) return;
+      await hydrate();
+      if (connectCancelledRef.current) return;
+      const fresh = appById(useApps.getState().apps, app.id);
+      if (fresh?.oauthTokenStored && !fresh.oauthReconnectRequired) {
+        toast.success(`Connected ${app.name}`);
+        setConnectPending(false);
+        return;
+      }
+    }
+    if (!connectCancelledRef.current) {
+      setConnectPending(false);
+      setConnectExpired(true);
+    }
+  };
+
+  const cancelConnect = () => {
+    connectCancelledRef.current = true;
+    setConnectPending(false);
+  };
+
+  const onDisconnect = async () => {
+    setConnectBusy(true);
+    await disconnectMcp(app.id);
+    setConnectBusy(false);
   };
 
   return (
@@ -146,15 +216,65 @@ export function AppDetailView({ id }: { id: string }) {
                   {app.transport === "http" ? (app.url ?? "—") : [app.command, ...app.args].filter(Boolean).join(" ")}
                 </span>
               </CardRow>
-              {app.authKind === "env" ? (
+              {app.authKind === "env" && (
                 <CardRow>
                   <span className={rowLabel}>Environment</span>
                   <span className="flex-1 font-mono text-xs text-muted-foreground">{app.authDetail ?? "—"}</span>
                 </CardRow>
+              )}
+              {app.transport === "http" ? (
+                <>
+                  <CardRow>
+                    <span className={rowLabel}>OAuth</span>
+                    <span className="flex-1 text-[12.5px] text-muted-foreground">
+                      {app.oauthReconnectRequired
+                        ? "Cockpit has a saved token for this server, but it needs to be reconnected."
+                        : app.oauthTokenStored
+                          ? "Cockpit has a saved OAuth token for this server."
+                          : "Connect this server to an account before agents can use its tools."}
+                    </span>
+                    {app.oauthReconnectRequired ? (
+                      <Pill variant="warn">Reconnect required</Pill>
+                    ) : app.oauthTokenStored ? (
+                      // "OAuth connected", not bare "Connected" — the hero's
+                      // status pill (transport reachability) can ALSO read
+                      // "Connected" at the same time, for a different thing.
+                      <Pill variant="primary">OAuth connected</Pill>
+                    ) : (
+                      <Pill variant="secondary">Not connected</Pill>
+                    )}
+                    {app.oauthTokenStored && (
+                      <Button variant="outline" size="sm" onClick={() => void onDisconnect()} disabled={connectBusy || connectPending}>
+                        Disconnect
+                      </Button>
+                    )}
+                    <Button size="sm" onClick={() => void startConnect()} disabled={connectBusy || connectPending}>
+                      {connectBusy ? "Opening…" : app.oauthReconnectRequired || app.oauthTokenStored ? "Reconnect" : "Connect"}
+                    </Button>
+                  </CardRow>
+                  {connectPending && (
+                    <div className="flex items-center gap-3 border-t border-border px-[18px] py-3">
+                      <span className="text-[12.5px] text-muted-foreground">Waiting for you to finish signing in in the browser…</span>
+                      <Button variant="ghost" size="sm" onClick={cancelConnect}>
+                        Cancel
+                      </Button>
+                    </div>
+                  )}
+                  {connectExpired && !connectPending && (
+                    <div className="flex items-center gap-3 border-t border-border px-[18px] py-3">
+                      <span className="text-[12.5px] text-muted-foreground">The sign-in link expired before you finished.</span>
+                      <Button size="sm" onClick={() => void startConnect()}>
+                        Try again
+                      </Button>
+                    </div>
+                  )}
+                </>
               ) : (
-                <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
-                  No authentication configured — runs with the environment it inherits.
-                </div>
+                app.authKind !== "env" && (
+                  <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+                    No authentication configured — runs with the environment it inherits.
+                  </div>
+                )
               )}
             </Card>
           </div>
