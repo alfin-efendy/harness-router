@@ -71,6 +71,8 @@ function mkApp(overrides: Partial<AppInfo> = {}): AppInfo {
     publisher: null,
     authKind: "none",
     authDetail: null,
+    // A stdio server's credential is never the host's to broker.
+    oauthConnectAvailable: false,
     oauthTokenStored: false,
     oauthReconnectRequired: false,
     tools: [],

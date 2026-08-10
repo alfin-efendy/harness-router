@@ -1998,6 +1998,8 @@ test("an installed + trusted plugin with a matching MCP app row shows full mcp__
       publisher: null,
       authKind: "none",
       authDetail: null,
+      // A stdio server's credential is never the host's to broker.
+      oauthConnectAvailable: false,
       oauthTokenStored: false,
       oauthReconnectRequired: false,
       tools: [{ name: "create_issue", desc: "Open an issue", perm: "ask" }],

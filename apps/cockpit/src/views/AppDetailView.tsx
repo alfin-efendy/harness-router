@@ -66,11 +66,21 @@ export function AppDetailView({ id }: { id: string }) {
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectPending, setConnectPending] = useState(false);
   const [connectExpired, setConnectExpired] = useState(false);
-  // Set on unmount so the async poll loop below stops touching state after
-  // teardown, and on Cancel so it stops early without waiting the full
-  // 5-minute timeout — same pattern `OauthProfileConnections.tsx` uses.
-  const connectCancelledRef = useRef(false);
-  useEffect(() => () => void (connectCancelledRef.current = true), []);
+  // The connect flow's IDENTITY, bumped by every Connect and by Cancel. Each
+  // run of `startConnect` captures it and guards every state write with it, so
+  // only the newest flow can write — the flow-identity guard
+  // `OauthProfileConnections.tsx` uses, which this view had dropped in favour
+  // of one shared boolean. That boolean was reset to `false` on entry, so
+  // Cancel-then-Connect inside a single 2 s tick RESURRECTED the cancelled
+  // loop: it woke, read `false`, and polled alongside the new one, then its
+  // own earlier deadline fired `setConnectExpired(true)` — the card claiming
+  // "The sign-in link expired" and hiding Cancel while a live flow and its
+  // Rust loopback listener were still running, and a success double-toasting.
+  const connectGenRef = useRef(0);
+  // Set on unmount and never reset, so a loop that outlives the component
+  // stops touching state after teardown.
+  const unmountedRef = useRef(false);
+  useEffect(() => () => void (unmountedRef.current = true), []);
   const goApps = () => nav.navigate({ kind: "plugins" });
 
   useEffect(() => {
@@ -117,21 +127,28 @@ export function AppDetailView({ id }: { id: string }) {
   // `OauthProfileConnections.tsx`'s PKCE poll, just reading the refreshed
   // Apps list instead of `pluginReleaseDetail`.
   const startConnect = async () => {
-    connectCancelledRef.current = false;
+    const gen = ++connectGenRef.current;
+    // This flow is stale the moment Cancel or another Connect bumps the
+    // generation (or the view unmounts) — checked before EVERY state write,
+    // because an abandoned loop writing terminal state over a live flow is
+    // exactly the failure this replaced.
+    const stale = () => unmountedRef.current || connectGenRef.current !== gen;
     setConnectExpired(false);
     setConnectBusy(true);
     const start = await beginMcpConnect(app.id);
+    // `busy` belongs to this flow: a second one cannot start while Connect is
+    // disabled by it, so clearing it here can never un-disable another's.
     setConnectBusy(false);
-    if (!start) return; // store already toasted the failure
+    if (stale() || !start) return; // `!start` ⇒ the store already toasted it
     void openUrl(start.authorizeUrl);
     setConnectPending(true);
 
     const deadline = Date.now() + CONNECT_POLL_TIMEOUT_MS;
-    while (!connectCancelledRef.current && Date.now() < deadline) {
+    while (Date.now() < deadline) {
       await sleep(CONNECT_POLL_INTERVAL_MS);
-      if (connectCancelledRef.current) return;
+      if (stale()) return;
       await hydrate();
-      if (connectCancelledRef.current) return;
+      if (stale()) return;
       const fresh = appById(useApps.getState().apps, app.id);
       if (fresh?.oauthTokenStored && !fresh.oauthReconnectRequired) {
         toast.success(`Connected ${app.name}`);
@@ -139,14 +156,16 @@ export function AppDetailView({ id }: { id: string }) {
         return;
       }
     }
-    if (!connectCancelledRef.current) {
+    if (!stale()) {
       setConnectPending(false);
       setConnectExpired(true);
     }
   };
 
+  // Abandons the in-flight loop BY IDENTITY rather than by a shared flag a
+  // later Connect could clear, so the loop can never come back to life.
   const cancelConnect = () => {
-    connectCancelledRef.current = true;
+    connectGenRef.current += 1;
     setConnectPending(false);
   };
 
@@ -222,7 +241,19 @@ export function AppDetailView({ id }: { id: string }) {
                   <span className="flex-1 font-mono text-xs text-muted-foreground">{app.authDetail ?? "—"}</span>
                 </CardRow>
               )}
-              {app.transport === "http" ? (
+              {/* Gated on `oauthConnectAvailable`, NOT on `transport ===
+                  "http"`. That comparison merely correlates with "the host
+                  owns this server's credential": the daemon resolves auth by
+                  whether the spec already carries an `Authorization` header
+                  (`harness::native::mcp_http_credential`), and when it does —
+                  atlassian-rovo's `Basic ${setting:…}` — a token connected
+                  here is never used, never refreshed, never even read. This
+                  card used to say "Not connected", offer Connect, take the
+                  user through a real Atlassian consent screen, then show
+                  "OAuth connected" while every session went on sending the
+                  Basic header. The field is derived from that same predicate
+                  server-side, so the two cannot drift. */}
+              {app.oauthConnectAvailable ? (
                 <>
                   <CardRow>
                     <span className={rowLabel}>OAuth</span>
@@ -269,6 +300,11 @@ export function AppDetailView({ id }: { id: string }) {
                     </div>
                   )}
                 </>
+              ) : app.transport === "http" ? (
+                <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+                  Authenticated with a credential from this server's configuration — an API token, or a sign-in its plugin manages. There is
+                  no separate OAuth connection to make here.
+                </div>
               ) : (
                 app.authKind !== "env" && (
                   <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
