@@ -211,10 +211,11 @@ impl Default for NativeHarness {
     }
 }
 
-/// Connect the session's enabled MCP servers (stdio only) and build native
-/// tool wrappers for their tools. Servers connect CONCURRENTLY (`join_all` —
-/// each stdio handshake is independent), so total startup latency is the
-/// slowest server, not the sum. Failures are logged and skipped; `join_all`
+/// Connect the session's enabled MCP servers — stdio (`mcp_client`) and
+/// remote Streamable HTTP (`mcp_http`) alike — and build native tool
+/// wrappers for their tools. Servers connect CONCURRENTLY (`join_all` — each
+/// handshake is independent), so total startup latency is the slowest
+/// server, not the sum. Failures are logged and skipped; `join_all`
 /// preserves input order, so tool order stays deterministic.
 ///
 /// `principals` is the `SessionCtx.mcp_principals` binding map
@@ -226,11 +227,38 @@ async fn connect_mcp_tools(
     principals: &std::collections::HashMap<String, crate::domain::Principal>,
 ) -> Vec<Arc<dyn tools::Tool>> {
     let connections = futures::future::join_all(mcp_servers.iter().map(|spec| async move {
-        if !matches!(spec.transport, crate::domain::McpTransport::Stdio { .. }) {
-            return None; // HTTP MCP transport is not yet executed natively
-        }
-        match mcp_client::McpConnection::connect_stdio(spec).await {
-            Ok(conn) => Some(Arc::new(conn)),
+        let opened: anyhow::Result<(
+            String,
+            Vec<mcp_client::McpToolDef>,
+            Arc<dyn mcp_client::McpCaller>,
+        )> = match &spec.transport {
+            crate::domain::McpTransport::Stdio { .. } => {
+                mcp_client::McpConnection::connect_stdio(spec)
+                    .await
+                    .map(|conn| {
+                        let conn = Arc::new(conn);
+                        (
+                            conn.server_name.clone(),
+                            conn.tools.clone(),
+                            conn as Arc<dyn mcp_client::McpCaller>,
+                        )
+                    })
+            }
+            // The bearer is None here: a manifest-resolved credential is
+            // already in `headers`. Task 8 supplies a host-minted token.
+            crate::domain::McpTransport::Http { .. } => {
+                mcp_http::connect_http(spec, None).await.map(|conn| {
+                    let conn = Arc::new(conn);
+                    (
+                        conn.server_name.clone(),
+                        conn.tools.clone(),
+                        conn as Arc<dyn mcp_client::McpCaller>,
+                    )
+                })
+            }
+        };
+        match opened {
+            Ok(parts) => Some(parts),
             Err(e) => {
                 tracing::warn!("native: MCP server `{}` unavailable: {e}", spec.name);
                 None
@@ -239,15 +267,15 @@ async fn connect_mcp_tools(
     }))
     .await;
     let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
-    for conn in connections.into_iter().flatten() {
-        let principal = principals.get(&conn.server_name).cloned();
-        for t in &conn.tools {
+    for (server_name, tool_defs, caller) in connections.into_iter().flatten() {
+        let principal = principals.get(&server_name).cloned();
+        for t in &tool_defs {
             extra.push(Arc::new(tools::mcp::McpTool::new(
-                &conn.server_name,
+                &server_name,
                 &t.name,
                 &t.description,
                 t.input_schema.clone(),
-                conn.clone(),
+                caller.clone(),
                 principal.clone(),
             )));
         }
@@ -2079,13 +2107,42 @@ mod tests {
         );
     }
 
+    /// An HTTP server spec must contribute its tools to the session, with the
+    /// same `mcp__<server>__<tool>` naming stdio servers get. Before this
+    /// task `connect_mcp_tools` returned early for every HTTP spec — this
+    /// would still pass on a build that reintroduced that early return only
+    /// if the assertion below is checked against a real dispatch, not a
+    /// hand-built tool list, which is why it goes through
+    /// `connect_mcp_tools` itself rather than constructing an `McpTool`
+    /// directly.
     #[tokio::test]
-    async fn connect_mcp_tools_skips_http_and_unreachable_servers() {
+    async fn an_http_mcp_server_contributes_its_tools_to_the_session() {
+        let (url, _seen, _server) = mcp_http::tests::spawn_json_server().await;
+        let spec = crate::domain::McpServerSpec {
+            name: "remote".to_string(),
+            transport: crate::domain::McpTransport::Http {
+                url,
+                headers: vec![],
+            },
+        };
+
+        let tools = connect_mcp_tools(&[spec], &std::collections::HashMap::new()).await;
+
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "mcp__remote__ping"),
+            "expected the remote server's tool in the session set, got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_tools_skips_unreachable_http_and_stdio_servers() {
         use crate::domain::{McpServerSpec, McpTransport};
-        // One HTTP spec (not executed natively) + two stdio specs whose
-        // commands don't exist (spawn fails fast, no real process). The
-        // joined connect must complete and yield no tools — failures are
-        // logged and skipped, never propagated.
+        // One HTTP spec pointed at a port nothing listens on, plus two stdio
+        // specs whose commands don't exist (spawn fails fast, no real
+        // process). The joined connect must complete and yield no tools —
+        // failures are logged and skipped, never propagated, for either
+        // transport.
         let specs = vec![
             McpServerSpec {
                 name: "http-server".into(),
@@ -2112,7 +2169,12 @@ mod tests {
             },
         ];
         let tools = connect_mcp_tools(&specs, &std::collections::HashMap::new()).await;
-        assert!(tools.is_empty());
+        assert!(
+            tools.is_empty(),
+            "a server that can't be reached (bad HTTP endpoint or missing stdio binary) must be \
+             logged and skipped, not surfaced as a tool or turned into a panic — got {} tool(s)",
+            tools.len()
+        );
     }
 
     #[test]

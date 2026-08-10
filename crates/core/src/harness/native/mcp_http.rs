@@ -217,7 +217,7 @@ impl McpCaller for McpHttpConnection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::{McpServerSpec, McpTransport};
 
@@ -235,7 +235,7 @@ mod tests {
     /// that is to record what actually arrived and assert on it here, not on
     /// what the server chose to reply.
     #[derive(Debug, Clone)]
-    struct SeenRequest {
+    pub(crate) struct SeenRequest {
         protocol_version: Option<String>,
         accept: Option<String>,
         /// EVERY `Authorization` value on this request, in arrival order. A
@@ -250,7 +250,7 @@ mod tests {
         body: Value,
     }
 
-    type Seen = std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>;
+    pub(crate) type Seen = std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>;
 
     /// Whether the in-test server encodes a JSON-RPC reply as a bare
     /// `application/json` body (Task 1's path), or wraps it in a
@@ -376,8 +376,11 @@ mod tests {
         (format!("http://{addr}"), sink, handle_task)
     }
 
-    /// Task 1's plain-JSON response path.
-    async fn spawn_json_server() -> (String, Seen, tokio::task::JoinHandle<()>) {
+    /// Task 1's plain-JSON response path. `pub(crate)`: Task 3's
+    /// `harness::native::tests::an_http_mcp_server_contributes_its_tools_to_the_session`
+    /// spins up the same in-test server to exercise `connect_mcp_tools`'s
+    /// HTTP dispatch, rather than duplicating this fixture.
+    pub(crate) async fn spawn_json_server() -> (String, Seen, tokio::task::JoinHandle<()>) {
         spawn_server(ResponseMode::Json).await
     }
 
