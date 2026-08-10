@@ -289,6 +289,106 @@ A `${auth}` placeholder anywhere in `command`/`args`/`env`/`url`/`headers`
 with no `[auth]` block present on the manifest is
 `AuthPlaceholderWithoutAuth`.
 
+### Remote MCP servers: transport and auth
+
+An MCP server — whether declared in a manifest's `[[mcp]]` array or added
+directly through Cockpit's Apps surface — is either **stdio** (a local
+child process, the original mechanism) or **remote HTTP**: the Streamable
+HTTP transport, speaking MCP protocol version `2025-06-18`
+(`harness::native::mcp_client::MCP_PROTOCOL_VERSION` — the one constant
+every handshake, stdio and HTTP alike, sends; there is deliberately only
+one). The HTTP transport (`crates/core/src/harness/native/mcp_http.rs`)
+POSTs each JSON-RPC message and accepts either a plain `application/json`
+response or a `text/event-stream` body, echoing the server-issued
+`Mcp-Session-Id` header on every request after `initialize`. Both
+transports implement the same `McpCaller` trait and feed the session's tool
+registry through the same `mcp__<server>__<tool>` naming (see
+[MCP tool naming](#mcp-tool-naming-and-per-tool-perms)) — a remote server's
+tools are not a distinct mechanism from a stdio server's.
+
+A remote server's URL MUST be `https://`, enforced where the server is
+added (`add_app` / `begin_mcp_connect`), not lazily at request time. Its
+OAuth redirect URI (used only by the connect flow below) is always loopback
+— `http://127.0.0.1:8976/mcp-oauth/<server>/callback`
+(`mcp_oauth::mcp_redirect_uri`), sharing the fixed port
+`PLUGIN_OAUTH_CALLBACK_PORT` the plugin-install OAuth wizard already binds.
+
+#### Auth precedence
+
+Credentials resolve in this order every time a session connects to an HTTP
+MCP server (`harness::native::mod.rs::connect_mcp_tools`):
+
+1. **A manifest-supplied credential wins when present.** If the server's
+   spec already carries a resolved `Authorization` header — an API token
+   substituted via `${setting:...}` (e.g. `atlassian-rovo`'s `Basic
+   ${setting:...}`), or a plugin-managed OAuth bearer a declarative
+   connector injected — that header is sent verbatim and the host never
+   touches it: it isn't the host's to refresh, and a 401 on it is never
+   retried or reconnect-marked.
+2. **Otherwise, the spec's OAuth discovery flow runs.** With no header in
+   the spec, the host falls back to a token it minted and stored itself:
+   RFC 9728 Protected Resource Metadata discovery (from a 401's
+   `WWW-Authenticate` header), RFC 8414 authorization-server metadata, RFC
+   7591 dynamic client registration (reusing an already-registered client
+   id per issuer rather than re-registering), and a PKCE
+   authorization-code exchange — all built on the primitives already
+   shipped in `crates/core/src/plugins/oauth.rs`, new here only in that
+   this is their first production caller. On an HTTP 401 from a
+   store-managed connection, the host re-discovers the authorization
+   server, exchanges the stored refresh token, and retries the request
+   once; a second 401 marks the server `reconnect_required` and the error
+   names it.
+
+`atlassian-rovo` documents (in its own manifest comments and settings help
+text) that it has no live OAuth fallback wired up yet — the generic connect
+flow above needs a per-server Connect action, and this plugin's `[[mcp]]`
+entry ships only the Basic-auth header path. Rule 2 exists for servers that
+need it; not every remote server has to use it.
+
+**Where a plugin-resolved header is persisted, and how.** A resolved
+`Authorization` header a plugin's manifest produces is written to the
+`mcp_servers.headers_json` column by `plugins::mcp_sync` when the plugin's
+servers sync, and read back by `mcp::servers_for_session` into the live
+`McpTransport::Http { headers, .. }` spec — this is what makes rule 1 above
+reachable for a plugin-supplied server at all; without it every such
+server's headers arrive empty and silently fall through to rule 2. Like
+every other credential this codebase stores, it is **encrypted at rest**:
+each header value goes through the same `encrypt_field`/`decrypt_field`
+path (`crate::llm_router::secrets`) the `plugin_oauth_*` and `mcp_oauth_*`
+tables use below — never written in the clear.
+
+#### The `resource` parameter (RFC 8707)
+
+Every authorize request AND every token request the OAuth connect flow
+makes carries a `resource` query/form parameter: the canonical URI of the
+MCP server being connected to (lowercase scheme and host, no fragment, no
+trailing slash — `mcp_oauth::canonical_resource_uri`). It is sent
+unconditionally, whether or not the authorization server's own metadata
+advertises RFC 8707 support, because this is what binds the resulting
+token to THIS MCP server rather than some other resource the same
+authorization server also protects — dropping it from either request (not
+just one) is exactly the regression this codebase's tests pin against.
+
+#### Token storage: `mcp_oauth_tokens`, disjoint from `plugin_oauth_tokens`
+
+An MCP server's OAuth token (`McpOauthToken`: access/refresh token, type,
+expiry, scopes, a `reconnect_required` flag) lives in its own
+`mcp_oauth_tokens` table, keyed by server name, with the same per-field
+encryption the plugin-token path uses. `mcp_oauth_clients` similarly stores
+one registered DCR client id per authorization-server issuer, reused across
+every MCP server behind the same issuer rather than re-registering.
+
+This is a **deliberately separate store from `plugin_oauth_tokens`** — the
+table a declarative connector's own `[auth]` / `[[oauth]]` flow already
+uses — and the two are never allowed to leak into each other (pinned by a
+test asserting a stored MCP token never appears in the plugin-token
+lookup). The reason is lifecycle, not mechanism: uninstalling or disabling
+a *plugin* must not revoke an *MCP server's* access token, because the
+remote server a plugin's `[[mcp]]` block points at can outlive, or be
+entirely unrelated to, that plugin. Retiring the `atlassian-rovo` plugin,
+for instance, must not be what silently invalidates a user's live
+connection to Atlassian's MCP server if anything else still references it.
+
 ### `[[hooks]]`
 
 | Field | Type | Rules |
@@ -701,6 +801,8 @@ matches the RPC method 1:1:
 | `set_plugin_enabled` / `set_plugin_setting` | |
 | `begin_plugin_oauth` / `complete_plugin_oauth` / `disconnect_plugin_oauth` | Cockpit's native declarative-connector OAuth flow. |
 | `plugin_profile_begin_pkce` / `plugin_profile_complete_pkce` / `plugin_profile_disconnect` / `plugin_profile_begin_device_flow` / `plugin_profile_poll_device_flow` | Host-managed component OAuth (`[[oauth]]` profiles) — PKCE and RFC 8628 device flow. |
+| `add_app` | Register a new MCP server (stdio or remote HTTP) as an App — rejects a non-`https://` remote URL at this boundary. |
+| `begin_mcp_connect` / `complete_mcp_connect` / `disconnect_mcp` | The remote-MCP OAuth connect flow — see [Remote MCP servers: transport and auth](#remote-mcp-servers-transport-and-auth). |
 | `begin_plugin_install` / `cancel_plugin_install` | Signed-catalog install. |
 | `begin_plugin_source_install` / `confirm_plugin_source_install` | The local-folder/git-URL two-phase trust flow — see [Install sources](#install-sources-and-trust-tiers). |
 | `begin_skill_install` / `confirm_skill_install` | Skill-pack installs (unrelated to `[[skills]]` bundled in a plugin manifest — see [Removed in v2](#removed-in-v2)). |
@@ -713,24 +815,33 @@ matches the RPC method 1:1:
 
 ## Release pipeline
 
-Signed first-party component bundles go through
-`scripts/plugins/build-first-party.ts` — 18 bundles today: `mimo`,
+Signed first-party bundles go through
+`scripts/plugins/build-first-party.ts` — 19 entries today: `mimo`,
 `opencode`, the twelve provider bundles (`openai`, `openrouter`, `groq`,
 `deepseek`, `mistral`, `xai`, `nvidia`, `huggingface`, `google`, `qwen`,
-`anthropic`, `anthropic-oauth`), and the four connectors (`github`,
-`discord`, `atlassian`, `bitbucket`) — driven by `COMPONENTS` in that script,
-guarded by a `bun test` that fails if any `plugins/<id>/ryuzi-plugin.toml`
-is missing from the list (or vice versa).
+`anthropic`, `anthropic-oauth`), the four component-backed connectors
+(`github`, `discord`, `atlassian`, `bitbucket`), and `atlassian-rovo` — a
+**declarative-only, component-less** first-party connector (see
+[Component-less bundles](#component-less-bundles-are-signed-too) below) —
+driven by `COMPONENTS` in that script, guarded by a `bun test` that fails if
+any `plugins/<id>/ryuzi-plugin.toml` is missing from the list (or vice
+versa).
 
 `readManifest(dir)` is the release pipeline's own manifest reader — it
-asserts `contract == 2` and reads the wasm filename from `[component].file`
-(the v1 shape had a top-level `component = "<name>.wasm"` string field,
-which no longer parses):
+asserts `contract == 2` and, when a `[component]` table is present, reads
+the wasm filename from `[component].file` (the v1 shape had a top-level
+`component = "<name>.wasm"` string field, which no longer parses). The
+table itself is optional — a declarative-only manifest omits it entirely
+and `readManifest` returns just `{ id, version }`:
 
 ```ts
-const component = (parsed.component as Record<string, unknown> | undefined)?.file;
 const contract = parsed.contract;
 if (contract !== 2) throw new Error(`${path}: 'contract' must be 2`);
+
+const componentTable = parsed.component as Record<string, unknown> | undefined;
+if (componentTable === undefined) return { id, version }; // declarative-only
+
+const component = componentTable.file;
 if (typeof component !== "string" || component.length === 0)
   throw new Error(`${path}: missing '[component].file'`);
 ```
@@ -764,6 +875,29 @@ manifest via `PluginManifest::from_toml`, which rejects an artifact declaring
 an unsupported `contract` outright (`ContractUnsupported`) before any
 hash/signature check even runs. A pre-v2 artifact that declares no `contract`
 key at all goes through the contract-1 compatibility shim instead (see below).
+
+### Component-less bundles are signed too
+
+`[component]` is optional on the manifest — a purely declarative plugin
+(only `[[mcp]]`, `[[hooks]]`, `[[jobs]]`, commands, skills; no WASM at all)
+can omit it entirely, and `PluginManifest` always allowed that shape. What
+did **not** work until this branch was signing and shipping one as a
+genuinely first-party release: `PluginRelease::validate()`,
+`verify_bundle`/`load_active_bundles`, `install_component_release`, the CI
+`artifact_verify.rs`, and `build-first-party.ts` itself all rejected a
+component-less manifest unconditionally, several of them before signature
+verification even ran. `atlassian-rovo` (a remote-MCP-over-HTTP connector
+with no wasm to sandbox) is the first plugin to exercise this path end to
+end, and is now a permanent regression guard for it in `COMPONENTS`.
+
+For a component-less entry the artifact set shrinks to **six** files, not
+seven — everything above minus `<id>.wasm` — and `release.json` carries no
+`wit_api`/`component_url`/`sha256`/`size_bytes` fields (all four are
+omitted together; a caller supplying some but not all of them is a bug).
+**The signature requirement does not relax**: `<id>.release.json.sig` is
+still mandatory and still verified exactly the same way — the missing wasm
+changes what the signed descriptor contains, never whether it must be
+signed.
 
 ### Contract-1 compatibility shim
 
@@ -917,8 +1051,11 @@ longer exist:
   (`scripts/catalog/build-feed.ts`'s `DEFAULT_CATALOG_DIR`) now defaults to
   that same removed path and treats a missing directory as an empty catalog
   (`readCatalogEntries` catches `ENOENT`) rather than an error — every
-  first-party connector today ships as a signed WASM component bundle
-  instead (`plugins/github`, `plugins/atlassian`, `plugins/bitbucket`).
+  first-party connector today ships as a signed release instead
+  (`plugins/github`, `plugins/atlassian`, `plugins/bitbucket` as WASM
+  component bundles; `plugins/atlassian-rovo` as a declarative-only,
+  component-less bundle — see
+  [Component-less bundles are signed too](#component-less-bundles-are-signed-too)).
 - **`WasmToolSet`** — the old bespoke `wasm__<id>__<tool>` in-process tool
   bridge. Replaced by `ComponentMcpServer`, which surfaces the exact same
   tools as ordinary `mcp__<id>__<tool>` MCP tools (see
