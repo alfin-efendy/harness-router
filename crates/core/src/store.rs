@@ -8292,6 +8292,63 @@ mod tests {
         );
     }
 
+    async fn raw_mcp_oauth_token_json(store: &Store, server: &str) -> String {
+        let server = server.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![server],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_token_roundtrip_encrypts_at_rest() {
+        // A regression that dropped the encrypt_field/decrypt_field calls
+        // from upsert_mcp_oauth_token_json would still pass a plain
+        // round-trip-equality test, because decode would simply hand back
+        // whatever was written. This test reads the raw column, bypassing
+        // the decode path, so a dropped encrypt call is caught directly.
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "mcp-access-secret".into(),
+            refresh_token: Some("mcp-refresh-secret".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["read".into(), "write".into()],
+            reconnect_required: false,
+        };
+
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+
+        let raw_json = raw_mcp_oauth_token_json(&store, "rovo").await;
+        assert!(
+            !raw_json.contains("mcp-access-secret"),
+            "MCP access tokens are being written to disk in the clear: {raw_json}"
+        );
+        assert!(
+            !raw_json.contains("mcp-refresh-secret"),
+            "MCP refresh tokens are being written to disk in the clear: {raw_json}"
+        );
+
+        let roundtrip = store.get_mcp_oauth_token("rovo").await.unwrap().unwrap();
+        assert_eq!(roundtrip.access_token, "mcp-access-secret");
+        assert_eq!(
+            roundtrip.refresh_token.as_deref(),
+            Some("mcp-refresh-secret")
+        );
+        assert_eq!(roundtrip.token_type, "Bearer");
+        assert_eq!(roundtrip.expires_at, Some(1_700_000_000_000));
+        assert_eq!(roundtrip.scopes, vec!["read", "write"]);
+        assert!(!roundtrip.reconnect_required);
+    }
+
     #[tokio::test]
     async fn an_mcp_token_never_appears_in_the_plugin_token_store() {
         // The two credential stores stay disjoint so retiring a plugin cannot
@@ -8314,6 +8371,48 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        // And vice versa: a plugin token must not surface through the MCP
+        // token store either. This direction is structurally guaranteed
+        // today (two separate tables, no shared read path between them), so
+        // this half documents the invariant rather than hunting a live bug.
+        // Uses a fresh identifier ("acme") rather than "rovo" so this
+        // assertion isn't trivially satisfied by the MCP token already
+        // written under "rovo" above.
+        let plugin_token = PluginOauthToken {
+            plugin_id: "acme".into(),
+            access_token: "plugin-tok".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        };
+        store
+            .upsert_plugin_oauth_token(&plugin_token)
+            .await
+            .unwrap();
+
+        assert!(
+            store.get_mcp_oauth_token("acme").await.unwrap().is_none(),
+            "a plugin token must not be readable through the MCP token store — \
+             this is structurally guaranteed by two disjoint tables with no \
+             shared read path, so a failure here means that guarantee broke"
+        );
+    }
+
+    async fn raw_mcp_oauth_client_created_at(store: &Store, issuer: &str) -> i64 {
+        let issuer = issuer.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT created_at FROM mcp_oauth_clients WHERE issuer=?1",
+                    params![issuer],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -8338,6 +8437,45 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        // Pin created_at to a sentinel far in the past via raw SQL, rather
+        // than relying on two upserts landing in different milliseconds, so
+        // a re-upsert that wrongly resets created_at to "now" is unmistakable.
+        let sentinel_created_at = 1_000_i64;
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE mcp_oauth_clients SET created_at=?1 WHERE issuer='https://as.example'",
+                    params![sentinel_created_at],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        // A second registration for the same issuer (e.g. re-registering
+        // after a client was revoked/rotated) must update the client id
+        // while preserving the original created_at — the upsert deliberately
+        // excludes created_at from its ON CONFLICT ... DO UPDATE SET.
+        store
+            .upsert_mcp_oauth_client("https://as.example", "client-2")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("client-2"),
+            "a second upsert for the same issuer must update the client id"
+        );
+        assert_eq!(
+            raw_mcp_oauth_client_created_at(&store, "https://as.example").await,
+            sentinel_created_at,
+            "created_at must be preserved across a re-upsert, not reset to now"
+        );
     }
 
     #[tokio::test]
@@ -8347,25 +8485,43 @@ mod tests {
         let store = Store::open(tmp.path()).await.unwrap();
         let token = McpOauthToken {
             access_token: "tok".into(),
-            refresh_token: None,
+            refresh_token: Some("ref".into()),
             token_type: "Bearer".into(),
             expires_at: None,
             scopes: vec![],
             reconnect_required: false,
         };
         store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+        // Inject an unknown JSON field via raw SQL, the way a future field
+        // this table doesn't know about yet would show up, so the assertion
+        // below proves the mark's read-merge-write path doesn't clobber
+        // neighbouring data.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE mcp_oauth_tokens SET token_json = json_set(token_json, '$.resource_metadata', 'https://example.test/.well-known/oauth-protected-resource')",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
         store
             .mark_mcp_oauth_reconnect_required("rovo")
             .await
             .unwrap();
 
-        assert!(
-            store
-                .get_mcp_oauth_token("rovo")
-                .await
-                .unwrap()
-                .unwrap()
-                .reconnect_required
+        let roundtrip = store.get_mcp_oauth_token("rovo").await.unwrap().unwrap();
+        assert!(roundtrip.reconnect_required);
+        assert_eq!(roundtrip.access_token, "tok");
+        assert_eq!(roundtrip.refresh_token.as_deref(), Some("ref"));
+
+        let raw_json = raw_mcp_oauth_token_json(&store, "rovo").await;
+        let raw_value: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(
+            raw_value["resource_metadata"],
+            "https://example.test/.well-known/oauth-protected-resource"
         );
     }
 
