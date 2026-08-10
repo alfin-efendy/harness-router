@@ -211,6 +211,127 @@ impl Default for NativeHarness {
     }
 }
 
+/// Who owns the credential a remote (HTTP) MCP server authenticates with.
+///
+/// This is the single predicate the whole product is allowed to branch on for
+/// that question — [`open_http_mcp`] (and therefore every agent session) and
+/// `api::apps_api::assemble`'s `AppInfo.oauth_connect_available` (and
+/// therefore the Connection card's OAuth affordance) both read it, so the card
+/// cannot claim one thing while the session does another.
+///
+/// It exists because `transport == "http"` was standing in for it, and merely
+/// CORRELATES with it: `atlassian-rovo` is an http server that authenticates
+/// with a manifest `Authorization: Basic ${setting:…}` header, so the card
+/// offered a full OAuth consent flow whose resulting token
+/// [`open_http_mcp`] then never used — a successful-looking sign-in with
+/// literally zero effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpHttpCredential {
+    /// The spec already carries an `Authorization` header — a `${setting:…}`
+    /// API token or an injected plugin OAuth bearer that
+    /// `plugins::mcp_sync` resolved, or headers a user typed by hand. It wins
+    /// VERBATIM: no stored MCP OAuth token is read, used, refreshed or
+    /// reconnect-marked for this server, because the credential is not this
+    /// host's to manage.
+    Manifest,
+    /// No manifest `Authorization`, so the credential slot belongs to this
+    /// host: a token minted by the MCP OAuth connect flow is what
+    /// authenticates the session — or nothing at all, when none is stored
+    /// (an unauthenticated/public server, or one waiting to be connected).
+    /// This, and only this, is when offering "Connect" tells the truth.
+    HostManaged,
+}
+
+impl McpHttpCredential {
+    /// Whether this host owns the credential — the exact question the UI's
+    /// OAuth-connect affordance has to be gated on.
+    pub(crate) fn host_managed(self) -> bool {
+        matches!(self, McpHttpCredential::HostManaged)
+    }
+}
+
+/// Classify an HTTP MCP spec's resolved headers. Case-insensitive, per RFC
+/// 9110 §5.1 — a manifest that writes `authorization:` in lower case supplies
+/// a credential exactly as much as one that writes `Authorization`.
+///
+/// Only `Authorization` counts: the question this answers is not "does the
+/// manifest supply SOME credential" but the narrower, decidable one "would a
+/// stored MCP OAuth token be used for this server" — and a manifest header of
+/// any other name (`X-Api-Key`, a tenant id) is sent ALONGSIDE such a token
+/// rather than instead of it, so it leaves the host in charge of the
+/// `Authorization` slot.
+pub(crate) fn mcp_http_credential(headers: &[(String, String)]) -> McpHttpCredential {
+    if headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+    {
+        McpHttpCredential::Manifest
+    } else {
+        McpHttpCredential::HostManaged
+    }
+}
+
+/// [`mcp_http_credential`] for a whole spec — `None` for a stdio transport,
+/// which has no credential of this kind at all (and therefore never an OAuth
+/// connect affordance).
+pub(crate) fn mcp_http_credential_of(
+    spec: &crate::domain::McpServerSpec,
+) -> Option<McpHttpCredential> {
+    match &spec.transport {
+        crate::domain::McpTransport::Http { headers, .. } => Some(mcp_http_credential(headers)),
+        crate::domain::McpTransport::Stdio { .. } => None,
+    }
+}
+
+/// Open a remote MCP connection (initialize → tools/list) applying the auth
+/// precedence rule [`McpHttpCredential`] describes.
+///
+/// The ONE implementation of that rule: session start goes through it via
+/// [`connect_mcp_tools`], and so does `api::apps_api::probe_and_persist` —
+/// the Probe button, `add_app`, and the re-probe after an OAuth connect.
+/// That matters because the probe used to POST a bare `initialize` with NO
+/// credential at all: every auth-gated remote server showed a red "HTTP
+/// initialize failed — check the URL" for a perfectly good URL, and since the
+/// probe is also what writes `mcp_tools` rows, no remote server's per-tool
+/// permissions could be configured at all. A probe that authenticates
+/// differently from the session it predicts is worse than no probe.
+pub(crate) async fn open_http_mcp(
+    store: &Arc<crate::store::Store>,
+    spec: &crate::domain::McpServerSpec,
+) -> anyhow::Result<mcp_http::McpHttpConnection> {
+    let Some(credential) = mcp_http_credential_of(spec) else {
+        anyhow::bail!("{} is not a remote (http) MCP server", spec.name);
+    };
+    match credential {
+        // bearer=None leaves the manifest header untouched, and this
+        // connection never wires a Store, so a later 401 is never treated as
+        // ours to refresh or reconnect-mark.
+        McpHttpCredential::Manifest => mcp_http::connect_http(spec, None).await,
+        McpHttpCredential::HostManaged => {
+            // reconnect_required tokens are filtered out HERE, not merely
+            // ignored downstream — this is the only place that decides
+            // whether a stored token is used at all.
+            let stored = store
+                .get_mcp_oauth_token(&spec.name)
+                .await
+                .ok()
+                .flatten()
+                .filter(|t| !t.reconnect_required);
+            match stored {
+                Some(token) => {
+                    mcp_http::connect_http_with_store(
+                        spec,
+                        Some(&token.access_token),
+                        Arc::clone(store),
+                    )
+                    .await
+                }
+                None => mcp_http::connect_http(spec, None).await,
+            }
+        }
+    }
+}
+
 /// Connect the session's enabled MCP servers — stdio (`mcp_client`) and
 /// remote Streamable HTTP (`mcp_http`) alike — and build native tool
 /// wrappers for their tools. Servers connect CONCURRENTLY (`join_all` — each
@@ -224,13 +345,12 @@ impl Default for NativeHarness {
 /// `principal = None`.
 ///
 /// `store` resolves auth for an HTTP server per the plan's precedence rule
-/// (Task 8): a manifest-supplied `Authorization` header — a `${setting:…}`
-/// API token or an injected plugin OAuth bearer — always wins when present,
-/// so a declaratively-configured plugin never drags the user into an OAuth
-/// flow it never asked for. Only when the spec carries none is a token this
-/// host minted itself (via the MCP OAuth connect flow) read from the store
-/// and used, and only when it is not `reconnect_required` — a token marked
-/// that way must never be used, full stop.
+/// (Task 8), which lives in [`open_http_mcp`] / [`McpHttpCredential`] rather
+/// than inline here: a manifest-supplied `Authorization` header always wins
+/// when present, so a declaratively-configured plugin never drags the user
+/// into an OAuth flow it never asked for; only when the spec carries none is
+/// a token this host minted itself used, and only when it is not
+/// `reconnect_required`.
 async fn connect_mcp_tools(
     store: &Arc<crate::store::Store>,
     mcp_servers: &[crate::domain::McpServerSpec],
@@ -254,39 +374,10 @@ async fn connect_mcp_tools(
                         )
                     })
             }
-            crate::domain::McpTransport::Http { headers, .. } => {
-                let has_manifest_auth = headers
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
-                let opened_conn = if has_manifest_auth {
-                    // The manifest's Authorization header wins verbatim —
-                    // bearer=None leaves it untouched, and this connection
-                    // never wires a Store, so a later 401 is never treated
-                    // as ours to refresh or reconnect-mark.
-                    mcp_http::connect_http(spec, None).await
-                } else {
-                    // reconnect_required tokens are filtered out here, not
-                    // merely ignored downstream — that is the only place
-                    // this function decides whether to use one at all.
-                    let stored = store
-                        .get_mcp_oauth_token(&spec.name)
-                        .await
-                        .ok()
-                        .flatten()
-                        .filter(|t| !t.reconnect_required);
-                    match stored {
-                        Some(token) => {
-                            mcp_http::connect_http_with_store(
-                                spec,
-                                Some(&token.access_token),
-                                Arc::clone(store),
-                            )
-                            .await
-                        }
-                        None => mcp_http::connect_http(spec, None).await,
-                    }
-                };
-                opened_conn.map(|conn| {
+            // The auth-precedence rule lives in `open_http_mcp` — shared
+            // verbatim with the Apps probe, so the two can never drift.
+            crate::domain::McpTransport::Http { .. } => {
+                open_http_mcp(store, spec).await.map(|conn| {
                     let conn = Arc::new(conn);
                     (
                         conn.server_name.clone(),
@@ -788,8 +879,12 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
     }
 }
 
+/// `pub(crate)` (the same reason `mcp_http::tests` is): `api::apps_api`'s
+/// tests reuse [`tests::spawn_auth_echo_server`] to prove the Apps card's
+/// `oauth_connect_available` and this module's session-time auth precedence
+/// read the SAME predicate, which needs one fixture observing one wire.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::agents::types::NativeToolDecision;
     use crate::approval::ApprovalHub;
@@ -2250,7 +2345,8 @@ mod tests {
     /// just enough of the handshake for `connect_http`/`connect_mcp_tools`
     /// to succeed. Used to assert on what actually reached the wire, not on
     /// `connect_mcp_tools`'s return value.
-    async fn spawn_auth_echo_server() -> (String, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+    pub(crate) async fn spawn_auth_echo_server() -> (String, Arc<std::sync::Mutex<Vec<Vec<String>>>>)
+    {
         use axum::extract::{Json, State};
         use axum::http::{HeaderMap, StatusCode};
         use axum::routing::post;
@@ -2492,5 +2588,115 @@ mod tests {
     #[test]
     fn connect_component_mcp_tools_is_a_no_op_with_no_components() {
         assert!(connect_component_mcp_tools(&[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // The credential-ownership predicate itself
+    // -----------------------------------------------------------------
+
+    fn http_spec_with(headers: &[(&str, &str)]) -> crate::domain::McpServerSpec {
+        crate::domain::McpServerSpec {
+            name: "remote".into(),
+            transport: crate::domain::McpTransport::Http {
+                url: "https://mcp.example.com".into(),
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+        }
+    }
+
+    /// PROPERTY: [`mcp_http_credential`] answers exactly "would a stored MCP
+    /// OAuth token be used for this server", which is the question BOTH
+    /// `open_http_mcp` and the Apps card's `oauth_connect_available` need. The
+    /// three assertions pin the three ways it has to be gotten right:
+    ///
+    /// * an `Authorization` header means the manifest owns the credential —
+    ///   the case the UI got wrong for atlassian-rovo;
+    /// * the match is case-INSENSITIVE (RFC 9110 §5.1), so a manifest written
+    ///   `authorization` is not silently treated as no credential at all,
+    ///   which would offer a connect flow whose token the transport then
+    ///   drops in favour of the header;
+    /// * a non-`Authorization` header (`X-Api-Key`) is NOT a manifest
+    ///   credential for this purpose — it is sent alongside a stored token,
+    ///   so the host still owns the `Authorization` slot and connect is real.
+    #[test]
+    fn credential_ownership_follows_the_authorization_header_case_insensitively() {
+        assert_eq!(
+            mcp_http_credential(&[]),
+            McpHttpCredential::HostManaged,
+            "no credential in the spec means a connected token is what authenticates"
+        );
+        assert_eq!(
+            mcp_http_credential(&[("Authorization".into(), "Basic abc".into())]),
+            McpHttpCredential::Manifest
+        );
+        assert_eq!(
+            mcp_http_credential(&[("authorization".into(), "Basic abc".into())]),
+            McpHttpCredential::Manifest,
+            "a lower-case header name supplies a credential exactly as much as a capitalised one"
+        );
+        assert_eq!(
+            mcp_http_credential(&[("X-Api-Key".into(), "abc".into())]),
+            McpHttpCredential::HostManaged,
+            "a non-Authorization header rides alongside a stored bearer rather than replacing it, \
+             so the host still owns the credential slot"
+        );
+        assert!(McpHttpCredential::HostManaged.host_managed());
+        assert!(!McpHttpCredential::Manifest.host_managed());
+    }
+
+    /// PROPERTY: a stdio server has no HTTP credential at all, so it must
+    /// never classify as host-managed — `AppInfo.oauth_connect_available` is
+    /// derived through this, and a stdio row that answered `Some(HostManaged)`
+    /// would grow an OAuth Connect button for a local subprocess.
+    #[test]
+    fn a_stdio_spec_has_no_http_credential_to_classify() {
+        let stdio = crate::domain::McpServerSpec {
+            name: "local".into(),
+            transport: crate::domain::McpTransport::Stdio {
+                command: "acme-mcp".into(),
+                args: vec![],
+                env: vec![],
+            },
+        };
+        assert_eq!(mcp_http_credential_of(&stdio), None);
+        assert_eq!(
+            mcp_http_credential_of(&http_spec_with(&[])),
+            Some(McpHttpCredential::HostManaged)
+        );
+        assert_eq!(
+            mcp_http_credential_of(&http_spec_with(&[("Authorization", "Bearer x")])),
+            Some(McpHttpCredential::Manifest)
+        );
+    }
+
+    /// PROPERTY: `open_http_mcp` refuses a stdio spec instead of silently
+    /// doing something surprising — it is now reachable from `api::apps_api`
+    /// (the Probe button), which is one `row.transport` typo away from
+    /// handing it the wrong shape.
+    #[tokio::test]
+    async fn open_http_mcp_rejects_a_stdio_spec() {
+        let store = mcp_test_store().await;
+        // `McpHttpConnection` is not `Debug`, so this cannot use
+        // `expect_err` — match instead of widening a production type's derives
+        // for a test's convenience.
+        let opened = open_http_mcp(
+            &store,
+            &crate::domain::McpServerSpec {
+                name: "local".into(),
+                transport: crate::domain::McpTransport::Stdio {
+                    command: "acme-mcp".into(),
+                    args: vec![],
+                    env: vec![],
+                },
+            },
+        )
+        .await;
+        match opened {
+            Ok(_) => panic!("a stdio spec is not something this can open"),
+            Err(err) => assert!(err.to_string().contains("not a remote (http)"), "{err:#}"),
+        }
     }
 }

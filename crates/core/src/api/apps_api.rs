@@ -333,8 +333,66 @@ fn derive_auth(env: &[(String, String)]) -> (&'static str, Option<String>) {
     (auth_kind, auth_detail)
 }
 
+/// The exact `McpServerSpec` — URL *and credential* — a native session would
+/// open for this HTTP row.
+///
+/// Both of this module's HTTP paths take their answer from here, and that is
+/// the point: [`probe_and_persist`], so a probe result predicts the session it
+/// claims to describe, and [`assemble`]'s `oauth_connect_available`, so the
+/// Connection card offers OAuth connect only when a token connected through it
+/// would actually be used.
+///
+/// Sourced from [`mcp::servers_for_session`] whenever that function attaches
+/// the row, because THAT is what decides what a session's transport carries —
+/// the row's persisted headers today, plus (for a plugin-owned row) the owning
+/// plugin's live OAuth bearer. Re-deriving any of that here is how the two
+/// drift apart. A row it does NOT attach (out of scope, agent access revoked,
+/// owning plugin disabled) has no session behaviour to agree with, so it falls
+/// back to the row's persisted headers — which is that function's own starting
+/// point for the moment the row becomes attachable again.
+///
+/// `attachable` is `servers_for_session`'s output, passed in rather than
+/// fetched per row so `assemble` pays for it once per `list_apps`.
+///
+/// `None` means the row's stored headers could not be DECODED — a rotated or
+/// unavailable `llm_router::secrets` key, or a hand-edited row.
+/// `get_server_headers` hard-errors on that, and propagating it would fail the
+/// whole of `assemble`, i.e. blank the entire Apps screen over one bad row; so
+/// this is log-and-skip, exactly as `mcp::servers_for_session` treats the same
+/// failure (it drops that one row and attaches every other server). Both
+/// callers then fail CLOSED: no OAuth affordance and a red probe with the
+/// decode error, which is honest — a session cannot attach this server either.
+async fn http_session_spec(
+    store: &crate::store::Store,
+    row: &McpServerRow,
+    attachable: &[McpServerSpec],
+) -> Option<McpServerSpec> {
+    if let Some(spec) = attachable.iter().find(|spec| spec.name == row.id) {
+        return Some(spec.clone());
+    }
+    match mcp::get_server_headers(store, &row.id).await {
+        Ok(headers) => Some(McpServerSpec {
+            name: row.id.clone(),
+            transport: McpTransport::Http {
+                url: row.url.clone().unwrap_or_default(),
+                headers,
+            },
+        }),
+        Err(error) => {
+            tracing::warn!(
+                server = %row.id,
+                "apps: this server's stored headers could not be decoded (rotated/unavailable \
+                 secret key, or a hand-edited row): {error}"
+            );
+            None
+        }
+    }
+}
+
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
     let mut out = Vec::new();
+    // Fetched once, not per row — see `http_session_spec`.
+    let attachable = mcp::servers_for_session(cp.store(), "native").await?;
     for row in mcp::list_servers(cp.store()).await? {
         let tools = mcp::list_tools(cp.store(), &row.id)
             .await?
@@ -358,6 +416,22 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
             Some(t) => (true, t.reconnect_required),
             None => (false, false),
         };
+        // Whether THIS host owns the server's credential, decided by the one
+        // predicate the session path branches on
+        // (`harness::native::mcp_http_credential`) applied to the spec a
+        // session would really open. `transport == "http"` used to stand in
+        // for it in the UI, which merely CORRELATES: a row authenticating
+        // with a manifest `Authorization` header (atlassian-rovo's
+        // `Basic ${setting:…}`) got the whole OAuth Connect block, and the
+        // token a completed consent stored was then never used by anything.
+        let oauth_connect_available = if row.transport == "http" {
+            http_session_spec(cp.store(), &row, &attachable)
+                .await
+                .and_then(|spec| crate::harness::native::mcp_http_credential_of(&spec))
+                .is_some_and(crate::harness::native::McpHttpCredential::host_managed)
+        } else {
+            false
+        };
         out.push(AppInfo {
             initial: initial_of(&row.name),
             id: row.id,
@@ -377,6 +451,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
             publisher: row.publisher,
             auth_kind: row.auth_kind,
             auth_detail: row.auth_detail,
+            oauth_connect_available,
             oauth_token_stored,
             oauth_reconnect_required,
             tools,
@@ -387,44 +462,85 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
     Ok(out)
 }
 
+/// How long the HTTP probe may take in total.
+///
+/// The probe shares `harness::native::mcp_http`'s connection path, whose own
+/// deadline is sized for an agent turn (120 s). This is a button a human is
+/// watching, so it is bounded far tighter: an unreachable or wedged server has
+/// to become a red dot in seconds, not minutes.
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Probe one server and persist status/version/tools.
 async fn probe_and_persist(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
     let Some(mut row) = mcp::get_server(cp.store(), id).await? else {
         anyhow::bail!("unknown app: {id}");
     };
     if row.transport == "http" {
-        let url = row.url.clone().unwrap_or_default();
-        let ok = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            // Keeps this probe's shorter deadline, but must not follow a
-            // redirect off the https origin the caller was gated on.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-        {
-            Ok(client) => client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json, text/event-stream")
-                .body(
-                    serde_json::json!({
-                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                        "params": {
-                            "protocolVersion": "2025-06-18",
-                            "capabilities": {},
-                            "clientInfo": { "name": "ryuzi-cockpit", "version": env!("CARGO_PKG_VERSION") }
-                        }
-                    })
-                    .to_string(),
+        // The real client, with the real credential: this used to POST a bare
+        // `initialize` with NO `Authorization` header at all — not the
+        // manifest-resolved one, not the stored OAuth token — so every
+        // auth-gated remote server reported `error` / "HTTP initialize failed
+        // — check the URL" for a URL that was correct, and (because it also
+        // never called `replace_tools`) no remote server ever got `mcp_tools`
+        // rows, which is what per-tool permissions and the Tools tab need.
+        // `http_session_spec` + `open_http_mcp` mean the probe now
+        // authenticates exactly as the session it is predicting does.
+        let attachable = mcp::servers_for_session(cp.store(), "native").await?;
+        let (ok, detail, tools) = match http_session_spec(cp.store(), &row, &attachable).await {
+            Some(spec) => {
+                let opened = tokio::time::timeout(
+                    HTTP_PROBE_TIMEOUT,
+                    crate::harness::native::open_http_mcp(cp.store(), &spec),
                 )
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false),
-            Err(_) => false,
+                .await;
+                match opened {
+                    // `open_http_mcp` has already done `initialize` +
+                    // `tools/list`.
+                    Ok(Ok(conn)) => (
+                        true,
+                        None,
+                        conn.tools
+                            .iter()
+                            .map(|t| (t.name.clone(), t.description.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    // `{e:#}` — the whole error chain. The single-line "check
+                    // the URL" this replaced was actively misleading for the
+                    // failure it saw most: a 401 from a server whose URL was
+                    // fine.
+                    Ok(Err(e)) => (false, Some(format!("{e:#}")), Vec::new()),
+                    Err(_) => (
+                        false,
+                        Some(format!(
+                            "the server did not answer within {}s",
+                            HTTP_PROBE_TIMEOUT.as_secs()
+                        )),
+                        Vec::new(),
+                    ),
+                }
+            }
+            // Undecodable stored headers — see `http_session_spec`. A session
+            // cannot attach this server either, so say so instead of probing
+            // it without the credential it is supposed to carry.
+            None => (
+                false,
+                Some(
+                    "this server's stored headers could not be decoded — the secret key that \
+                     encrypted them is unavailable or has been rotated"
+                        .to_string(),
+                ),
+                Vec::new(),
+            ),
         };
         row.status = if ok { "connected" } else { "error" }.into();
-        row.status_detail = (!ok).then(|| "HTTP initialize failed — check the URL".to_string());
+        row.status_detail = detail;
         mcp::upsert_server(cp.store(), row).await?;
+        if ok {
+            // Same call the stdio path makes, and the reason per-tool
+            // permissions exist for a remote server at all. `replace_tools`
+            // preserves the perm of every tool that survives.
+            mcp::replace_tools(cp.store(), id, tools).await?;
+        }
         return Ok(());
     }
 
@@ -609,6 +725,16 @@ async fn complete_mcp_connect(
         verifier,
     )
     .await?;
+    // Re-probe with the token that was just stored, before returning the list
+    // this RPC's caller renders. Without it a successful connect left the card
+    // showing whatever the last (unauthenticated, therefore failed) probe
+    // wrote: a red Error dot and an empty Tools tab sitting next to an "OAuth
+    // connected" pill. Best-effort — the token IS stored and usable, so a
+    // server that is momentarily unreachable must not turn a completed connect
+    // into a failed RPC; the row simply keeps its previous status.
+    if let Err(e) = probe_and_persist(cp, id).await {
+        tracing::warn!("apps: re-probe after OAuth connect failed for {id}: {e:#}");
+    }
     Ok(assemble(cp).await?)
 }
 
@@ -1436,5 +1562,457 @@ mod tests {
                 .is_none(),
             "and no token may be stored for the server from a refused exchange"
         );
+    }
+
+    // ---------- the http probe must authenticate, and persist tools ----------
+
+    fn stored_token(access_token: &str) -> crate::store::McpOauthToken {
+        crate::store::McpOauthToken {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        }
+    }
+
+    /// An MCP resource server that actually ENFORCES a bearer — the shape
+    /// every real auth-gated remote server has, and the shape the old probe
+    /// could not get past, because it sent no `Authorization` header at all
+    /// and therefore only ever saw the 401.
+    ///
+    /// With `Authorization: Bearer <accepted>` it answers the full JSON-RPC
+    /// handshake and advertises one tool (`ping`); anything else gets a 401
+    /// carrying a `WWW-Authenticate` header that names its own
+    /// protected-resource metadata, which in turn points at `as_url` — so the
+    /// same fixture also drives a real `begin_mcp_connect` discovery run.
+    async fn spawn_bearer_gated_mcp(accepted: &'static str, as_url: String) -> String {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct McpState {
+            mcp_url: Arc<Mutex<String>>,
+            as_url: String,
+            accepted: &'static str,
+        }
+
+        async fn handle_rpc(
+            State(state): State<McpState>,
+            headers: HeaderMap,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            let presented = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if presented != format!("Bearer {}", state.accepted) {
+                let mcp_url = state.mcp_url.lock().unwrap().clone();
+                return axum::response::Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(
+                        axum::http::header::WWW_AUTHENTICATE,
+                        format!(
+                            "Bearer resource_metadata=\"{mcp_url}/.well-known/oauth-protected-resource\""
+                        ),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+            let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let id = msg["id"].clone();
+            let result = match msg["method"].as_str().unwrap_or_default() {
+                "initialize" => json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+                "tools/list" => json!({ "tools": [{
+                    "name": "ping",
+                    "description": "ping it",
+                    "inputSchema": { "type": "object" }
+                }] }),
+                _ => Value::Null,
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string(),
+            )
+                .into_response()
+        }
+
+        async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            axum::Json(json!({
+                "resource": "placeholder",
+                "authorization_servers": [state.as_url],
+            }))
+        }
+
+        let mcp_url_slot = Arc::new(Mutex::new(String::new()));
+        let app = Router::new()
+            .route("/", post(handle_rpc))
+            .route("/.well-known/oauth-protected-resource", get(handle_prm))
+            .with_state(McpState {
+                mcp_url: mcp_url_slot.clone(),
+                as_url,
+                accepted,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mcp_url = format!("http://{addr}");
+        *mcp_url_slot.lock().unwrap() = mcp_url.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        mcp_url
+    }
+
+    /// PROPERTY: the http probe authenticates with the credential the SESSION
+    /// would use, and persists the tools it discovers.
+    ///
+    /// Both halves matter and neither existed. The probe POSTed a bare
+    /// `initialize` with no `Authorization` header, so every auth-gated remote
+    /// server sat at `status = "error"` / "HTTP initialize failed — check the
+    /// URL" with a URL that was perfectly correct; and it never called
+    /// `replace_tools`, so an http server never got `mcp_tools` rows — which
+    /// is what the Tools tab (`hasTools: app.tools.length > 0`) and per-tool
+    /// permissions are built out of. Remote servers therefore had NO
+    /// configurable per-tool permissions at all.
+    ///
+    /// Structured so it cannot pass on a server that accepts anything: the
+    /// first probe runs with NO stored token and must FAIL with the server's
+    /// real 401 surfaced, and only the second — after a token is stored —
+    /// succeeds. Verified by observed failure: restoring the old bare
+    /// `reqwest` POST turns the second half red (status `error`, no tools, and
+    /// the `set_app_tool_perm` round-trip below has no row to write).
+    #[tokio::test]
+    async fn the_http_probe_authenticates_with_the_stored_token_and_persists_the_tools() {
+        let mcp_url = spawn_bearer_gated_mcp("real-token", "http://127.0.0.1:9".into()).await;
+        let s = state().await;
+        mcp::upsert_server(s.cp.store(), http_row("remote", &mcp_url))
+            .await
+            .unwrap();
+
+        let out = dispatch(&s, "probe_app", json!({ "id": "remote" }))
+            .await
+            .unwrap();
+        let apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+        assert_eq!(
+            apps[0].status, "error",
+            "with no credential at all the server really is unusable"
+        );
+        assert!(
+            apps[0]
+                .status_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("401")),
+            "the detail must name what actually happened (a 401), not blame the URL: {:?}",
+            apps[0].status_detail
+        );
+        assert!(apps[0].tools.is_empty());
+
+        s.cp.store()
+            .upsert_mcp_oauth_token("remote", &stored_token("real-token"))
+            .await
+            .unwrap();
+        let out = dispatch(&s, "probe_app", json!({ "id": "remote" }))
+            .await
+            .unwrap();
+        let apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+        assert_eq!(
+            apps[0].status, "connected",
+            "the probe must present the stored OAuth token, exactly as a session does: {:?}",
+            apps[0].status_detail
+        );
+        assert_eq!(
+            apps[0]
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ping"],
+            "the tools the handshake discovered must be persisted, or there is no Tools tab and \
+             no per-tool permission to configure"
+        );
+
+        // The concrete consequence: a remote server's per-tool permission is
+        // now configurable at all, because a `mcp_tools` row exists to carry it.
+        let out = dispatch(
+            &s,
+            "set_app_tool_perm",
+            json!({ "id": "remote", "tool": "ping", "perm": "allow" }),
+        )
+        .await
+        .unwrap();
+        let apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+        assert_eq!(apps[0].tools[0].perm, "allow");
+    }
+
+    /// PROPERTY: a completed OAuth connect leaves the card's status and its
+    /// pill AGREEING, because completion re-probes with the token it just
+    /// stored. Before this, `complete_mcp_connect` returned the app list
+    /// untouched, so a fully successful connect rendered an "OAuth connected"
+    /// pill next to the red Error dot and empty Tools tab that the earlier
+    /// (unauthenticated, therefore failed) probe had written — and clicking
+    /// Probe again could not fix it either.
+    ///
+    /// Drives the real RPC against a real bearer-enforcing MCP server and a
+    /// real authorization server. Verified by observed failure: removing the
+    /// `probe_and_persist` call from `complete_mcp_connect` leaves
+    /// `status == "unknown"` with no tools, turning the last two assertions
+    /// red while the token/pill assertions still pass — which is exactly the
+    /// contradiction this pins.
+    #[tokio::test]
+    async fn complete_mcp_connect_reprobes_so_the_status_and_the_pill_agree() {
+        let (as_url, _up, _hits) = spawn_authorization_server().await;
+        // `spawn_authorization_server`'s token endpoint always mints
+        // `issued-token`; the MCP server accepts exactly that bearer.
+        let mcp_url = spawn_bearer_gated_mcp("issued-token", as_url.clone()).await;
+        let s = state().await;
+        mcp::upsert_server(s.cp.store(), http_row("remote", &mcp_url))
+            .await
+            .unwrap();
+
+        // Same shortcut (and same reason) as
+        // `complete_mcp_connect_uses_the_authorization_server_begin_selected_
+        // not_a_fresh_discovery`: `begin_mcp_connect` is called directly to
+        // sidestep the RPC's https-only gate, since this fixture — like every
+        // discovery fixture in this crate — can only bind plaintext loopback.
+        // `complete_mcp_connect`, the handler under test, goes through the
+        // real dispatch.
+        let http = reqwest::Client::new();
+        let spec = McpServerSpec {
+            name: "remote".to_string(),
+            transport: McpTransport::Http {
+                url: mcp_url.clone(),
+                headers: vec![],
+            },
+        };
+        let start =
+            crate::harness::native::mcp_oauth::begin_mcp_connect(s.cp.store(), &http, &spec)
+                .await
+                .expect("the 401 + PRM + AS-metadata + DCR chain must resolve");
+
+        let out = dispatch(
+            &s,
+            "complete_mcp_connect",
+            json!({
+                "id": "remote",
+                "code": "the-code",
+                "verifier": start.verifier,
+                "issuer_token_endpoint": start.issuer_token_endpoint,
+                "client_id": start.client_id,
+            }),
+        )
+        .await
+        .expect("the token exchange must succeed");
+        let apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+        assert!(apps[0].oauth_token_stored, "the token must be stored");
+        assert!(apps[0].oauth_connect_available);
+        assert_eq!(
+            apps[0].status, "connected",
+            "the very response that reports a stored token must not still show the failed \
+             pre-connect probe's status: {:?}",
+            apps[0].status_detail
+        );
+        assert_eq!(
+            apps[0]
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ping"],
+            "and the tools the now-authenticated handshake found must be there, so the Tools tab \
+             appears without the user hunting for the Probe button"
+        );
+    }
+
+    // ---------- the OAuth affordance must not lie about who owns the credential ----------
+
+    /// PROPERTY: `AppInfo.oauth_connect_available` and what the session
+    /// actually authenticates with are the SAME decision, and they flip
+    /// TOGETHER.
+    ///
+    /// This is the anti-drift test. `transport === "http"` used to gate the
+    /// UI's OAuth block, and it only correlates with credential ownership: for
+    /// `atlassian-rovo` (`Authorization: Basic ${setting:…}`) the card said
+    /// "Not connected", walked the user through a real Atlassian consent
+    /// screen, flipped to "OAuth connected" — and the session went on sending
+    /// the Basic header, ignoring the token forever.
+    ///
+    /// Both sides are observed for real, on one row, from one store: the card
+    /// side through the `list_apps` RPC, the session side through
+    /// `mcp::servers_for_session` → `harness::native::open_http_mcp` (the
+    /// exact path `connect_mcp_tools` delegates to) with the assertion on the
+    /// `Authorization` header the server RECEIVED. Then the manifest header is
+    /// cleared and both sides must invert.
+    ///
+    /// Verified by observed failure: hardcoding `oauth_connect_available` to
+    /// `true` in `assemble` turns the first assertion red; hardcoding it to
+    /// `false` turns the third red; and making `open_http_mcp` prefer the
+    /// stored token over a manifest header turns the second red.
+    #[tokio::test]
+    async fn oauth_connect_available_agrees_with_what_the_session_authenticates_with() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (url, seen_auth) = crate::harness::native::tests::spawn_auth_echo_server().await;
+        let s = state().await;
+        let store = s.cp.store();
+        mcp::upsert_server(store, http_row("remote", &url))
+            .await
+            .unwrap();
+        store
+            .upsert_mcp_oauth_token("remote", &stored_token("stored-token"))
+            .await
+            .unwrap();
+        mcp::set_server_headers(
+            store,
+            "remote",
+            &[(
+                "Authorization".to_string(),
+                "Basic manifest-creds".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let session_auth = |seen: &Arc<Mutex<Vec<Vec<String>>>>| -> Vec<String> {
+            seen.lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .expect("the initialize request must have reached the server")
+        };
+
+        let apps: Vec<AppInfo> =
+            serde_json::from_value(dispatch(&s, "list_apps", json!({})).await.unwrap()).unwrap();
+        assert!(
+            !apps[0].oauth_connect_available,
+            "a server whose manifest supplies the credential must not offer an OAuth connect the \
+             session would then ignore"
+        );
+        let specs = mcp::servers_for_session(store, "native").await.unwrap();
+        let _ = crate::harness::native::open_http_mcp(store, &specs[0]).await;
+        assert_eq!(
+            session_auth(&seen_auth),
+            ["Basic manifest-creds".to_string()],
+            "and that is exactly what the session sends — the card's claim and the wire agree"
+        );
+
+        // Drop the manifest credential: the host now owns the slot, so BOTH
+        // sides must invert in lockstep.
+        mcp::set_server_headers(store, "remote", &[]).await.unwrap();
+        seen_auth.lock().unwrap().clear();
+
+        let apps: Vec<AppInfo> =
+            serde_json::from_value(dispatch(&s, "list_apps", json!({})).await.unwrap()).unwrap();
+        assert!(
+            apps[0].oauth_connect_available,
+            "with no manifest credential the connected token IS what authenticates, so connect is \
+             a real offer"
+        );
+        let specs = mcp::servers_for_session(store, "native").await.unwrap();
+        let _ = crate::harness::native::open_http_mcp(store, &specs[0]).await;
+        assert_eq!(
+            session_auth(&seen_auth),
+            ["Bearer stored-token".to_string()],
+            "the session now sends the connected token, matching the affordance the card offers"
+        );
+    }
+
+    /// PROPERTY: one row whose stored headers cannot be DECODED costs exactly
+    /// that row — `list_apps` must still return, and the row must fail CLOSED.
+    ///
+    /// `mcp::get_server_headers` hard-errors on an undecodable `headers_json`
+    /// (a rotated or unavailable secret key, a hand-edited row), and
+    /// `assemble` now reads headers where it previously read none — so a
+    /// propagated error here would blank the ENTIRE Apps screen over one bad
+    /// row, which is precisely what `mcp::servers_for_session` refuses to do
+    /// for the identical failure. Verified by observed failure: making
+    /// `http_session_spec` propagate the error with `?` instead of logging and
+    /// returning `None` turns the first assertion red — `list_apps` errors
+    /// instead of listing, and the healthy stdio row disappears with it.
+    #[tokio::test]
+    async fn a_row_with_undecodable_headers_costs_one_row_not_the_whole_list() {
+        crate::llm_router::secrets::use_test_key_file();
+        let s = state().await;
+        let store = s.cp.store();
+        mcp::upsert_server(store, http_row("broken", "https://mcp.example.com"))
+            .await
+            .unwrap();
+        mcp::upsert_server(store, http_row("healthy", "https://other.example.com"))
+            .await
+            .unwrap();
+        // Straight past `set_server_headers` (which would encrypt properly):
+        // this is the hand-edited/rotated-key shape.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE mcp_servers SET headers_json='not-json-at-all' WHERE id='broken'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        let out = dispatch(&s, "list_apps", json!({}))
+            .await
+            .expect("one undecodable row must not fail the whole list");
+        let apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+        assert_eq!(apps.len(), 2, "every other server must still be listed");
+        let broken = apps.iter().find(|a| a.id == "broken").unwrap();
+        let healthy = apps.iter().find(|a| a.id == "healthy").unwrap();
+        assert!(
+            !broken.oauth_connect_available,
+            "a credential this host cannot even read must not be advertised as connectable — a \
+             session cannot attach this server at all"
+        );
+        assert!(
+            healthy.oauth_connect_available,
+            "and the failure must be scoped to the one row"
+        );
+    }
+
+    /// PROPERTY: a stdio server never offers OAuth connect. `begin_mcp_connect`
+    /// already refuses one (see
+    /// `begin_mcp_connect_rejects_a_stdio_server`), so a card that offered the
+    /// button could only ever produce an error toast. Verified by observed
+    /// failure: dropping the `row.transport == "http"` arm from `assemble`'s
+    /// derivation makes a stdio row report `true` (it has no headers, so the
+    /// predicate alone reads as host-managed) and turns this red.
+    #[tokio::test]
+    async fn a_stdio_row_never_offers_oauth_connect() {
+        let s = state().await;
+        mcp::upsert_server(
+            s.cp.store(),
+            McpServerRow {
+                id: "stdio-app".into(),
+                name: "Stdio App".into(),
+                kind: "MCP server".into(),
+                color: "#8B8B8B".into(),
+                description: String::new(),
+                transport: "stdio".into(),
+                command: Some("acme-mcp".into()),
+                args: vec![],
+                env: vec![],
+                url: None,
+                scope: "global".into(),
+                scope_gateways: vec![],
+                version: None,
+                publisher: None,
+                status: "unknown".into(),
+                status_detail: None,
+                auth_kind: "none".into(),
+                auth_detail: None,
+                plugin_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let apps: Vec<AppInfo> =
+            serde_json::from_value(dispatch(&s, "list_apps", json!({})).await.unwrap()).unwrap();
+        assert!(!apps[0].oauth_connect_available);
     }
 }

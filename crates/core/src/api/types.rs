@@ -597,6 +597,27 @@ pub struct AppInfo {
     pub publisher: Option<String>,
     pub auth_kind: String,
     pub auth_detail: Option<String>,
+    /// Whether THIS host owns the server's credential, and therefore whether
+    /// offering an OAuth "Connect" for it tells the truth. `false` for every
+    /// stdio row, and for an http row whose spec already carries an
+    /// `Authorization` header (a manifest `${setting:…}` API token, or an
+    /// owning plugin's own OAuth bearer): for those, `harness::native`'s
+    /// `connect_mcp_tools` uses the manifest credential VERBATIM and never
+    /// reads, uses or refreshes a token connected here.
+    ///
+    /// Derived by applying `harness::native::mcp_http_credential` — the same
+    /// predicate the session path branches on — to the spec
+    /// `mcp::servers_for_session` would attach, never re-derived from
+    /// `transport`/`auth_kind`. Cockpit MUST gate the whole OAuth row on this
+    /// rather than on `transport == "http"`: that comparison merely correlates
+    /// with credential ownership, and where it diverged
+    /// (`plugins/atlassian-rovo`, which authenticates with
+    /// `Authorization: Basic ${setting:…}`) the card claimed "Not connected",
+    /// walked the user through a real Atlassian consent screen, flipped to
+    /// "OAuth connected" — and the session kept sending the Basic header.
+    /// Mirrors `PluginAuthInfo.oauth_connect_available`, which models the same
+    /// thing for a plugin.
+    pub oauth_connect_available: bool,
     /// A `mcp_oauth_tokens` row exists for this server's id — independent of
     /// `auth_kind`/`auth_detail` (those describe the manifest/env-derived
     /// credential, never an interactively-connected OAuth token). Only ever
