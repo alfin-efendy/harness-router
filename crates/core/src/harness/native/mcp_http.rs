@@ -178,6 +178,14 @@ impl McpHttpConnection {
 
 /// Pull the JSON-RPC message whose `id` matches `want` out of an SSE body.
 ///
+/// Per the SSE spec, one event may carry MULTIPLE `data:` lines — a server
+/// that pretty-prints its JSON, or that simply splits a large payload
+/// across lines, sends exactly this shape. Those lines are not independent
+/// JSON documents: they are joined with `\n` into a single payload and
+/// parsed once, at the blank line that terminates the event. A single
+/// leading space after the `data:` colon is part of the field syntax, not
+/// the value, and is stripped (`data: x` and `data:x` both yield `x`).
+///
 /// Any other message on the stream — a notification, or a server-initiated
 /// request this client does not implement — is skipped rather than mistaken
 /// for the answer. A stream that ends without the wanted id is a TRANSPORT
@@ -186,16 +194,35 @@ impl McpHttpConnection {
 /// that legitimately returned nothing.
 fn sse_message_for_id(body: &str, want: Option<&Value>) -> anyhow::Result<Value> {
     let mut skipped = 0usize;
-    for line in body.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
+    let mut data_lines: Vec<&str> = Vec::new();
+
+    // `.chain(once(""))` appends a synthetic trailing blank line so the
+    // final event still gets dispatched even when the body itself doesn't
+    // end with one — a POST response arrives whole, not streamed
+    // field-by-field, so a trailing blank line isn't guaranteed the way it
+    // would be on a live `EventSource` connection.
+    for line in body.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            // A blank line terminates the event: join and parse whatever
+            // `data:` lines it accumulated, then reset for the next event —
+            // resetting unconditionally (matched, skipped, or unparseable)
+            // is what keeps one event's lines from leaking into the next.
+            if data_lines.is_empty() {
+                continue;
+            }
+            let payload = data_lines.join("\n");
+            data_lines.clear();
+            let Ok(message) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            match (want, message.get("id")) {
+                (Some(want), Some(got)) if want == got => return Ok(message),
+                _ => skipped += 1,
+            }
             continue;
-        };
-        let Ok(message) = serde_json::from_str::<Value>(data.trim()) else {
-            continue;
-        };
-        match (want, message.get("id")) {
-            (Some(want), Some(got)) if want == got => return Ok(message),
-            _ => skipped += 1,
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.strip_prefix(' ').unwrap_or(data));
         }
     }
     anyhow::bail!(
@@ -639,6 +666,75 @@ pub(crate) mod tests {
             result.is_err(),
             "with nothing pending, the stream must end in error rather than matching a null-id \
              message: {result:?}"
+        );
+    }
+
+    /// The SSE spec lets one event carry MULTIPLE `data:` lines, which a
+    /// client must concatenate with `\n` into a single payload before
+    /// parsing — a server that pretty-prints its JSON, or that simply
+    /// splits a large payload across lines, sends exactly this shape.
+    /// Treating each `data:` line as its own JSON document (the pre-fix
+    /// behaviour) fails to parse every single line here, so the whole
+    /// response goes missing and the call fails with "event stream ended
+    /// without a response" even though the server behaved legally.
+    #[test]
+    fn sse_multi_line_data_lines_within_one_event_are_joined_before_parsing() {
+        let pending = json!(3);
+        let body = concat!(
+            "event: message\n",
+            "data: {\n",
+            "data:   \"jsonrpc\": \"2.0\",\n",
+            "data:   \"id\": 3,\n",
+            "data:   \"result\": {}\n",
+            "data: }\n",
+            "\n",
+        );
+
+        let result = sse_message_for_id(body, Some(&pending)).expect(
+            "a legally pretty-printed multi-line SSE event must still parse into the pending \
+             response — treating each data: line as its own JSON document silently drops it",
+        );
+
+        assert_eq!(result["id"], json!(3));
+        assert_eq!(result["result"], json!({}));
+    }
+
+    /// Naive concatenation across EVENT boundaries (instead of resetting
+    /// the accumulator at the blank line the SSE spec defines as the event
+    /// terminator) is worse than the plain miss above: it risks silently
+    /// splicing fields from an unrelated event into the one being matched.
+    /// Two multi-line events — the first carrying a different id, the
+    /// second carrying the pending one — must resolve to exactly the
+    /// second event's own payload, not something blended with the first.
+    #[test]
+    fn a_multi_line_event_for_a_different_id_does_not_leak_into_the_pending_events_payload() {
+        let pending = json!(3);
+        let body = concat!(
+            "event: message\n",
+            "data: {\n",
+            "data:   \"jsonrpc\": \"2.0\",\n",
+            "data:   \"id\": 9999,\n",
+            "data:   \"result\": {\"marker\": \"unrelated\"}\n",
+            "data: }\n",
+            "\n",
+            "event: message\n",
+            "data: {\n",
+            "data:   \"jsonrpc\": \"2.0\",\n",
+            "data:   \"id\": 3,\n",
+            "data:   \"result\": {\"marker\": \"pending\"}\n",
+            "data: }\n",
+            "\n",
+        );
+
+        let result = sse_message_for_id(body, Some(&pending)).expect(
+            "the second multi-line event carries the pending id and must be parsed and returned",
+        );
+
+        assert_eq!(result["id"], json!(3));
+        assert_eq!(
+            result["result"]["marker"], "pending",
+            "must resolve to the SECOND event's own payload, not one spliced together with the \
+             first (unrelated-id) event's data lines: {result:?}"
         );
     }
 }
