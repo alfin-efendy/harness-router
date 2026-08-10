@@ -1387,6 +1387,48 @@ fn auth_configured(setting_value: Option<&str>, env_is_set: bool) -> bool {
     setting_value.is_some_and(|v| !v.is_empty()) || env_is_set
 }
 
+/// Aggregate OAuth status across a component bundle's declared `[[oauth]]`
+/// profiles: `token_stored` iff EVERY profile has a stored token, and
+/// `reconnect_required` iff ANY stored one needs reconnecting. `None` when the
+/// plugin declares no component profiles, so the caller falls back to the
+/// legacy single `plugin_oauth_tokens` row.
+///
+/// Shared by `plugin_auth_configured` (list payload) and `build_auth_info`
+/// (detail payload) on purpose: they drifted once already — the detail payload
+/// kept reporting "not connected" for an Atlassian install whose profile token
+/// was live, which left the Overview setup checklist permanently grey.
+#[derive(Debug, Clone, Copy)]
+struct OauthProfileStatus {
+    token_stored: bool,
+    reconnect_required: bool,
+}
+
+async fn oauth_profile_status(
+    store: &Store,
+    plugin_id: &str,
+) -> anyhow::Result<Option<OauthProfileStatus>> {
+    let Some(bundle) = crate::plugins::component_catalog::declared_manifest(plugin_id) else {
+        return Ok(None);
+    };
+    if bundle.oauth.is_empty() {
+        return Ok(None);
+    }
+    let mut status = OauthProfileStatus {
+        token_stored: true,
+        reconnect_required: false,
+    };
+    for profile in &bundle.oauth {
+        match store
+            .get_plugin_oauth_profile_token(plugin_id, &profile.id)
+            .await?
+        {
+            Some(token) => status.reconnect_required |= token.reconnect_required,
+            None => status.token_stored = false,
+        }
+    }
+    Ok(Some(status))
+}
+
 /// `PluginAuthInfo.configured` for the list payload without building the whole
 /// auth DTO: oauth → a token is stored and reconnect isn't required; otherwise
 /// the `auth.setting`-row / `auth.env` check. No `[auth]` → false.
@@ -1407,19 +1449,8 @@ async fn plugin_auth_configured(
         return Ok(false);
     };
     if auth.kind == AuthKind::Oauth {
-        if let Some(bundle) = crate::plugins::component_catalog::declared_manifest(plugin_id) {
-            if !bundle.oauth.is_empty() {
-                for profile in &bundle.oauth {
-                    let live = store
-                        .get_plugin_oauth_profile_token(plugin_id, &profile.id)
-                        .await?
-                        .is_some_and(|t| !t.reconnect_required);
-                    if !live {
-                        return Ok(false);
-                    }
-                }
-                return Ok(true);
-            }
+        if let Some(status) = oauth_profile_status(store, plugin_id).await? {
+            return Ok(status.token_stored && !status.reconnect_required);
         }
         let token = store.get_plugin_oauth_token(plugin_id).await?;
         return Ok(token.is_some_and(|token| !token.reconnect_required));
@@ -1453,15 +1484,18 @@ async fn build_auth_info(
     } else {
         None
     };
-    let oauth_token = if auth.kind == AuthKind::Oauth {
-        store.get_plugin_oauth_token(plugin_id).await?
+    let (oauth_token_stored, oauth_reconnect_required) = if auth.kind == AuthKind::Oauth {
+        match oauth_profile_status(store, plugin_id).await? {
+            Some(status) => (status.token_stored, status.reconnect_required),
+            None => {
+                let token = store.get_plugin_oauth_token(plugin_id).await?;
+                let reconnect = token.as_ref().is_some_and(|t| t.reconnect_required);
+                (token.is_some(), reconnect)
+            }
+        }
     } else {
-        None
+        (false, false)
     };
-    let oauth_reconnect_required = oauth_token
-        .as_ref()
-        .is_some_and(|token| token.reconnect_required);
-    let oauth_token_stored = oauth_token.is_some();
     let oauth_connect_error = resolved_oauth
         .as_ref()
         .and_then(|resolved| plugin_oauth_prereq_error(plugin_id, auth, resolved));
@@ -4478,6 +4512,83 @@ description = "does a thing"
         assert!(plugin_auth_configured(cp.store(), "github", auth.as_ref())
             .await
             .unwrap());
+    }
+
+    /// The Overview checklist reads `PluginDetail.auth.configured`, so it must see
+    /// a component profile token the wizard already shows as CONNECTED. Before this
+    /// fix `build_auth_info` only read the legacy plugin-level table and the
+    /// "Connect your account" row stayed grey forever.
+    #[tokio::test]
+    async fn build_auth_info_reports_configured_for_a_profile_only_token() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "atlassian",
+                "atlassian-cloud",
+                &crate::plugins::oauth::PluginOauthToken {
+                    plugin_id: "atlassian".to_string(),
+                    access_token: "tok".to_string(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let info = build_auth_info(store, "atlassian", &auth).await.unwrap();
+
+        assert!(info.configured, "a live profile token means connected");
+        assert!(info.oauth_token_stored);
+        assert!(!info.oauth_reconnect_required);
+
+        // The list payload and the detail payload must agree on the same fixture —
+        // this is the drift that caused the bug.
+        assert_eq!(
+            plugin_auth_configured(store, "atlassian", Some(&auth))
+                .await
+                .unwrap(),
+            info.configured
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_token_needing_reconnect_is_not_configured() {
+        let cp = test_cp().await;
+        let store = cp.store();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "atlassian",
+                "atlassian-cloud",
+                &crate::plugins::oauth::PluginOauthToken {
+                    plugin_id: "atlassian".to_string(),
+                    access_token: "tok".to_string(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_at: None,
+                    scopes: vec![],
+                    reconnect_required: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let info = build_auth_info(store, "atlassian", &auth).await.unwrap();
+
+        assert!(!info.configured);
+        assert!(info.oauth_token_stored);
+        assert!(info.oauth_reconnect_required);
     }
 
     #[tokio::test]

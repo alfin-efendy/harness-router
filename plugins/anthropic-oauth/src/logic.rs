@@ -37,13 +37,14 @@
 //! authenticating; see the task report for the full accounting.
 
 use ryuzi_anthropic_format::{
-    AnthropicFormat, ProviderFail, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS,
+    AnthropicFormat, MessagesRequest, ProviderFail, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS,
 };
 
 // Re-exported so `crate::guest` references these through `crate::logic` (kept
 // structurally parallel to the `anthropic` bundle's guest).
 pub use ryuzi_anthropic_format::{
-    status_is_success, ChunkOut, ModelOut, ANTHROPIC_VERSION, BASE_URL_STORAGE_KEY,
+    status_is_success, BlockIn, ChunkOut, MessageIn, ModelOut, RoleIn, StopOut, ToolCallOut,
+    ToolChoiceIn, ToolIn, ANTHROPIC_VERSION, BASE_URL_STORAGE_KEY,
 };
 
 /// The OAuth profile id this component passes to `authorized-request`. It MUST
@@ -107,23 +108,30 @@ pub fn messages_url(base: &str) -> String {
     format!("{}?{}", CONFIG.messages_url(base), MESSAGES_BETA_QUERY)
 }
 
-/// Build the `/messages` body for the OAuth path: the flat prompt plus the
-/// REQUIRED Claude-subscription system marker
-/// ([`CLAUDE_CODE_SYSTEM_PROMPT`]). Everything else (single user turn, mandatory
-/// `max_tokens`, non-finite-temperature handling) is the shared crate's.
+/// Build the `/messages` body for the OAuth path: the full transcript plus
+/// the REQUIRED Claude-subscription system marker
+/// ([`CLAUDE_CODE_SYSTEM_PROMPT`]), which the shared crate emits as the FIRST
+/// block of `system` — ahead of any `RoleIn::System` messages the transcript
+/// itself carries. Everything else (block-array content, tools carrying
+/// `input_schema` directly, mandatory `max_tokens`, non-finite-temperature
+/// handling) is the shared crate's.
 pub fn build_completion_body(
     model: &str,
-    prompt: &str,
+    messages: &[MessageIn],
+    tools: &[ToolIn],
+    tool_choice: ToolChoiceIn,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
 ) -> Vec<u8> {
-    CONFIG.build_messages_body(
+    CONFIG.build_messages_body(MessagesRequest {
         model,
-        prompt,
+        messages,
+        tools,
+        tool_choice,
         max_tokens,
         temperature,
-        Some(CLAUDE_CODE_SYSTEM_PROMPT),
-    )
+        leading_system: Some(CLAUDE_CODE_SYSTEM_PROMPT),
+    })
 }
 
 /// A host OAuth failure, mirrored host-free so the mapping to [`ProviderFail`]
@@ -203,9 +211,19 @@ mod tests {
         // The OAuth endpoint rejects a subscription bearer without the
         // Claude-Code leading system block — so unlike the x-api-key path, this
         // body MUST carry it.
-        let body: Value =
-            serde_json::from_slice(&build_completion_body("claude-opus-4-8", "hi", None, None))
-                .unwrap();
+        let messages = [MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".to_string())],
+        }];
+        let body: Value = serde_json::from_slice(&build_completion_body(
+            "claude-opus-4-8",
+            &messages,
+            &[],
+            ToolChoiceIn::Auto,
+            None,
+            None,
+        ))
+        .unwrap();
         assert_eq!(
             body["system"],
             serde_json::json!([
@@ -213,11 +231,14 @@ mod tests {
             ]),
             "the OAuth request must lead with the Claude-Code system marker",
         );
-        // The flat prompt is still exactly one user turn, and max_tokens is
+        // The transcript is still exactly one user turn, and max_tokens is
         // present (Anthropic rejects a request without it).
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "hi");
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!([{"type": "text", "text": "hi"}])
+        );
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
     }
 

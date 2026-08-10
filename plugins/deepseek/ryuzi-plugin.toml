@@ -1,13 +1,13 @@
 contract = 2
 id = "deepseek"
 name = "DeepSeek"
-version = "0.1.0"
+version = "0.2.0"
 publisher = "Ryuzi"
 description = "DeepSeek chat provider. Talks to api.deepseek.com with the user's stored API key, which the host injects through ryuzi:provider-auth — the component never sees the key."
 
 [component]
 file = "deepseek.wasm"
-wit-api = ">=0.1.0, <0.2.0"
+wit-api = ">=0.2.0, <0.3.0"
 lifecycle = "per-call"
 
 # The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is

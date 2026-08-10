@@ -1,7 +1,15 @@
 import { expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { artifactNames, buildSignatureEnvelope, COMPONENTS, FIRST_PARTY_KEY_ID, readManifest, signingKeyId } from "./build-first-party.ts";
+import {
+  artifactNames,
+  buildSignatureEnvelope,
+  COMPONENTS,
+  deriveWitApiVersion,
+  FIRST_PARTY_KEY_ID,
+  readManifest,
+  signingKeyId,
+} from "./build-first-party.ts";
 
 // Repo root relative to this file (scripts/plugins/), so the test is
 // cwd-independent — it resolves plugins/ the same way regardless of where
@@ -81,7 +89,44 @@ test("readManifest accepts every shipped plugins/<id>/ryuzi-plugin.toml as contr
     const manifest = await readManifest(join(REPO_ROOT, spec.dir));
     expect(manifest.id).toBe(spec.id);
     expect(manifest.component.length).toBeGreaterThan(0);
+    expect(manifest.witApiRange.length).toBeGreaterThan(0);
   }
+});
+
+// The published `release.json` `wit-api` is derived from EACH component's own
+// manifest range (Defect 2 fix) rather than one shared constant, since the
+// host now supports two WIT contract versions simultaneously (0.1.0 and the
+// newer tool-carrying 0.2.0) and different first-party components target
+// different ones. This is the drift-guard: every shipped manifest's actual
+// `wit-api` range must be a shape `deriveWitApiVersion` can interpret,
+// otherwise a real release build would throw.
+test("deriveWitApiVersion interprets every shipped component's manifest wit-api range", async () => {
+  for (const spec of COMPONENTS) {
+    const manifest = await readManifest(join(REPO_ROOT, spec.dir));
+    expect(() => deriveWitApiVersion(manifest.witApiRange)).not.toThrow();
+  }
+});
+
+// The ten provider components that moved to the tool-carrying interface
+// publish `0.2.0`; the rest (mimo, opencode, connectors) still publish
+// `0.1.0` — both paths must derive correctly, not just whichever one this
+// script happened to hardcode before.
+test("deriveWitApiVersion returns the range's lower bound for both host-supported shapes", () => {
+  expect(deriveWitApiVersion(">=0.1.0, <0.2.0")).toBe("0.1.0");
+  expect(deriveWitApiVersion(">=0.2.0, <0.3.0")).toBe("0.2.0");
+  // Tolerate the lack of a space after the comma too.
+  expect(deriveWitApiVersion(">=0.1.0,<0.2.0")).toBe("0.1.0");
+});
+
+// A range shape this derivation cannot interpret must fail loudly (throw) at
+// build time rather than silently guessing a wrong `wit-api` — the whole
+// point of Defect 2's fix over the old hardcoded constant.
+test("deriveWitApiVersion throws on a range shape it cannot interpret", () => {
+  expect(() => deriveWitApiVersion("^0.1.0")).toThrow();
+  expect(() => deriveWitApiVersion("*")).toThrow();
+  expect(() => deriveWitApiVersion(">=0.1.0")).toThrow();
+  expect(() => deriveWitApiVersion("0.1.0")).toThrow();
+  expect(() => deriveWitApiVersion("")).toThrow();
 });
 
 // The published-name contract: 3 descriptor files under BOTH stems (unversioned

@@ -61,6 +61,11 @@ pub(crate) const HOOKS_EXPORT: &str = "ryuzi:hooks/hooks@0.1.0";
 /// The `ryuzi:provider/provider` export interface name — shared by
 /// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_provider`] (Task 10).
 pub(crate) const PROVIDER_EXPORT: &str = "ryuzi:provider/provider@0.1.0";
+/// The `ryuzi:provider/provider@0.2.0` export interface name — the structured,
+/// tool-carrying provider interface. Shared by `ALLOWED_EXPORTS` and
+/// [`CompiledComponent::exports_provider_v2`]. A component may export this,
+/// `PROVIDER_EXPORT`, or both; the transport prefers this one.
+pub(crate) const PROVIDER_V2_EXPORT: &str = "ryuzi:provider/provider@0.2.0";
 /// The `ryuzi:gateway/gateway` export interface name — shared by
 /// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_gateway`] (Task 10).
 pub(crate) const GATEWAY_EXPORT: &str = "ryuzi:gateway/gateway@0.1.0";
@@ -70,8 +75,46 @@ const ALLOWED_EXPORTS: &[&str] = &[
     GATEWAY_EXPORT,
     CONNECTOR_EXPORT,
     PROVIDER_EXPORT,
+    PROVIDER_V2_EXPORT,
     HOOKS_EXPORT,
 ];
+
+/// The set of WIT contract (provider ABI) versions this host implements
+/// simultaneously — currently the original `ryuzi:provider/provider@0.1.0`
+/// export ([`PROVIDER_EXPORT`]) and the newer, tool-carrying
+/// `ryuzi:provider/provider@0.2.0` export ([`PROVIDER_V2_EXPORT`]), with the
+/// host picking whichever a given component actually exports (see
+/// [`CompiledComponent::exports_provider`]/[`CompiledComponent::exports_provider_v2`]).
+/// A component's manifest `wit-api` RANGE is compatible with this host as
+/// long as it matches AT LEAST ONE of these concrete versions — see
+/// [`host_satisfies_wit_api_range`], which is the single source of truth both
+/// the doctor's read-only `abi-incompatible` finding
+/// ([`crate::plugins::doctor`]) and the install-time gate
+/// ([`crate::plugins::remote_catalog::install_component_release`]) key off,
+/// so the two can never drift out of agreement about what this host
+/// supports.
+pub(crate) const HOST_WIT_API_VERSIONS: &[&str] = &["0.1.0", "0.2.0"];
+
+/// Whether a manifest's `[component] wit-api` semver RANGE is satisfied by AT
+/// LEAST ONE of [`HOST_WIT_API_VERSIONS`] — the single predicate both the
+/// doctor's `abi-incompatible` finding and `remote_catalog`'s pre-download
+/// install gate evaluate, so they can never disagree about what this host
+/// supports. An unparseable range is treated as compatible (`true`): by the
+/// time either caller has a `PluginManifest` in hand, `wit-api` has already
+/// been validated as a parseable [`semver::VersionReq`] by
+/// `PluginManifest::from_toml`/`from_toml_detecting_legacy` — this fallback
+/// exists only so a parse failure reads as "not this predicate's problem to
+/// reject", not as a silent false negative that blocks an otherwise-valid
+/// install for the wrong reason.
+pub(crate) fn host_satisfies_wit_api_range(wit_api_range: &str) -> bool {
+    let Ok(req) = semver::VersionReq::parse(wit_api_range) else {
+        return true;
+    };
+    HOST_WIT_API_VERSIONS
+        .iter()
+        .filter_map(|v| semver::Version::parse(v).ok())
+        .any(|host| req.matches(&host))
+}
 
 /// Default resource budget a plugin runtime may consume.
 ///
@@ -583,6 +626,22 @@ impl CompiledComponent {
     /// instantiation (Task 10, mirrors the IMP-2 connector/hooks gating).
     pub(crate) fn exports_provider(&self) -> bool {
         self.exports.iter().any(|name| name == PROVIDER_EXPORT)
+    }
+
+    /// Whether this component exports `ryuzi:provider/provider@0.2.0` — the
+    /// structured interface that can carry tools. This alone decides which
+    /// ABI the router calls (`WasmProviderRuntime::speaks_structured_abi`): a
+    /// component exporting this takes the `complete_v2` path UNCONDITIONALLY,
+    /// even when its own `capabilities().tools` answer is `false` (mimo
+    /// exports only 0.2.0 and honestly reports `tools: false` — it still
+    /// goes through `complete_v2`, with an empty tools list, never through
+    /// `complete`, which a 0.2.0-only component doesn't export at all). Only
+    /// a component with NO 0.2.0 export falls back to `exports_provider`'s
+    /// 0.1.0 `complete`. `capabilities().tools` answers a different
+    /// question — whether tools may be forwarded — and must never be used to
+    /// pick the ABI.
+    pub(crate) fn exports_provider_v2(&self) -> bool {
+        self.exports.iter().any(|name| name == PROVIDER_V2_EXPORT)
     }
 
     /// Whether this component exports `ryuzi:gateway/gateway` — used by the
@@ -1372,6 +1431,16 @@ mod tests {
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{NetworkPermission, PluginLifecycle, PluginPermissions, PluginRelease};
+
+    #[test]
+    fn provider_v2_export_id_is_registered_and_distinct_from_v1() {
+        assert_eq!(PROVIDER_EXPORT, "ryuzi:provider/provider@0.1.0");
+        assert_eq!(PROVIDER_V2_EXPORT, "ryuzi:provider/provider@0.2.0");
+        assert!(
+            ALLOWED_EXPORTS.contains(&PROVIDER_V2_EXPORT),
+            "a component must be structurally allowed to export provider v2"
+        );
+    }
 
     /// A throwaway [`PluginCapabilityContext`] over a fresh on-disk `Store` —
     /// enough for `instantiate` tests that don't exercise the settings/

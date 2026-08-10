@@ -8,5 +8,5 @@ package ryuzi:opencode@0.1.0;
 world opencode {
   import ryuzi:plugin/types@0.1.0;
   import ryuzi:http/http@0.1.0;
-  export ryuzi:provider/provider@0.1.0;
+  export ryuzi:provider/provider@0.2.0;
 }

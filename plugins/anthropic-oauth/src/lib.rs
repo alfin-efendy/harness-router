@@ -1,6 +1,6 @@
 //! First-party Anthropic (Claude subscription) provider component.
 //!
-//! Exports `ryuzi:provider/provider@0.1.0` (`list-models` + `complete`) over
+//! Exports `ryuzi:provider/provider@0.2.0` (`list-models` + `complete`) over
 //! Anthropic's `/models` and `/messages` endpoints — the SAME wire format as the
 //! `anthropic` (x-api-key) bundle, shared through the `ryuzi_anthropic_format`
 //! crate. This bundle differs in exactly two ways, both of which are what make

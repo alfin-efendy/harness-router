@@ -27,3 +27,4 @@ pub mod server;
 pub mod sse;
 pub mod translate;
 pub mod usage;
+pub(crate) mod wasm_bridge;

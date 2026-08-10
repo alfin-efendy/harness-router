@@ -1,6 +1,6 @@
 //! First-party OpenAI provider component.
 //!
-//! Exports `ryuzi:provider/provider@0.1.0` (the Task 10 adapter's contract:
+//! Exports `ryuzi:provider/provider@0.2.0` (the Task 10 adapter's contract:
 //! `list-models` + `complete`) over OpenAI's `/v1/models` and
 //! `/v1/chat/completions` endpoints.
 //!

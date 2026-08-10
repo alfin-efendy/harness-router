@@ -650,6 +650,38 @@ pub(crate) fn sanitize_staged_component(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reject a manifest whose `[component] wit-api` range matches NONE of this
+/// host's implemented WIT contract versions
+/// ([`crate::plugins::runtime::HOST_WIT_API_VERSIONS`]) — the install-time
+/// counterpart of the doctor's read-only `abi-incompatible` finding
+/// (`crate::plugins::doctor::plugin_doctor`), which only ever reports AFTER
+/// an incompatible bundle already landed on disk. Both key off the same
+/// [`crate::plugins::runtime::host_satisfies_wit_api_range`] predicate, so
+/// they can never disagree about what this host supports. A manifest with no
+/// `[component]` block at all (not a component-backed plugin) is not this
+/// gate's concern and passes through.
+fn require_host_supports_wit_api(
+    manifest: &PluginManifest,
+    plugin_id: &str,
+    version: &str,
+) -> anyhow::Result<()> {
+    use crate::plugins::runtime::{host_satisfies_wit_api_range, HOST_WIT_API_VERSIONS};
+
+    let Some(component) = manifest.component.as_ref() else {
+        return Ok(());
+    };
+    if host_satisfies_wit_api_range(&component.wit_api) {
+        return Ok(());
+    }
+    let supported = HOST_WIT_API_VERSIONS.join(", ");
+    anyhow::bail!(
+        "{plugin_id} ({version}) targets WIT contract `{}`, which excludes every WIT contract \
+         version this host supports (`{supported}`). Update Ryuzi to a release built for one of \
+         this host's supported WIT versions before installing this bundle.",
+        component.wit_api,
+    )
+}
+
 /// Reject a `component_url` that is not same-origin (scheme + host + port) with
 /// the release `base_url`. The URL comes from the fetched, still-UNVERIFIED
 /// `release.json`; without this constraint it is an arbitrary outbound-fetch
@@ -736,6 +768,15 @@ pub async fn install_component_release(
             );
         }
     }
+
+    // ABI GATE: reject a bundle whose manifest `[component] wit-api` range
+    // this host cannot satisfy, BEFORE the (larger) wasm download — the
+    // catalog feed is unpinned, so an older host build can be offered a
+    // bundle built for a newer WIT contract it does not implement.
+    // `runtime::HOST_WIT_API_VERSIONS` is the single source of truth (shared
+    // with the doctor's read-only `abi-incompatible` finding); this is the
+    // only place that ACTS on it before anything is installed.
+    require_host_supports_wit_api(&manifest, plugin_id, &release.version)?;
 
     // SECURITY: `manifest.component` and `release.component_url` both come from
     // the fetched, still-UNVERIFIED descriptors. Constrain them BEFORE any
@@ -940,10 +981,25 @@ mod component_install_tests {
         component: &str,
         component_url: &str,
     ) -> Artifacts {
+        build_artifacts_with_wit_api(id, version, key, key_id, component, component_url, "^0.1.0")
+    }
+
+    /// Like [`build_artifacts_full`] but with an explicit manifest `[component]
+    /// wit-api` RANGE — the ABI-gate tests drive a range the host does/does not
+    /// satisfy through here.
+    fn build_artifacts_with_wit_api(
+        id: &str,
+        version: &str,
+        key: &SigningKey,
+        key_id: &str,
+        component: &str,
+        component_url: &str,
+        wit_api: &str,
+    ) -> Artifacts {
         let wasm = format!("wasm bytes for {id} {version}").into_bytes();
         let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
         let manifest_toml = format!(
-            "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"{component}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\n"
+            "contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[component]\nfile = \"{component}\"\nwit-api = \"{wit_api}\"\nlifecycle = \"singleton\"\n"
         )
         .into_bytes();
         let release_json = format!(
@@ -1100,6 +1156,108 @@ mod component_install_tests {
             format!("{err:#}").contains("hash mismatch"),
             "unexpected error: {err:#}"
         );
+    }
+
+    // IMPORTANT (review fix wave): a bundle whose manifest `wit-api` range this
+    // host DOES satisfy must install normally — proving the ABI gate is not
+    // over-broad. `>=0.2.0, <0.3.0` is the exact range every migrated provider
+    // bundle in this branch ships (mimo, openai, anthropic, ...), so this test
+    // pins the case the Important finding says every one of them must keep
+    // working.
+    #[tokio::test]
+    async fn install_pipeline_installs_a_wit_api_range_the_host_satisfies() {
+        let (store, _tmp) = test_store().await;
+        let root = tempfile::tempdir().unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        let base = "http://feed.test/latest";
+        let http = FakeReleaseHttp::new();
+        let component_url = "http://feed.test/mimo-0.2.0/mimo.wasm".to_string();
+        let a = build_artifacts_with_wit_api(
+            "mimo",
+            "0.2.0",
+            &bundle_key(),
+            KEY_ID,
+            "mimo.wasm",
+            &component_url,
+            ">=0.2.0, <0.3.0",
+        );
+        http.register_latest(base, "mimo", &a);
+
+        let record = install_component_release(&http, &installer, &trusted(), base, "mimo", None)
+            .await
+            .expect("a wit-api range the host satisfies must install");
+        assert_eq!(record.version, "0.2.0");
+        assert!(record.active);
+    }
+
+    // IMPORTANT (review fix wave): a bundle whose manifest `wit-api` range this
+    // host does NOT satisfy must be rejected before the (larger) wasm download
+    // — the catalog feed is unpinned, so an older host build can be offered a
+    // bundle built for a newer WIT contract it does not implement
+    // (`ComponentRuntime::compile` would otherwise reject the unknown export
+    // and discovery would silently warn-and-skip it, with no explanation
+    // outside the doctor panel). The wasm route is deliberately left
+    // UNREGISTERED: if the gate did not fire before the download, the fetch
+    // would surface as an "HTTP 404" error instead of the ABI message below,
+    // which is how this test proves no artifact was ever downloaded.
+    #[tokio::test]
+    async fn install_pipeline_rejects_a_wit_api_range_the_host_does_not_satisfy() {
+        let (store, _tmp) = test_store().await;
+        let root = tempfile::tempdir().unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        let base = "http://feed.test/latest";
+        let http = FakeReleaseHttp::new();
+        let component_url = "http://feed.test/mimo-0.3.0/mimo.wasm".to_string();
+        let a = build_artifacts_with_wit_api(
+            "mimo",
+            "0.3.0",
+            &bundle_key(),
+            KEY_ID,
+            "mimo.wasm",
+            &component_url,
+            ">=0.3.0, <0.4.0",
+        );
+        // Register everything EXCEPT the wasm bytes at `component_url` — a
+        // download attempt would surface as "HTTP 404 fetching ...", never the
+        // ABI message asserted below.
+        http.put(
+            format!("{base}/mimo.ryuzi-plugin.toml"),
+            200,
+            a.manifest_toml.clone(),
+        );
+        http.put(
+            format!("{base}/mimo.release.json"),
+            200,
+            a.release_json.clone(),
+        );
+        http.put(
+            format!("{base}/mimo.release.json.sig"),
+            200,
+            a.sig_json.clone(),
+        );
+
+        let err = install_component_release(&http, &installer, &trusted(), base, "mimo", None)
+            .await
+            .expect_err(
+                "a wit-api range matching none of the host's supported versions must be rejected",
+            );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("targets WIT contract")
+                && message.contains(">=0.3.0, <0.4.0")
+                && message.contains("0.1.0")
+                && message.contains("0.2.0"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("HTTP 404"),
+            "the wasm must never be fetched once the ABI gate rejects the manifest: {message}"
+        );
+        assert!(store
+            .active_component_release("mimo")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // SECURITY (Critical): a manifest whose `component` is an ABSOLUTE path must

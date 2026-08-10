@@ -1,10 +1,19 @@
 //! wasm32-only guest glue: wires [`crate::logic`] to the `ryuzi:http`/
-//! `ryuzi:storage` host imports and exports `ryuzi:provider/provider`.
+//! `ryuzi:storage` host imports and exports `ryuzi:provider/provider@0.2.0`.
 //!
 //! Kept deliberately thin — no wire-protocol decisions live here, only effect
 //! orchestration (bootstrap/cache/retry) and WIT type mapping. The JWT, device
 //! fingerprint, and session-affinity id are cached in host storage so they
 //! survive the per-call re-instantiation the Task 10 adapter performs.
+//!
+//! This component can NOT use `ryuzi_openai_format::provider_component!`: that
+//! macro's egress goes through the host-mediated `ryuzi:provider-auth`
+//! capability, which injects a HOST-managed credential. MiMo's world imports
+//! `ryuzi:http` directly and sends its own bootstrap bearer (see
+//! [`chat_headers`](crate::logic::chat_headers)), so this glue is hand-rolled
+//! — but it follows the exact mapper shapes
+//! `ryuzi_openai_format::__openai_provider_guest_core!` uses, so a reader who
+//! knows that macro recognizes every function here.
 
 use crate::logic::{self, ChunkOut, ProviderFail};
 
@@ -14,8 +23,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use exports::ryuzi::provider::provider::{
-    CompletionChunk, CompletionRequest, Guest, ModelInfo, ProviderError, TokenUsage,
+use exports::ryuzi::provider0_2_0::provider::{
+    CompletionChunk, CompletionRequest, ContentBlock, Guest, ModelInfo, ProviderCapabilities,
+    ProviderError, Role, StopReason, TokenUsage, ToolCall,
 };
 use ryuzi::storage::storage;
 
@@ -28,6 +38,23 @@ const KEY_SESSION_AFFINITY: &str = "session_affinity";
 struct Mimo;
 
 impl Guest for Mimo {
+    /// The free-tier gate does NOT prove it accepts a `tools` array: Task C5's
+    /// live probe (`plugins/mimo/tests/probe_tools_gate.rs`, 2026-08-09) found
+    /// the entire `mimo-auto` free channel already sunset upstream (both a
+    /// toolless baseline and a one-tool request came back an identical
+    /// `HTTP 400 "Unsupported model mimo-auto"` — see the probe result
+    /// recorded on [`logic::classify_chat_error`]), so there is no live
+    /// evidence either way. `tools: false` is the honest answer: the host
+    /// trusts this flag to decide whether to drop the agent's bound tools,
+    /// and a false `true` would silently cost the user those tools with no
+    /// error message.
+    fn capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            tools: false,
+            parallel_tool_calls: false,
+        }
+    }
+
     fn list_models() -> Result<Vec<ModelInfo>, ProviderError> {
         // No network: MiMo's free host has no /models endpoint (see logic).
         Ok(logic::models().into_iter().map(map_model).collect())
@@ -39,10 +66,11 @@ impl Guest for Mimo {
         } else {
             request.model.clone()
         };
+        let messages: Vec<logic::MessageIn> = request.messages.iter().map(map_message_in).collect();
         let session_affinity = ensure_session_affinity();
 
         let jwt = ensure_jwt().map_err(map_fail)?;
-        let response = send_chat(&jwt, &session_affinity, &model, &request).map_err(map_fail)?;
+        let response = send_chat(&jwt, &session_affinity, &model, &messages).map_err(map_fail)?;
 
         // The upstream rejected the bootstrap JWT — invalidate, re-mint once,
         // and retry the same request (mirrors llm_router::client::send_upstream).
@@ -50,7 +78,7 @@ impl Guest for Mimo {
             let _ = storage::delete(KEY_JWT);
             let _ = storage::delete(KEY_JWT_EXP);
             let fresh = mint_jwt().map_err(map_fail)?;
-            send_chat(&fresh, &session_affinity, &model, &request).map_err(map_fail)?
+            send_chat(&fresh, &session_affinity, &model, &messages).map_err(map_fail)?
         } else {
             response
         };
@@ -67,18 +95,29 @@ impl Guest for Mimo {
 }
 
 /// Build + send one chat request through the host HTTP capability.
+///
+/// `tools` is always empty and `tool_choice` is always `Auto`, matching
+/// [`capabilities`](Guest::capabilities)'s honest `tools: false` — MiMo's free
+/// gate has no proven tools support, so nothing bound by the caller is ever
+/// forwarded upstream. `leading_system` is always `Some(SYSTEM_MARKER)`: the
+/// gate 403s any request whose first message is not that exact marker (see
+/// `logic`'s module docs and
+/// `logic::tests::the_gate_marker_stays_messages_zero_ahead_of_the_transcript`).
 fn send_chat(
     jwt: &str,
     session_affinity: &str,
     model: &str,
-    request: &CompletionRequest,
+    messages: &[logic::MessageIn],
 ) -> Result<ryuzi::http::http::HttpResponse, ProviderFail> {
-    let body = logic::build_chat_body(
+    let body = logic::build_chat_body(logic::ChatRequest {
         model,
-        &request.prompt,
-        request.max_tokens,
-        request.temperature,
-    );
+        messages,
+        tools: &[],
+        tool_choice: logic::ToolChoiceIn::Auto,
+        max_tokens: None,
+        temperature: None,
+        leading_system: Some(logic::SYSTEM_MARKER),
+    });
     let headers = logic::chat_headers(jwt, session_affinity);
     http_post(logic::CHAT_URL, headers, body)
 }
@@ -226,10 +265,52 @@ fn map_model(model: logic::ModelOut) -> ModelInfo {
     }
 }
 
+fn map_message_in(message: &exports::ryuzi::provider0_2_0::provider::Message) -> logic::MessageIn {
+    logic::MessageIn {
+        role: match message.role {
+            Role::System => logic::RoleIn::System,
+            Role::User => logic::RoleIn::User,
+            Role::Assistant => logic::RoleIn::Assistant,
+        },
+        content: message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => logic::BlockIn::Text(text.clone()),
+                ContentBlock::ToolUse(call) => logic::BlockIn::ToolUse {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+                ContentBlock::ToolResult(result) => logic::BlockIn::ToolResult {
+                    tool_call_id: result.tool_call_id.clone(),
+                    content: result.content.clone(),
+                    is_error: result.is_error,
+                },
+            })
+            .collect(),
+    }
+}
+
 fn map_chunk(chunk: ChunkOut) -> CompletionChunk {
     CompletionChunk {
         text: chunk.text,
+        tool_calls: chunk
+            .tool_calls
+            .into_iter()
+            .map(|call| ToolCall {
+                id: call.id,
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect(),
         finished: chunk.finished,
+        stop_reason: chunk.stop_reason.map(|reason| match reason {
+            logic::StopOut::EndTurn => StopReason::EndTurn,
+            logic::StopOut::ToolUse => StopReason::ToolUse,
+            logic::StopOut::MaxTokens => StopReason::MaxTokens,
+            logic::StopOut::Other => StopReason::Other,
+        }),
         usage: chunk.usage.map(|u| TokenUsage {
             input: u.input,
             output: u.output,

@@ -78,6 +78,7 @@ pub const CONFIG: OpenAiFormat = OpenAiFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryuzi_openai_format::{BlockIn, ChatRequest, MessageIn, RoleIn, ToolChoiceIn};
     use serde_json::Value;
 
     #[test]
@@ -97,12 +98,19 @@ mod tests {
     fn chat_body_uses_the_legacy_max_tokens_field() {
         // `uses_max_completion_tokens: false` -> qwen speaks the legacy
         // `max_tokens`, never OpenAI's `max_completion_tokens`.
-        let body: Value = serde_json::from_slice(&CONFIG.build_chat_body(
-            "qwen3-coder-plus",
-            "hi",
-            Some(64),
-            None,
-        ))
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".to_string())],
+        }];
+        let body: Value = serde_json::from_slice(&CONFIG.build_chat_body(ChatRequest {
+            model: "qwen3-coder-plus",
+            messages: &messages,
+            tools: &[],
+            tool_choice: ToolChoiceIn::Auto,
+            max_tokens: Some(64),
+            temperature: None,
+            leading_system: None,
+        }))
         .unwrap();
         assert_eq!(body["max_tokens"], 64);
         assert!(

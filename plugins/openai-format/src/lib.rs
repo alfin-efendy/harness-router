@@ -32,15 +32,18 @@
 //! [`error_tag`] exists specifically to keep upstream error PROSE (which can
 //! echo a submitted key) out of the guest-visible error string.
 //!
-//! # Accepted ABI limitation
-//! `ryuzi:provider/provider` is flat text: a `prompt` string in, text chunks
-//! out. Every component built on this crate therefore supports plain text
-//! completion only — no tool calling, no structured multi-turn messages, no
-//! multimodal content, and no true token streaming (the single buffered
-//! upstream response is returned as one terminal chunk). That is a deliberate,
-//! accepted tradeoff of the WASM provider migration, not an oversight.
+//! # Interface: `ryuzi:provider@0.2.0`
+//! Every component built on this crate exports the 0.2.0 interface: a full
+//! transcript (`messages`, each a role plus text/tool-use/tool-result blocks)
+//! and a bound `tools` list go in, and `capabilities()` reports `tools: true`
+//! for all ten — every OpenAI-format upstream behind this macro speaks native
+//! function calling. `parallel_tool_calls` is never claimed, since support
+//! varies per upstream and the host only treats it as a hint. What remains an
+//! accepted limitation is no true token streaming: the single buffered
+//! upstream response is still returned as one terminal
+//! [`ChunkOut`]/`completion-chunk`, not incremental deltas.
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 mod guest_macro;
 
@@ -137,11 +140,98 @@ pub struct UsageOut {
     pub output: u32,
 }
 
+/// Who authored a message (host-free mirror of the WIT 0.2.0 `role`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleIn {
+    System,
+    User,
+    Assistant,
+}
+
+/// One piece of a message (host-free mirror of WIT `content-block`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockIn {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        /// A serialized JSON object.
+        arguments: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+/// One turn of the transcript (host-free mirror of WIT `message`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageIn {
+    pub role: RoleIn,
+    pub content: Vec<BlockIn>,
+}
+
+/// A tool the agent bound for this turn (host-free mirror of WIT `tool-def`).
+/// `input_schema` is a serialized JSON Schema object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolIn {
+    pub name: String,
+    pub description: String,
+    pub input_schema: String,
+}
+
+/// How hard to push the model to call a tool (mirror of WIT `tool-choice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoiceIn {
+    Auto,
+    None,
+    Required,
+}
+
+/// Why the model stopped (mirror of WIT `stop-reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOut {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    Other,
+}
+
+/// One model-emitted tool call (mirror of WIT `tool-call`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallOut {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Everything one chat-generation call needs.
+///
+/// A struct rather than a parameter list because it grew past the point where
+/// positional arguments read safely, and because `leading_system` is easy to
+/// pass in the wrong slot as a bare `Option<&str>`.
+pub struct ChatRequest<'a> {
+    pub model: &'a str,
+    pub messages: &'a [MessageIn],
+    pub tools: &'a [ToolIn],
+    pub tool_choice: ToolChoiceIn,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    /// Prepended as `messages[0]` with role `system` when set. Exists for
+    /// MiMo's anti-abuse gate, which rejects any request whose first message
+    /// is not its marker. Providers with no such gate pass `None`.
+    pub leading_system: Option<&'a str>,
+}
+
 /// One completion chunk (host-free mirror of WIT `completion-chunk`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkOut {
     pub text: String,
+    /// Tool calls the model emitted. Empty for a plain text turn.
+    pub tool_calls: Vec<ToolCallOut>,
     pub finished: bool,
+    pub stop_reason: Option<StopOut>,
     pub usage: Option<UsageOut>,
 }
 
@@ -187,42 +277,117 @@ impl OpenAiFormat {
             .unwrap_or(self.default_context_window)
     }
 
-    /// Build the NON-STREAMING chat-completions body for a flat prompt.
+    /// Build the NON-STREAMING chat-completions body for a full transcript.
     ///
-    /// The `ryuzi:provider/provider` ABI carries a single `prompt` string, so
-    /// the request is exactly one `user` message — no system turn, no tools, no
-    /// multimodal parts. `stream` is false because the host capability is a
-    /// buffered request/response: the component asks for the whole completion
-    /// and returns it as one terminal chunk.
+    /// One input message can expand into SEVERAL OpenAI messages: a
+    /// `ToolResult` block must become its own `role: "tool"` message carrying
+    /// `tool_call_id`, because that is the shape the API requires. Text blocks
+    /// within one message are newline-joined into `content`.
+    ///
+    /// `tools`/`tool_choice` are omitted entirely when no tools are bound —
+    /// several OpenAI-compatible upstreams reject a `tool_choice` sent without
+    /// a `tools` array, and every pure-chat turn takes that path.
     ///
     /// `temperature` is OMITTED when it is not finite (NaN/±inf): JSON has no
-    /// representation for those values, so there is nothing to send. The request
-    /// still goes out and the upstream applies its own default — failing an
-    /// entire completion over an unrepresentable optional tuning knob would be
-    /// the worse trade. Pinned by
+    /// representation for those values. The request still goes out and the
+    /// upstream applies its own default — failing an entire completion over an
+    /// unrepresentable optional tuning knob would be the worse trade. Pinned by
     /// `tests::chat_body_drops_a_non_finite_temperature_rather_than_failing`.
-    pub fn build_chat_body(
-        &self,
-        model: &str,
-        prompt: &str,
-        max_tokens: Option<u32>,
-        temperature: Option<f32>,
-    ) -> Vec<u8> {
-        let mut message = Map::new();
-        message.insert("role".to_string(), Value::String("user".to_string()));
-        message.insert("content".to_string(), Value::String(prompt.to_string()));
+    pub fn build_chat_body(&self, request: ChatRequest<'_>) -> Vec<u8> {
+        let mut messages: Vec<Value> = Vec::new();
+        if let Some(leading) = request.leading_system {
+            messages.push(json!({"role": "system", "content": leading}));
+        }
+        for message in request.messages {
+            let mut text: Vec<&str> = Vec::new();
+            let mut calls: Vec<Value> = Vec::new();
+            let mut results: Vec<Value> = Vec::new();
+            for block in &message.content {
+                match block {
+                    BlockIn::Text(value) => text.push(value.as_str()),
+                    BlockIn::ToolUse {
+                        id,
+                        name,
+                        arguments,
+                    } => calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    })),
+                    BlockIn::ToolResult {
+                        tool_call_id,
+                        content,
+                        ..
+                    } => results.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": content,
+                    })),
+                }
+            }
+            if !text.is_empty() || !calls.is_empty() {
+                let mut entry = Map::new();
+                entry.insert(
+                    "role".to_string(),
+                    Value::String(role_name(message.role).to_string()),
+                );
+                entry.insert("content".to_string(), Value::String(text.join("\n")));
+                if !calls.is_empty() {
+                    entry.insert("tool_calls".to_string(), Value::Array(calls));
+                }
+                messages.push(Value::Object(entry));
+            }
+            // Tool results follow the turn that produced them.
+            messages.extend(results);
+        }
 
         let mut obj = Map::new();
-        obj.insert("model".to_string(), Value::String(model.to_string()));
         obj.insert(
-            "messages".to_string(),
-            Value::Array(vec![Value::Object(message)]),
+            "model".to_string(),
+            Value::String(request.model.to_string()),
         );
+        obj.insert("messages".to_string(), Value::Array(messages));
         obj.insert("stream".to_string(), Value::Bool(false));
-        if let Some(max) = max_tokens {
+        if !request.tools.is_empty() {
+            obj.insert(
+                "tools".to_string(),
+                Value::Array(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "type": "function",
+                                "function": {
+                                    "name": tool.name,
+                                    "description": tool.description,
+                                    // A schema that does not parse is a host
+                                    // bug, not a reason to fail the turn:
+                                    // degrade to the permissive open object.
+                                    "parameters": serde_json::from_str::<Value>(&tool.input_schema)
+                                        .unwrap_or_else(|_| json!({"type": "object"})),
+                                },
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+            obj.insert(
+                "tool_choice".to_string(),
+                Value::String(
+                    match request.tool_choice {
+                        ToolChoiceIn::Auto => "auto",
+                        ToolChoiceIn::None => "none",
+                        ToolChoiceIn::Required => "required",
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+        if let Some(max) = request.max_tokens {
             obj.insert(self.max_tokens_field.to_string(), Value::from(max));
         }
-        if let Some(temp) = temperature {
+        if let Some(temp) = request.temperature {
             if let Some(number) = serde_json::Number::from_f64(temp as f64) {
                 obj.insert("temperature".to_string(), Value::Number(number));
             }
@@ -277,25 +442,59 @@ impl OpenAiFormat {
     }
 
     /// Convert a buffered (non-stream) chat completion into ordered completion
-    /// chunks: the assistant message content becomes a single terminal chunk
-    /// carrying the response's token usage when present.
+    /// chunks: one terminal chunk carrying the assistant text, any tool calls,
+    /// the mapped stop reason, and the response's token usage when present.
+    ///
+    /// A missing/empty `content` is NOT an error: a tool-call turn legitimately
+    /// carries `""` or `null` there, and rejecting it would fail every tool
+    /// call. Only a response with no `choices` entry at all is malformed.
     pub fn parse_chat_response(&self, body: &[u8]) -> Result<Vec<ChunkOut>, ProviderFail> {
         let label = self.provider_label;
         let value: Value = serde_json::from_slice(body)
             .map_err(|e| ProviderFail::Failed(format!("{label} chat response is not JSON: {e}")))?;
-        let content = value
+        let choice = value
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
             .ok_or_else(|| {
-                ProviderFail::Failed(format!("{label} chat response carried no content"))
+                ProviderFail::Failed(format!("{label} chat response carried no choices"))
             })?;
+        let message = choice.get("message").unwrap_or(&Value::Null);
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| {
+                        let function = call.get("function")?;
+                        Some(ToolCallOut {
+                            id: call.get("id")?.as_str()?.to_string(),
+                            name: function.get("name")?.as_str()?.to_string(),
+                            arguments: function
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}")
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(vec![ChunkOut {
-            text: content.to_string(),
+            text: message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool_calls,
             finished: true,
+            stop_reason: Some(match choice.get("finish_reason").and_then(Value::as_str) {
+                Some("tool_calls") => StopOut::ToolUse,
+                Some("length") => StopOut::MaxTokens,
+                Some("stop") => StopOut::EndTurn,
+                _ => StopOut::Other,
+            }),
             usage: parse_usage(&value),
         }])
     }
@@ -410,6 +609,14 @@ pub fn error_tag(body: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+fn role_name(role: RoleIn) -> &'static str {
+    match role {
+        RoleIn::System => "system",
+        RoleIn::User => "user",
+        RoleIn::Assistant => "assistant",
+    }
+}
+
 fn parse_usage(value: &Value) -> Option<UsageOut> {
     let usage = value.get("usage")?;
     let input = usage.get("prompt_tokens").and_then(Value::as_u64)?;
@@ -519,25 +726,39 @@ mod tests {
     }
 
     #[test]
-    fn chat_body_maps_the_flat_prompt_to_a_single_user_message() {
-        let body: Value =
-            serde_json::from_slice(&OPENAI.build_chat_body("gpt-5.2", "ping", None, None)).unwrap();
+    fn chat_body_sets_model_and_stream_and_omits_optional_fields_by_default() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("ping".into())],
+        }];
+        let mut request = req(&messages, &[]);
+        request.model = "gpt-5.2";
+        let body: Value = serde_json::from_slice(&OPENAI.build_chat_body(request)).unwrap();
         assert_eq!(body["model"], "gpt-5.2");
         assert_eq!(body["stream"], false);
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1, "the flat ABI carries exactly one turn");
-        assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "ping");
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"], "ping");
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("temperature").is_none());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]
     fn chat_body_uses_the_configured_token_cap_field_and_never_both() {
-        let newer: Value =
-            serde_json::from_slice(&OPENAI.build_chat_body("gpt-5.2", "hi", Some(64), Some(0.2)))
-                .unwrap();
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
+
+        let mut newer_request = req(&messages, &[]);
+        newer_request.model = "gpt-5.2";
+        newer_request.max_tokens = Some(64);
+        newer_request.temperature = Some(0.2);
+        let newer: Value = serde_json::from_slice(&OPENAI.build_chat_body(newer_request)).unwrap();
         assert_eq!(newer["max_completion_tokens"], 64);
         assert!(
             newer.get("max_tokens").is_none(),
@@ -547,8 +768,9 @@ mod tests {
         // value — compare within f32 precision rather than bit-exactly.
         assert!((newer["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
 
-        let legacy: Value =
-            serde_json::from_slice(&OTHER.build_chat_body("m", "hi", Some(64), None)).unwrap();
+        let mut legacy_request = req(&messages, &[]);
+        legacy_request.max_tokens = Some(64);
+        let legacy: Value = serde_json::from_slice(&OTHER.build_chat_body(legacy_request)).unwrap();
         assert_eq!(legacy["max_tokens"], 64);
         assert!(
             legacy.get("max_completion_tokens").is_none(),
@@ -559,10 +781,15 @@ mod tests {
 
     #[test]
     fn chat_body_drops_a_non_finite_temperature_rather_than_failing() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let body: Value =
-                serde_json::from_slice(&OPENAI.build_chat_body("gpt-5.2", "hi", None, Some(bad)))
-                    .unwrap();
+            let mut request = req(&messages, &[]);
+            request.model = "gpt-5.2";
+            request.temperature = Some(bad);
+            let body: Value = serde_json::from_slice(&OPENAI.build_chat_body(request)).unwrap();
             assert!(
                 body.get("temperature").is_none(),
                 "a non-finite temperature ({bad}) must be omitted, not serialized"
@@ -900,5 +1127,236 @@ mod tests {
         );
         assert!(!rendered.to_lowercase().contains("bearer"));
         assert!(!rendered.contains("access_token"));
+    }
+
+    // --- Tool-bearing chat requests / responses (Task C1) ---
+    //
+    // These reuse the existing `OPENAI` fixture const above rather than adding
+    // a second `fixture()` helper — the module already has exactly one config
+    // every other test in this file builds against.
+
+    fn req<'a>(messages: &'a [MessageIn], tools: &'a [ToolIn]) -> ChatRequest<'a> {
+        ChatRequest {
+            model: "m",
+            messages,
+            tools,
+            tool_choice: ToolChoiceIn::Auto,
+            max_tokens: None,
+            temperature: None,
+            leading_system: None,
+        }
+    }
+
+    #[test]
+    fn chat_body_carries_the_full_transcript_not_a_single_user_message() {
+        let messages = vec![
+            MessageIn {
+                role: RoleIn::System,
+                content: vec![BlockIn::Text("sys".into())],
+            },
+            MessageIn {
+                role: RoleIn::User,
+                content: vec![BlockIn::Text("hi".into())],
+            },
+        ];
+        let body: Value =
+            serde_json::from_slice(&OPENAI.build_chat_body(req(&messages, &[]))).unwrap();
+
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "sys");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "hi");
+    }
+
+    #[test]
+    fn a_leading_system_is_prepended_ahead_of_the_transcript() {
+        // MiMo's anti-abuse gate needs its marker as messages[0]; providers with
+        // no such gate pass `None` and get no extra message.
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
+        let mut request = req(&messages, &[]);
+        request.leading_system = Some("MARKER");
+        let body: Value = serde_json::from_slice(&OPENAI.build_chat_body(request)).unwrap();
+
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "MARKER");
+        assert_eq!(out[1]["role"], "user");
+    }
+
+    #[test]
+    fn tools_are_forwarded_in_the_openai_function_shape() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("w?".into())],
+        }];
+        let tools = vec![ToolIn {
+            name: "get_weather".into(),
+            description: "Get weather".into(),
+            input_schema: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
+        }];
+        let body: Value =
+            serde_json::from_slice(&OPENAI.build_chat_body(req(&messages, &tools))).unwrap();
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn no_tools_means_no_tools_or_tool_choice_key_at_all() {
+        // Several OpenAI-compatible upstreams reject a tool_choice sent without
+        // tools, and every pure-chat turn takes this path.
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
+        let body: Value =
+            serde_json::from_slice(&OPENAI.build_chat_body(req(&messages, &[]))).unwrap();
+
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn an_unparseable_tool_schema_degrades_to_an_open_object_instead_of_failing() {
+        let messages = vec![MessageIn {
+            role: RoleIn::User,
+            content: vec![BlockIn::Text("hi".into())],
+        }];
+        let tools = vec![ToolIn {
+            name: "broken".into(),
+            description: String::new(),
+            input_schema: "not json".into(),
+        }];
+        let body: Value =
+            serde_json::from_slice(&OPENAI.build_chat_body(req(&messages, &tools))).unwrap();
+
+        assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn an_assistant_tool_call_and_its_result_become_openai_turns() {
+        let messages = vec![
+            MessageIn {
+                role: RoleIn::Assistant,
+                content: vec![BlockIn::ToolUse {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"Jakarta"}"#.into(),
+                }],
+            },
+            MessageIn {
+                role: RoleIn::User,
+                content: vec![BlockIn::ToolResult {
+                    tool_call_id: "call_1".into(),
+                    content: "31C".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let body: Value =
+            serde_json::from_slice(&OPENAI.build_chat_body(req(&messages, &[]))).unwrap();
+
+        let out = body["messages"].as_array().unwrap();
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(out[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            out[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Jakarta"}"#
+        );
+        // A tool result is its own message with role "tool" — the shape the API
+        // requires, and the reason one input message can expand into several.
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["tool_call_id"], "call_1");
+        assert_eq!(out[1]["content"], "31C");
+    }
+
+    #[test]
+    fn parse_chat_response_reads_tool_calls_and_the_tool_use_stop_reason() {
+        // Captured verbatim from a live OpenCode Zen call on 2026-08-09.
+        let body = br#"{
+            "choices":[{"index":0,"finish_reason":"tool_calls","message":{
+                "role":"assistant","content":"",
+                "tool_calls":[{"index":0,"id":"call_00_abc","type":"function",
+                    "function":{"name":"get_weather","arguments":"{\"city\": \"Jakarta\"}"}}]}}],
+            "usage":{"prompt_tokens":369,"completion_tokens":68}
+        }"#;
+
+        let chunks = OPENAI.parse_chat_response(body).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].finished);
+        assert_eq!(chunks[0].stop_reason, Some(StopOut::ToolUse));
+        assert_eq!(chunks[0].tool_calls.len(), 1);
+        assert_eq!(chunks[0].tool_calls[0].id, "call_00_abc");
+        assert_eq!(chunks[0].tool_calls[0].name, "get_weather");
+        assert_eq!(chunks[0].tool_calls[0].arguments, r#"{"city": "Jakarta"}"#);
+        assert_eq!(
+            chunks[0].usage,
+            Some(UsageOut {
+                input: 369,
+                output: 68
+            })
+        );
+    }
+
+    #[test]
+    fn a_tool_call_response_with_empty_content_is_not_an_error() {
+        // The previous parser REQUIRED a content string and returned
+        // "chat response carried no content" otherwise — which would have failed
+        // every single tool call.
+        assert!(OPENAI
+            .parse_chat_response(
+                br#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"n","arguments":"{}"}}]}}]}"#
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn a_plain_text_response_still_parses_with_an_end_turn_stop_reason() {
+        let chunks = OPENAI
+            .parse_chat_response(
+                br#"{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}"#,
+            )
+            .unwrap();
+        assert_eq!(chunks[0].text, "ok");
+        assert!(chunks[0].tool_calls.is_empty());
+        assert_eq!(chunks[0].stop_reason, Some(StopOut::EndTurn));
+    }
+
+    #[test]
+    fn a_length_finish_maps_to_max_tokens_and_an_unknown_one_to_other() {
+        let stop = |reason: &str| {
+            OPENAI
+                .parse_chat_response(
+                    format!(
+                        r#"{{"choices":[{{"finish_reason":"{reason}","message":{{"content":"x"}}}}]}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()[0]
+                .stop_reason
+        };
+        assert_eq!(stop("length"), Some(StopOut::MaxTokens));
+        assert_eq!(stop("content_filter"), Some(StopOut::Other));
+    }
+
+    #[test]
+    fn a_response_with_no_choices_is_still_an_error() {
+        assert!(matches!(
+            OPENAI.parse_chat_response(br#"{"choices":[]}"#),
+            Err(ProviderFail::Failed(_))
+        ));
     }
 }

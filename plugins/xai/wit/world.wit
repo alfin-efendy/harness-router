@@ -19,5 +19,5 @@ world xai {
   import ryuzi:plugin/types@0.1.0;
   import ryuzi:provider-auth/provider-auth@0.1.0;
   import ryuzi:storage/storage@0.1.0;
-  export ryuzi:provider/provider@0.1.0;
+  export ryuzi:provider/provider@0.2.0;
 }

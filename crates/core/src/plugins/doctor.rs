@@ -15,14 +15,6 @@ use ryuzi_plugin_sdk::{PluginManifest, PluginRelease};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The WIT contract version this host implements — the single concrete version
-/// every `ryuzi:*@0.1.0` import/export in [`crate::plugins::runtime`] is pinned
-/// to, and the value the first-party signer stamps into each `release.json`
-/// (`scripts/plugins/build-first-party.ts`'s `WIT_API_VERSION`). A component
-/// whose manifest `wit-api` range excludes this version cannot bind against the
-/// host — see the `abi-incompatible` finding.
-const HOST_WIT_API_VERSION: &str = "0.1.0";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorFinding {
@@ -384,37 +376,43 @@ fn append_signature_finding(
 }
 
 /// Finding #3 — ABI compatibility. Check the installed release's manifest
-/// `wit-api` RANGE against the host's supported WIT contract version
-/// ([`HOST_WIT_API_VERSION`]) using [`semver::VersionReq`] — never a hand-rolled
-/// range parser. A release whose accepted range excludes the running host
-/// version cannot bind its imports/exports against this host.
+/// `wit-api` RANGE against the SET of WIT contract versions this host
+/// implements ([`crate::plugins::runtime::HOST_WIT_API_VERSIONS`]) via
+/// [`crate::plugins::runtime::host_satisfies_wit_api_range`] — the SAME
+/// predicate `remote_catalog::install_component_release`'s pre-download gate
+/// evaluates, so the two can never disagree about what this host supports. A
+/// release is compatible as soon as its accepted range matches ANY one of the
+/// host's supported versions; the finding fires only when it matches NONE of
+/// them (a range can't bind its imports/exports against this host at all).
 fn append_abi_finding(
     findings: &mut Vec<DoctorFinding>,
     record: &ComponentPluginReleaseRecord,
     manifest: &PluginManifest,
 ) {
+    use crate::plugins::runtime::{host_satisfies_wit_api_range, HOST_WIT_API_VERSIONS};
+
     let Some(component) = manifest.component.as_ref() else {
         return;
     };
-    let (Ok(req), Ok(host)) = (
-        semver::VersionReq::parse(&component.wit_api),
-        semver::Version::parse(HOST_WIT_API_VERSION),
-    ) else {
-        return;
-    };
-    if req.matches(&host) {
+    // `host_satisfies_wit_api_range` treats an unparseable range as
+    // compatible (see its doc comment) — the same "not this predicate's
+    // problem to reject" behavior this finding always had (its own former
+    // `let Ok(req) = ... else { return }` skipped an unparseable range with
+    // no finding pushed).
+    if host_satisfies_wit_api_range(&component.wit_api) {
         return;
     }
+    let supported = HOST_WIT_API_VERSIONS.join(", ");
     findings.push(DoctorFinding {
         plugin_id: record.plugin_id.clone(),
         severity: "error".into(),
         kind: "abi-incompatible".into(),
         message: format!(
-            "{} ({}) targets WIT contract `{}`, which excludes this host's `{HOST_WIT_API_VERSION}`",
+            "{} ({}) targets WIT contract `{}`, which excludes every WIT contract version this host supports (`{supported}`)",
             record.plugin_id, record.version, component.wit_api
         ),
         suggested_action: format!(
-            "Update {} to a release built for WIT `{HOST_WIT_API_VERSION}`",
+            "Update {} to a release built for one of this host's supported WIT versions (`{supported}`)",
             record.plugin_id
         ),
     });
@@ -957,6 +955,8 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn healthy_installed_release_yields_no_component_findings() {
+            // `wit-api = "^0.1.0"` matches ONLY the host's `0.1.0` (of the two
+            // it supports) — this is the "range matching only 0.1.0" ABI case.
             let (cp, store, _db) = cp_with_store().await;
             let root = tempfile::tempdir().unwrap();
             let m = manifest("acme-connector", "0.1.0", "^0.1.0", "");
@@ -979,6 +979,38 @@ pub(crate) mod tests {
             assert!(
                 findings.is_empty(),
                 "a fully valid installed release must yield no finding, got: {findings:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn installed_release_targeting_only_the_newer_host_abi_yields_no_component_findings()
+        {
+            // `wit-api = "^0.2.0"` matches ONLY the host's `0.2.0` (of the two
+            // it supports) — this is the "range matching only 0.2.0" ABI case,
+            // covering the ten provider components that moved to the
+            // tool-carrying 0.2.0 export.
+            let (cp, store, _db) = cp_with_store().await;
+            let root = tempfile::tempdir().unwrap();
+            let m = manifest("acme-connector", "0.1.0", "^0.2.0", "");
+            let sha = write_bundle(
+                root.path(),
+                "acme-connector",
+                "0.1.0",
+                &m,
+                b"component bytes",
+                "0.2.0",
+                &signing_key(),
+                FIRST_PARTY,
+            );
+            seed_active(&store, "acme-connector", "0.1.0", &sha, FIRST_PARTY).await;
+
+            let findings =
+                plugin_doctor_with(&cp, &wasm_inputs(root.path(), trusted_keys(), vec![]))
+                    .await
+                    .unwrap();
+            assert!(
+                findings.iter().all(|f| f.kind != "abi-incompatible"),
+                "a release targeting only the host's newer supported ABI must not report abi-incompatible, got: {findings:?}"
             );
         }
 
@@ -1126,15 +1158,17 @@ pub(crate) mod tests {
         async fn release_targeting_incompatible_wit_reports_abi_incompatible() {
             let (cp, store, _db) = cp_with_store().await;
             let root = tempfile::tempdir().unwrap();
-            // Manifest targets `^0.2.0`, which excludes the host's `0.1.0`.
-            let m = manifest("acme-connector", "0.1.0", "^0.2.0", "");
+            // Manifest targets `^0.5.0` (i.e. `>=0.5.0, <0.6.0`), which matches
+            // NEITHER of the host's supported `0.1.0`/`0.2.0` — the "range
+            // matching neither" ABI case, which must still be reported.
+            let m = manifest("acme-connector", "0.1.0", "^0.5.0", "");
             let sha = write_bundle(
                 root.path(),
                 "acme-connector",
                 "0.1.0",
                 &m,
                 b"component bytes",
-                "0.1.0",
+                "0.5.0",
                 &signing_key(),
                 FIRST_PARTY,
             );
@@ -1147,10 +1181,13 @@ pub(crate) mod tests {
             let finding = findings
                 .iter()
                 .find(|f| f.kind == "abi-incompatible")
-                .expect("a WIT range excluding the host version must report abi-incompatible");
+                .expect(
+                    "a WIT range matching none of the host's supported versions must report abi-incompatible",
+                );
             assert_eq!(finding.severity, "error");
             assert!(finding.message.contains("0.1.0"), "{}", finding.message);
-            assert!(finding.message.contains("^0.2.0"), "{}", finding.message);
+            assert!(finding.message.contains("0.2.0"), "{}", finding.message);
+            assert!(finding.message.contains("^0.5.0"), "{}", finding.message);
         }
 
         #[tokio::test]

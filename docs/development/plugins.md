@@ -191,6 +191,75 @@ itself never drives PKCE/device-flow and never sees a token.
 else `[self.id]` when a `[provider]` block exists at all (even metadata-only,
 `ids = []`), else empty (not a provider plugin at all).
 
+#### Two provider WIT interfaces: 0.1.0 (flat) and 0.2.0 (tool-carrying)
+
+A component-backed provider (`[component]` + non-empty `provider.ids`) exports
+one of two versions of `ryuzi:provider/provider`, declared implicitly by
+whichever the component's `wit/world.wit` actually `export`s and covered by
+its manifest's `wit-api` range:
+
+- **`ryuzi:provider/provider@0.1.0`** — the original, flat-prompt interface.
+  Its `complete` takes a single string `prompt` and returns chunks with no
+  tool channel at all; a 0.1.0-only component can never carry tools.
+- **`ryuzi:provider/provider@0.2.0`** — the structured, tool-carrying
+  interface. Its own `complete` (same function name — the two are
+  disambiguated by package version, not a different function name) takes a
+  full transcript (`messages`, each with typed content blocks — text,
+  tool-use, tool-result) plus a `tools` list and a `tool-choice`, and can
+  return tool calls the router turns into `tool_use` events.
+
+The host implements **both simultaneously** — see `HOST_WIT_API_VERSIONS` in
+`crates/core/src/plugins/runtime.rs`, which lists `["0.1.0", "0.2.0"]` and
+accepts a component whose `wit-api` range matches either. A component may
+export only 0.1.0, only 0.2.0, or (in principle) both; the host **prefers
+0.2.0** and negotiates per component, at discovery time, by reading which
+export(s) the compiled component actually has
+(`WasmProviderTransport::exports_provider` /
+`exports_provider_v2` in `crates/core/src/plugins/wasm_provider.rs`) — this is
+a per-component decision, not a global host setting, so a mixed fleet (some
+providers still 0.1.0-only, some migrated to 0.2.0) is fully supported.
+
+Discovery then resolves the component's own `capabilities()` export **once**
+and caches it (`WasmProviderTransport::new_resolved`). Two *different*
+questions are in play once the router has a routed connection in hand, and
+they must never be conflated:
+
+- **Which ABI to call** is decided ENTIRELY by `exports_provider_v2()`
+  (exposed to the router as `WasmProviderRuntime::speaks_structured_abi`) —
+  never by `capabilities().tools`. A component that exports 0.2.0 always
+  goes through the structured `complete_v2`; only a component with no 0.2.0
+  export at all falls back to the flat 0.1.0 `complete`.
+- **Whether tools may be forwarded** is `capabilities().tools`, consulted
+  only after the ABI is already decided. It changes what a 0.2.0 request
+  carries, never which function is called: `tools: true` forwards the
+  request's bound tools and its `tool_choice` as given; `tools: false`
+  still calls `complete_v2`, but with an empty `tools` list and
+  `tool_choice: none`.
+
+So there are three cases, not two:
+
+| component exports | `capabilities().tools` | path |
+| --- | --- | --- |
+| 0.2.0 | `true` | `complete_v2`, tools forwarded |
+| 0.2.0 | `false` | `complete_v2`, empty tools list |
+| 0.1.0 only | *(no 0.2.0 export to ask)* | `complete`, flat prompt |
+
+The middle row matters in practice, not just in principle: `mimo`'s
+free-tier component exports ONLY 0.2.0 and honestly reports `tools: false`
+(its live probe found no evidence the upstream accepts a tools array).
+Keying the ABI choice on `capabilities().tools` instead of the export would
+route every `mimo` turn into the flat `complete` — which a 0.2.0-only
+component never exports — failing every turn outright rather than returning
+a toolless completion. In practice, a real 0.2.0 component should answer
+`capabilities().tools = true` only if it genuinely forwards the bound tool
+list to its upstream and can return tool-use content back; a component that
+exports 0.2.0 but never forwards tools (or whose upstream doesn't support
+tool-calling) must still report `tools: false`, or the router will hand it
+tool definitions it silently drops. `capabilities()` fails closed: an error,
+trap, or timeout while resolving it — and a transport that has never been
+resolved at all — is always treated as `tools: false`, never optimistically
+tool-capable.
+
 ### `[[tools]]`
 
 See the top-level table above; full field shape:

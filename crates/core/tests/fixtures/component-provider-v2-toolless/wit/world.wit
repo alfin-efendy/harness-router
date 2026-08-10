@@ -1,0 +1,6 @@
+package fixture:provider-v2-toolless@0.1.0;
+
+world provider-v2-toolless-fixture {
+  import ryuzi:plugin/types@0.1.0;
+  export ryuzi:provider/provider@0.2.0;
+}

@@ -1,0 +1,98 @@
+package ryuzi:provider@0.2.0;
+
+/// Structured model completion. The 0.1.0 interface in `provider.wit` takes a
+/// single flattened `prompt` and returns text, so a turn routed to a component
+/// provider loses every bound tool. This version carries the transcript and the
+/// tool contract, so an agent's tools, MCP servers and skills reach the model
+/// exactly as they do over HTTP.
+///
+/// Additive: `ryuzi:provider@0.1.0` is unchanged and still exported by the root
+/// world, so a component that implements only that keeps working.
+interface provider {
+  record token-usage { input: u32, output: u32 }
+
+  record model-info {
+    id: string,
+    display-name: string,
+    context-window: u32,
+  }
+
+  variant provider-error {
+    invalid-request(string),
+    model-not-found,
+    rate-limited,
+    unavailable,
+    failed(string),
+  }
+
+  /// A tool the agent bound for this turn. `input-schema` is a serialized JSON
+  /// Schema object: WIT has no JSON value type, and every upstream treats the
+  /// schema as opaque JSON anyway.
+  record tool-def {
+    name: string,
+    description: string,
+    input-schema: string,
+  }
+
+  /// One model-emitted call. `arguments` is a serialized JSON object.
+  record tool-call {
+    id: string,
+    name: string,
+    arguments: string,
+  }
+
+  /// The outcome of a previous call, replayed on the next turn.
+  record tool-result {
+    tool-call-id: string,
+    content: string,
+    is-error: bool,
+  }
+
+  variant content-block {
+    text(string),
+    tool-use(tool-call),
+    tool-result(tool-result),
+  }
+
+  enum role { system, user, assistant }
+
+  record message {
+    role: role,
+    content: list<content-block>,
+  }
+
+  enum tool-choice { auto, none, required }
+
+  record completion-request {
+    model: string,
+    messages: list<message>,
+    tools: list<tool-def>,
+    tool-choice: tool-choice,
+    max-tokens: option<u32>,
+    temperature: option<f32>,
+  }
+
+  enum stop-reason { end-turn, tool-use, max-tokens, other }
+
+  record completion-chunk {
+    text: string,
+    tool-calls: list<tool-call>,
+    finished: bool,
+    stop-reason: option<stop-reason>,
+    usage: option<token-usage>,
+  }
+
+  /// What this component can actually do, independent of what this interface
+  /// allows. A component whose upstream rejects a tools array reports
+  /// `tools: false`; the host then keeps treating it as toolless rather than
+  /// failing the turn. Infallible and side-effect free: it is a static
+  /// declaration, and the router consults it on every routing decision.
+  record provider-capabilities {
+    tools: bool,
+    parallel-tool-calls: bool,
+  }
+
+  capabilities: func() -> provider-capabilities;
+  list-models: func() -> result<list<model-info>, provider-error>;
+  complete: func(request: completion-request) -> result<list<completion-chunk>, provider-error>;
+}

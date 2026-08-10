@@ -23,5 +23,5 @@ world anthropic-oauth {
   import ryuzi:plugin/types@0.1.0;
   import ryuzi:oauth/oauth@0.2.0;
   import ryuzi:storage/storage@0.1.0;
-  export ryuzi:provider/provider@0.1.0;
+  export ryuzi:provider/provider@0.2.0;
 }

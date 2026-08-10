@@ -16,6 +16,16 @@
 //! `for<'a> D::Data<'a>: Host` — the state type `T` itself is *not* the
 //! `HasData` marker; `wasmtime::component::HasSelf<T>` is, and is what every
 //! call site here passes as `D` (confirmed by direct probe, not assumed).
+//!
+//! Since the `plugin` world exports BOTH `ryuzi:provider/provider@0.1.0` and
+//! `ryuzi:provider/provider@0.2.0` (same namespace+package name, different
+//! version), wasmtime's codegen disambiguates the whole `ryuzi:provider`
+//! package module by version rather than colliding on a bare `provider`
+//! module — confirmed empirically, not documented behavior. The guest exports
+//! land at `exports::ryuzi::provider0_1_0::provider` and
+//! `exports::ryuzi::provider0_2_0::provider` (each still exposing an
+//! interface-level `provider` module underneath). `wasm_provider.rs` imports
+//! the 0.1.0 path; a later task imports the 0.2.0 one the same way.
 
 wasmtime::component::bindgen!({
     path: "../plugin-sdk/wit",

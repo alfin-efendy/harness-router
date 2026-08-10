@@ -8,17 +8,31 @@ publish = false
 description = "First-party Xiaomi MiMo free-tier provider component (ryuzi:provider/provider)."
 
 [lib]
-crate-type = ["cdylib"]
+# "rlib" (alongside "cdylib") is needed so the throwaway integration test in
+# `tests/probe_tools_gate.rs` can link `logic` as an ordinary dependency; only
+# the cdylib artifact is ever picked up by the wasm32-wasip2 component build.
+# Kept deliberately, not leftover scaffolding: MiMo's free tier is `#[ignore]`d
+# rather than deleted so it can be re-probed by hand if the gate ever accepts
+# tools again, and the probe needs `rlib` to compile at all.
+crate-type = ["cdylib", "rlib"]
 
 # `wit-bindgen` is only invoked inside the `#[cfg(target_arch = "wasm32")]`
 # guest module; the pure `logic` module (and its native `cargo test`) never
 # touches the generated host bindings. serde_json/sha2/base64 are shared by
 # both the pure logic and the guest glue.
+#
+# `ryuzi-openai-format` is a path dependency on a sibling standalone workspace —
+# the mechanism for sharing code across the independently buildable
+# `plugins/<id>/` bundles. MiMo's free chat endpoint is OpenAI-compatible
+# (`/openai/chat`), so its request/response mapping is delegated to this crate
+# rather than reimplemented. What stays local — the bootstrap/JWT dance, device
+# fingerprint, gate headers, `classify_chat_error` — has no counterpart there.
 [dependencies]
 wit-bindgen = "0.57"
 serde_json = "1"
 sha2 = "0.10"
 base64 = "0.22"
+ryuzi-openai-format = { path = "../openai-format" }
 
 # wasm32-only: the guest seeds its per-install device id from the host's
 # `wasi:random/random` (the WASI baseline the runtime always grants) via
@@ -26,6 +40,13 @@ base64 = "0.22"
 # pull it. No features needed — wasm32-wasip2 is supported out of the box.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = "0.3"
+
+# Dev-only, used by the throwaway `tests/probe_tools_gate.rs` (Task C5 Step 1)
+# to hit the live MiMo free-tier gate with a real bootstrap + tools array. Not
+# part of the wasm build (dev-dependencies never are); the test itself is
+# `#[ignore]`d so it never runs on a normal `cargo test`.
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [profile.release]
 # Small, reproducible components: no debug info, abort on panic (a panicking

@@ -1,6 +1,6 @@
 //! First-party Anthropic provider component.
 //!
-//! Exports `ryuzi:provider/provider@0.1.0` (`list-models` + `complete`) over
+//! Exports `ryuzi:provider/provider@0.2.0` (`list-models` + `complete`) over
 //! Anthropic's `/models` and `/messages` endpoints.
 //!
 //! # A different wire format
