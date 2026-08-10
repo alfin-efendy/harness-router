@@ -88,6 +88,69 @@ pub async fn select_authorization_server(
     )
 }
 
+/// A started PKCE authorization: the URL to open, plus the verifier and state
+/// the callback must be matched against.
+pub struct McpAuthorizeStart {
+    pub url: String,
+    pub verifier: String,
+    pub state: String,
+}
+
+/// Build the authorization URL. `resource` MUST be the canonical MCP server
+/// URI — see [`canonical_resource_uri`] — and is sent whether or not the
+/// authorization server advertises support for it, as the spec requires.
+pub fn build_authorize_url(
+    metadata: &OauthServerMetadata,
+    client_id: &str,
+    redirect_uri: &str,
+    resource: &str,
+    scopes: &[String],
+) -> anyhow::Result<McpAuthorizeStart> {
+    let verifier = crate::plugins::oauth::generate_pkce_verifier();
+    let challenge = crate::plugins::oauth::pkce_challenge_s256(&verifier);
+    let state = crate::plugins::oauth::generate_pkce_verifier();
+    let mut url = url::Url::parse(&metadata.authorization_endpoint)
+        .map_err(|e| anyhow::anyhow!("invalid authorization_endpoint: {e}"))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("response_type", "code");
+        q.append_pair("client_id", client_id);
+        q.append_pair("redirect_uri", redirect_uri);
+        q.append_pair("code_challenge", &challenge);
+        q.append_pair("code_challenge_method", "S256");
+        q.append_pair("state", &state);
+        q.append_pair("resource", resource);
+        if !scopes.is_empty() {
+            q.append_pair("scope", &scopes.join(" "));
+        }
+    }
+    Ok(McpAuthorizeStart {
+        url: url.to_string(),
+        verifier,
+        state,
+    })
+}
+
+/// The form body for the authorization-code exchange. `resource` appears here
+/// too — RFC 8707 requires it on the token request as well, and a token minted
+/// without it is not bound to this MCP server.
+pub fn token_request_form(
+    code: &str,
+    verifier: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    resource: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("grant_type".to_string(), "authorization_code".to_string()),
+        ("code".to_string(), code.to_string()),
+        ("redirect_uri".to_string(), redirect_uri.to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+        ("code_verifier".to_string(), verifier.to_string()),
+        ("resource".to_string(), resource.to_string()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +220,104 @@ mod tests {
             authorization_servers_from_prm(&serde_json::json!({})).is_err(),
             "a PRM document missing the field entirely must fail the same way as an empty array, \
              not be treated as a different (silently-ignored) case"
+        );
+    }
+
+    fn metadata() -> OauthServerMetadata {
+        serde_json::from_value(serde_json::json!({
+            "issuer": "https://as.example",
+            "authorization_endpoint": "https://as.example/authorize",
+            "token_endpoint": "https://as.example/token"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_authorize_url_carries_pkce_and_the_resource_parameter() {
+        let start = build_authorize_url(
+            &metadata(),
+            "client-1",
+            "http://127.0.0.1:8976/mcp-oauth/rovo/callback",
+            "https://mcp.example.com",
+            &["read".to_string()],
+        )
+        .unwrap();
+
+        let url = url::Url::parse(&start.url).unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("response_type").map(String::as_str),
+            Some("code"),
+            "an authorization-code grant must be requested explicitly"
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256"),
+            "the challenge method must be S256, not the deprecated plain method"
+        );
+        assert_eq!(
+            q.get("client_id").map(String::as_str),
+            Some("client-1"),
+            "the registered client id must be forwarded verbatim"
+        );
+        assert_eq!(
+            q.get("resource").map(String::as_str),
+            Some("https://mcp.example.com"),
+            "RFC 8707 requires `resource` on the authorization request — without it the token this \
+             flow eventually mints is not bound to this MCP server, and nothing here would tell you"
+        );
+        assert!(
+            !start.verifier.is_empty() && !start.state.is_empty(),
+            "both the PKCE verifier and the anti-CSRF state must be non-empty or the callback has \
+             nothing to validate the response against"
+        );
+        assert_ne!(
+            q.get("code_challenge").map(String::as_str),
+            Some(start.verifier.as_str()),
+            "the challenge sent to the AS must be the S256 hash of the verifier, never the raw \
+             verifier itself — sending the verifier would defeat PKCE entirely"
+        );
+    }
+
+    #[test]
+    fn the_token_request_also_carries_the_resource_parameter() {
+        // This is the half implementers forget: the spec requires `resource`
+        // on BOTH requests, and omitting it here yields a token that is not
+        // audience-bound even though the authorize call looked correct — and
+        // nothing at runtime would tell you, because the token endpoint still
+        // returns 200. This test is deliberately separate from the authorize
+        // one above so a regression that drops `resource` from only one of
+        // the two call sites still fails a test.
+        let form = token_request_form(
+            "the-code",
+            "the-verifier",
+            "client-1",
+            "http://127.0.0.1:8976/mcp-oauth/rovo/callback",
+            "https://mcp.example.com",
+        );
+        let map: std::collections::HashMap<_, _> = form.into_iter().collect();
+        assert_eq!(
+            map.get("grant_type").map(String::as_str),
+            Some("authorization_code"),
+            "the code exchange must use the authorization_code grant"
+        );
+        assert_eq!(
+            map.get("code").map(String::as_str),
+            Some("the-code"),
+            "the authorization code returned by the callback must be forwarded verbatim"
+        );
+        assert_eq!(
+            map.get("code_verifier").map(String::as_str),
+            Some("the-verifier"),
+            "the PKCE verifier must accompany the code or the AS cannot validate the challenge \
+             it was given at the authorize step"
+        );
+        assert_eq!(
+            map.get("resource").map(String::as_str),
+            Some("https://mcp.example.com"),
+            "RFC 8707 requires `resource` on the TOKEN request too, not just the authorize request — \
+             this is the parameter half of implementers drop, and dropping it here mints an \
+             unbound token that still looks like success"
         );
     }
 }
