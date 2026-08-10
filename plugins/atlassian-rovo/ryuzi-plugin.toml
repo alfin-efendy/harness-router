@@ -1,0 +1,47 @@
+contract = 2
+id = "atlassian-rovo"
+name = "Atlassian Rovo"
+version = "0.1.0"
+publisher = "Ryuzi"
+description = "Atlassian's official hosted MCP server: Jira, Confluence and Bitbucket tools over one remote connection."
+
+# No [component] — this is a declarative-only plugin (Task 10 made that
+# genuinely optional end to end). There is no WASM component to sandbox, so
+# `[permissions] network` below is informational only (surfaced to Cockpit's
+# plugin-detail "domains" list, `api/types.rs`'s `domains` field) — it is
+# never enforced the way a component's host-mediated egress allowlist is
+# (see `plugins/runtime.rs`), since a declarative HTTP MCP entry's request
+# goes straight from the host's own `reqwest` client, never through a
+# component sandbox.
+[permissions]
+network = ["mcp.atlassian.com"]
+
+# Atlassian's personal-API-token mechanism is Basic auth over a base64 join
+# of the user's email and their token — `Authorization: Basic
+# <base64(email:api_token)>` — NOT a bearer token of the API token alone
+# (confirmed against Atlassian's "Configure authentication via API token"
+# doc; see docs/design/2026-08-10-remote-mcp-http-oauth-plan.md Task 11).
+# The manifest's `${setting:KEY}` templating (`plugins/declarative.rs`) only
+# substitutes one literal setting value into a string — it cannot compute a
+# base64 join of two settings at fetch time — so the user pastes the
+# already-base64-encoded credential as a single secret setting.
+[[settings]]
+key = "basic_credential"
+label = "Atlassian Basic auth credential"
+help = "Create an API token at id.atlassian.com/manage-profile/security/api-tokens, note the email address it belongs to, then base64-encode \"email:api_token\" (e.g. `echo -n \"you@example.com:YOUR_TOKEN\" | base64`) and paste the result here. Leave blank to connect with OAuth instead, once the generic remote-MCP OAuth connect flow (Tasks 1-9) is wired to a Connect button for this server."
+
+# `${setting:...}` substitution (`declarative.rs::resolver`/`build_spec`)
+# looks the key up verbatim in the settings store, and every `[[settings]]`
+# row is persisted under the HOST-QUALIFIED key `plugin.<id>.<key>`
+# (`plugins::host::qualified_setting_key`) even though the `[[settings]]`
+# table above keeps its own `key` bare (v2 manifests forbid a
+# `plugin.`-prefixed bare key outright — `PluginManifest::validate`). So the
+# placeholder here must reference the QUALIFIED form, matching the
+# `${setting:plugin.acme-required.user}` pattern in `declarative.rs`'s own
+# `ACME_REQUIRED_SETTING_MANIFEST` test fixture — a bare `${setting:basic_credential}`
+# would never resolve.
+[[mcp]]
+name = "atlassian-rovo"
+transport = "http"
+url = "https://mcp.atlassian.com/v1/mcp"
+headers = { Authorization = "Basic ${setting:plugin.atlassian-rovo.basic_credential}" }

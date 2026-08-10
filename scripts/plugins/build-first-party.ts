@@ -152,6 +152,12 @@ export const COMPONENTS: ComponentSpec[] = [
   { id: "discord", dir: "plugins/discord", crateWasmStem: "ryuzi_plugin_discord" },
   { id: "atlassian", dir: "plugins/atlassian", crateWasmStem: "ryuzi_plugin_atlassian" },
   { id: "bitbucket", dir: "plugins/bitbucket", crateWasmStem: "ryuzi_plugin_bitbucket" },
+  // Declarative-only: a remote-MCP-over-HTTP manifest with no `[component]`
+  // at all (Task 10 made that genuinely optional end to end) — no
+  // `crateWasmStem`, so `processComponent` builds and hashes nothing and
+  // publishes a `release.json` with no component fields, signed exactly
+  // like every other first-party release.
+  { id: "atlassian-rovo", dir: "plugins/atlassian-rovo" },
 ];
 
 /**

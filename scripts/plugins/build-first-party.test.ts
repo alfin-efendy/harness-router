@@ -69,8 +69,11 @@ test("each COMPONENTS entry's dir exists and its manifest id matches", async () 
 // `crateWasmStem` is cargo's wasm output filename: the crate's `[package] name`
 // with `-` -> `_`. A mismatch makes `processComponent` read a nonexistent
 // `<stem>.wasm` and the release fails — so pin it to each crate's real name.
+// A declarative-only entry (no `crateWasmStem`, e.g. `atlassian-rovo`) has no
+// crate/Cargo.toml to check at all — skip it rather than fail on a missing file.
 test("each COMPONENTS entry's crateWasmStem matches its crate's [package] name", async () => {
   for (const spec of COMPONENTS) {
+    if (spec.crateWasmStem === undefined) continue;
     const parsed = Bun.TOML.parse(await Bun.file(join(REPO_ROOT, spec.dir, "Cargo.toml")).text()) as {
       package?: { name?: unknown };
     };
@@ -90,9 +93,15 @@ test("readManifest accepts every shipped plugins/<id>/ryuzi-plugin.toml as contr
   for (const spec of COMPONENTS) {
     const manifest = await readManifest(join(REPO_ROOT, spec.dir));
     expect(manifest.id).toBe(spec.id);
-    // Every COMPONENTS entry as of this task still ships a [component] —
-    // `readManifest`'s component-less branch is covered by the dedicated
-    // test below, not by fixture data.
+    // A declarative-only COMPONENTS entry (no `crateWasmStem`, e.g.
+    // `atlassian-rovo`) ships a manifest with no `[component]` table at all —
+    // that component-less shape is covered by the dedicated fixture-based
+    // test below; here just confirm readManifest agrees it has none.
+    if (spec.crateWasmStem === undefined) {
+      expect(manifest.component).toBeUndefined();
+      expect(manifest.witApiRange).toBeUndefined();
+      continue;
+    }
     const { component, witApiRange } = manifest;
     if (component === undefined || witApiRange === undefined) {
       throw new Error(`${spec.id}: expected a component-bearing manifest`);
@@ -131,8 +140,10 @@ test("readManifest accepts a manifest with no [component] table", async () => {
 // otherwise a real release build would throw.
 test("deriveWitApiVersion interprets every shipped component's manifest wit-api range", async () => {
   for (const spec of COMPONENTS) {
+    // A declarative-only entry (no `crateWasmStem`, e.g. `atlassian-rovo`)
+    // has no `[component] wit-api` range to derive from — nothing to check.
+    if (spec.crateWasmStem === undefined) continue;
     const manifest = await readManifest(join(REPO_ROOT, spec.dir));
-    // Every COMPONENTS entry as of this task still ships a [component].
     const { witApiRange } = manifest;
     if (witApiRange === undefined) {
       throw new Error(`${spec.id}: expected a component-bearing manifest`);
