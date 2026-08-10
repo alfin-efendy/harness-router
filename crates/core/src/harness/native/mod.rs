@@ -222,7 +222,17 @@ impl Default for NativeHarness {
 /// (`McpServerSpec.name` → owning plugin); a server absent from it (a
 /// DB-configured, non-plugin server) resolves every one of its tools to
 /// `principal = None`.
+///
+/// `store` resolves auth for an HTTP server per the plan's precedence rule
+/// (Task 8): a manifest-supplied `Authorization` header — a `${setting:…}`
+/// API token or an injected plugin OAuth bearer — always wins when present,
+/// so a declaratively-configured plugin never drags the user into an OAuth
+/// flow it never asked for. Only when the spec carries none is a token this
+/// host minted itself (via the MCP OAuth connect flow) read from the store
+/// and used, and only when it is not `reconnect_required` — a token marked
+/// that way must never be used, full stop.
 async fn connect_mcp_tools(
+    store: &Arc<crate::store::Store>,
     mcp_servers: &[crate::domain::McpServerSpec],
     principals: &std::collections::HashMap<String, crate::domain::Principal>,
 ) -> Vec<Arc<dyn tools::Tool>> {
@@ -244,10 +254,39 @@ async fn connect_mcp_tools(
                         )
                     })
             }
-            // The bearer is None here: a manifest-resolved credential is
-            // already in `headers`. Task 8 supplies a host-minted token.
-            crate::domain::McpTransport::Http { .. } => {
-                mcp_http::connect_http(spec, None).await.map(|conn| {
+            crate::domain::McpTransport::Http { headers, .. } => {
+                let has_manifest_auth = headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+                let opened_conn = if has_manifest_auth {
+                    // The manifest's Authorization header wins verbatim —
+                    // bearer=None leaves it untouched, and this connection
+                    // never wires a Store, so a later 401 is never treated
+                    // as ours to refresh or reconnect-mark.
+                    mcp_http::connect_http(spec, None).await
+                } else {
+                    // reconnect_required tokens are filtered out here, not
+                    // merely ignored downstream — that is the only place
+                    // this function decides whether to use one at all.
+                    let stored = store
+                        .get_mcp_oauth_token(&spec.name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|t| !t.reconnect_required);
+                    match stored {
+                        Some(token) => {
+                            mcp_http::connect_http_with_store(
+                                spec,
+                                Some(&token.access_token),
+                                Arc::clone(store),
+                            )
+                            .await
+                        }
+                        None => mcp_http::connect_http(spec, None).await,
+                    }
+                };
+                opened_conn.map(|conn| {
                     let conn = Arc::new(conn);
                     (
                         conn.server_name.clone(),
@@ -392,7 +431,8 @@ impl Harness for NativeHarness {
         );
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
-        let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
+        let mut extra_tools =
+            connect_mcp_tools(&ctx.store, &ctx.mcp_servers, &ctx.mcp_principals).await;
         // Task 6: fold in every enabled WASM component's connector tools
         // alongside the external MCP ones — both are `McpTool`s in the SAME
         // registry now, dispatched through the identical `deps.tools.get(name)`
@@ -2115,6 +2155,15 @@ mod tests {
     /// hand-built tool list, which is why it goes through
     /// `connect_mcp_tools` itself rather than constructing an `McpTool`
     /// directly.
+    /// A bare `tempfile::NamedTempFile` + `Store::open` store, matching the
+    /// inline-per-test pattern `store.rs` itself uses (there is no shared
+    /// `test_store()` helper anywhere in the crate — see the remote-MCP-OAuth
+    /// plan's Task 5 scouting note).
+    async fn mcp_test_store() -> Arc<Store> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        Arc::new(Store::open(tmp.path()).await.unwrap())
+    }
+
     #[tokio::test]
     async fn an_http_mcp_server_contributes_its_tools_to_the_session() {
         let (url, _seen, _server) = mcp_http::tests::spawn_json_server().await;
@@ -2125,8 +2174,9 @@ mod tests {
                 headers: vec![],
             },
         };
+        let store = mcp_test_store().await;
 
-        let tools = connect_mcp_tools(&[spec], &std::collections::HashMap::new()).await;
+        let tools = connect_mcp_tools(&store, &[spec], &std::collections::HashMap::new()).await;
 
         let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
@@ -2168,12 +2218,195 @@ mod tests {
                 },
             },
         ];
-        let tools = connect_mcp_tools(&specs, &std::collections::HashMap::new()).await;
+        let store = mcp_test_store().await;
+        let tools = connect_mcp_tools(&store, &specs, &std::collections::HashMap::new()).await;
         assert!(
             tools.is_empty(),
             "a server that can't be reached (bad HTTP endpoint or missing stdio binary) must be \
              logged and skipped, not surfaced as a tool or turned into a panic — got {} tool(s)",
             tools.len()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 8: auth precedence
+    // -----------------------------------------------------------------
+
+    fn stored_mcp_token(access_token: &str) -> crate::store::McpOauthToken {
+        crate::store::McpOauthToken {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            token_type: "Bearer".to_string(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        }
+    }
+
+    /// A minimal MCP server that records EVERY `Authorization` header value
+    /// on each request (in arrival order, not just the first — a client
+    /// that duplicates the header rather than replacing it must be visible,
+    /// not hidden by `HeaderMap::get`'s "first wins" behavior) and answers
+    /// just enough of the handshake for `connect_http`/`connect_mcp_tools`
+    /// to succeed. Used to assert on what actually reached the wire, not on
+    /// `connect_mcp_tools`'s return value.
+    async fn spawn_auth_echo_server() -> (String, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        use axum::extract::{Json, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use axum::Router;
+
+        type SeenAuth = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+        async fn handle(
+            State(seen): State<SeenAuth>,
+            headers: HeaderMap,
+            Json(msg): Json<serde_json::Value>,
+        ) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+            seen.lock().unwrap().push(
+                headers
+                    .get_all("authorization")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok().map(str::to_string))
+                    .collect(),
+            );
+            let id = msg["id"].clone();
+            let result = match msg["method"].as_str().unwrap_or_default() {
+                "initialize" => {
+                    serde_json::json!({"protocolVersion": "2025-06-18", "capabilities": {}})
+                }
+                "tools/list" => serde_json::json!({"tools": []}),
+                _ => serde_json::Value::Null,
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            )
+        }
+
+        let seen: SeenAuth = Default::default();
+        let app = Router::new()
+            .route("/", post(handle))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// PROPERTY: with a manifest `Authorization` header present AND a
+    /// stored token available, the manifest value reaches the wire and the
+    /// stored token does not — asserted on the header the server actually
+    /// received (not on internal state), and asserting exactly ONE
+    /// `Authorization` arrives so a regression that sent BOTH would also
+    /// fail this, not just a regression that swapped which one won.
+    #[tokio::test]
+    async fn a_manifest_supplied_authorization_header_wins_over_a_stored_token() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (url, seen_auth) = spawn_auth_echo_server().await;
+        let store = mcp_test_store().await;
+        store
+            .upsert_mcp_oauth_token("remote", &stored_mcp_token("stored-token"))
+            .await
+            .unwrap();
+        let spec = crate::domain::McpServerSpec {
+            name: "remote".to_string(),
+            transport: crate::domain::McpTransport::Http {
+                url,
+                headers: vec![(
+                    "Authorization".to_string(),
+                    "Bearer manifest-token".to_string(),
+                )],
+            },
+        };
+
+        let _ = connect_mcp_tools(&store, &[spec], &Default::default()).await;
+
+        let requests = seen_auth.lock().unwrap().clone();
+        let init = requests
+            .first()
+            .expect("the initialize request must have reached the server");
+        assert_eq!(
+            init.len(),
+            1,
+            "exactly one Authorization header must reach the wire — sending both the manifest \
+             token and the stored one would leak the stored credential alongside it: {init:?}"
+        );
+        assert_eq!(
+            init[0], "Bearer manifest-token",
+            "the manifest's Authorization header must win over the stored token: {init:?}"
+        );
+    }
+
+    /// PROPERTY: with no manifest credential, the stored token must reach
+    /// the wire.
+    #[tokio::test]
+    async fn a_stored_token_is_used_when_the_spec_carries_no_credential() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (url, seen_auth) = spawn_auth_echo_server().await;
+        let store = mcp_test_store().await;
+        store
+            .upsert_mcp_oauth_token("remote", &stored_mcp_token("stored-token"))
+            .await
+            .unwrap();
+        let spec = crate::domain::McpServerSpec {
+            name: "remote".to_string(),
+            transport: crate::domain::McpTransport::Http {
+                url,
+                headers: vec![],
+            },
+        };
+
+        let _ = connect_mcp_tools(&store, &[spec], &Default::default()).await;
+
+        let requests = seen_auth.lock().unwrap().clone();
+        let init = requests
+            .first()
+            .expect("the initialize request must have reached the server");
+        assert_eq!(
+            init.as_slice(),
+            ["Bearer stored-token".to_string()],
+            "with no manifest credential, the stored token must reach the wire: {init:?}"
+        );
+    }
+
+    /// PROPERTY: a token marked `reconnect_required` must NEVER be used —
+    /// that is the entire point of the flag. Proven by observing that NO
+    /// Authorization header reaches the wire at all (not merely that the
+    /// specific stored value is absent), so a regression that instead fell
+    /// back to some other credential would still be caught here.
+    #[tokio::test]
+    async fn a_reconnect_required_token_is_never_used() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (url, seen_auth) = spawn_auth_echo_server().await;
+        let store = mcp_test_store().await;
+        let mut token = stored_mcp_token("stale-token");
+        token.reconnect_required = true;
+        store
+            .upsert_mcp_oauth_token("remote", &token)
+            .await
+            .unwrap();
+        let spec = crate::domain::McpServerSpec {
+            name: "remote".to_string(),
+            transport: crate::domain::McpTransport::Http {
+                url,
+                headers: vec![],
+            },
+        };
+
+        let _ = connect_mcp_tools(&store, &[spec], &Default::default()).await;
+
+        let requests = seen_auth.lock().unwrap().clone();
+        let init = requests
+            .first()
+            .expect("the initialize request must have reached the server");
+        assert!(
+            init.is_empty(),
+            "a reconnect_required token must never be used as a bearer — got Authorization: \
+             {init:?}"
         );
     }
 

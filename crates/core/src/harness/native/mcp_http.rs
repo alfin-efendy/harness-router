@@ -8,6 +8,7 @@
 //! tools reach a session through exactly the same path.
 
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,8 +16,10 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use super::mcp_client::{build_call_request, McpCaller, McpToolDef, MCP_PROTOCOL_VERSION};
+use super::mcp_oauth;
 use crate::domain::{McpServerSpec, McpTransport};
 use crate::stdio_jsonrpc;
+use crate::store::Store;
 
 /// A live remote MCP server connection.
 pub struct McpHttpConnection {
@@ -24,14 +27,26 @@ pub struct McpHttpConnection {
     url: String,
     /// Static headers from the server spec (a manifest-resolved API token or
     /// injected OAuth bearer), plus the `Authorization` this connection was
-    /// opened with, if any.
-    headers: Vec<(String, String)>,
+    /// opened with, if any. `Mutex`-wrapped (not merely for interior
+    /// mutability parity with `session_id`): the refresh-on-401 path
+    /// (`set_bearer`) rewrites the `Authorization` entry in place once a
+    /// refreshed access token is minted.
+    headers: Mutex<Vec<(String, String)>>,
     /// `Mcp-Session-Id` if the server issued one at `initialize`; echoed on
     /// every subsequent request.
     session_id: Mutex<Option<String>>,
     next_id: AtomicI64,
     pub server_name: String,
     pub tools: Vec<McpToolDef>,
+    /// Set only when this connection's `Authorization` header was sourced
+    /// from a STORE-managed MCP OAuth token — never for a manifest-supplied
+    /// credential or an anonymous connection (see [`connect_http_with_store`]
+    /// and `connect_mcp_tools`'s auth-precedence dispatch, Task 8 of the
+    /// remote-MCP-OAuth plan). Enables the reactive refresh-on-401 path in
+    /// `post`: a manifest credential is not this host's to refresh or mark
+    /// `reconnect_required`, so a connection with `oauth_store: None` simply
+    /// propagates a 401 as a plain error and never touches the store.
+    oauth_store: Option<Arc<Store>>,
 }
 
 /// Open a remote MCP connection: handshake, then list its tools.
@@ -39,9 +54,34 @@ pub struct McpHttpConnection {
 /// `bearer`, when present, is sent as `Authorization: Bearer <bearer>` and
 /// OVERRIDES any `Authorization` already in the spec's headers — a token this
 /// host just minted is always fresher than one baked into a manifest.
+///
+/// This connection never attempts an OAuth refresh on a 401 — use
+/// [`connect_http_with_store`] for a connection whose `bearer` came from a
+/// stored MCP OAuth token.
 pub async fn connect_http(
     spec: &McpServerSpec,
     bearer: Option<&str>,
+) -> anyhow::Result<McpHttpConnection> {
+    connect_http_inner(spec, bearer, None).await
+}
+
+/// Like [`connect_http`], but wires the connection to a [`Store`] so a 401
+/// triggers the reactive refresh-and-retry path in `post` instead of a plain
+/// error. Callers MUST pass this only when `bearer` itself came from a
+/// stored MCP OAuth token (never for a manifest-supplied credential) — see
+/// `connect_mcp_tools`'s auth-precedence dispatch.
+pub(crate) async fn connect_http_with_store(
+    spec: &McpServerSpec,
+    bearer: Option<&str>,
+    store: Arc<Store>,
+) -> anyhow::Result<McpHttpConnection> {
+    connect_http_inner(spec, bearer, Some(store)).await
+}
+
+async fn connect_http_inner(
+    spec: &McpServerSpec,
+    bearer: Option<&str>,
+    oauth_store: Option<Arc<Store>>,
 ) -> anyhow::Result<McpHttpConnection> {
     let McpTransport::Http { url, headers } = &spec.transport else {
         anyhow::bail!("mcp_http: not an HTTP transport");
@@ -62,11 +102,12 @@ pub async fn connect_http(
     let mut conn = McpHttpConnection {
         http: reqwest::Client::new(),
         url: url.clone(),
-        headers: merged,
+        headers: Mutex::new(merged),
         session_id: Mutex::new(None),
         next_id: AtomicI64::new(1),
         server_name: spec.name.clone(),
         tools: Vec::new(),
+        oauth_store,
     };
     conn.handshake().await?;
     conn.tools = conn.list_tools().await?;
@@ -133,14 +174,33 @@ impl McpHttpConnection {
     /// carrying one or more SSE events, of which at most one is the reply to
     /// THIS message (Task 2) — `sse_message_for_id` picks that one out and
     /// treats a stream that never carries it as a transport failure.
+    ///
+    /// On an HTTP 401, delegates to [`Self::refresh_and_retry`] (Task 8):
+    /// a store-managed connection gets ONE refresh-and-retry; any other
+    /// non-success status (including a 401 the retry itself produces) is a
+    /// plain error, same as before this task.
     async fn post(&self, message: &Value) -> anyhow::Result<(Value, Option<String>)> {
+        match self.post_once(message).await? {
+            PostOutcome::Ok(value, session) => Ok((value, session)),
+            PostOutcome::Unauthorized(www_authenticate) => {
+                self.refresh_and_retry(message, www_authenticate).await
+            }
+        }
+    }
+
+    /// One POST attempt, no retry. A 401 is reported as
+    /// `PostOutcome::Unauthorized` (carrying `WWW-Authenticate`, if any)
+    /// rather than an error — only `post`'s caller decides whether that's
+    /// retryable.
+    async fn post_once(&self, message: &Value) -> anyhow::Result<PostOutcome> {
         let mut request = self
             .http
             .post(&self.url)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION);
-        for (key, value) in &self.headers {
+        let headers_snapshot = self.headers.lock().await.clone();
+        for (key, value) in &headers_snapshot {
             request = request.header(key, value);
         }
         if let Some(session) = self.session_id.lock().await.as_deref() {
@@ -149,6 +209,14 @@ impl McpHttpConnection {
         let response = tokio::time::timeout(Duration::from_secs(120), request.json(message).send())
             .await
             .map_err(|_| anyhow::anyhow!("mcp: request timed out"))??;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let www_authenticate = response
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            return Ok(PostOutcome::Unauthorized(www_authenticate));
+        }
         let session = response
             .headers()
             .get("mcp-session-id")
@@ -166,14 +234,160 @@ impl McpHttpConnection {
             anyhow::bail!("mcp: HTTP {status}");
         }
         if body.trim().is_empty() {
-            return Ok((Value::Null, session));
+            return Ok(PostOutcome::Ok(Value::Null, session));
         }
         if content_type.contains("text/event-stream") {
             let want = message.get("id").cloned();
-            return Ok((sse_message_for_id(&body, want.as_ref())?, session));
+            return Ok(PostOutcome::Ok(
+                sse_message_for_id(&body, want.as_ref())?,
+                session,
+            ));
         }
-        Ok((serde_json::from_str(&body)?, session))
+        Ok(PostOutcome::Ok(serde_json::from_str(&body)?, session))
     }
+
+    /// Handle a 401 seen by `post_once`: a connection with no `oauth_store`
+    /// (manifest-authenticated or anonymous) simply reports it as a plain
+    /// error — refreshing or reconnect-marking a credential this host
+    /// doesn't own would be wrong. A store-managed connection gets exactly
+    /// ONE refresh-and-retry (the plan's precedence rule): if the refresh
+    /// itself fails, or the retry ALSO 401s, the server is marked
+    /// `reconnect_required` in the store and the error names it, so the UI
+    /// can prompt a reconnect instead of retrying a dead credential forever.
+    async fn refresh_and_retry(
+        &self,
+        message: &Value,
+        www_authenticate: Option<String>,
+    ) -> anyhow::Result<(Value, Option<String>)> {
+        let Some(store) = self.oauth_store.as_deref() else {
+            anyhow::bail!("mcp: {} returned 401 Unauthorized", self.server_name);
+        };
+        if let Err(e) = self.refresh_stored_token(store, www_authenticate).await {
+            let _ = store
+                .mark_mcp_oauth_reconnect_required(&self.server_name)
+                .await;
+            anyhow::bail!(
+                "mcp: {} needs reconnecting — token refresh failed: {e}",
+                self.server_name
+            );
+        }
+        match self.post_once(message).await? {
+            PostOutcome::Ok(value, session) => Ok((value, session)),
+            PostOutcome::Unauthorized(_) => {
+                let _ = store
+                    .mark_mcp_oauth_reconnect_required(&self.server_name)
+                    .await;
+                anyhow::bail!(
+                    "mcp: {} needs reconnecting — still unauthorized after a token refresh",
+                    self.server_name
+                );
+            }
+        }
+    }
+
+    /// Exchange the stored refresh token for a new access token and persist
+    /// it, updating this connection's in-memory `Authorization` header on
+    /// success. The token endpoint is re-discovered from THIS 401's
+    /// `WWW-Authenticate` header (the same RFC 9728 → RFC 8414 chain
+    /// `mcp_oauth::begin_mcp_connect` uses to connect in the first place) —
+    /// nothing about the issuer or token endpoint is persisted anywhere
+    /// keyed by server name, so rediscovering here is the only way back to
+    /// it; `mcp_oauth_clients` (keyed by issuer, not server) already caches
+    /// the client id from that original connect.
+    async fn refresh_stored_token(
+        &self,
+        store: &Store,
+        www_authenticate: Option<String>,
+    ) -> anyhow::Result<()> {
+        let current = store
+            .get_mcp_oauth_token(&self.server_name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no stored token to refresh"))?;
+        let refresh_token = current
+            .refresh_token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("no refresh token available"))?;
+        let header = www_authenticate
+            .ok_or_else(|| anyhow::anyhow!("401 carried no WWW-Authenticate header"))?;
+        let metadata_url = crate::plugins::oauth::parse_www_authenticate_resource(&header)
+            .ok_or_else(|| anyhow::anyhow!("WWW-Authenticate names no resource metadata"))?;
+        let issuers = mcp_oauth::protected_resource_metadata(&self.http, &metadata_url).await?;
+        let (issuer, metadata) =
+            mcp_oauth::select_authorization_server(&self.http, &issuers).await?;
+        let client_id = store
+            .get_mcp_oauth_client(&issuer)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no registered client id for {issuer}"))?;
+        let resource = mcp_oauth::canonical_resource_uri(&self.url)?;
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", client_id.as_str()),
+            ("resource", resource.as_str()),
+        ];
+        let response = self
+            .http
+            .post(&metadata.token_endpoint)
+            .form(&form)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("token endpoint returned HTTP {}", response.status());
+        }
+        let body: Value = response.json().await?;
+        let access_token = body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("refresh response carried no access_token"))?
+            .to_string();
+        let new_token = crate::store::McpOauthToken {
+            access_token: access_token.clone(),
+            refresh_token: body
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or(Some(refresh_token)),
+            token_type: body
+                .get("token_type")
+                .and_then(Value::as_str)
+                .unwrap_or("Bearer")
+                .to_string(),
+            expires_at: body
+                .get("expires_in")
+                .and_then(Value::as_i64)
+                .map(|secs| crate::paths::now_ms() + secs * 1000),
+            scopes: body
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(|s| s.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_else(|| current.scopes.clone()),
+            reconnect_required: false,
+        };
+        store
+            .upsert_mcp_oauth_token(&self.server_name, &new_token)
+            .await?;
+        self.set_bearer(&access_token).await;
+        Ok(())
+    }
+
+    /// Replace this connection's `Authorization` header in place — used only
+    /// by [`Self::refresh_stored_token`] once a refresh succeeds, so the
+    /// retried request (and every request after it) carries the new token.
+    async fn set_bearer(&self, token: &str) {
+        let mut headers = self.headers.lock().await;
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+        headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+    }
+}
+
+/// The outcome of one [`McpHttpConnection::post_once`] attempt.
+enum PostOutcome {
+    /// A non-401 response: the parsed JSON-RPC message, plus a session id if
+    /// the server issued one on this response.
+    Ok(Value, Option<String>),
+    /// An HTTP 401, carrying `WWW-Authenticate` if the server sent one.
+    Unauthorized(Option<String>),
 }
 
 /// Pull the JSON-RPC message whose `id` matches `want` out of an SSE body.
@@ -735,6 +949,300 @@ pub(crate) mod tests {
             result["result"]["marker"], "pending",
             "must resolve to the SECOND event's own payload, not one spliced together with the \
              first (unrelated-id) event's data lines: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 8: refresh-on-401
+    // -----------------------------------------------------------------
+
+    /// What `spawn_refresh_fixture` hands back: the two origins it bound,
+    /// plus every token-request body the AS actually received, so a test
+    /// can assert on what reached the wire.
+    struct RefreshFixture {
+        mcp_url: String,
+        as_url: String,
+        token_request_bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// Binds a two-origin OAuth-refresh fixture: an MCP resource server and
+    /// a SEPARATE authorization server — the same two-origin shape
+    /// `mcp_oauth.rs`'s own `spawn_oauth_fixture` uses, since a real
+    /// deployment never colocates the two.
+    ///
+    /// The MCP server 401s any request whose `Authorization` header is not
+    /// exactly `Bearer <accepted_bearer>`, and points every 401 at its own
+    /// protected-resource metadata; when `accepted_bearer` is `None` it
+    /// 401s UNCONDITIONALLY, no matter what token this client ever presents
+    /// — the shape the reconnect-required test below needs (a refresh that
+    /// succeeds at the AS but doesn't actually fix access, e.g. because the
+    /// underlying grant was revoked). The AS's `/token` endpoint accepts a
+    /// `refresh_token` grant and always mints `new_access_token`.
+    async fn spawn_refresh_fixture(
+        accepted_bearer: Option<&'static str>,
+        new_access_token: &'static str,
+    ) -> RefreshFixture {
+        use axum::extract::{Json, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct AsState {
+            as_url: String,
+            new_access_token: &'static str,
+            token_request_bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        async fn handle_as_metadata(State(state): State<AsState>) -> axum::Json<Value> {
+            let as_url = &state.as_url;
+            axum::Json(json!({
+                "issuer": as_url,
+                "authorization_endpoint": format!("{as_url}/authorize"),
+                "token_endpoint": format!("{as_url}/token"),
+            }))
+        }
+
+        async fn handle_token(
+            State(state): State<AsState>,
+            body: axum::body::Bytes,
+        ) -> axum::Json<Value> {
+            state
+                .token_request_bodies
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&body).into_owned());
+            axum::Json(json!({
+                "access_token": state.new_access_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "rotated-refresh",
+            }))
+        }
+
+        let as_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let as_addr = as_listener.local_addr().unwrap();
+        let as_url = format!("http://{as_addr}");
+        let token_request_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let as_state = AsState {
+            as_url: as_url.clone(),
+            new_access_token,
+            token_request_bodies: token_request_bodies.clone(),
+        };
+        let as_app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(handle_as_metadata),
+            )
+            .route("/token", post(handle_token))
+            .with_state(as_state);
+        tokio::spawn(async move {
+            axum::serve(as_listener, as_app).await.unwrap();
+        });
+
+        #[derive(Clone)]
+        struct McpState {
+            accepted_bearer: Option<&'static str>,
+            as_url: String,
+            mcp_url: std::sync::Arc<std::sync::Mutex<String>>,
+        }
+
+        async fn handle_mcp(
+            State(state): State<McpState>,
+            headers: HeaderMap,
+            Json(msg): Json<Value>,
+        ) -> axum::response::Response {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let authorized = match (state.accepted_bearer, auth.as_deref()) {
+                (Some(want), Some(got)) => got == format!("Bearer {want}"),
+                _ => false,
+            };
+            if !authorized {
+                let mcp_url = state.mcp_url.lock().unwrap().clone();
+                let www_auth = format!(
+                    "Bearer resource_metadata=\"{mcp_url}/.well-known/oauth-protected-resource\""
+                );
+                return axum::response::Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(axum::http::header::WWW_AUTHENTICATE, www_auth)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+                    .into_response();
+            }
+            let id = msg["id"].clone();
+            let result = match msg["method"].as_str().unwrap_or_default() {
+                "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+                "tools/list" => json!({"tools": []}),
+                _ => Value::Null,
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            )
+                .into_response()
+        }
+
+        async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            axum::Json(json!({
+                "resource": "placeholder",
+                "authorization_servers": [state.as_url],
+            }))
+        }
+
+        let mcp_url_slot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mcp_state = McpState {
+            accepted_bearer,
+            as_url: as_url.clone(),
+            mcp_url: mcp_url_slot.clone(),
+        };
+        let mcp_app = Router::new()
+            .route("/", post(handle_mcp))
+            .route("/.well-known/oauth-protected-resource", get(handle_prm))
+            .with_state(mcp_state);
+        let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = mcp_listener.local_addr().unwrap();
+        let mcp_url = format!("http://{mcp_addr}");
+        *mcp_url_slot.lock().unwrap() = mcp_url.clone();
+        tokio::spawn(async move {
+            axum::serve(mcp_listener, mcp_app).await.unwrap();
+        });
+
+        RefreshFixture {
+            mcp_url,
+            as_url,
+            token_request_bodies,
+        }
+    }
+
+    fn stale_token_with_refresh() -> crate::store::McpOauthToken {
+        crate::store::McpOauthToken {
+            access_token: "stale-token".to_string(),
+            refresh_token: Some("refresh-1".to_string()),
+            token_type: "Bearer".to_string(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        }
+    }
+
+    /// PROPERTY: a 401 on a store-managed connection triggers exactly ONE
+    /// refresh, and the RETRY actually carries the refreshed token — proven
+    /// by the MCP server only accepting `Bearer fresh-token`, so a bug that
+    /// retried with the stale bearer (or never updated it at all) would
+    /// leave the connect failing instead of succeeding.
+    #[tokio::test]
+    async fn a_401_is_refreshed_once_and_the_retry_succeeds_with_the_new_token() {
+        crate::llm_router::secrets::use_test_key_file();
+        let fixture = spawn_refresh_fixture(Some("fresh-token"), "fresh-token").await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        // Keyed by "test-remote" — the server name `spec()` bakes in below.
+        // A mismatch here would make `refresh_stored_token`'s store lookup
+        // fail with "no stored token to refresh" before it ever reaches the
+        // AS, which would make this test fail for the WRONG reason.
+        store
+            .upsert_mcp_oauth_token("test-remote", &stale_token_with_refresh())
+            .await
+            .unwrap();
+        store
+            .upsert_mcp_oauth_client(&fixture.as_url, "client-1")
+            .await
+            .unwrap();
+        let target_spec = spec(&fixture.mcp_url);
+
+        let conn = connect_http_with_store(&target_spec, Some("stale-token"), store.clone())
+            .await
+            .expect(
+                "the refresh-then-retry must let connect succeed even though the FIRST attempt \
+                 (using the stale stored token) 401s",
+            );
+
+        assert_eq!(conn.server_name, "test-remote");
+        let bodies = fixture.token_request_bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "exactly one refresh request must have been sent — a bug that refreshed on every \
+             request (not just the first 401) would drive this above 1: {bodies:?}"
+        );
+        assert!(
+            bodies[0].contains("grant_type=refresh_token"),
+            "the refresh must use the refresh_token grant: {}",
+            bodies[0]
+        );
+
+        let stored = store
+            .get_mcp_oauth_token("test-remote")
+            .await
+            .unwrap()
+            .expect("the refreshed token must still be stored under the server's name");
+        assert_eq!(
+            stored.access_token, "fresh-token",
+            "the store must hold the NEW access token after a successful refresh, not the stale one"
+        );
+        assert!(
+            !stored.reconnect_required,
+            "a successful refresh must not leave reconnect_required set"
+        );
+    }
+
+    /// PROPERTY: when the retry ALSO 401s (a refresh that talks to the AS
+    /// successfully but doesn't actually restore access), the server must be
+    /// marked `reconnect_required` in the STORE — not merely reported in the
+    /// error text. A test that only checked the error message would miss a
+    /// regression that failed loudly but never actually persisted the flag,
+    /// silently leaving a future connect attempt free to retry the same dead
+    /// credential forever.
+    #[tokio::test]
+    async fn a_401_that_persists_through_a_refresh_marks_the_server_reconnect_required() {
+        crate::llm_router::secrets::use_test_key_file();
+        // accepted_bearer: None => the MCP server 401s unconditionally, no
+        // matter what token this client ever presents.
+        let fixture = spawn_refresh_fixture(None, "fresh-token").await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        store
+            .upsert_mcp_oauth_token("test-remote", &stale_token_with_refresh())
+            .await
+            .unwrap();
+        store
+            .upsert_mcp_oauth_client(&fixture.as_url, "client-1")
+            .await
+            .unwrap();
+        let target_spec = spec(&fixture.mcp_url);
+
+        // `.expect_err(..)`/`.unwrap_err(..)` would require `McpHttpConnection`
+        // (the `Ok` type) to implement `Debug`, which it deliberately does
+        // not — match explicitly instead.
+        let err =
+            match connect_http_with_store(&target_spec, Some("stale-token"), store.clone()).await {
+                Err(e) => e,
+                Ok(_) => panic!(
+                "a server that keeps 401ing after a refresh must fail the connect, not silently \
+                 succeed"
+            ),
+            };
+
+        assert!(
+            err.to_string().contains("test-remote"),
+            "the error must name the server so the UI can point the user at the right reconnect \
+             control: {err}"
+        );
+
+        let stored = store
+            .get_mcp_oauth_token("test-remote")
+            .await
+            .unwrap()
+            .expect("the token row must still exist after a failed reconnect attempt");
+        assert!(
+            stored.reconnect_required,
+            "a 401 that survives a refresh-and-retry must mark the server reconnect_required in \
+             the store"
         );
     }
 }
