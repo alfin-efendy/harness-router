@@ -242,9 +242,10 @@ jobs:
           fi
           gh release upload "$TAG" --repo "${{ github.repository }}" --clobber catalog.json catalog.json.sig
 
-  # Builds, signs, uploads, then RE-VERIFIES the first-party WASM plugin
-  # bundles for this release (scripts/plugins/build-first-party.ts — 18
-  # bundles, dual descriptor stems + one <id>.wasm each). Artifacts publish
+  # Builds, signs, uploads, then RE-VERIFIES the first-party plugin bundles for
+  # this release (scripts/plugins/build-first-party.ts — 19 bundles, dual
+  # descriptor stems, plus one <id>.wasm for each of the 18 that declare a
+  # [component]; a declarative-only bundle ships descriptors only). Artifacts publish
   # under this release's own immutable tag URL: release builds pin their
   # unversioned fetches to it via RYUZI_RELEASE_TAG, while the catalog feed's
   # update flow fetches versioned stems from `latest`. Like catalog-feed,
@@ -352,10 +353,18 @@ jobs:
           for manifest in plugins/*/ryuzi-plugin.toml; do
             id=$(basename "$(dirname "$manifest")")
             version=$(grep -E '^version *= *"' "$manifest" | head -1 | sed -E 's/^version *= *"([^"]+)".*/\1/')
-            for want in \
-              "${id}.wasm" \
+            wants=( \
               "${id}.ryuzi-plugin.toml" "${id}.release.json" "${id}.release.json.sig" \
-              "${id}-${version}.ryuzi-plugin.toml" "${id}-${version}.release.json" "${id}-${version}.release.json.sig"; do
+              "${id}-${version}.ryuzi-plugin.toml" "${id}-${version}.release.json" "${id}-${version}.release.json.sig")
+            # A declarative-only plugin has no [component] and therefore ships
+            # no wasm (atlassian-rovo is the first). The signer derives the
+            # artifact set from the manifest, so this gate must too — requiring
+            # <id>.wasm unconditionally would fail the release for a bundle the
+            # signer was never supposed to produce a component for.
+            if grep -qE '^\[component\]' "$manifest"; then
+              wants+=("${id}.wasm")
+            fi
+            for want in "${wants[@]}"; do
               echo "$assets" | grep -qxF "$want" || { echo "::error::release $TAG is missing plugin asset: $want"; fail=1; }
             done
           done
