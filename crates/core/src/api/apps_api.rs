@@ -138,7 +138,12 @@ fn slugify(name: &str) -> String {
 /// with a stale `http://` URL from before this check, e.g. a plugin-synced
 /// `[[mcp]]` row, which doesn't go through `add_app` at all).
 fn require_https(url: &str) -> Result<(), ApiError> {
-    if url.starts_with("https://") {
+    // RFC 3986 makes the scheme case-insensitive, so `HTTPS://…` is a valid
+    // https URL. Comparing case-sensitively here rejected a URL the form had
+    // already accepted (it lowercases first) and that `mcp_http::require_https`
+    // accepts too — a bounce with the exact opaque error the form exists to
+    // pre-empt, not a security gate.
+    if url.to_ascii_lowercase().starts_with("https://") {
         Ok(())
     } else {
         Err(ApiError::bad_request(
@@ -389,7 +394,13 @@ async fn probe_and_persist(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
     };
     if row.transport == "http" {
         let url = row.url.clone().unwrap_or_default();
-        let ok = match reqwest::Client::builder().timeout(Duration::from_secs(8)).build() {
+        let ok = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            // Keeps this probe's shorter deadline, but must not follow a
+            // redirect off the https origin the caller was gated on.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
             Ok(client) => client
                 .post(&url)
                 .header("Content-Type", "application/json")
@@ -526,7 +537,10 @@ async fn begin_mcp_connect(state: &ApiState, id: &str) -> Result<McpConnectStart
             headers: vec![],
         },
     };
-    let http = reqwest::Client::new();
+    // Hardened, not bare: this client is what `select_authorization_server` and
+    // `register_oauth_client` borrow, and both would otherwise follow redirects
+    // with no deadline. See `hardened_http_client`.
+    let http = crate::harness::native::mcp_http::hardened_http_client()?;
     let start =
         crate::harness::native::mcp_oauth::begin_mcp_connect(cp.store(), &http, &spec).await?;
     Ok(McpConnectStart {
@@ -581,7 +595,9 @@ async fn complete_mcp_connect(
         .ok_or_else(|| ApiError::bad_request(format!("{id} has no URL configured")))?;
     // Before anything leaves the machine: the caller named this endpoint.
     require_registered_token_endpoint(cp.store(), issuer_token_endpoint, client_id).await?;
-    let http = reqwest::Client::new();
+    // Hardened, not bare — the token exchange POSTs `code`/`code_verifier` in a
+    // form body, which redirect header-stripping cannot protect at all.
+    let http = crate::harness::native::mcp_http::hardened_http_client()?;
     crate::harness::native::mcp_oauth::complete_mcp_connect(
         cp.store(),
         &http,
@@ -716,6 +732,17 @@ mod tests {
     fn require_https_rejects_plain_http_and_accepts_https() {
         assert!(require_https("http://mcp.example.com").is_err());
         assert!(require_https("https://mcp.example.com").is_ok());
+        // RFC 3986: the scheme is case-insensitive. A case-sensitive check here
+        // bounced a URL the Add-server form had already accepted, since the form
+        // lowercases before validating.
+        assert!(
+            require_https("HTTPS://mcp.example.com").is_ok(),
+            "an uppercase scheme is still https"
+        );
+        assert!(
+            require_https("HTTP://mcp.example.com").is_err(),
+            "an uppercase plain-http scheme must still be rejected"
+        );
     }
 
     #[tokio::test]
