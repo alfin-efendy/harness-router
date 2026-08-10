@@ -90,6 +90,7 @@ pub async fn select_authorization_server(
 
 /// A started PKCE authorization: the URL to open, plus the verifier and state
 /// the callback must be matched against.
+#[derive(Debug)]
 pub struct McpAuthorizeStart {
     pub url: String,
     pub verifier: String,
@@ -151,9 +152,179 @@ pub fn token_request_form(
     ]
 }
 
+/// The loopback redirect this client registers and uses for a given MCP
+/// server. Port 8976 is the same fixed port the plugin install wizard's
+/// OAuth flow binds (`PLUGIN_OAUTH_CALLBACK_PORT`,
+/// `crates/core/src/api/plugins_api.rs`) — reusing it, rather than a second
+/// port, keeps this to one thing to keep free and one thing to explain. The
+/// literal is duplicated here rather than imported: that constant is
+/// private to `plugins_api.rs`, and the equivalent Cockpit-side listener
+/// (`apps/cockpit/src-tauri/src/plugins_cmd.rs`) already independently
+/// redefines its own copy of the same port for the same reason — the daemon
+/// and Cockpit are separate processes with no shared Rust module boundary
+/// here to draw a single canonical constant from.
+pub fn mcp_redirect_uri(server_name: &str) -> String {
+    format!("http://127.0.0.1:8976/mcp-oauth/{server_name}/callback")
+}
+
+/// Probe the server with a credential-less request, discover its
+/// authorization server from the resulting 401's `WWW-Authenticate` header,
+/// ensure a client id is registered for it, and build the authorize URL.
+///
+/// The probe is deliberately not a full [`super::mcp_http::connect_http`]
+/// handshake: only the 401 and its header matter here, so a lighter,
+/// purpose-built request keeps this function usable before any bearer
+/// exists to hand to a real connection.
+pub async fn begin_mcp_connect(
+    store: &crate::store::Store,
+    http: &reqwest::Client,
+    server: &crate::domain::McpServerSpec,
+) -> anyhow::Result<McpAuthorizeStart> {
+    let crate::domain::McpTransport::Http { url, .. } = &server.transport else {
+        anyhow::bail!("{} is not a remote MCP server", server.name);
+    };
+    // A bare initialize with no credential: the 401 is the point — it is
+    // what carries the WWW-Authenticate header this whole flow starts from.
+    let probe = http
+        .post(url)
+        .header("content-type", "application/json")
+        .header(
+            "MCP-Protocol-Version",
+            crate::harness::native::mcp_client::MCP_PROTOCOL_VERSION,
+        )
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": crate::harness::native::mcp_client::MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "ryuzi-native", "version": env!("CARGO_PKG_VERSION")}
+            }
+        }))
+        .send()
+        .await?;
+    if probe.status() != reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!(
+            "{} did not ask for authorization (HTTP {}) — it may need no credential, or a static one already in its manifest",
+            server.name,
+            probe.status()
+        );
+    }
+    let header = probe
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} returned 401 without a WWW-Authenticate header — there is nothing to discover \
+                 an authorization server from, so it cannot be connected via OAuth",
+                server.name
+            )
+        })?;
+    let metadata_url =
+        crate::plugins::oauth::parse_www_authenticate_resource(header).ok_or_else(|| {
+            anyhow::anyhow!(
+            "{}'s WWW-Authenticate header names no protected-resource metadata to discover from",
+            server.name
+        )
+        })?;
+
+    let issuers = protected_resource_metadata(http, &metadata_url).await?;
+    let (issuer, metadata) = select_authorization_server(http, &issuers).await?;
+
+    let redirect_uri = mcp_redirect_uri(&server.name);
+    // A client id already registered for this issuer (by this server or any
+    // other one behind the same authorization server) is reused verbatim —
+    // registering a second time would leave an orphaned client id at the AS
+    // for no benefit, and some authorization servers rate-limit DCR.
+    let client_id = match store.get_mcp_oauth_client(&issuer).await? {
+        Some(existing) => existing,
+        None => {
+            let registration = metadata.registration_endpoint.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{issuer} supports no dynamic client registration — a client id for it must be supplied manually before {} can connect",
+                    server.name
+                )
+            })?;
+            let id =
+                crate::plugins::oauth::register_oauth_client(http, registration, &redirect_uri)
+                    .await?;
+            store.upsert_mcp_oauth_client(&issuer, &id).await?;
+            id
+        }
+    };
+    build_authorize_url(
+        &metadata,
+        &client_id,
+        &redirect_uri,
+        &canonical_resource_uri(url)?,
+        &[],
+    )
+}
+
+/// Exchange the callback's authorization code for a token and store it under
+/// the server's name. The `resource` parameter — the same canonical MCP
+/// server URI [`begin_mcp_connect`] put on the authorize request — rides
+/// along via [`token_request_form`], so the minted token stays bound to this
+/// server rather than silently losing its audience restriction.
+///
+/// `issuer_token_endpoint` and `client_id` are supplied by the caller rather
+/// than rediscovered here: the caller already holds both from the matching
+/// `begin_mcp_connect` call (the client id was also just persisted to
+/// `mcp_oauth_clients` by that call, so a caller that isn't threading it
+/// through by hand can re-read it with [`crate::store::Store::get_mcp_oauth_client`]).
+/// Re-running discovery here would risk landing on a different authorization
+/// server than the one that actually issued the code.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_mcp_connect(
+    store: &crate::store::Store,
+    http: &reqwest::Client,
+    server_name: &str,
+    server_url: &str,
+    issuer_token_endpoint: &str,
+    client_id: &str,
+    code: &str,
+    verifier: &str,
+) -> anyhow::Result<()> {
+    let form = token_request_form(
+        code,
+        verifier,
+        client_id,
+        &mcp_redirect_uri(server_name),
+        &canonical_resource_uri(server_url)?,
+    );
+    let response = http.post(issuer_token_endpoint).form(&form).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "token exchange failed for {server_name}: HTTP {}",
+            response.status()
+        );
+    }
+    let body: serde_json::Value = response.json().await?;
+    let token = crate::store::McpOauthToken {
+        access_token: body["access_token"]
+            .as_str()
+            .ok_or_else(|| {
+                anyhow::anyhow!("{server_name}'s token response carried no access_token")
+            })?
+            .to_string(),
+        refresh_token: body["refresh_token"].as_str().map(str::to_string),
+        token_type: body["token_type"].as_str().unwrap_or("Bearer").to_string(),
+        expires_at: body["expires_in"]
+            .as_i64()
+            .map(|secs| crate::paths::now_ms() + secs * 1000),
+        scopes: body["scope"]
+            .as_str()
+            .map(|s| s.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default(),
+        reconnect_required: false,
+    };
+    store.upsert_mcp_oauth_token(server_name, &token).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn canonical_uri_lowercases_scheme_and_host_and_drops_a_trailing_slash() {
@@ -500,6 +671,381 @@ mod tests {
         assert!(
             message.contains(&bad_two),
             "the error must name the SECOND issuer tried too: {message}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 7: begin_mcp_connect / complete_mcp_connect
+    // -----------------------------------------------------------------
+
+    use crate::domain::{McpServerSpec, McpTransport};
+    use std::sync::{Arc, Mutex};
+
+    fn mcp_spec(url: &str) -> McpServerSpec {
+        McpServerSpec {
+            name: "rovo".to_string(),
+            transport: McpTransport::Http {
+                url: url.to_string(),
+                headers: vec![],
+            },
+        }
+    }
+
+    /// Bind a bare MCP resource server that unconditionally 401s a POST with
+    /// no `WWW-Authenticate` header at all — the case where there is
+    /// nothing whatsoever to discover from.
+    async fn spawn_mcp_401_without_www_authenticate() -> String {
+        use axum::routing::post;
+        use axum::Router;
+
+        async fn handle() -> axum::http::StatusCode {
+            axum::http::StatusCode::UNAUTHORIZED
+        }
+
+        let app = Router::new().route("/", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Bind an MCP resource server that 401s a POST with a `WWW-Authenticate`
+    /// header naming its own protected-resource metadata endpoint, which in
+    /// turn serves `prm_body` verbatim. Shared by every discovery-path test
+    /// below — only the PRM body differs test to test (a real AS, or an
+    /// authorization_servers-less document).
+    async fn spawn_mcp_401_with_prm(prm_body: Value) -> String {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct McpState {
+            mcp_url: Arc<Mutex<String>>,
+            prm_body: Value,
+        }
+
+        async fn handle_probe(State(state): State<McpState>) -> axum::response::Response {
+            let mcp_url = state.mcp_url.lock().unwrap().clone();
+            let www_auth = format!(
+                "Bearer resource_metadata=\"{mcp_url}/.well-known/oauth-protected-resource\""
+            );
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::UNAUTHORIZED)
+                .header(axum::http::header::WWW_AUTHENTICATE, www_auth)
+                .body(axum::body::Body::empty())
+                .unwrap()
+                .into_response()
+        }
+
+        async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            axum::Json(state.prm_body.clone())
+        }
+
+        // The WWW-Authenticate value needs the server's own address, which
+        // is only known after binding — the shared `mcp_url` slot is filled
+        // in right after bind, before the first request can possibly land.
+        let mcp_url_slot = Arc::new(Mutex::new(String::new()));
+        let state = McpState {
+            mcp_url: mcp_url_slot.clone(),
+            prm_body,
+        };
+        let app = Router::new()
+            .route("/", post(handle_probe))
+            .route("/.well-known/oauth-protected-resource", get(handle_prm))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mcp_url = format!("http://{addr}");
+        *mcp_url_slot.lock().unwrap() = mcp_url.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        mcp_url
+    }
+
+    /// A full, self-contained OAuth round: the remote MCP server that 401s
+    /// and points at its own protected-resource metadata, and a SEPARATE
+    /// authorization server serving RFC 8414 metadata, RFC 7591
+    /// registration, and the token endpoint. Two servers, not one — a real
+    /// deployment never colocates an MCP resource server with the
+    /// authorization server that issues its tokens, and testing that shape
+    /// here would hide any code that quietly assumed they were the same
+    /// origin.
+    struct OauthFixture {
+        mcp_url: String,
+        as_url: String,
+        /// Every request body the token endpoint received, as raw
+        /// `application/x-www-form-urlencoded` text — captured so a test can
+        /// assert on what the client actually put ON THE WIRE (e.g. that
+        /// `resource=` is really there), not merely on what
+        /// `token_request_form` returns in isolation.
+        token_request_bodies: Arc<Mutex<Vec<String>>>,
+        /// Count of POSTs the registration (DCR) endpoint received.
+        registration_hits: Arc<Mutex<usize>>,
+    }
+
+    async fn spawn_oauth_fixture() -> OauthFixture {
+        use axum::extract::{Json, State};
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct AsState {
+            as_url: String,
+            registration_hits: Arc<Mutex<usize>>,
+            token_request_bodies: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn handle_as_metadata(State(state): State<AsState>) -> axum::Json<Value> {
+            let as_url = &state.as_url;
+            axum::Json(json!({
+                "issuer": as_url,
+                "authorization_endpoint": format!("{as_url}/authorize"),
+                "token_endpoint": format!("{as_url}/token"),
+                "registration_endpoint": format!("{as_url}/register"),
+            }))
+        }
+
+        async fn handle_register(
+            State(state): State<AsState>,
+            Json(_req): Json<Value>,
+        ) -> axum::Json<Value> {
+            *state.registration_hits.lock().unwrap() += 1;
+            axum::Json(json!({"client_id": "the-registered-client"}))
+        }
+
+        async fn handle_token(
+            State(state): State<AsState>,
+            body: axum::body::Bytes,
+        ) -> axum::Json<Value> {
+            let text = String::from_utf8_lossy(&body).into_owned();
+            state.token_request_bodies.lock().unwrap().push(text);
+            axum::Json(json!({
+                "access_token": "issued-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "issued-refresh",
+                "scope": "read write"
+            }))
+        }
+
+        let as_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let as_addr = as_listener.local_addr().unwrap();
+        let as_url = format!("http://{as_addr}");
+        let registration_hits = Arc::new(Mutex::new(0usize));
+        let token_request_bodies = Arc::new(Mutex::new(Vec::new()));
+        let as_state = AsState {
+            as_url: as_url.clone(),
+            registration_hits: registration_hits.clone(),
+            token_request_bodies: token_request_bodies.clone(),
+        };
+        let as_app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(handle_as_metadata),
+            )
+            .route("/register", post(handle_register))
+            .route("/token", post(handle_token))
+            .with_state(as_state);
+        tokio::spawn(async move {
+            axum::serve(as_listener, as_app).await.unwrap();
+        });
+
+        let mcp_url = spawn_mcp_401_with_prm(json!({
+            "resource": "placeholder",
+            "authorization_servers": [as_url.clone()],
+        }))
+        .await;
+
+        OauthFixture {
+            mcp_url,
+            as_url,
+            token_request_bodies,
+            registration_hits,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_drives_discovery_registration_and_a_stored_token_bound_to_the_resource() {
+        let fixture = spawn_oauth_fixture().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+        let spec = mcp_spec(&fixture.mcp_url);
+
+        let start = begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect("discovery must succeed");
+        assert!(
+            start
+                .url
+                .starts_with(&format!("{}/authorize", fixture.as_url)),
+            "the authorize URL must point at the discovered AS: {}",
+            start.url
+        );
+
+        let client_id = store
+            .get_mcp_oauth_client(&fixture.as_url)
+            .await
+            .unwrap()
+            .expect("begin_mcp_connect must have registered and persisted a client id");
+        assert_eq!(
+            client_id, "the-registered-client",
+            "the persisted client id must be the one the DCR endpoint actually returned"
+        );
+
+        complete_mcp_connect(
+            &store,
+            &http,
+            "rovo",
+            &fixture.mcp_url,
+            &format!("{}/token", fixture.as_url),
+            &client_id,
+            "the-code",
+            &start.verifier,
+        )
+        .await
+        .expect("the token exchange must succeed");
+
+        let stored =
+            store.get_mcp_oauth_token("rovo").await.unwrap().expect(
+                "a token must be stored under the server's name after a successful exchange",
+            );
+        assert_eq!(stored.access_token, "issued-token");
+
+        // PROPERTY: the RFC 8707 `resource` parameter must be on the actual
+        // outgoing token-request body, not merely returned by
+        // token_request_form() in isolation — this is the assertion that
+        // would fail if complete_mcp_connect ever stopped threading
+        // `resource` through to the real HTTP call.
+        let bodies = fixture.token_request_bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "expected exactly one token request: {bodies:?}"
+        );
+        assert!(
+            bodies[0].contains("resource="),
+            "the token exchange sent to the wire must carry the resource parameter: {}",
+            bodies[0]
+        );
+        let decoded: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(bodies[0].as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(
+            decoded.get("resource").map(String::as_str),
+            Some(fixture.mcp_url.as_str()),
+            "the resource value on the wire must be the MCP server's own canonical URI: {}",
+            bodies[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_connect_for_the_same_issuer_reuses_the_stored_client_id() {
+        // PROPERTY: a stored client id for an issuer must be reused rather
+        // than re-registered. Proven by counting hits on the registration
+        // endpoint itself — a regression that re-registers on every connect
+        // would drive this count to 2, not merely leave the stored value
+        // looking unchanged (a same-string assertion alone could not catch
+        // a DCR endpoint that happens to return the same client_id twice).
+        let fixture = spawn_oauth_fixture().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+        let spec = mcp_spec(&fixture.mcp_url);
+
+        begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect("first connect must succeed");
+        assert_eq!(
+            *fixture.registration_hits.lock().unwrap(),
+            1,
+            "the first connect for a new issuer must register exactly once"
+        );
+
+        begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect("second connect for the same issuer must also succeed");
+        assert_eq!(
+            *fixture.registration_hits.lock().unwrap(),
+            1,
+            "a second connect for the SAME issuer must reuse the stored client id — the \
+             registration endpoint must not see a second hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_401_without_www_authenticate_is_an_actionable_error_not_a_silent_noop() {
+        // PROPERTY: a 401 that names no WWW-Authenticate header must fail
+        // loudly, not resolve to some default/empty flow the caller could
+        // mistake for "nothing to do here."
+        let url = spawn_mcp_401_without_www_authenticate().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+        let spec = mcp_spec(&url);
+
+        let err = begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect_err("a 401 with no WWW-Authenticate header gives nothing to discover from");
+
+        let message = err.to_string();
+        // Deliberately a specific phrase, not just "contains WWW-Authenticate":
+        // the discovery-failed error a few lines further into
+        // `begin_mcp_connect` also mentions "WWW-Authenticate" in passing, so
+        // a weaker substring check here would still pass even if the
+        // missing-header branch were bypassed and a different, unrelated
+        // failure fired downstream instead.
+        assert!(
+            message.contains("without a WWW-Authenticate header"),
+            "the error must specifically name a missing WWW-Authenticate header so a user has \
+             something actionable to report, not merely fail for some other reason: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prm_naming_no_authorization_server_is_an_actionable_error_through_the_full_flow() {
+        // PROPERTY: the same guarantee as
+        // `a_prm_document_without_authorization_servers_is_an_error` above,
+        // but exercised through begin_mcp_connect end to end rather than
+        // calling authorization_servers_from_prm directly — this is what
+        // actually catches a regression in how the two are wired together,
+        // not just in the parsing function itself.
+        let url = spawn_mcp_401_with_prm(json!({
+            "resource": "placeholder",
+            "authorization_servers": []
+        }))
+        .await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+        let spec = mcp_spec(&url);
+
+        let err = begin_mcp_connect(&store, &http, &spec).await.expect_err(
+            "a PRM document naming no authorization server must fail, not silently proceed",
+        );
+
+        assert!(
+            err.to_string().contains("no authorization server"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_redirect_uri_is_scoped_per_server_on_the_shared_callback_port() {
+        assert_eq!(
+            mcp_redirect_uri("rovo"),
+            "http://127.0.0.1:8976/mcp-oauth/rovo/callback"
+        );
+        assert_ne!(
+            mcp_redirect_uri("rovo"),
+            mcp_redirect_uri("other-server"),
+            "two different servers must not collide on the same redirect_uri"
         );
     }
 }
