@@ -70,12 +70,30 @@ CREATE INDEX idx_automation_hooks_plugin ON automation_hooks(plugin_id);
 CREATE INDEX idx_jobs_plugin ON jobs(plugin_id);
 ";
 
+/// v4 -> v5: MCP-scoped OAuth token and registered-client storage, disjoint
+/// from `plugin_oauth_tokens`/`plugin_oauth_clients` by design (Global
+/// Constraints, remote MCP OAuth plan) — an MCP server's token must never be
+/// reachable through a plugin id, and vice versa.
+const MCP_OAUTH_MIGRATION_SQL: &str = "
+CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+  server_name TEXT PRIMARY KEY,
+  token_json  TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+  issuer     TEXT PRIMARY KEY,
+  client_id  TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
         M::up(AGENT_STATS_MIGRATION_SQL),
         M::up(OAUTH_CLIENT_SECRET_SETTING_MIGRATION_SQL),
         M::up(PLUGIN_ORIGIN_MIGRATION_SQL),
+        M::up(MCP_OAUTH_MIGRATION_SQL),
     ])
 }
 
@@ -429,6 +447,114 @@ fn decode_plugin_oauth_token(plugin_id: &str, raw: &str) -> anyhow::Result<Plugi
     })
 }
 
+/// An MCP server's OAuth token, stored in `mcp_oauth_tokens` and keyed by
+/// `server_name`. Deliberately disjoint from [`PluginOauthToken`]/
+/// `plugin_oauth_tokens`: an MCP server's access must not be revocable by
+/// retiring an unrelated plugin, and vice versa (Global Constraints, remote
+/// MCP OAuth plan). Mirrors `PluginOauthToken` minus `plugin_id`, since the
+/// server name is the row's primary key rather than a field on the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpOauthToken {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_at: Option<i64>,
+    pub scopes: Vec<String>,
+    pub reconnect_required: bool,
+}
+
+fn parse_mcp_oauth_token_json(raw: &str) -> anyhow::Result<Map<String, Value>> {
+    let value: Value = serde_json::from_str(raw)?;
+    let object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("mcp oauth token json must be an object"))?;
+    Ok(object)
+}
+
+fn upsert_mcp_oauth_token_json(
+    existing: Option<&str>,
+    token: &McpOauthToken,
+) -> anyhow::Result<String> {
+    let mut object = match existing {
+        Some(raw) => parse_mcp_oauth_token_json(raw)?,
+        None => Map::new(),
+    };
+    object.insert(
+        "access_token".to_string(),
+        Value::String(encrypt_field(&token.access_token)),
+    );
+    object.insert(
+        "refresh_token".to_string(),
+        token
+            .refresh_token
+            .as_deref()
+            .map(encrypt_field)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "token_type".to_string(),
+        Value::String(token.token_type.clone()),
+    );
+    object.insert(
+        "expires_at".to_string(),
+        token
+            .expires_at
+            .map(Number::from)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "scopes".to_string(),
+        Value::Array(token.scopes.iter().cloned().map(Value::String).collect()),
+    );
+    object.insert(
+        "reconnect_required".to_string(),
+        Value::Bool(token.reconnect_required),
+    );
+    Ok(serde_json::to_string(&Value::Object(object))?)
+}
+
+fn decode_mcp_oauth_token(raw: &str) -> anyhow::Result<McpOauthToken> {
+    let object = parse_mcp_oauth_token_json(raw)?;
+    let access_token = object
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("mcp oauth token missing access_token"))?;
+    let token_type = object
+        .get("token_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("mcp oauth token missing token_type"))?;
+    let expires_at = object.get("expires_at").and_then(Value::as_i64);
+    let scopes = object
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let reconnect_required = object
+        .get("reconnect_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(McpOauthToken {
+        access_token: decrypt_field(access_token)?,
+        refresh_token: match object.get("refresh_token").and_then(Value::as_str) {
+            Some(refresh_token) => Some(decrypt_field(refresh_token)?),
+            None => None,
+        },
+        token_type: token_type.to_string(),
+        expires_at,
+        scopes,
+        reconnect_required,
+    })
+}
+
 /// One row per plugin in `plugin_oauth_clients` — a partial cache that
 /// accretes: discovery fills the endpoint columns, DCR or the user's manual
 /// entry fills `client_id`. `upsert_plugin_oauth_client` merges per column
@@ -631,9 +757,10 @@ impl Store {
         // ahead". Detect it up front and return an actionable error instead.
         // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage, 3 =
         // + plugin_oauth_profile_clients.client_secret_setting, 4 =
-        // + automation_hooks/jobs/mcp_servers.plugin_id origin columns.)
+        // + automation_hooks/jobs/mcp_servers.plugin_id origin columns, 5 =
+        // + mcp_oauth_tokens/mcp_oauth_clients.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 4;
+        const LATEST_VERSION: i64 = 5;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -3246,6 +3373,134 @@ impl Store {
                 params![plugin_id],
             )
             .map(|_| ())
+        })
+        .await
+    }
+
+    /// Upsert an MCP server's OAuth token, keyed by `server_name`. Mirrors
+    /// [`Store::upsert_plugin_oauth_token`], including the per-field
+    /// encrypt-at-rest path — see [`McpOauthToken`] for why this is a
+    /// separate table rather than a row in `plugin_oauth_tokens`.
+    pub async fn upsert_mcp_oauth_token(
+        &self,
+        server: &str,
+        token: &McpOauthToken,
+    ) -> anyhow::Result<()> {
+        let server = server.to_string();
+        let token = token.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let existing: Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![&server],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let token_json = upsert_mcp_oauth_token_json(existing.as_deref(), &token)
+                .map_err(to_sql_json_error)?;
+            c.execute(
+                "INSERT INTO mcp_oauth_tokens(server_name, token_json, updated_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(server_name) DO UPDATE SET \
+                   token_json=excluded.token_json, \
+                   updated_at=excluded.updated_at",
+                params![server, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_mcp_oauth_token(&self, server: &str) -> anyhow::Result<Option<McpOauthToken>> {
+        let server = server.to_string();
+        let raw: Option<String> = self
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![server],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        raw.map(|raw| decode_mcp_oauth_token(&raw)).transpose()
+    }
+
+    pub async fn delete_mcp_oauth_token(&self, server: &str) -> anyhow::Result<()> {
+        let server = server.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM mcp_oauth_tokens WHERE server_name=?1",
+                params![server],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn mark_mcp_oauth_reconnect_required(&self, server: &str) -> anyhow::Result<()> {
+        let server = server.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let Some(raw): Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![&server],
+                    |r| r.get(0),
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let mut token =
+                decode_mcp_oauth_token(&raw).map_err(|err| from_sql_json_error(0, err))?;
+            token.reconnect_required = true;
+            let token_json =
+                upsert_mcp_oauth_token_json(Some(&raw), &token).map_err(to_sql_json_error)?;
+            c.execute(
+                "UPDATE mcp_oauth_tokens SET token_json=?2, updated_at=?3 WHERE server_name=?1",
+                params![server, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Registers (or reuses) the DCR client id for an authorization server,
+    /// keyed by `issuer`. Unlike [`Store::upsert_plugin_oauth_client`] there
+    /// is only one mutable column, so this is a plain upsert rather than a
+    /// per-column COALESCE merge; `created_at` is set once and preserved on
+    /// a later re-upsert.
+    pub async fn upsert_mcp_oauth_client(
+        &self,
+        issuer: &str,
+        client_id: &str,
+    ) -> anyhow::Result<()> {
+        let issuer = issuer.to_string();
+        let client_id = client_id.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(issuer) DO UPDATE SET client_id=excluded.client_id",
+                params![issuer, client_id, created_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_mcp_oauth_client(&self, issuer: &str) -> anyhow::Result<Option<String>> {
+        let issuer = issuer.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT client_id FROM mcp_oauth_clients WHERE issuer=?1",
+                params![issuer],
+                |r| r.get(0),
+            )
+            .optional()
         })
         .await
     }
@@ -8007,6 +8262,113 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn an_mcp_token_round_trips_and_is_scoped_to_its_server() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "tok".into(),
+            refresh_token: Some("ref".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(123),
+            scopes: vec!["read".into()],
+            reconnect_required: false,
+        };
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_token("rovo")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "tok"
+        );
+        assert!(
+            store.get_mcp_oauth_token("other").await.unwrap().is_none(),
+            "a token must not leak to a different MCP server"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_token_never_appears_in_the_plugin_token_store() {
+        // The two credential stores stay disjoint so retiring a plugin cannot
+        // revoke an MCP server's access, and vice versa.
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "tok".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        };
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+
+        assert!(store
+            .get_plugin_oauth_token("rovo")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_registered_client_id_is_reused_per_issuer() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_mcp_oauth_client("https://as.example", "client-1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("client-1")
+        );
+        assert!(store
+            .get_mcp_oauth_client("https://other.example")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn marking_reconnect_required_survives_a_read() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "tok".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        };
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+        store
+            .mark_mcp_oauth_reconnect_required("rovo")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .get_mcp_oauth_token("rovo")
+                .await
+                .unwrap()
+                .unwrap()
+                .reconnect_required
+        );
+    }
+
     async fn raw_plugin_oauth_profile_token_json(
         store: &Store,
         plugin_id: &str,
@@ -9785,11 +10147,12 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 4 database (v1 squashed baseline + v2
+    // produce a `user_version` 5 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
-    // automation_hooks/jobs/mcp_servers.plugin_id origin columns) whose
-    // schema + seeded rows exactly match the golden fixture.
+    // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
+    // mcp_oauth_tokens/mcp_oauth_clients) whose schema + seeded rows exactly
+    // match the golden fixture.
     //
     // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
     // version, messages_fts_data blocks), which are artifacts of the bundled
@@ -9802,8 +10165,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 4,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin migrations must be user_version 4"
+            user_version, 5,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth migrations must be user_version 5"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

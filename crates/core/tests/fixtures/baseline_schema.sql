@@ -29,6 +29,16 @@ CREATE TABLE gateways (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL
 CREATE TABLE job_runs (id TEXT PRIMARY KEY,job_id TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'running',started_at INTEGER NOT NULL,finished_at INTEGER,session_pk TEXT,error TEXT,add_lines INTEGER,del_lines INTEGER,note TEXT,log TEXT);
 CREATE TABLE jobs (id TEXT PRIMARY KEY,name TEXT NOT NULL,cron TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'cron',natural_text TEXT NOT NULL DEFAULT '',project_id TEXT NOT NULL,branch TEXT NOT NULL DEFAULT 'main',gateway TEXT NOT NULL DEFAULT 'local',enabled INTEGER NOT NULL DEFAULT 1,prompt TEXT NOT NULL,notify_success INTEGER NOT NULL DEFAULT 0,notify_fail INTEGER NOT NULL DEFAULT 1,created_at INTEGER, pre_check TEXT NOT NULL DEFAULT '', model_override TEXT, plugin_id TEXT);
 CREATE TABLE mcp_agent_access (server_id TEXT NOT NULL,agent_id TEXT NOT NULL,allowed INTEGER NOT NULL DEFAULT 1,PRIMARY KEY (server_id, agent_id));
+CREATE TABLE mcp_oauth_clients (
+  issuer     TEXT PRIMARY KEY,
+  client_id  TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE mcp_oauth_tokens (
+  server_name TEXT PRIMARY KEY,
+  token_json  TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
 CREATE TABLE mcp_servers (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'MCP server',color TEXT NOT NULL DEFAULT '#8B8B8B',description TEXT NOT NULL DEFAULT '',transport TEXT NOT NULL DEFAULT 'stdio',command TEXT,args TEXT NOT NULL DEFAULT '[]',env TEXT NOT NULL DEFAULT '{}',url TEXT,scope TEXT NOT NULL DEFAULT 'global',scope_gateways TEXT NOT NULL DEFAULT '[]',version TEXT,publisher TEXT,status TEXT NOT NULL DEFAULT 'unknown',status_detail TEXT,auth_kind TEXT NOT NULL DEFAULT 'none',auth_detail TEXT,created_at INTEGER, plugin_id TEXT);
 CREATE TABLE mcp_tools (server_id TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',perm TEXT NOT NULL DEFAULT 'ask',PRIMARY KEY (server_id, name));
 CREATE TABLE messages (session_pk TEXT NOT NULL,seq INTEGER NOT NULL,role TEXT NOT NULL,block_type TEXT NOT NULL,payload TEXT NOT NULL,tool_call_id TEXT,status TEXT,tool_kind TEXT,created_at INTEGER NOT NULL, speaker TEXT,PRIMARY KEY (session_pk, seq));
