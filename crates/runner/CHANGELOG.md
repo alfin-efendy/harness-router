@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.9.1](https://github.com/alfin-efendy/ryuzi/compare/v0.9.0...v0.9.1) (2026-08-10)
+
 ## [0.9.0](https://github.com/alfin-efendy/ryuzi/compare/v0.8.0...v0.9.0) (2026-08-09)
 
 

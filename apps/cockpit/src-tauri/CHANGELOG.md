@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.6.1](https://github.com/alfin-efendy/ryuzi/compare/cockpit-v0.6.0...cockpit-v0.6.1) (2026-08-10)
+
 ## [0.6.0](https://github.com/alfin-efendy/ryuzi/compare/cockpit-v0.5.0...cockpit-v0.6.0) (2026-08-09)
 
 
