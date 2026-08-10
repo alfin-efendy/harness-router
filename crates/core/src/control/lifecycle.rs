@@ -1615,10 +1615,24 @@ impl ControlPlane {
         // `mcp_servers` once, at enable/install-complete time
         // (`crate::plugins::mcp_sync::sync_plugin_mcp`), and ride the exact
         // same path a user-added server does from here on.
+        // A store-level failure here must not block the session from starting,
+        // but it must never be invisible either: this used to be a bare
+        // `unwrap_or_default()`, so a single unreadable row (see
+        // `servers_for_session`, which now skips those individually) took out
+        // every MCP server in every session with nothing in the logs.
         let mcp_servers =
-            crate::mcp::servers_for_session(&self.store, crate::harness::native::NATIVE_ID)
+            match crate::mcp::servers_for_session(&self.store, crate::harness::native::NATIVE_ID)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(servers) => servers,
+                Err(error) => {
+                    tracing::warn!(
+                        "mcp: reading this session's Apps servers failed; starting the session \
+                         with NO mcp servers attached: {error}"
+                    );
+                    Vec::new()
+                }
+            };
         let mcp_principals = self.mcp_principals_for(&mcp_servers).await;
         // Tasks 8/9: every enabled, installed plugin's `commands/` and
         // `skills/` directories, discovered by directory convention — LIVE
@@ -2652,7 +2666,9 @@ async fn coordinator_cancelled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::wasm_provider::install_component_less_bundle_on_disk;
+    use crate::plugins::wasm_provider::{
+        install_bundle_on_disk, install_component_less_bundle_on_disk,
+    };
     use serial_test::serial;
 
     /// A minimal `ControlPlane` over a fresh temp-file-backed store, with no
@@ -2670,6 +2686,65 @@ mod tests {
         (plane, settings, tmp)
     }
 
+    /// A minimal `tracing::Subscriber` that flattens every event into one
+    /// `field=value …` line, so a test can assert on what was — and was NOT —
+    /// logged. Hand-rolled: the crate carries no `tracing-subscriber`
+    /// dev-dependency, and one warn-and-skip assertion does not justify adding
+    /// one. Attached per-future via `WithSubscriber` (never globally), so it
+    /// captures only the call under test and cannot leak across tests.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedEvents {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Flatten(String);
+            impl tracing::field::Visit for Flatten {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={value}", field.name());
+                }
+            }
+            let mut line = Flatten(String::new());
+            event.record(&mut line);
+            self.0.lock().unwrap().push(line.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     // `build_component_mcp_servers` (unlike `wasm_provider`'s
     // `discover_provider_components`, which takes an explicit root) always
     // reads the real install root via
@@ -2677,33 +2752,82 @@ mod tests {
     // must redirect it through the `RYUZI_PLUGINS_ROOT` env var — a
     // process-global override, hence `#[serial]` (matches `bundle.rs`'s own
     // convention for this seam).
+    //
+    /// PROPERTY: a declarative-only bundle (no `[component]` at all — the
+    /// atlassian-rovo shape) is skipped BEFORE the compile attempt.
+    ///
+    /// "no servers registered" cannot prove that on its own: delete the
+    /// `manifest.component.is_none()` guard and the pre-existing
+    /// compile-failure arm (`warn!` + `continue`) yields the identical empty
+    /// result, since a component-less bundle's `component_path` is a directory
+    /// placeholder that `std::fs::read` rejects. So this observes the LOGS
+    /// instead — and stages a bundle that DOES have a `[component]`, whose
+    /// bytes are not a wasm component, as a positive control: the absence of a
+    /// compile-failure warning for the declarative bundle is only meaningful in
+    /// a run where that warning demonstrably appears for a bundle that really
+    /// did reach `compile`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn component_less_bundle_contributes_no_mcp_server() {
+    async fn a_component_less_bundle_is_skipped_before_the_compile_attempt() {
+        use tracing::instrument::WithSubscriber;
+
         let (plane, settings, _tmp) = test_plane().await;
         let root = tempfile::tempdir().unwrap();
         std::env::set_var("RYUZI_PLUGINS_ROOT", root.path());
 
-        // A declarative-only bundle (no `[component]` at all — the
-        // atlassian-rovo shape): enabled, so the ONLY reason it could be
-        // skipped is the missing component itself. Its `component_path` is
-        // a directory placeholder (see `bundle.rs`'s `load_active_bundles`),
-        // so a naive `runtime.compile` attempt would always fail —
-        // discovery must skip it before ever reaching `compile`.
         install_component_less_bundle_on_disk(root.path(), plane.store(), "life-declarative").await;
-        plane
-            .store()
-            .set_setting_raw("plugin.life-declarative.enabled", "true")
-            .await
-            .unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let not_wasm = artifacts.path().join("not-a-component.wasm");
+        std::fs::write(&not_wasm, b"definitely not a wasm component").unwrap();
+        install_bundle_on_disk(
+            root.path(),
+            plane.store(),
+            "life-broken-wasm",
+            &not_wasm,
+            &[],
+        )
+        .await;
+        // Both enabled, so a missing/false enablement can never be the reason
+        // either one is skipped.
+        for id in ["life-declarative", "life-broken-wasm"] {
+            plane
+                .store()
+                .set_setting_raw(&format!("plugin.{id}.enabled"), "true")
+                .await
+                .unwrap();
+        }
 
-        let servers = plane.build_component_mcp_servers(&settings).await;
+        let captured = CapturedEvents::default();
+        let servers = plane
+            .build_component_mcp_servers(&settings)
+            .with_subscriber(captured.clone())
+            .await;
 
         std::env::remove_var("RYUZI_PLUGINS_ROOT");
 
         assert!(
             servers.is_empty(),
-            "a component-less bundle must contribute no MCP server"
+            "neither bundle can contribute an MCP server"
+        );
+        let lines = captured.lines();
+        let compile_failures: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("component compile failed"))
+            .collect();
+        assert!(
+            compile_failures
+                .iter()
+                .any(|line| line.contains("life-broken-wasm")),
+            "positive control: a bundle WITH a component whose bytes are not wasm must reach \
+             compile and warn — otherwise the absence assertion below proves nothing. Captured: \
+             {lines:?}"
+        );
+        assert!(
+            !compile_failures
+                .iter()
+                .any(|line| line.contains("life-declarative")),
+            "a component-less bundle must be skipped before `runtime.compile` is ever attempted, \
+             but a compile-failure warning names it: {compile_failures:?}"
         );
     }
 }
