@@ -25,6 +25,7 @@
 use crate::engine::EngineClient;
 use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
+use ryuzi_core::api::apps_api::validate_mcp_oauth_callback;
 use ryuzi_core::oauth_loopback;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -254,6 +255,11 @@ pub async fn begin_mcp_connect(
     let engine_client = client.clone();
     let task_id = id.clone();
     let verifier = start.verifier.clone();
+    // The state this flow issued — the ONLY thing that distinguishes the
+    // authorization server's real redirect from anything else that can reach
+    // the fixed loopback port while it is live. See
+    // `validate_mcp_oauth_callback`.
+    let state_token = start.state.clone();
     // Carried forward alongside the verifier — the authorization server
     // `begin_mcp_connect` actually selected, so the completion step below
     // never has to rediscover it (and risk resolving a different one).
@@ -286,6 +292,7 @@ pub async fn begin_mcp_connect(
                 &verifier,
                 &issuer_token_endpoint,
                 &connect_client_id,
+                &state_token,
                 callback,
             )
             .await;
@@ -295,30 +302,42 @@ pub async fn begin_mcp_connect(
     Ok(start)
 }
 
-/// Hands a captured loopback callback's `code` + the stashed `verifier` to
-/// the daemon's `complete_mcp_connect` for the token exchange. There is no
-/// dedicated event/toast for this background completion (unlike the plugin
-/// install wizard's `PluginOauthCompletedMsg`) — Cockpit's polling loop
-/// (mirroring `OauthProfileConnections.tsx`'s PKCE poll) is what notices the
-/// server turn "connected"; a failure here is only logged.
+/// Validate a captured loopback callback's `state` against the state this flow
+/// issued — via the daemon's `validate_mcp_oauth_callback`, which is where that
+/// rule is defined and tested — then hand the `code` + the stashed `verifier`
+/// to the daemon's `complete_mcp_connect` for the token exchange. Mirrors
+/// `plugins_cmd.rs`'s `complete_local_profile_callback`, which rejects a
+/// missing `code`, a missing `state` and a mismatched `state` alike; this path
+/// used to check only the first, which made every one of those a token
+/// exchange against an attacker-supplied code.
+///
+/// There is no dedicated event/toast for this background completion (unlike
+/// the plugin install wizard's `PluginOauthCompletedMsg`) — Cockpit's polling
+/// loop (mirroring `OauthProfileConnections.tsx`'s PKCE poll) is what notices
+/// the server turn "connected"; a failure here, rejection included, is only
+/// logged, and the server simply stays disconnected for the user to retry.
 async fn complete_local_mcp_callback(
     engine: &EngineClient,
     id: &str,
     verifier: &str,
     issuer_token_endpoint: &str,
     client_id: &str,
+    state_token: &str,
     callback: oauth_loopback::CallbackResult,
 ) {
-    let Some(code) = callback.code else {
-        eprintln!("[ryuzi] MCP OAuth callback for {id} did not include a `code` parameter");
-        return;
+    let code = match validate_mcp_oauth_callback(&callback, state_token) {
+        Ok(code) => code,
+        Err(reason) => {
+            eprintln!("[ryuzi] MCP OAuth callback for {id} rejected: {reason}");
+            return;
+        }
     };
     if let Err(err) = engine
         .rpc::<Vec<AppInfo>>(
             "complete_mcp_connect",
             serde_json::json!({
                 "id": id,
-                "code": code.trim(),
+                "code": code,
                 "verifier": verifier,
                 "issuer_token_endpoint": issuer_token_endpoint,
                 "client_id": client_id,

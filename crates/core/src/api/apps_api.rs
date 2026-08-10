@@ -147,6 +147,153 @@ fn require_https(url: &str) -> Result<(), ApiError> {
     }
 }
 
+/// Does `url` point at the loopback interface? Used only to carve plain-http
+/// loopback out of the `https://` requirement on an OAuth token endpoint —
+/// RFC 8252 §8.3's reasoning (a loopback request never leaves the machine, so
+/// there is no transport to intercept), and the same carve-out
+/// `automation::validate_webhook_url` already makes for outbound HTTP in this
+/// crate. Only literal loopback IPs and `localhost` qualify; unlike
+/// `automation`'s check this does not re-resolve `localhost` to confirm it
+/// lands on a loopback address, because the registered-issuer gate in
+/// [`require_registered_token_endpoint`] — not this one — is what actually
+/// decides whether an endpoint may be POSTed to.
+fn is_loopback_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Every URL prefix of `endpoint` that could be its authorization server's
+/// `issuer`, shortest first: the bare origin, then each successive path
+/// segment. RFC 8414 §3 derives an authorization server's metadata URL from
+/// its issuer, and an issuer may carry a path (multi-tenant deployments do),
+/// so a token endpoint like `https://as.example/tenant1/oauth/token` can
+/// legitimately belong to issuer `https://as.example` OR
+/// `https://as.example/tenant1` — both have to be considered. Shortest-first
+/// only fixes the probe order; [`require_registered_token_endpoint`] accepts
+/// on the first candidate whose registered client id MATCHES, so a longer
+/// tenant-scoped issuer is still reachable when a bare-origin row also exists.
+fn issuer_candidates(endpoint: &url::Url) -> Vec<String> {
+    let mut acc = endpoint.origin().ascii_serialization();
+    let mut out = vec![acc.clone()];
+    for segment in endpoint.path().split('/').filter(|s| !s.is_empty()) {
+        acc.push('/');
+        acc.push_str(segment);
+        out.push(acc.clone());
+    }
+    out
+}
+
+/// Gate an `issuer_token_endpoint` before the daemon POSTs an authorization
+/// code, a PKCE verifier and a client id to it.
+///
+/// `complete_mcp_connect` takes that endpoint as an RPC PARAMETER, and it is a
+/// registered Tauri command — so the webview, or anything else that reaches
+/// the control API, chooses the URL. Used verbatim it is both an SSRF lever
+/// (the daemon fetches an attacker-named host) and a credential-exfiltration
+/// one (`code` + `code_verifier` + `client_id` arrive there in the request
+/// body), followed by credential INJECTION: whatever `access_token` comes back
+/// lands in `mcp_oauth_tokens` for this server id, and the session path then
+/// sends it as the bearer to the real MCP server. Two gates:
+///
+/// 1. Transport — `https://`, per [`require_https`], with the loopback
+///    carve-out [`is_loopback_url`] documents.
+/// 2. Binding — the endpoint must sit under an issuer that ALREADY has a
+///    client row in `mcp_oauth_clients`, and `client_id` must be exactly that
+///    row's client id. Only `mcp_oauth::begin_mcp_connect` writes those rows,
+///    and only for an authorization server it reached through the MCP server's
+///    own RFC 9728 metadata — so this is what ties the endpoint back to a real
+///    discovery run instead of to the caller's say-so. This is the gate doing
+///    the real work; the transport one is hygiene.
+async fn require_registered_token_endpoint(
+    store: &crate::store::Store,
+    issuer_token_endpoint: &str,
+    client_id: &str,
+) -> Result<(), ApiError> {
+    let parsed = url::Url::parse(issuer_token_endpoint).map_err(|e| {
+        ApiError::bad_request(format!(
+            "invalid OAuth token endpoint {issuer_token_endpoint}: {e}"
+        ))
+    })?;
+    if !is_loopback_url(&parsed) {
+        require_https(issuer_token_endpoint)
+            .map_err(|_| ApiError::bad_request("the OAuth token endpoint must use https://"))?;
+    }
+    let mut saw_registered_issuer = false;
+    for candidate in issuer_candidates(&parsed) {
+        // A PRM's `authorization_servers` entry is stored verbatim, so an
+        // issuer published with a trailing slash is keyed with one.
+        for key in [format!("{candidate}/"), candidate] {
+            if let Some(registered) = store.get_mcp_oauth_client(&key).await? {
+                if registered == client_id {
+                    return Ok(());
+                }
+                saw_registered_issuer = true;
+            }
+        }
+    }
+    Err(ApiError::bad_request(if saw_registered_issuer {
+        "the supplied client_id is not the one registered with that authorization server"
+    } else {
+        "the OAuth token endpoint does not belong to an authorization server this \
+         server has a registered client for"
+    }))
+}
+
+/// Validate a captured MCP OAuth loopback callback against the `state` this
+/// flow's [`begin_mcp_connect`] issued, returning the authorization code to
+/// exchange.
+///
+/// `state` is not decoration, and nothing upstream of this checks it.
+/// `oauth_loopback::handle_profile_callback` computes a `validation_ok` solely
+/// to pick which HTML page to serve and forwards the `CallbackResult` down the
+/// channel either way (by design — otherwise the awaiting side hangs), so the
+/// consumer is the ONLY thing between a forged loopback request and a token
+/// exchange. The listener holds a FIXED port (8976) on a guessable path
+/// (`/mcp-oauth/{server_id}/callback`, and a server id is just
+/// `{plugin_id}-{mcp.name}`) for up to five minutes, so any local process — or
+/// any page the user has open — can spend its one-shot slot with
+/// `?code=<attacker's>&state=anything`. Unchecked, that either silently kills
+/// the connect flow (an authorization server that binds PKCE strictly rejects
+/// the mismatched verifier) or stores the ATTACKER's token for this server,
+/// which every later agent turn then reads and writes through.
+///
+/// This lives in the daemon crate, and is `pub`, for a specific reason: the
+/// loopback listener runs in COCKPIT's process (`apps/cockpit/src-tauri/src/
+/// apps_cmd.rs` — the registered `redirect_uri` must be reachable even when
+/// the daemon is remote), so the comparison has to happen there, but a rule
+/// deciding whether an authorization code is trusted must not sit in a crate
+/// no test suite reaches: `cargo test -p ryuzi-cockpit` cannot start at all on
+/// Windows (tauri#13419, STATUS_ENTRYPOINT_NOT_FOUND) and CI runs
+/// `cargo test` for `ryuzi-core`/`ryuzi-runner`/`ryuzi-plugin-sdk` only.
+/// Defined here it is covered by this module's tests; Cockpit calls it.
+pub fn validate_mcp_oauth_callback(
+    callback: &crate::oauth_loopback::CallbackResult,
+    expected_state: &str,
+) -> Result<String, String> {
+    let Some(code) = callback
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    else {
+        return Err("the callback carried no `code` parameter".into());
+    };
+    let Some(state) = callback.state.as_deref() else {
+        return Err("the callback carried no `state` parameter".into());
+    };
+    if state != expected_state {
+        return Err(
+            "the callback's `state` does not match the state this flow issued — discarding it"
+                .into(),
+        );
+    }
+    Ok(code.to_string())
+}
+
 fn initial_of(name: &str) -> String {
     name.chars()
         .next()
@@ -411,6 +558,11 @@ async fn begin_mcp_connect(state: &ApiState, id: &str) -> Result<McpConnectStart
 /// `McpConnectStart` now carries `issuer_token_endpoint`/`client_id`
 /// forward from the exact authorization server `begin_mcp_connect` selected;
 /// use those, not a fresh lookup.
+///
+/// Carried forward is not the same as trusted, though: both values arrive as
+/// RPC parameters on a registered Tauri command, so
+/// [`require_registered_token_endpoint`] has to tie them back to a real
+/// discovery run before anything is POSTed anywhere.
 async fn complete_mcp_connect(
     state: &ApiState,
     id: &str,
@@ -427,6 +579,8 @@ async fn complete_mcp_connect(
         .url
         .clone()
         .ok_or_else(|| ApiError::bad_request(format!("{id} has no URL configured")))?;
+    // Before anything leaves the machine: the caller named this endpoint.
+    require_registered_token_endpoint(cp.store(), issuer_token_endpoint, client_id).await?;
     let http = reqwest::Client::new();
     crate::harness::native::mcp_oauth::complete_mcp_connect(
         cp.store(),
@@ -667,6 +821,199 @@ mod tests {
         let err = res.expect_err("a stored http:// URL must not be usable for OAuth connect");
         assert_eq!(err.status, 400);
         assert!(err.message.contains("https://"), "{}", err.message);
+    }
+
+    // ---------- the loopback callback's `state` must be compared ----------
+
+    fn callback(code: Option<&str>, state: Option<&str>) -> crate::oauth_loopback::CallbackResult {
+        crate::oauth_loopback::CallbackResult {
+            code: code.map(str::to_string),
+            state: state.map(str::to_string),
+        }
+    }
+
+    /// PROPERTY: a callback whose `state` is not the state this flow issued
+    /// must be REJECTED, not exchanged. This is the whole security value of
+    /// generating a state at all on this path — `oauth_loopback`'s server
+    /// forwards every `CallbackResult` down the channel regardless of what it
+    /// thinks of it (it only varies the HTML page), so the consumer is the
+    /// only check that exists.
+    ///
+    /// Verified by observed failure: deleting the `state != expected_state`
+    /// arm from `validate_mcp_oauth_callback` turns the mismatch assertion
+    /// red (a forged state comes back `Ok("attacker-code")`), and deleting the
+    /// missing-`state` arm turns the `None` assertion red the same way.
+    #[test]
+    fn a_callback_state_that_does_not_match_the_issued_state_is_rejected() {
+        assert_eq!(
+            validate_mcp_oauth_callback(&callback(Some("real-code"), Some("s-1")), "s-1"),
+            Ok("real-code".to_string()),
+            "the authorization server's own redirect must still go through"
+        );
+
+        let forged =
+            validate_mcp_oauth_callback(&callback(Some("attacker-code"), Some("anything")), "s-1")
+                .expect_err("a mismatched state must not yield a code to exchange");
+        assert!(forged.contains("does not match"), "{forged}");
+
+        let stateless = validate_mcp_oauth_callback(&callback(Some("attacker-code"), None), "s-1")
+            .expect_err("a callback with no state at all must not yield a code either");
+        assert!(stateless.contains("no `state`"), "{stateless}");
+    }
+
+    /// A state match is exact — no prefix, suffix or case latitude, since a
+    /// guessable-prefix acceptance would hand the whole check away.
+    #[test]
+    fn state_comparison_is_exact() {
+        for wrong in ["s-1 ", " s-1", "s-11", "s-", "S-1", ""] {
+            assert!(
+                validate_mcp_oauth_callback(&callback(Some("c"), Some(wrong)), "s-1").is_err(),
+                "state {wrong:?} must not be accepted for expected state \"s-1\""
+            );
+        }
+    }
+
+    /// `code` handling: absent, blank, or whitespace-only is nothing to
+    /// exchange; a real code comes back trimmed (the trim used to happen at
+    /// the call site, and moved in here with the rest of the validation).
+    #[test]
+    fn a_callback_without_a_usable_code_is_rejected_and_a_real_one_is_trimmed() {
+        for empty in [None, Some(""), Some("   ")] {
+            let err =
+                validate_mcp_oauth_callback(&callback(empty, Some("s-1")), "s-1").unwrap_err();
+            assert!(err.contains("no `code`"), "{err}");
+        }
+        assert_eq!(
+            validate_mcp_oauth_callback(&callback(Some("  c-1\n"), Some("s-1")), "s-1"),
+            Ok("c-1".to_string())
+        );
+    }
+
+    // ---------- the token endpoint is caller-supplied, so it is gated ----------
+
+    /// PROPERTY: a token endpoint the caller invented must be rejected on
+    /// transport grounds before anything else — `complete_mcp_connect` is a
+    /// registered Tauri command, so `http://attacker.test/token` is one
+    /// webview call away, and the request body carries `code` +
+    /// `code_verifier` + `client_id`.
+    ///
+    /// Verified by observed failure: dropping the `require_https` arm from
+    /// `require_registered_token_endpoint` turns the first assertion's
+    /// message check red (the URL then falls through to the binding gate and
+    /// is rejected for the wrong reason).
+    #[tokio::test]
+    async fn a_plain_http_token_endpoint_is_rejected_unless_it_is_loopback() {
+        let s = state().await;
+        let store = s.cp.store();
+        store
+            .upsert_mcp_oauth_client("http://attacker.test", "c")
+            .await
+            .unwrap();
+        let err = require_registered_token_endpoint(store, "http://attacker.test/token", "c")
+            .await
+            .expect_err("a plain http:// token endpoint must not be POSTed to");
+        assert_eq!(err.status, 400);
+        assert!(
+            err.message.contains("https://"),
+            "the rejection must be the transport one — a registered row exists, so the \
+             binding gate would have let this through: {}",
+            err.message
+        );
+
+        // Loopback is the documented carve-out (and what every mock
+        // authorization server in this crate binds).
+        store
+            .upsert_mcp_oauth_client("http://127.0.0.1:9", "c")
+            .await
+            .unwrap();
+        require_registered_token_endpoint(store, "http://127.0.0.1:9/token", "c")
+            .await
+            .expect("a registered loopback endpoint stays usable");
+    }
+
+    /// PROPERTY: the endpoint must belong to an authorization server this
+    /// store has actually registered a client with, and `client_id` must be
+    /// that registration's — a caller cannot name an arbitrary https host, nor
+    /// swap in its own client id at a real one.
+    #[tokio::test]
+    async fn a_token_endpoint_with_no_registered_client_row_is_rejected() {
+        let s = state().await;
+        let store = s.cp.store();
+        store
+            .upsert_mcp_oauth_client("https://as.example", "registered-client")
+            .await
+            .unwrap();
+
+        let unknown = require_registered_token_endpoint(
+            store,
+            "https://evil.example/token",
+            "registered-client",
+        )
+        .await
+        .expect_err("an issuer with no client row must be rejected");
+        assert_eq!(unknown.status, 400);
+        assert!(
+            unknown.message.contains("does not belong"),
+            "{}",
+            unknown.message
+        );
+
+        let wrong_client =
+            require_registered_token_endpoint(store, "https://as.example/token", "attacker-client")
+                .await
+                .expect_err("a client_id that is not the registered one must be rejected");
+        assert!(
+            wrong_client.message.contains("client_id"),
+            "{}",
+            wrong_client.message
+        );
+
+        require_registered_token_endpoint(store, "https://as.example/token", "registered-client")
+            .await
+            .expect("the real pairing must still be accepted");
+    }
+
+    /// A tenant-scoped issuer (a path, not just an origin) and an issuer
+    /// published with a trailing slash both still resolve — the candidate walk
+    /// exists so this gate rejects attackers, not multi-tenant authorization
+    /// servers.
+    #[tokio::test]
+    async fn issuer_lookup_handles_a_path_scoped_issuer_and_a_trailing_slash() {
+        let s = state().await;
+        let store = s.cp.store();
+        store
+            .upsert_mcp_oauth_client("https://as.example/tenant1", "tenant1-client")
+            .await
+            .unwrap();
+        store
+            .upsert_mcp_oauth_client("https://slash.example/", "slash-client")
+            .await
+            .unwrap();
+
+        require_registered_token_endpoint(
+            store,
+            "https://as.example/tenant1/oauth/token",
+            "tenant1-client",
+        )
+        .await
+        .expect("a path-scoped issuer must resolve from its token endpoint");
+        require_registered_token_endpoint(store, "https://slash.example/token", "slash-client")
+            .await
+            .expect("an issuer stored with a trailing slash must resolve too");
+
+        // A bare-origin row for a DIFFERENT client must not shadow the
+        // tenant-scoped one that actually matches.
+        store
+            .upsert_mcp_oauth_client("https://as.example", "other-client")
+            .await
+            .unwrap();
+        require_registered_token_endpoint(
+            store,
+            "https://as.example/tenant1/oauth/token",
+            "tenant1-client",
+        )
+        .await
+        .expect("a shorter non-matching row must not shadow a longer matching one");
     }
 
     #[tokio::test]
@@ -1006,6 +1353,61 @@ mod tests {
             "AS-2 must never see a token request here: it was never the authorization server \
              that issued the code, it only LOOKS usable because a client id happens to already \
              be on file for it"
+        );
+    }
+
+    /// PROPERTY: an `issuer_token_endpoint` the caller made up never receives
+    /// a request AT ALL — the rejection has to happen before the POST, because
+    /// the POST itself is the whole attack: `grant_type`/`code`/`code_verifier`
+    /// /`client_id`/`resource` in the body, and then whatever `access_token`
+    /// comes back gets stored as this server's bearer.
+    ///
+    /// Driven through the real RPC dispatch (`complete_mcp_connect` is a
+    /// registered Tauri command, so the webview picks these arguments), and
+    /// pointed at a LIVE authorization server that records every token hit —
+    /// so this asserts on absence of traffic, not merely on an error being
+    /// returned.
+    ///
+    /// Verified by observed failure: with
+    /// `require_registered_token_endpoint`'s call removed from
+    /// `complete_mcp_connect`, the dispatch succeeds instead of erroring, the
+    /// hit count is 1 instead of 0, and `attacker-token` lands in
+    /// `mcp_oauth_tokens` for `remote` — all three assertions go red.
+    #[tokio::test]
+    async fn complete_mcp_connect_never_posts_to_a_token_endpoint_the_caller_invented() {
+        let (attacker_url, _up, attacker_token_hits) = spawn_authorization_server().await;
+        let s = state().await;
+        mcp::upsert_server(s.cp.store(), http_row("remote", "https://mcp.example.com"))
+            .await
+            .unwrap();
+
+        let err = dispatch(
+            &s,
+            "complete_mcp_connect",
+            json!({
+                "id": "remote",
+                "code": "victims-code",
+                "verifier": "victims-verifier",
+                "issuer_token_endpoint": format!("{attacker_url}/token"),
+                "client_id": "attacker-client",
+            }),
+        )
+        .await
+        .expect_err("a token endpoint with no registered client row must be refused");
+        assert_eq!(err.status, 400);
+
+        assert!(
+            attacker_token_hits.lock().unwrap().is_empty(),
+            "the caller-named endpoint must never be contacted — it received: {:?}",
+            attacker_token_hits.lock().unwrap()
+        );
+        assert!(
+            s.cp.store()
+                .get_mcp_oauth_token("remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "and no token may be stored for the server from a refused exchange"
         );
     }
 }
