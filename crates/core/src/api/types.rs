@@ -622,12 +622,21 @@ pub struct AppInfo {
 /// the redirect (see `mcp_oauth::mcp_redirect_uri` and the Task 9 plan
 /// correction on why the callback listener lives in Cockpit's own process,
 /// not the daemon's).
+///
+/// `issuer_token_endpoint` and `client_id` are the token endpoint and client
+/// id of the authorization server this flow actually selected — carried
+/// forward from `harness::native::mcp_oauth::McpAuthorizeStart` so the caller
+/// can hand them straight back to `complete_mcp_connect` instead of
+/// rediscovering them (which could resolve a different authorization server
+/// than the one that issued the code).
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct McpConnectStart {
     pub authorize_url: String,
     pub state: String,
     pub verifier: String,
+    pub issuer_token_endpoint: String,
+    pub client_id: String,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]

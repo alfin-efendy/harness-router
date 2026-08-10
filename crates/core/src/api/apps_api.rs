@@ -59,6 +59,12 @@ struct McpCompleteConnectP {
     id: String,
     code: String,
     verifier: String,
+    /// Carried forward verbatim from the matching `begin_mcp_connect` call's
+    /// `McpConnectStart.issuer_token_endpoint` — see `complete_mcp_connect`'s
+    /// doc comment for why this must not be rediscovered here.
+    issuer_token_endpoint: String,
+    /// Carried forward verbatim from `McpConnectStart.client_id`.
+    client_id: String,
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
@@ -98,7 +104,15 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "complete_mcp_connect" => {
             let a: McpCompleteConnectP = params(p)?;
-            ok(complete_mcp_connect(state, &a.id, &a.code, &a.verifier).await?)
+            ok(complete_mcp_connect(
+                state,
+                &a.id,
+                &a.code,
+                &a.verifier,
+                &a.issuer_token_endpoint,
+                &a.client_id,
+            )
+            .await?)
         }
         "disconnect_mcp" => {
             let a: IdP = params(p)?;
@@ -372,67 +386,38 @@ async fn begin_mcp_connect(state: &ApiState, id: &str) -> Result<McpConnectStart
         authorize_url: start.url,
         state: start.state,
         verifier: start.verifier,
+        // Carried forward so `complete_mcp_connect` never has to rediscover
+        // the authorization server this flow selected.
+        issuer_token_endpoint: start.issuer_token_endpoint,
+        client_id: start.client_id,
     })
 }
 
-/// Re-run the RFC 9728 → RFC 8414 discovery chain from scratch to recover
-/// the issuer and its token endpoint for the OAuth-code exchange.
-/// `begin_mcp_connect` (Task 7) already did this once — and cached the
-/// resulting client id in `mcp_oauth_clients` — but it returns only the
-/// built authorize URL, not the discovered issuer/metadata, so
-/// `complete_mcp_connect` (called minutes later, from a separate request
-/// after the browser round-trip) has nothing to recover the token endpoint
-/// from except redoing the same deterministic, side-effect-free lookup: the
-/// server's own discovery documents don't change between the two calls in
-/// any realistic flow, and this performs no registration (client id comes
-/// from the store, already persisted by `begin_mcp_connect`).
-async fn discover_authorization_server(
-    http: &reqwest::Client,
-    url: &str,
-) -> anyhow::Result<(String, crate::plugins::oauth::OauthServerMetadata)> {
-    let probe = http
-        .post(url)
-        .header("content-type", "application/json")
-        .header(
-            "MCP-Protocol-Version",
-            crate::harness::native::mcp_client::MCP_PROTOCOL_VERSION,
-        )
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {
-                "protocolVersion": crate::harness::native::mcp_client::MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "ryuzi-cockpit", "version": env!("CARGO_PKG_VERSION")}
-            }
-        }))
-        .send()
-        .await?;
-    if probe.status() != reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!(
-            "expected a 401 challenge while completing the OAuth connect, got HTTP {}",
-            probe.status()
-        );
-    }
-    let header = probe
-        .headers()
-        .get(reqwest::header::WWW_AUTHENTICATE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("401 response carried no WWW-Authenticate header"))?;
-    let metadata_url = crate::plugins::oauth::parse_www_authenticate_resource(header)
-        .ok_or_else(|| anyhow::anyhow!("WWW-Authenticate names no protected-resource metadata"))?;
-    let issuers =
-        crate::harness::native::mcp_oauth::protected_resource_metadata(http, &metadata_url).await?;
-    crate::harness::native::mcp_oauth::select_authorization_server(http, &issuers).await
-}
-
 /// Complete a remote MCP server's OAuth connect flow: Cockpit's loopback
-/// callback captured `code`, and hands it back here with the `verifier` it
-/// stashed from `begin_mcp_connect`'s response.
+/// callback captured `code`, and hands it back here with the `verifier`,
+/// `issuer_token_endpoint` and `client_id` it stashed from
+/// `begin_mcp_connect`'s `McpConnectStart` response.
+///
+/// This deliberately does NOT rediscover the authorization server. An
+/// earlier version of this handler re-ran the full RFC 9728 → RFC 8414
+/// discovery chain here to recover the issuer and token endpoint, because
+/// `begin_mcp_connect`'s response didn't carry them. That reintroduced the
+/// exact hazard `harness::native::mcp_oauth::complete_mcp_connect`'s design
+/// was meant to avoid: discovery run a second time, minutes later, from a
+/// separate request, could resolve a DIFFERENT authorization server than the
+/// one that actually issued the code (e.g. a PRM document listing several,
+/// the first becoming reachable or unreachable in between) — and it cost an
+/// extra round of read-only HTTP requests on every connect completion.
+/// `McpConnectStart` now carries `issuer_token_endpoint`/`client_id`
+/// forward from the exact authorization server `begin_mcp_connect` selected;
+/// use those, not a fresh lookup.
 async fn complete_mcp_connect(
     state: &ApiState,
     id: &str,
     code: &str,
     verifier: &str,
+    issuer_token_endpoint: &str,
+    client_id: &str,
 ) -> Result<Vec<AppInfo>, ApiError> {
     let cp = &state.cp;
     let row = mcp::get_server(cp.store(), id)
@@ -443,23 +428,13 @@ async fn complete_mcp_connect(
         .clone()
         .ok_or_else(|| ApiError::bad_request(format!("{id} has no URL configured")))?;
     let http = reqwest::Client::new();
-    let (issuer, metadata) = discover_authorization_server(&http, &url).await?;
-    let client_id = cp
-        .store()
-        .get_mcp_oauth_client(&issuer)
-        .await?
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "no OAuth client is registered for {issuer} yet — start Connect again"
-            ))
-        })?;
     crate::harness::native::mcp_oauth::complete_mcp_connect(
         cp.store(),
         &http,
         id,
         &url,
-        &metadata.token_endpoint,
-        &client_id,
+        issuer_token_endpoint,
+        client_id,
         code,
         verifier,
     )
@@ -481,6 +456,8 @@ mod tests {
     use super::*;
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn lines(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -791,6 +768,244 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the token row itself must be gone, not merely hidden"
+        );
+    }
+
+    // ---------- complete_mcp_connect must not rediscover the AS ----------
+
+    /// One authorization server: RFC 8414 metadata (whose availability the
+    /// returned `Arc<AtomicBool>` controls), RFC 7591 registration, and a
+    /// token endpoint that records every request body it receives. The
+    /// token endpoint is deliberately NOT gated by the same flag — only the
+    /// discovery *metadata* document goes dark when toggled off, mirroring
+    /// an authorization server whose discovery endpoint flakes while a
+    /// token endpoint a caller already knows about keeps working.
+    async fn spawn_authorization_server() -> (String, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>) {
+        use axum::extract::{Json, State};
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct AsState {
+            as_url: String,
+            up: Arc<AtomicBool>,
+            token_hits: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn handle_metadata(
+            State(state): State<AsState>,
+        ) -> (axum::http::StatusCode, axum::Json<Value>) {
+            if state.up.load(Ordering::SeqCst) {
+                let as_url = &state.as_url;
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(json!({
+                        "issuer": as_url,
+                        "authorization_endpoint": format!("{as_url}/authorize"),
+                        "token_endpoint": format!("{as_url}/token"),
+                        "registration_endpoint": format!("{as_url}/register"),
+                    })),
+                )
+            } else {
+                (axum::http::StatusCode::NOT_FOUND, axum::Json(Value::Null))
+            }
+        }
+
+        async fn handle_register(Json(_req): Json<Value>) -> axum::Json<Value> {
+            axum::Json(json!({ "client_id": "freshly-registered-client" }))
+        }
+
+        async fn handle_token(
+            State(state): State<AsState>,
+            body: axum::body::Bytes,
+        ) -> axum::Json<Value> {
+            state
+                .token_hits
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&body).into_owned());
+            axum::Json(
+                json!({ "access_token": "issued-token", "token_type": "Bearer", "expires_in": 3600 }),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let as_url = format!("http://{addr}");
+        let up = Arc::new(AtomicBool::new(true));
+        let token_hits = Arc::new(Mutex::new(Vec::new()));
+        let state = AsState {
+            as_url: as_url.clone(),
+            up: up.clone(),
+            token_hits: token_hits.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(handle_metadata),
+            )
+            .route("/register", post(handle_register))
+            .route("/token", post(handle_token))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (as_url, up, token_hits)
+    }
+
+    /// An MCP resource server that 401s with a `WWW-Authenticate` header
+    /// naming its own protected-resource metadata, which in turn lists BOTH
+    /// authorization servers, in document order — `as1_url` first. Mirrors
+    /// `mcp_oauth.rs`'s `spawn_mcp_401_with_prm`, generalized to two issuers
+    /// so `select_authorization_server`'s document-order fallback has
+    /// something real to fall back to.
+    async fn spawn_mcp_with_two_authorization_servers(as1_url: String, as2_url: String) -> String {
+        use axum::extract::State;
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct McpState {
+            mcp_url: Arc<Mutex<String>>,
+            as1_url: String,
+            as2_url: String,
+        }
+
+        async fn handle_probe(State(state): State<McpState>) -> axum::response::Response {
+            let mcp_url = state.mcp_url.lock().unwrap().clone();
+            let www_auth = format!(
+                "Bearer resource_metadata=\"{mcp_url}/.well-known/oauth-protected-resource\""
+            );
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::UNAUTHORIZED)
+                .header(axum::http::header::WWW_AUTHENTICATE, www_auth)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+
+        async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            axum::Json(json!({
+                "resource": "placeholder",
+                "authorization_servers": [state.as1_url, state.as2_url],
+            }))
+        }
+
+        let mcp_url_slot = Arc::new(Mutex::new(String::new()));
+        let mcp_state = McpState {
+            mcp_url: mcp_url_slot.clone(),
+            as1_url,
+            as2_url,
+        };
+        let app = Router::new()
+            .route("/", post(handle_probe))
+            .route("/.well-known/oauth-protected-resource", get(handle_prm))
+            .with_state(mcp_state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mcp_url = format!("http://{addr}");
+        *mcp_url_slot.lock().unwrap() = mcp_url.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        mcp_url
+    }
+
+    /// PROPERTY: completion must use the authorization server
+    /// `begin_mcp_connect` actually selected, not whatever a fresh discovery
+    /// run would resolve to at completion time.
+    ///
+    /// Pinned by making AS-1 — first in the PRM's document order, and the
+    /// one `begin_mcp_connect` selects because it is reachable at that
+    /// point — go dark (its discovery *metadata* only; its token endpoint
+    /// keeps working) strictly BETWEEN the begin and complete calls, while
+    /// AS-2 already has a client id on file (as if some other MCP server
+    /// once connected through the same authorization server). A completion
+    /// handler that rediscovers here would fail over to AS-2, find a
+    /// pre-existing client id waiting for it, and complete SILENTLY against
+    /// the wrong authorization server — exactly the hazard the plan's Task 7
+    /// commentary warns about. Verified by observed failure: see this test's
+    /// module doc / the accompanying report for the manual before/after run
+    /// that reintroduced the old rediscovery path and watched this go red.
+    #[tokio::test]
+    async fn complete_mcp_connect_uses_the_authorization_server_begin_selected_not_a_fresh_discovery(
+    ) {
+        let (as1_url, as1_up, as1_token_hits) = spawn_authorization_server().await;
+        let (as2_url, _as2_up, as2_token_hits) = spawn_authorization_server().await;
+        let mcp_url =
+            spawn_mcp_with_two_authorization_servers(as1_url.clone(), as2_url.clone()).await;
+
+        let s = state().await;
+        mcp::upsert_server(s.cp.store(), http_row("remote", &mcp_url))
+            .await
+            .unwrap();
+        s.cp.store()
+            .upsert_mcp_oauth_client(&as2_url, "as2-preexisting-client")
+            .await
+            .unwrap();
+
+        // `begin_mcp_connect` is called directly rather than through the RPC
+        // dispatch here, purely to sidestep the `https://`-only gate that
+        // guards the RPC entrypoint (this fixture's mock servers are plain
+        // http, same as every other discovery test in this crate) — that
+        // gate is an unrelated concern. The values below are byte-identical
+        // to what `dispatch(&s, "begin_mcp_connect", ...)` would have
+        // returned: the RPC handler's `begin_mcp_connect` fn is a thin
+        // wrapper around exactly this call. `complete_mcp_connect`, the
+        // actual site of the defect this test pins, IS driven through the
+        // real RPC dispatch below.
+        let http = reqwest::Client::new();
+        let spec = McpServerSpec {
+            name: "remote".to_string(),
+            transport: McpTransport::Http {
+                url: mcp_url.clone(),
+                headers: vec![],
+            },
+        };
+        let start =
+            crate::harness::native::mcp_oauth::begin_mcp_connect(s.cp.store(), &http, &spec)
+                .await
+                .expect("AS-1 is reachable at begin time, so begin_mcp_connect must succeed");
+        assert_eq!(
+            start.issuer_token_endpoint,
+            format!("{as1_url}/token"),
+            "document order + AS-1 reachable means begin_mcp_connect must select AS-1, not AS-2"
+        );
+
+        // AS-1 goes dark for discovery purposes strictly between authorize
+        // and completion. Its token endpoint is untouched by this flag.
+        as1_up.store(false, Ordering::SeqCst);
+
+        let out = dispatch(
+            &s,
+            "complete_mcp_connect",
+            json!({
+                "id": "remote",
+                "code": "the-code",
+                "verifier": start.verifier,
+                "issuer_token_endpoint": start.issuer_token_endpoint,
+                "client_id": start.client_id,
+            }),
+        )
+        .await
+        .expect(
+            "completion must succeed using the carried-forward values, without needing AS-1's \
+             now-dead discovery endpoint at all",
+        );
+        let _apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+
+        assert_eq!(
+            as1_token_hits.lock().unwrap().len(),
+            1,
+            "the token exchange must land on AS-1 — the authorization server begin_mcp_connect \
+             actually selected, and presumably the one that issued the code — regardless of \
+             whether AS-1's discovery endpoint is reachable right now"
+        );
+        assert_eq!(
+            as2_token_hits.lock().unwrap().len(),
+            0,
+            "AS-2 must never see a token request here: it was never the authorization server \
+             that issued the code, it only LOOKS usable because a client id happens to already \
+             be on file for it"
         );
     }
 }

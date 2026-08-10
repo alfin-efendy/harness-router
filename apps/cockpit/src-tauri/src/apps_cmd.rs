@@ -10,9 +10,13 @@
 //! registered `redirect_uri` (`127.0.0.1:8976` on the USER's machine) must be
 //! reachable even when the daemon is remote. The daemon owns discovery / DCR
 //! / PKCE state and the token exchange; Cockpit only binds the port, awaits
-//! the callback, validates `state` locally, and hands the code + the
-//! verifier it stashed from `begin_mcp_connect`'s response back to
-//! `complete_mcp_connect`. Mirrors `plugins_cmd.rs`'s
+//! the callback, validates `state` locally, and hands the code back to
+//! `complete_mcp_connect` alongside the verifier, issuer token endpoint and
+//! client id it stashed from `begin_mcp_connect`'s response — `begin_mcp_connect`
+//! already selected the authorization server, so nothing on this path
+//! rediscovers it (a second discovery run between authorize and completion
+//! could resolve a different authorization server than the one that issued
+//! the code). Mirrors `plugins_cmd.rs`'s
 //! `plugin_profile_begin_pkce` / `plugin_profile_complete_pkce` exactly,
 //! minus the `redirect_uri` round-trip (the daemon computes it itself from
 //! the server id via `mcp_oauth::mcp_redirect_uri`, so there is nothing for
@@ -195,8 +199,9 @@ fn cancel_pending_mcp_flow(server_id: &str) {
 /// URL; this command then binds the fixed wizard port, spawns a one-shot
 /// callback server at the exact path the daemon's `mcp_redirect_uri` used
 /// when building that URL, and awaits the browser redirect in the
-/// background. On a captured callback it hands the code + the verifier
-/// (stashed from the daemon's response) to `complete_mcp_connect`.
+/// background. On a captured callback it hands the code + the verifier,
+/// issuer token endpoint and client id (all stashed from the daemon's
+/// response) to `complete_mcp_connect`.
 #[tauri::command]
 #[specta::specta]
 pub async fn begin_mcp_connect(
@@ -249,6 +254,11 @@ pub async fn begin_mcp_connect(
     let engine_client = client.clone();
     let task_id = id.clone();
     let verifier = start.verifier.clone();
+    // Carried forward alongside the verifier — the authorization server
+    // `begin_mcp_connect` actually selected, so the completion step below
+    // never has to rediscover it (and risk resolving a different one).
+    let issuer_token_endpoint = start.issuer_token_endpoint.clone();
+    let connect_client_id = start.client_id.clone();
     tauri::async_runtime::spawn(async move {
         let outcome = tokio::select! {
             res = oauth_loopback::await_callback(
@@ -270,7 +280,15 @@ pub async fn begin_mcp_connect(
         // closed): exit silently — the server just stays disconnected and
         // the user can retry, same as the profile flow's cancel path.
         if let Some(Ok(callback)) = outcome {
-            complete_local_mcp_callback(&engine_client, &task_id, &verifier, callback).await;
+            complete_local_mcp_callback(
+                &engine_client,
+                &task_id,
+                &verifier,
+                &issuer_token_endpoint,
+                &connect_client_id,
+                callback,
+            )
+            .await;
         }
     });
 
@@ -287,6 +305,8 @@ async fn complete_local_mcp_callback(
     engine: &EngineClient,
     id: &str,
     verifier: &str,
+    issuer_token_endpoint: &str,
+    client_id: &str,
     callback: oauth_loopback::CallbackResult,
 ) {
     let Some(code) = callback.code else {
@@ -296,7 +316,13 @@ async fn complete_local_mcp_callback(
     if let Err(err) = engine
         .rpc::<Vec<AppInfo>>(
             "complete_mcp_connect",
-            serde_json::json!({ "id": id, "code": code.trim(), "verifier": verifier }),
+            serde_json::json!({
+                "id": id,
+                "code": code.trim(),
+                "verifier": verifier,
+                "issuer_token_endpoint": issuer_token_endpoint,
+                "client_id": client_id,
+            }),
         )
         .await
     {
@@ -317,12 +343,20 @@ pub async fn complete_mcp_connect(
     id: String,
     code: String,
     verifier: String,
+    issuer_token_endpoint: String,
+    client_id: String,
 ) -> R<Vec<AppInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
             "complete_mcp_connect",
-            serde_json::json!({ "id": id, "code": code, "verifier": verifier }),
+            serde_json::json!({
+                "id": id,
+                "code": code,
+                "verifier": verifier,
+                "issuer_token_endpoint": issuer_token_endpoint,
+                "client_id": client_id,
+            }),
         )
         .await
 }

@@ -799,8 +799,9 @@ async toggleAppAgent(runnerId: string | null, id: string, agentId: string, allow
  * URL; this command then binds the fixed wizard port, spawns a one-shot
  * callback server at the exact path the daemon's `mcp_redirect_uri` used
  * when building that URL, and awaits the browser redirect in the
- * background. On a captured callback it hands the code + the verifier
- * (stashed from the daemon's response) to `complete_mcp_connect`.
+ * background. On a captured callback it hands the code + the verifier,
+ * issuer token endpoint and client id (all stashed from the daemon's
+ * response) to `complete_mcp_connect`.
  */
 async beginMcpConnect(runnerId: string | null, id: string) : Promise<Result<McpConnectStart, CmdError>> {
     try {
@@ -814,9 +815,9 @@ async beginMcpConnect(runnerId: string | null, id: string) : Promise<Result<McpC
  * Exposed for symmetry with [`begin_mcp_connect`] (and for direct testing)
  * — the loopback callback task above is the only production caller.
  */
-async completeMcpConnect(runnerId: string | null, id: string, code: string, verifier: string) : Promise<Result<AppInfo[], CmdError>> {
+async completeMcpConnect(runnerId: string | null, id: string, code: string, verifier: string, issuerTokenEndpoint: string, clientId: string) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("complete_mcp_connect", { runnerId, id, code, verifier }) };
+    return { status: "ok", data: await TAURI_INVOKE("complete_mcp_connect", { runnerId, id, code, verifier, issuerTokenEndpoint, clientId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2689,8 +2690,15 @@ export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: s
  * the redirect (see `mcp_oauth::mcp_redirect_uri` and the Task 9 plan
  * correction on why the callback listener lives in Cockpit's own process,
  * not the daemon's).
+ *
+ * `issuer_token_endpoint` and `client_id` are the token endpoint and client
+ * id of the authorization server this flow actually selected — carried
+ * forward from `harness::native::mcp_oauth::McpAuthorizeStart` so the caller
+ * can hand them straight back to `complete_mcp_connect` instead of
+ * rediscovering them (which could resolve a different authorization server
+ * than the one that issued the code).
  */
-export type McpConnectStart = { authorizeUrl: string; state: string; verifier: string }
+export type McpConnectStart = { authorizeUrl: string; state: string; verifier: string; issuerTokenEndpoint: string; clientId: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry, one row per native-runtime event block.

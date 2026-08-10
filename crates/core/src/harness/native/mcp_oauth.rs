@@ -88,13 +88,29 @@ pub async fn select_authorization_server(
     )
 }
 
-/// A started PKCE authorization: the URL to open, plus the verifier and state
-/// the callback must be matched against.
-#[derive(Debug)]
+/// A started PKCE authorization: the URL to open, the verifier and state the
+/// callback must be matched against, and — critically — the token endpoint
+/// and client id of the authorization server this flow actually selected.
+///
+/// The token endpoint and client id are carried here, rather than left for
+/// the completion step to rediscover, precisely so nothing downstream is
+/// ever tempted to re-run RFC 9728/8414 discovery to recover them. Between
+/// authorize and completion, a second discovery run could resolve a
+/// DIFFERENT authorization server than the one that actually issued the
+/// code (for instance if a PRM document lists several and the first becomes
+/// reachable or unreachable in between) — carrying these two values forward
+/// is what makes that impossible.
+#[derive(Debug, Clone)]
 pub struct McpAuthorizeStart {
     pub url: String,
     pub verifier: String,
     pub state: String,
+    /// The `token_endpoint` of the authorization server [`select_authorization_server`]
+    /// chose for this flow. Thread this to [`complete_mcp_connect`] verbatim.
+    pub issuer_token_endpoint: String,
+    /// The client id registered (or reused) for that same authorization
+    /// server. Thread this to [`complete_mcp_connect`] verbatim.
+    pub client_id: String,
 }
 
 /// Build the authorization URL. `resource` MUST be the canonical MCP server
@@ -129,6 +145,8 @@ pub fn build_authorize_url(
         url: url.to_string(),
         verifier,
         state,
+        issuer_token_endpoint: metadata.token_endpoint.clone(),
+        client_id: client_id.to_string(),
     })
 }
 
@@ -268,12 +286,16 @@ pub async fn begin_mcp_connect(
 /// server rather than silently losing its audience restriction.
 ///
 /// `issuer_token_endpoint` and `client_id` are supplied by the caller rather
-/// than rediscovered here: the caller already holds both from the matching
-/// `begin_mcp_connect` call (the client id was also just persisted to
-/// `mcp_oauth_clients` by that call, so a caller that isn't threading it
-/// through by hand can re-read it with [`crate::store::Store::get_mcp_oauth_client`]).
-/// Re-running discovery here would risk landing on a different authorization
-/// server than the one that actually issued the code.
+/// than rediscovered here: the caller already holds both, carried forward
+/// verbatim from [`McpAuthorizeStart`] (the matching `begin_mcp_connect`
+/// call's return value). Thread those two fields through unchanged — do NOT
+/// try to reconstruct them some other way (e.g. re-running RFC 9728/8414
+/// discovery "just for the issuer", or re-deriving the issuer from the store
+/// some other route). There is no cheap, side-effect-free way to recover the
+/// token endpoint without redoing discovery, and redoing discovery here
+/// reopens exactly the hazard this function exists to avoid: between
+/// authorize and completion, discovery could resolve a DIFFERENT
+/// authorization server than the one that actually issued the code.
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_mcp_connect(
     store: &crate::store::Store,
@@ -462,6 +484,16 @@ mod tests {
             "the URL's `code_challenge` must be exactly the S256 hash of the returned verifier — a \
              truncated hash, the wrong algorithm, or a double-encoding would still pass the weaker \
              not-equal-to-the-verifier check above, but not this one"
+        );
+        assert_eq!(
+            start.issuer_token_endpoint, "https://as.example/token",
+            "McpAuthorizeStart must carry the SELECTED authorization server's token endpoint \
+             forward, so a caller never has to rediscover it (and risk landing on a different AS) \
+             at completion time"
+        );
+        assert_eq!(
+            start.client_id, "client-1",
+            "McpAuthorizeStart must carry the client id this flow actually used forward too"
         );
     }
 
@@ -898,13 +930,24 @@ mod tests {
             "the persisted client id must be the one the DCR endpoint actually returned"
         );
 
+        // PROPERTY: `McpAuthorizeStart` must carry the same token endpoint and
+        // client id a caller would otherwise have to re-derive by hand (from
+        // the store, or by redoing discovery) — the whole point of carrying
+        // them is that a caller can use `start.issuer_token_endpoint`/
+        // `start.client_id` directly rather than reaching for either.
+        assert_eq!(
+            start.issuer_token_endpoint,
+            format!("{}/token", fixture.as_url)
+        );
+        assert_eq!(start.client_id, client_id);
+
         complete_mcp_connect(
             &store,
             &http,
             "rovo",
             &fixture.mcp_url,
-            &format!("{}/token", fixture.as_url),
-            &client_id,
+            &start.issuer_token_endpoint,
+            &start.client_id,
             "the-code",
             &start.verifier,
         )

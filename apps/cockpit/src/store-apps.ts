@@ -19,15 +19,20 @@ type AppsState = {
   /** Allow/deny the (single, native) agent to use this app. */
   toggleAgent: (id: string, allowed: boolean) => Promise<void>;
   /** Remote MCP server OAuth connect (Task 9). `beginMcpConnect` returns the
-   *  daemon's authorize URL/state/verifier (or `null` on error); the caller
-   *  opens the browser and holds `state`/`verifier` locally until its OWN
-   *  loopback callback captures the redirect (Cockpit's Rust side in
-   *  production — see `apps_cmd.rs`'s `begin_mcp_connect`; `completeMcpConnect`
-   *  is exposed here mainly for symmetry and direct testing). Both
-   *  complete/disconnect refresh `apps` from the RPC's returned list on
-   *  success, same as every other mutation in this store. */
+   *  daemon's authorize URL/state/verifier/issuerTokenEndpoint/clientId (or
+   *  `null` on error); the caller opens the browser and holds those values
+   *  locally until its OWN loopback callback captures the redirect
+   *  (Cockpit's Rust side in production — see `apps_cmd.rs`'s
+   *  `begin_mcp_connect`; `completeMcpConnect` is exposed here mainly for
+   *  symmetry and direct testing). `issuerTokenEndpoint`/`clientId` must be
+   *  threaded straight through to `completeMcpConnect` unchanged — they name
+   *  the authorization server `beginMcpConnect` actually selected, and
+   *  re-deriving them some other way risks completing against a different
+   *  one than the one that issued the code. Both complete/disconnect refresh
+   *  `apps` from the RPC's returned list on success, same as every other
+   *  mutation in this store. */
   beginMcpConnect: (id: string) => Promise<McpConnectStart | null>;
-  completeMcpConnect: (id: string, code: string, verifier: string) => Promise<boolean>;
+  completeMcpConnect: (id: string, code: string, verifier: string, issuerTokenEndpoint: string, clientId: string) => Promise<boolean>;
   disconnectMcp: (id: string) => Promise<boolean>;
 };
 
@@ -100,7 +105,8 @@ export const useApps = create<AppsState>((set, get) => ({
     return res.data;
   },
 
-  completeMcpConnect: async (id, code, verifier) => applyResult(set, await commands.completeMcpConnect("local", id, code, verifier), "Connect"),
+  completeMcpConnect: async (id, code, verifier, issuerTokenEndpoint, clientId) =>
+    applyResult(set, await commands.completeMcpConnect("local", id, code, verifier, issuerTokenEndpoint, clientId), "Connect"),
 
   disconnectMcp: async (id) => applyResult(set, await commands.disconnectMcp("local", id), "Disconnect"),
 }));

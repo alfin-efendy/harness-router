@@ -103,12 +103,20 @@ const toggleAppAgent = mock(async (_runnerId: string, id: string, agentId: strin
 });
 const beginMcpConnect = mock(async (_runnerId: string, _id: string) => ({
   status: "ok" as const,
-  data: { authorizeUrl: "https://auth.example.com/authorize?state=abc", state: "abc", verifier: "verifier-xyz" },
+  data: {
+    authorizeUrl: "https://auth.example.com/authorize?state=abc",
+    state: "abc",
+    verifier: "verifier-xyz",
+    issuerTokenEndpoint: "https://auth.example.com/token",
+    clientId: "client-1",
+  },
 }));
-const completeMcpConnect = mock(async (_runnerId: string, _id: string, _code: string, _verifier: string) => ({
-  status: "ok" as const,
-  data: appsFixture,
-}));
+const completeMcpConnect = mock(
+  async (_runnerId: string, _id: string, _code: string, _verifier: string, _issuerTokenEndpoint: string, _clientId: string) => ({
+    status: "ok" as const,
+    data: appsFixture,
+  }),
+);
 const disconnectMcp = mock(async (_runnerId: string, id: string) => {
   appsFixture = appsFixture.map((a) => (a.id === id ? { ...a, oauthTokenStored: false, oauthReconnectRequired: false } : a));
   return { status: "ok" as const, data: appsFixture };
