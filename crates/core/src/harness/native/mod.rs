@@ -25,6 +25,8 @@ pub mod ledger;
 pub mod llm;
 pub mod lsp;
 pub mod mcp_client;
+pub mod mcp_http;
+pub mod mcp_oauth;
 pub mod memory;
 pub mod permission;
 pub mod runner;
