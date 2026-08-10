@@ -7,7 +7,7 @@
 //! different failure modes. Both implement [`McpCaller`], so a remote server's
 //! tools reach a session through exactly the same path.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +20,164 @@ use super::mcp_oauth;
 use crate::domain::{McpServerSpec, McpTransport};
 use crate::stdio_jsonrpc;
 use crate::store::Store;
+
+/// How long ONE remote-MCP HTTP exchange may take, from the start of
+/// connecting to the last byte of the response BODY.
+///
+/// A head-only bound is not enough: `connect_mcp_tools` is awaited inside
+/// `start_harness_session`, so a server that accepts the POST and then
+/// trickles (or simply never finishes) its body would hang session start
+/// forever, and `begin_mcp_connect` would wedge an RPC handler the same way.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The deadline [`hardened_http_client`] and [`McpHttpConnection::post_once`]
+/// apply. A test may shorten it through [`override_request_timeout`] so a
+/// hanging-body fixture doesn't have to be waited out in real time.
+pub(crate) fn request_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(overridden) = TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+            return overridden;
+        }
+    }
+    DEFAULT_REQUEST_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    static TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Shortens [`request_timeout`] for as long as the returned guard lives.
+///
+/// Scoped rather than sticky on purpose: libtest run with `--test-threads=1`
+/// executes every test on the SAME thread, so a leaked thread-local would
+/// silently impose a millisecond deadline on unrelated tests.
+#[cfg(test)]
+#[must_use = "the override is reverted when this guard is dropped"]
+pub(crate) fn override_request_timeout(timeout: Duration) -> RequestTimeoutGuard {
+    let previous = TIMEOUT_OVERRIDE.with(|cell| cell.replace(Some(timeout)));
+    RequestTimeoutGuard(previous)
+}
+
+#[cfg(test)]
+pub(crate) struct RequestTimeoutGuard(Option<Duration>);
+
+#[cfg(test)]
+impl Drop for RequestTimeoutGuard {
+    fn drop(&mut self) {
+        let previous = self.0;
+        TIMEOUT_OVERRIDE.with(|cell| cell.set(previous));
+    }
+}
+
+/// A `reqwest::Client` fit to talk to a remote MCP server, its
+/// protected-resource metadata, or its authorization server. Prefer this over
+/// `reqwest::Client::new()` for ANY of those three.
+///
+/// Two non-default settings, both load-bearing:
+///
+/// * `redirect::Policy::none()`. reqwest's DEFAULT policy follows up to ten
+///   hops, and strips sensitive headers only when the host or PORT changes —
+///   it never compares the SCHEME:
+///
+///   ```text
+///   let cross_host = next.host_str() != previous.host_str()
+///       || next.port_or_known_default() != previous.port_or_known_default();
+///   if cross_host { headers.remove(AUTHORIZATION); ... }
+///   ```
+///
+///   So `https://mcp.example.com:8443/mcp` answering
+///   `307 Location: http://mcp.example.com:8443/x` keeps host and port equal,
+///   `cross_host` is false, and the `Authorization: Bearer …` header is
+///   re-sent over PLAINTEXT — defeating [`require_https`] entirely, since
+///   that only ever sees the configured string. `Mcp-Session-Id` (a session
+///   credential in Streamable HTTP) is not on reqwest's sensitive list at
+///   all, so it is never stripped on any hop. And a redirected token or
+///   refresh POST replays `code`/`code_verifier`/`refresh_token` in its FORM
+///   BODY, which no header-stripping rule can protect. MCP Streamable HTTP
+///   needs no redirects, so refusing them is both the safe and the correct
+///   policy.
+/// * `timeout` — see [`DEFAULT_REQUEST_TIMEOUT`]. A client-level timeout is a
+///   total deadline that covers the response body, not merely the head.
+pub fn hardened_http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(request_timeout())
+        .build()
+        .map_err(|e| anyhow::anyhow!("mcp: could not build an HTTP client: {e}"))
+}
+
+/// Reject a remote MCP URL that is not `https://`.
+///
+/// RFC 3986 makes the scheme case-insensitive, so `HTTPS://…` is just as
+/// valid as `https://…` — lowercase before comparing rather than reject it.
+///
+/// Compiled unconditionally, and reachable from a test. The previous spelling
+/// of this rule was inlined as
+/// `if !url.starts_with("https://") && !cfg!(test)`, so it was compiled OUT of
+/// every test build: no test could assert the production behaviour even in
+/// principle, and none did. It is now a real function with a real call site,
+/// and [`enforce_https_in_this_test`] lets a test opt into the production
+/// setting deliberately — see
+/// `tests::a_plaintext_http_url_is_rejected_before_any_request_is_made`.
+fn require_https(url: &str) -> anyhow::Result<()> {
+    if url.to_ascii_lowercase().starts_with("https://") {
+        return Ok(());
+    }
+    anyhow::bail!("mcp: remote server {url} must use https")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Defaults to PERMISSIVE in test builds, which is the one part of the old
+    /// `cfg!(test)` weakening that survives — every in-test MCP fixture in
+    /// this crate can only bind a plaintext loopback listener, and some of
+    /// them (`harness/native/mod.rs`'s `spawn_auth_echo_server` and the four
+    /// auth-precedence tests around it) live outside this module. Flipping the
+    /// default to DENY, so each fixture opts out one call site at a time, is a
+    /// follow-up that has to touch those tests in the same change.
+    ///
+    /// The difference that matters today: the rule itself is compiled in, so a
+    /// test can turn it on and prove it.
+    static PLAINTEXT_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Apply the production `https://`-only rule for as long as the returned guard
+/// lives.
+///
+/// Scoped rather than sticky: libtest run with `--test-threads=1` executes
+/// every test on the SAME thread, so a leaked `false` here would impose
+/// https-only on fixtures that can only serve plaintext.
+#[cfg(test)]
+#[must_use = "the https-only rule applies only while this guard is alive"]
+pub(crate) fn enforce_https_in_this_test() -> HttpsEnforcedGuard {
+    let previous = PLAINTEXT_ALLOWED.with(|cell| cell.replace(false));
+    HttpsEnforcedGuard(previous)
+}
+
+#[cfg(test)]
+pub(crate) struct HttpsEnforcedGuard(bool);
+
+#[cfg(test)]
+impl Drop for HttpsEnforcedGuard {
+    fn drop(&mut self) {
+        let previous = self.0;
+        PLAINTEXT_ALLOWED.with(|cell| cell.set(previous));
+    }
+}
+
+fn plaintext_allowed() -> bool {
+    #[cfg(test)]
+    {
+        PLAINTEXT_ALLOWED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
 
 /// A live remote MCP server connection.
 pub struct McpHttpConnection {
@@ -47,6 +205,17 @@ pub struct McpHttpConnection {
     /// `reconnect_required`, so a connection with `oauth_store: None` simply
     /// propagates a 401 as a plain error and never touches the store.
     oauth_store: Option<Arc<Store>>,
+    /// Latched once a refresh cycle has definitively failed, in lockstep with
+    /// `Store::mark_mcp_oauth_reconnect_required` (see
+    /// [`Self::mark_reconnect_required`]).
+    ///
+    /// Without it, `refresh_and_retry` is bounded per REQUEST but not per
+    /// CONNECTION: a token revoked mid-session makes every subsequent tool
+    /// call re-run PRM discovery → AS metadata discovery → a refresh exchange
+    /// → a retry → the store mark. Each of those exchanges rotates the
+    /// refresh token in the store, which on a rotation-detecting
+    /// authorization server is enough to kill the whole grant.
+    oauth_exhausted: AtomicBool,
 }
 
 /// Open a remote MCP connection: handshake, then list its tools.
@@ -86,10 +255,8 @@ async fn connect_http_inner(
     let McpTransport::Http { url, headers } = &spec.transport else {
         anyhow::bail!("mcp_http: not an HTTP transport");
     };
-    // RFC 3986 makes the scheme case-insensitive, so `HTTPS://…` is just as
-    // valid as `https://…` — lowercase before comparing rather than reject it.
-    if !url.to_ascii_lowercase().starts_with("https://") && !cfg!(test) {
-        anyhow::bail!("mcp: remote server {url} must use https");
+    if !plaintext_allowed() {
+        require_https(url)?;
     }
     let mut merged: Vec<(String, String)> = headers
         .iter()
@@ -100,7 +267,7 @@ async fn connect_http_inner(
         merged.push(("Authorization".to_string(), format!("Bearer {token}")));
     }
     let mut conn = McpHttpConnection {
-        http: reqwest::Client::new(),
+        http: hardened_http_client()?,
         url: url.clone(),
         headers: Mutex::new(merged),
         session_id: Mutex::new(None),
@@ -108,6 +275,7 @@ async fn connect_http_inner(
         server_name: spec.name.clone(),
         tools: Vec::new(),
         oauth_store,
+        oauth_exhausted: AtomicBool::new(false),
     };
     conn.handshake().await?;
     conn.tools = conn.list_tools().await?;
@@ -126,16 +294,19 @@ impl McpHttpConnection {
                 "clientInfo": { "name": "ryuzi-native", "version": env!("CARGO_PKG_VERSION") }
             })),
         );
-        let (resp, session) = self.post(&init).await?;
+        // `post_during_handshake`, not `post`: a 404 seen WHILE handshaking
+        // cannot be answered by another handshake. See its doc comment.
+        let (resp, _session) = self.post_during_handshake(&init).await?;
         if let Some(err) = resp.get("error") {
             anyhow::bail!("mcp initialize error: {err}");
         }
-        if let Some(session) = session {
-            *self.session_id.lock().await = Some(session);
-        }
+        // The `Mcp-Session-Id` the server issued here was already adopted
+        // centrally by `post_once`, which does it for EVERY response rather
+        // than only this one — `call`/`list_tools` used to discard any session
+        // id a later response carried.
         let initialized = stdio_jsonrpc::build_notification("notifications/initialized", None);
         // A notification has no id and no response body to await.
-        let _ = self.post(&initialized).await;
+        let _ = self.post_during_handshake(&initialized).await;
         Ok(())
     }
 
@@ -179,12 +350,43 @@ impl McpHttpConnection {
     /// a store-managed connection gets ONE refresh-and-retry; any other
     /// non-success status (including a 401 the retry itself produces) is a
     /// plain error, same as before this task.
+    ///
+    /// On an HTTP 404 for a request that CARRIED a session id, delegates to
+    /// [`Self::reinitialize_and_retry`]: per MCP `2025-06-18` a server may
+    /// terminate a session and answer 404, after which the client must
+    /// re-initialize.
     async fn post(&self, message: &Value) -> anyhow::Result<(Value, Option<String>)> {
         match self.post_once(message).await? {
             PostOutcome::Ok(value, session) => Ok((value, session)),
             PostOutcome::Unauthorized(www_authenticate) => {
                 self.refresh_and_retry(message, www_authenticate).await
             }
+            PostOutcome::SessionExpired => self.reinitialize_and_retry(message).await,
+        }
+    }
+
+    /// [`Self::post`] minus the session-expiry recovery, used for the two
+    /// requests the handshake itself sends.
+    ///
+    /// This split is what bounds the recovery path BY CONSTRUCTION rather
+    /// than by a counter. `reinitialize_and_retry` re-runs `handshake`, and
+    /// `handshake`'s second request (`notifications/initialized`) already
+    /// carries the freshly issued session id — so routing ITS 404 back into
+    /// `reinitialize_and_retry` would recurse without end against a server
+    /// that 404s a session it has just handed out.
+    async fn post_during_handshake(
+        &self,
+        message: &Value,
+    ) -> anyhow::Result<(Value, Option<String>)> {
+        match self.post_once(message).await? {
+            PostOutcome::Ok(value, session) => Ok((value, session)),
+            PostOutcome::Unauthorized(www_authenticate) => {
+                self.refresh_and_retry(message, www_authenticate).await
+            }
+            PostOutcome::SessionExpired => anyhow::bail!(
+                "mcp: {} rejected the session it had just issued (HTTP 404)",
+                self.server_name
+            ),
         }
     }
 
@@ -203,47 +405,91 @@ impl McpHttpConnection {
         for (key, value) in &headers_snapshot {
             request = request.header(key, value);
         }
-        if let Some(session) = self.session_id.lock().await.as_deref() {
+        // Snapshotted rather than re-read after the response arrives: the 404
+        // branch below must judge whether THIS request carried a session id,
+        // not whatever a concurrent re-initialization may have installed in
+        // the meantime.
+        let sent_session = self.session_id.lock().await.clone();
+        if let Some(session) = sent_session.as_deref() {
             request = request.header("Mcp-Session-Id", session);
         }
-        let response = tokio::time::timeout(Duration::from_secs(120), request.json(message).send())
-            .await
-            .map_err(|_| anyhow::anyhow!("mcp: request timed out"))??;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        // The deadline spans `send()` AND the body read. Bounding only
+        // `send()` leaves `text()` unbounded, which is exactly the shape that
+        // hangs `start_harness_session` on a server that accepts the POST and
+        // then trickles its body. (The client built by `hardened_http_client`
+        // carries the same total deadline, so this is belt AND braces —
+        // whichever fires first, the caller gets a bounded answer.)
+        let exchange = async {
+            let response = request.json(message).send().await?;
+            let status = response.status();
             let www_authenticate = response
                 .headers()
                 .get(reqwest::header::WWW_AUTHENTICATE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            return Ok(PostOutcome::Unauthorized(www_authenticate));
+            let session = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let body = response.text().await?;
+            Ok::<Exchange, reqwest::Error>(Exchange {
+                status,
+                www_authenticate,
+                session,
+                content_type,
+                body,
+            })
+        };
+        let exchange = tokio::time::timeout(request_timeout(), exchange)
+            .await
+            .map_err(|_| anyhow::anyhow!("mcp: request timed out"))??;
+
+        if exchange.status == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(PostOutcome::Unauthorized(exchange.www_authenticate));
         }
-        let session = response
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            anyhow::bail!("mcp: HTTP {status}");
+        // A 404 for a request that carried a session id is the spec's
+        // session-terminated signal, NOT a missing endpoint — the endpoint
+        // plainly existed a moment ago, when it issued that id. A 404 with no
+        // session established (a genuinely wrong URL) falls through to the
+        // plain transport error below, so it still fails loudly instead of
+        // driving an endless re-handshake loop.
+        if exchange.status == reqwest::StatusCode::NOT_FOUND && sent_session.is_some() {
+            return Ok(PostOutcome::SessionExpired);
         }
-        if body.trim().is_empty() {
-            return Ok(PostOutcome::Ok(Value::Null, session));
+        if !exchange.status.is_success() {
+            anyhow::bail!("mcp: HTTP {}", exchange.status);
         }
-        if content_type.contains("text/event-stream") {
+        // Adopt the session id from EVERY successful response, not only
+        // `initialize`'s: `call`/`list_tools` previously discarded one, so a
+        // server that re-issued an id mid-session would be echoed the stale
+        // value for the rest of the agent session.
+        if let Some(issued) = exchange.session.as_deref() {
+            let mut current = self.session_id.lock().await;
+            if current.as_deref() != Some(issued) {
+                *current = Some(issued.to_string());
+            }
+        }
+        if exchange.body.trim().is_empty() {
+            return Ok(PostOutcome::Ok(Value::Null, exchange.session));
+        }
+        if exchange.content_type.contains("text/event-stream") {
             let want = message.get("id").cloned();
             return Ok(PostOutcome::Ok(
-                sse_message_for_id(&body, want.as_ref())?,
-                session,
+                sse_message_for_id(&exchange.body, want.as_ref())?,
+                exchange.session,
             ));
         }
-        Ok(PostOutcome::Ok(serde_json::from_str(&body)?, session))
+        Ok(PostOutcome::Ok(
+            serde_json::from_str(&exchange.body)?,
+            exchange.session,
+        ))
     }
 
     /// Handle a 401 seen by `post_once`: a connection with no `oauth_store`
@@ -262,10 +508,21 @@ impl McpHttpConnection {
         let Some(store) = self.oauth_store.as_deref() else {
             anyhow::bail!("mcp: {} returned 401 Unauthorized", self.server_name);
         };
+        // The per-CONNECTION latch. One refresh per request was never the
+        // whole story: with a grant revoked mid-session, every later tool call
+        // would otherwise re-run PRM discovery → AS metadata discovery → a
+        // refresh exchange, rotating the stored refresh token each time. A
+        // rotation-detecting authorization server treats that as replay and
+        // can revoke the entire grant, so the second 401 must cost nothing.
+        if self.oauth_exhausted.load(Ordering::SeqCst) {
+            anyhow::bail!(
+                "mcp: {} needs reconnecting — a token refresh already failed on this connection, \
+                 so no further refresh will be attempted",
+                self.server_name
+            );
+        }
         if let Err(e) = self.refresh_stored_token(store, www_authenticate).await {
-            let _ = store
-                .mark_mcp_oauth_reconnect_required(&self.server_name)
-                .await;
+            self.mark_reconnect_required(store).await;
             anyhow::bail!(
                 "mcp: {} needs reconnecting — token refresh failed: {e}",
                 self.server_name
@@ -274,14 +531,62 @@ impl McpHttpConnection {
         match self.post_once(message).await? {
             PostOutcome::Ok(value, session) => Ok((value, session)),
             PostOutcome::Unauthorized(_) => {
-                let _ = store
-                    .mark_mcp_oauth_reconnect_required(&self.server_name)
-                    .await;
+                self.mark_reconnect_required(store).await;
                 anyhow::bail!(
                     "mcp: {} needs reconnecting — still unauthorized after a token refresh",
                     self.server_name
                 );
             }
+            PostOutcome::SessionExpired => anyhow::bail!(
+                "mcp: {} terminated the session while retrying after a token refresh (HTTP 404)",
+                self.server_name
+            ),
+        }
+    }
+
+    /// Latch this connection's refresh path dead AND persist the store flag —
+    /// always together, so the in-memory latch can never disagree with what
+    /// the UI reads out of the store.
+    async fn mark_reconnect_required(&self, store: &Store) {
+        self.oauth_exhausted.store(true, Ordering::SeqCst);
+        let _ = store
+            .mark_mcp_oauth_reconnect_required(&self.server_name)
+            .await;
+    }
+
+    /// Recover from a session the SERVER terminated: MCP `2025-06-18` lets a
+    /// server end a session and answer `404` to anything that still presents
+    /// its id, and requires the client to re-initialize before continuing.
+    /// Without this, the first such 404 poisoned the connection for the rest
+    /// of the agent session — every later tool call failed with
+    /// `"mcp: HTTP 404"` and nothing short of a restart recovered.
+    ///
+    /// Exactly ONE re-handshake and ONE retry, the same one-shot shape
+    /// [`Self::refresh_and_retry`] uses. Bounded by construction: the
+    /// handshake goes through [`Self::post_during_handshake`], which never
+    /// routes a 404 back here, and the retry calls `post_once` directly.
+    async fn reinitialize_and_retry(
+        &self,
+        message: &Value,
+    ) -> anyhow::Result<(Value, Option<String>)> {
+        // Cleared BEFORE re-handshaking so the fresh `initialize` goes out
+        // with no session header at all, exactly as the first one did.
+        *self.session_id.lock().await = None;
+        self.handshake().await.map_err(|e| {
+            anyhow::anyhow!(
+                "mcp: {} terminated the session and re-initializing failed: {e}",
+                self.server_name
+            )
+        })?;
+        match self.post_once(message).await? {
+            PostOutcome::Ok(value, session) => Ok((value, session)),
+            PostOutcome::Unauthorized(www_authenticate) => {
+                self.refresh_and_retry(message, www_authenticate).await
+            }
+            PostOutcome::SessionExpired => anyhow::bail!(
+                "mcp: {} terminated the re-initialized session too (HTTP 404)",
+                self.server_name
+            ),
         }
     }
 
@@ -383,11 +688,28 @@ impl McpHttpConnection {
 
 /// The outcome of one [`McpHttpConnection::post_once`] attempt.
 enum PostOutcome {
-    /// A non-401 response: the parsed JSON-RPC message, plus a session id if
-    /// the server issued one on this response.
+    /// A successful response: the parsed JSON-RPC message, plus a session id
+    /// if the server issued one on this response.
     Ok(Value, Option<String>),
     /// An HTTP 401, carrying `WWW-Authenticate` if the server sent one.
     Unauthorized(Option<String>),
+    /// An HTTP 404 answering a request that CARRIED a session id — the
+    /// spec's signal that the server terminated the session and the client
+    /// must re-initialize. A 404 with no session established is a plain
+    /// transport error instead, never this.
+    SessionExpired,
+}
+
+/// One completed HTTP exchange: everything `post_once` needs from the
+/// response, read INSIDE the timeout so the body can never be waited on
+/// unbounded. Fields are captured off the response head before the body is
+/// consumed, because consuming the body takes the response by value.
+struct Exchange {
+    status: reqwest::StatusCode,
+    www_authenticate: Option<String>,
+    session: Option<String>,
+    content_type: String,
+    body: String,
 }
 
 /// Pull the JSON-RPC message whose `id` matches `want` out of an SSE body.
@@ -978,9 +1300,15 @@ pub(crate) mod tests {
     /// succeeds at the AS but doesn't actually fix access, e.g. because the
     /// underlying grant was revoked). The AS's `/token` endpoint accepts a
     /// `refresh_token` grant and always mints `new_access_token`.
+    ///
+    /// `revoke_after`, when `Some(n)`, 401s every JSON-RPC request AFTER the
+    /// first `n` regardless of the bearer presented — a grant revoked
+    /// MID-SESSION, i.e. after a connection has already handshaked
+    /// successfully. `None` never revokes.
     async fn spawn_refresh_fixture(
         accepted_bearer: Option<&'static str>,
         new_access_token: &'static str,
+        revoke_after: Option<usize>,
     ) -> RefreshFixture {
         use axum::extract::{Json, State};
         use axum::http::{HeaderMap, StatusCode};
@@ -1044,6 +1372,8 @@ pub(crate) mod tests {
         #[derive(Clone)]
         struct McpState {
             accepted_bearer: Option<&'static str>,
+            revoke_after: Option<usize>,
+            requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
             as_url: String,
             mcp_url: std::sync::Arc<std::sync::Mutex<String>>,
         }
@@ -1053,14 +1383,17 @@ pub(crate) mod tests {
             headers: HeaderMap,
             Json(msg): Json<Value>,
         ) -> axum::response::Response {
+            let seen = state.requests.fetch_add(1, Ordering::SeqCst) + 1;
             let auth = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let authorized = match (state.accepted_bearer, auth.as_deref()) {
-                (Some(want), Some(got)) => got == format!("Bearer {want}"),
-                _ => false,
-            };
+            let revoked = state.revoke_after.is_some_and(|limit| seen > limit);
+            let authorized = !revoked
+                && match (state.accepted_bearer, auth.as_deref()) {
+                    (Some(want), Some(got)) => got == format!("Bearer {want}"),
+                    _ => false,
+                };
             if !authorized {
                 let mcp_url = state.mcp_url.lock().unwrap().clone();
                 let www_auth = format!(
@@ -1097,6 +1430,8 @@ pub(crate) mod tests {
         let mcp_url_slot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let mcp_state = McpState {
             accepted_bearer,
+            revoke_after,
+            requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             as_url: as_url.clone(),
             mcp_url: mcp_url_slot.clone(),
         };
@@ -1138,7 +1473,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_401_is_refreshed_once_and_the_retry_succeeds_with_the_new_token() {
         crate::llm_router::secrets::use_test_key_file();
-        let fixture = spawn_refresh_fixture(Some("fresh-token"), "fresh-token").await;
+        let fixture = spawn_refresh_fixture(Some("fresh-token"), "fresh-token", None).await;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         // Keyed by "test-remote" — the server name `spec()` bakes in below.
@@ -1203,7 +1538,7 @@ pub(crate) mod tests {
         crate::llm_router::secrets::use_test_key_file();
         // accepted_bearer: None => the MCP server 401s unconditionally, no
         // matter what token this client ever presents.
-        let fixture = spawn_refresh_fixture(None, "fresh-token").await;
+        let fixture = spawn_refresh_fixture(None, "fresh-token", None).await;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         store
@@ -1243,6 +1578,566 @@ pub(crate) mod tests {
             stored.reconnect_required,
             "a 401 that survives a refresh-and-retry must mark the server reconnect_required in \
              the store"
+        );
+    }
+
+    /// PROPERTY: a grant revoked MID-SESSION costs exactly ONE refresh for the
+    /// whole connection, not one per tool call.
+    ///
+    /// The per-request bound (`refresh_and_retry` calls `post_once`, never
+    /// `post`) was never the whole story: nothing latched the FAILURE, so
+    /// every later tool call re-ran PRM discovery → AS metadata discovery → a
+    /// refresh exchange → the store mark. Each of those exchanges rotates the
+    /// stored refresh token, and a rotation-detecting authorization server
+    /// treats a re-presented rotated token as replay — enough to revoke the
+    /// entire grant. Proven by counting hits on the AS's `/token` endpoint
+    /// across TWO failing calls, which is the only place the difference shows.
+    #[tokio::test]
+    async fn a_grant_revoked_mid_session_costs_exactly_one_refresh_for_the_whole_connection() {
+        crate::llm_router::secrets::use_test_key_file();
+        // The first three JSON-RPC requests (initialize,
+        // notifications/initialized, tools/list) are authorized with the
+        // stored token, so the connection handshakes normally; from the
+        // fourth on the server 401s whatever it is shown. The AS happily
+        // mints a token the resource server will nonetheless reject, which is
+        // exactly what a revoked grant looks like from the client's side.
+        let fixture =
+            spawn_refresh_fixture(Some("stale-token"), "useless-fresh-token", Some(3)).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        store
+            .upsert_mcp_oauth_token("test-remote", &stale_token_with_refresh())
+            .await
+            .unwrap();
+        store
+            .upsert_mcp_oauth_client(&fixture.as_url, "client-1")
+            .await
+            .unwrap();
+
+        let conn =
+            connect_http_with_store(&spec(&fixture.mcp_url), Some("stale-token"), store.clone())
+                .await
+                .expect("the connect itself happens before the revocation takes effect");
+
+        let first = conn.call("ping", json!({})).await;
+        assert!(
+            first.is_err(),
+            "the first call after revocation must fail: a refresh that the AS honours but the \
+             resource server still rejects is not a recovery"
+        );
+        let second_err = match conn.call("ping", json!({})).await {
+            Err(e) => e,
+            Ok(v) => panic!("the second call must fail too, got {v:?}"),
+        };
+
+        let bodies = fixture.token_request_bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "the refresh path must be latched dead after its first definitive failure — without \
+             the latch each later tool call runs another refresh exchange and rotates the stored \
+             refresh token again: {bodies:?}"
+        );
+        assert!(
+            second_err.to_string().contains("already failed"),
+            "the second failure must say the connection's refresh path is latched, rather than \
+             read like a fresh refresh attempt that happened to fail: {second_err}"
+        );
+
+        let stored = store
+            .get_mcp_oauth_token("test-remote")
+            .await
+            .unwrap()
+            .expect("the token row must survive");
+        assert!(
+            stored.reconnect_required,
+            "the latch must be set in lockstep with the store flag the UI reads, never instead of it"
+        );
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some("rotated-refresh"),
+            "the refresh token must have been rotated exactly ONCE — this is the value at risk, \
+             and re-rotating it on every subsequent tool call is what kills a grant at a \
+             rotation-detecting AS"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Transport hardening: https-only, redirects, timeouts, session expiry
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn require_https_accepts_any_case_of_the_scheme_and_rejects_plaintext() {
+        assert!(require_https("https://mcp.example.com/mcp").is_ok());
+        assert!(
+            require_https("HTTPS://MCP.Example.COM/mcp").is_ok(),
+            "RFC 3986 makes the scheme case-insensitive, so an uppercase scheme is a valid \
+             https URL and must not be rejected as if it were plaintext"
+        );
+        assert!(require_https("http://mcp.example.com/mcp").is_err());
+        assert!(
+            require_https("httpsx://mcp.example.com").is_err(),
+            "a scheme that merely STARTS with the letters of https is not https"
+        );
+    }
+
+    /// PROPERTY: a plaintext `http://` MCP URL is rejected by `connect_http`
+    /// itself, before any request is made.
+    ///
+    /// This test could not exist before: the guard was spelled
+    /// `if !url.starts_with("https://") && !cfg!(test)`, so it was compiled
+    /// OUT of every test build and no test could observe the production
+    /// behaviour even in principle. The rule is compiled in now, and
+    /// [`enforce_https_in_this_test`] turns it on for the duration of this
+    /// test — test builds still DEFAULT to permissive, because every in-test
+    /// MCP fixture in this crate binds plaintext loopback and several of them
+    /// live outside this module (see `PLAINTEXT_ALLOWED`).
+    #[tokio::test]
+    async fn a_plaintext_http_url_is_rejected_before_any_request_is_made() {
+        let _https = enforce_https_in_this_test();
+        // Port 1 on loopback: nothing is listening, so if the guard ever
+        // stopped firing this would fail with a connection error instead —
+        // a different message, which the assertion below would catch.
+        let err = match connect_http(&spec("http://127.0.0.1:1/mcp"), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("a plaintext MCP URL must never connect"),
+        };
+        assert!(
+            err.to_string().contains("must use https"),
+            "the rejection must be the https guard itself, not some incidental downstream \
+             failure: {err}"
+        );
+    }
+
+    /// What [`spawn_redirect_server`] hands back: the URL to configure, plus
+    /// the `Authorization` value (if any) seen on every request that reached
+    /// each of its two routes.
+    struct RedirectFixture {
+        url: String,
+        first_hop: RedirectHits,
+        second_hop: RedirectHits,
+    }
+
+    type RedirectHits = std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>;
+
+    /// A server whose `/` answers `307 Location: /followed` and whose
+    /// `/followed` records what reached it and then answers like a perfectly
+    /// good MCP server.
+    ///
+    /// SAME-ORIGIN on purpose. reqwest's default redirect policy strips
+    /// `Authorization` only when the host or port changes and never compares
+    /// the SCHEME, so a same-origin hop is exactly the case where it forwards
+    /// the credential — and it is the case an `https:` → `http:` downgrade on
+    /// the same host and port falls into. `/followed` answers successfully so
+    /// that, if a redirect ever IS followed, the connect SUCCEEDS and the
+    /// hop-count assertions are what fail, rather than some incidental parse
+    /// error further down.
+    async fn spawn_redirect_server() -> RedirectFixture {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct RedirectState {
+            first_hop: RedirectHits,
+            second_hop: RedirectHits,
+        }
+
+        fn record(hits: &RedirectHits, headers: &HeaderMap) {
+            hits.lock().unwrap().push(
+                headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+            );
+        }
+
+        async fn handle_redirect(
+            State(state): State<RedirectState>,
+            headers: HeaderMap,
+            _body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            record(&state.first_hop, &headers);
+            axum::response::Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(axum::http::header::LOCATION, "/followed")
+                .body(axum::body::Body::empty())
+                .unwrap()
+                .into_response()
+        }
+
+        async fn handle_followed(
+            State(state): State<RedirectState>,
+            headers: HeaderMap,
+            Json(msg): Json<Value>,
+        ) -> axum::response::Response {
+            record(&state.second_hop, &headers);
+            let id = msg["id"].clone();
+            let result = match msg["method"].as_str().unwrap_or_default() {
+                "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+                "tools/list" => json!({"tools": []}),
+                _ => Value::Null,
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            )
+                .into_response()
+        }
+
+        let state = RedirectState {
+            first_hop: Default::default(),
+            second_hop: Default::default(),
+        };
+        let app = Router::new()
+            .route("/", post(handle_redirect))
+            .route("/followed", post(handle_followed))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        RedirectFixture {
+            url: format!("http://{addr}"),
+            first_hop: state.first_hop,
+            second_hop: state.second_hop,
+        }
+    }
+
+    /// PROPERTY: a redirect is never followed, so no credential is ever
+    /// replayed to the redirect target.
+    ///
+    /// Asserted on what the FIXTURE RECEIVED, not merely on the call failing:
+    /// with reqwest's default policy the call would SUCCEED, and the only
+    /// visible difference is a request arriving at the second hop carrying the
+    /// bearer. The first-hop assertion is the non-vacuity guard — without it,
+    /// "no Authorization reached hop two" would pass just as happily if the
+    /// client had never sent one at all.
+    #[tokio::test]
+    async fn a_redirect_is_never_followed_so_no_credential_reaches_the_next_hop() {
+        let fixture = spawn_redirect_server().await;
+
+        let err = match connect_http(&spec(&fixture.url), Some("secret-token")).await {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a 307 must surface as a transport error — following it is what lets a redirect \
+                 chain move this client's credential somewhere it never agreed to send it"
+            ),
+        };
+
+        let first = fixture.first_hop.lock().unwrap().clone();
+        assert_eq!(
+            first.len(),
+            1,
+            "the client must have made exactly one request, to the configured URL: {first:?}"
+        );
+        assert_eq!(
+            first[0].as_deref(),
+            Some("Bearer secret-token"),
+            "non-vacuity guard: the bearer must really have gone out on hop one, or the \
+             hop-two assertion below proves nothing"
+        );
+
+        let second = fixture.second_hop.lock().unwrap().clone();
+        assert!(
+            second.is_empty(),
+            "the redirect target must never have been requested. reqwest's DEFAULT policy follows \
+             up to ten hops and strips Authorization only when the HOST or PORT changes — it never \
+             compares the SCHEME — so a same-origin 307 (and, identically, an https→http downgrade \
+             on the same host and port) carries the bearer straight through: {second:?}"
+        );
+        assert!(
+            err.to_string().contains("307"),
+            "the error must name the status actually received, so a maintainer sees a refused \
+             redirect rather than a mystery failure: {err}"
+        );
+    }
+
+    /// A raw-TCP server that writes a complete, valid response HEAD and then
+    /// never finishes the body: it promises `content-length: 4096` and writes
+    /// two bytes, holding the socket open so the client blocks in the body
+    /// read rather than seeing EOF.
+    ///
+    /// Deliberately NOT `axum`: hyper only ever frames a body it can
+    /// complete, and a body that never completes is the entire point. Every
+    /// accepted stream is retained by the loop so nothing closes it early.
+    ///
+    /// `pub(crate)`: `mcp_oauth.rs`'s own bounded-request test reuses this
+    /// rather than growing a second copy.
+    pub(crate) async fn spawn_hanging_body_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                // Nothing here parses the request; one read is only to let the
+                // client finish sending before the head goes back.
+                let _ = stream.read(&mut scratch).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          content-type: application/json\r\n\
+                          content-length: 4096\r\n\
+                          \r\n\
+                          { ",
+                    )
+                    .await;
+                let _ = stream.flush().await;
+                held.push(stream);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// PROPERTY: the deadline covers the response BODY, not just the response
+    /// head — so a server that accepts the POST and then trickles its body
+    /// cannot hang `start_harness_session` (which awaits `connect_mcp_tools`)
+    /// or wedge the `begin_mcp_connect` RPC handler.
+    ///
+    /// The OUTER `tokio::time::timeout` is what converts "hangs forever" into
+    /// a test FAILURE rather than a hung test run: with only `send()` inside
+    /// the deadline, `text()` was unbounded and this future never resolved.
+    #[tokio::test]
+    async fn a_trickled_response_body_is_bounded_and_cannot_hang_session_start() {
+        let _timeout = override_request_timeout(Duration::from_millis(300));
+        let url = spawn_hanging_body_server().await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), connect_http(&spec(&url), None))
+            .await
+            .expect(
+                "connect_http must return within its own deadline — a body read left outside the \
+                 timeout hangs session start indefinitely",
+            );
+
+        let err = match outcome {
+            Err(e) => e,
+            Ok(_) => panic!("a response whose body never arrives is not a successful connect"),
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.to_ascii_lowercase().contains("timed out"),
+            "the failure must be a timeout, not some other incidental error: {chain}"
+        );
+    }
+
+    /// An MCP server with real session LIFETIME: `initialize` mints `sess-N`
+    /// and makes it the live session, any other request presenting anything
+    /// but the live id gets `404`, and the first `tools/call` it answers
+    /// TERMINATES the session — the mid-session termination MCP `2025-06-18`
+    /// explicitly permits.
+    async fn spawn_session_expiry_server() -> (String, Seen) {
+        #[derive(Clone)]
+        struct SessionState {
+            sink: Seen,
+            live: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+            issued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            terminated_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        async fn handle(
+            State(state): State<SessionState>,
+            headers: HeaderMap,
+            Json(msg): Json<Value>,
+        ) -> axum::response::Response {
+            let presented = headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            state.sink.lock().unwrap().push(SeenRequest {
+                protocol_version: None,
+                accept: None,
+                authorization: vec![],
+                session_id: presented.clone(),
+                body: msg.clone(),
+            });
+            let id = msg["id"].clone();
+            let method = msg["method"].as_str().unwrap_or_default().to_string();
+
+            if method == "initialize" {
+                let nth = state.issued.fetch_add(1, Ordering::SeqCst) + 1;
+                let session = format!("sess-{nth}");
+                *state.live.lock().unwrap() = Some(session.clone());
+                return (
+                    StatusCode::OK,
+                    [
+                        ("content-type", "application/json".to_string()),
+                        ("mcp-session-id", session),
+                    ],
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"protocolVersion": "2025-06-18", "capabilities": {}}
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
+
+            let live = state.live.lock().unwrap().clone();
+            if live.is_none() || presented != live {
+                // The spec's session-terminated answer.
+                return StatusCode::NOT_FOUND.into_response();
+            }
+
+            let result = match method.as_str() {
+                "tools/list" => json!({"tools": [{
+                    "name": "ping",
+                    "description": "ping it",
+                    "inputSchema": {"type": "object"}
+                }]}),
+                "tools/call" => {
+                    if !state
+                        .terminated_once
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        // Answer this one, THEN end the session — so the next
+                        // request presenting sess-1 is the one that 404s.
+                        *state.live.lock().unwrap() = None;
+                    }
+                    json!({"content": [{"type": "text", "text": "pong"}]})
+                }
+                _ => Value::Null,
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            )
+                .into_response()
+        }
+
+        let sink: Seen = Default::default();
+        let state = SessionState {
+            sink: sink.clone(),
+            live: Default::default(),
+            issued: Default::default(),
+            terminated_once: Default::default(),
+        };
+        let app = Router::new().route("/", post(handle)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), sink)
+    }
+
+    /// PROPERTY: a 404 answering a request that carried a session id makes the
+    /// client re-handshake ONCE and retry — the recovery MCP `2025-06-18`
+    /// requires. Before this, the first such 404 poisoned the connection: it
+    /// bailed `"mcp: HTTP 404"` and every later tool call in the agent session
+    /// failed the same way, with no recovery short of a restart.
+    ///
+    /// Asserted on what the server RECEIVED (two `initialize` requests, and a
+    /// retry carrying the NEW session id), not merely on the second call
+    /// returning Ok — a client that recovered by silently dropping the session
+    /// id altogether would also "succeed" here, and that is a different bug.
+    #[tokio::test]
+    async fn a_server_terminated_session_is_reinitialized_once_and_the_call_retried() {
+        let (url, seen) = spawn_session_expiry_server().await;
+        let conn = connect_http(&spec(&url), None)
+            .await
+            .expect("connect must succeed");
+
+        let first = conn
+            .call("ping", json!({}))
+            .await
+            .expect("the first call happens while the session is still live");
+        let (first_text, _) = crate::harness::native::mcp_client::render_tool_result(&first);
+        assert_eq!(first_text, "pong");
+
+        // The server ended the session while answering that first call, so
+        // THIS one presents a dead id and is answered 404.
+        let second = conn.call("ping", json!({})).await.expect(
+            "a 404 for a request carrying a session id is the spec's session-terminated signal: \
+             the client must re-initialize and retry, not fail this and every later tool call",
+        );
+        let (second_text, is_error) =
+            crate::harness::native::mcp_client::render_tool_result(&second);
+        assert_eq!(second_text, "pong");
+        assert!(!is_error, "the retried call must be a clean success");
+
+        let requests = seen.lock().unwrap().clone();
+        let initializes = requests
+            .iter()
+            .filter(|r| r.body["method"] == "initialize")
+            .count();
+        assert_eq!(
+            initializes, 2,
+            "exactly two initialize requests: the original handshake and ONE re-handshake. Zero \
+             recovery would leave 1; an unbounded recovery loop would leave many: {requests:?}"
+        );
+        let call_sessions: Vec<Option<String>> = requests
+            .iter()
+            .filter(|r| r.body["method"] == "tools/call")
+            .map(|r| r.session_id.clone())
+            .collect();
+        assert_eq!(
+            call_sessions,
+            vec![
+                Some("sess-1".to_string()),
+                Some("sess-1".to_string()),
+                Some("sess-2".to_string()),
+            ],
+            "the server must have seen: the successful call on sess-1, the 404'd call still on \
+             sess-1, and the RETRY on the re-issued sess-2. A retry still carrying sess-1 would \
+             mean the stale id was never cleared; a retry carrying None would mean the client \
+             recovered by dropping session tracking entirely: {call_sessions:?}"
+        );
+    }
+
+    /// PROPERTY: a 404 that is genuinely "no such endpoint" — no session was
+    /// ever established — still fails loudly as a plain transport error, and
+    /// does NOT trigger a re-handshake (let alone a loop of them).
+    ///
+    /// The request count is the half that matters: a recovery path gated on
+    /// nothing but the status code would re-handshake against a server that
+    /// 404s everything, and each re-handshake 404s in turn.
+    #[tokio::test]
+    async fn a_404_with_no_session_established_fails_loudly_without_re_handshaking() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{addr}");
+
+        let err = match connect_http(&spec(&url), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("a server that 404s the MCP endpoint cannot yield a connection"),
+        };
+
+        assert!(
+            err.to_string().contains("mcp: HTTP 404"),
+            "a 404 with no session established must surface as the PLAIN transport error, not be \
+             mistaken for the spec's session-terminated signal (which reports a re-handshake \
+             failure instead): {err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "exactly one request must have been made — a 404 with no session id in play must not \
+             provoke a re-handshake, and certainly not a loop of them"
         );
     }
 }

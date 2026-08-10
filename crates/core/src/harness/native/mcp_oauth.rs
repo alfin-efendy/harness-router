@@ -54,11 +54,23 @@ pub fn authorization_servers_from_prm(doc: &Value) -> anyhow::Result<Vec<String>
 }
 
 /// Fetch and parse the RFC 9728 document at `metadata_url`.
+///
+/// The explicit per-request `timeout` is not redundant with the client's own:
+/// `http` is supplied by the CALLER, and a caller that hands in a bare
+/// `reqwest::Client::new()` has no deadline of any kind — this function is
+/// awaited from `begin_mcp_connect` (inside an RPC handler) and from
+/// `mcp_http`'s refresh-on-401 path (inside `start_harness_session`), both of
+/// which wedge outright if it never returns. Same reasoning at every other
+/// request in this module.
 pub async fn protected_resource_metadata(
     http: &reqwest::Client,
     metadata_url: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let response = http.get(metadata_url).send().await?;
+    let response = http
+        .get(metadata_url)
+        .timeout(super::mcp_http::request_timeout())
+        .send()
+        .await?;
     if !response.status().is_success() {
         anyhow::bail!(
             "protected-resource metadata fetch failed: HTTP {}",
@@ -181,8 +193,23 @@ pub fn token_request_form(
 /// redefines its own copy of the same port for the same reason — the daemon
 /// and Cockpit are separate processes with no shared Rust module boundary
 /// here to draw a single canonical constant from.
+///
+/// `server_name` is a PATH SEGMENT, so it is percent-encoded rather than
+/// interpolated: a server id containing `?` or `#` would otherwise reshape the
+/// URL this client registers with the authorization server and then sends as
+/// `redirect_uri` — `…/mcp-oauth/a#b/callback` is a fragment, and
+/// `…/mcp-oauth/a?b/callback` is a query string, neither of which is the
+/// callback route Cockpit actually serves. (Host and port are hardcoded, so
+/// loopback-only holds either way; the shape of the path does not.)
 pub fn mcp_redirect_uri(server_name: &str) -> String {
-    format!("http://127.0.0.1:8976/mcp-oauth/{server_name}/callback")
+    let mut url = url::Url::parse("http://127.0.0.1:8976/mcp-oauth/")
+        .expect("the base callback URL is a compile-time constant and always parses");
+    url.path_segments_mut()
+        .expect("an http:// URL always has a path that can be segmented")
+        .pop_if_empty()
+        .push(server_name)
+        .push("callback");
+    url.to_string()
 }
 
 /// Probe the server with a credential-less request, discover its
@@ -205,6 +232,7 @@ pub async fn begin_mcp_connect(
     // what carries the WWW-Authenticate header this whole flow starts from.
     let probe = http
         .post(url)
+        .timeout(super::mcp_http::request_timeout())
         .header("content-type", "application/json")
         .header(
             "MCP-Protocol-Version",
@@ -314,7 +342,12 @@ pub async fn complete_mcp_connect(
         &mcp_redirect_uri(server_name),
         &canonical_resource_uri(server_url)?,
     );
-    let response = http.post(issuer_token_endpoint).form(&form).send().await?;
+    let response = http
+        .post(issuer_token_endpoint)
+        .timeout(super::mcp_http::request_timeout())
+        .form(&form)
+        .send()
+        .await?;
     if !response.status().is_success() {
         anyhow::bail!(
             "token exchange failed for {server_name}: HTTP {}",
@@ -1089,6 +1122,94 @@ mod tests {
             mcp_redirect_uri("rovo"),
             mcp_redirect_uri("other-server"),
             "two different servers must not collide on the same redirect_uri"
+        );
+    }
+
+    /// PROPERTY: the server id lands in ONE path segment and cannot reshape
+    /// the URL. Interpolated with `format!`, an id containing `?` or `#` turns
+    /// the rest of the template into a query string or a fragment — so the
+    /// `redirect_uri` this client REGISTERS with the authorization server, and
+    /// then sends on both the authorize and token requests, stops being the
+    /// callback route Cockpit actually serves.
+    #[test]
+    fn mcp_redirect_uri_percent_encodes_a_server_id_that_would_otherwise_reshape_the_url() {
+        let uri = mcp_redirect_uri("weird?q=1#frag");
+        let parsed = url::Url::parse(&uri).expect("the redirect_uri must remain a valid URL");
+
+        assert_eq!(
+            parsed.query(),
+            None,
+            "a `?` in the server id must not open a query string — everything after it would \
+             otherwise stop being part of the path: {uri}"
+        );
+        assert_eq!(
+            parsed.fragment(),
+            None,
+            "a `#` in the server id must not open a fragment — a fragment is never even sent to \
+             the server, so `/callback` would vanish from the request entirely: {uri}"
+        );
+        let segments: Vec<&str> = parsed
+            .path_segments()
+            .expect("a loopback http URL always has path segments")
+            .collect();
+        assert_eq!(
+            segments.len(),
+            3,
+            "exactly three segments — the scope prefix, the encoded id, and the callback: \
+             {segments:?}"
+        );
+        assert_eq!(segments[0], "mcp-oauth");
+        assert_eq!(
+            segments[2], "callback",
+            "the `/callback` suffix must survive whatever the id contains: {uri}"
+        );
+        assert!(
+            !segments[1].contains('?') && !segments[1].contains('#'),
+            "the id must be percent-encoded into its single segment, not left raw: {}",
+            segments[1]
+        );
+        assert_eq!(
+            parsed.host_str(),
+            Some("127.0.0.1"),
+            "loopback-only must still hold — host and port are hardcoded"
+        );
+        assert_eq!(parsed.port(), Some(8976));
+    }
+
+    /// PROPERTY: every request in this module is bounded even when the CALLER
+    /// hands in a client that has no deadline of its own.
+    ///
+    /// That is not hypothetical: `api/apps_api.rs` builds a bare
+    /// `reqwest::Client::new()` for both `begin_mcp_connect` and
+    /// `complete_mcp_connect`. The client used here is deliberately just as
+    /// bare, so the per-REQUEST timeout is the only thing under test — and
+    /// the outer `tokio::time::timeout` is what turns an unbounded body read
+    /// into a test FAILURE instead of a hung test run.
+    #[tokio::test]
+    async fn protected_resource_metadata_is_bounded_even_with_a_timeout_less_caller_client() {
+        let _timeout = crate::harness::native::mcp_http::override_request_timeout(
+            std::time::Duration::from_millis(300),
+        );
+        let url = crate::harness::native::mcp_http::tests::spawn_hanging_body_server().await;
+        let http = reqwest::Client::new();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            protected_resource_metadata(&http, &url),
+        )
+        .await
+        .expect(
+            "the metadata fetch must return on its own — this call is awaited inside the \
+             begin_mcp_connect RPC handler and inside mcp_http's refresh-on-401 path, both of \
+             which wedge indefinitely if it never does",
+        );
+
+        let err = outcome.expect_err("a response whose body never arrives is not a valid document");
+        assert!(
+            format!("{err:#}")
+                .to_ascii_lowercase()
+                .contains("timed out"),
+            "the failure must be the timeout, not some other incidental error: {err:#}"
         );
     }
 }
