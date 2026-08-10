@@ -1801,6 +1801,13 @@ impl ControlPlane {
         let mut activations: Vec<Arc<WasmActivation>> = Vec::new();
         for bundle in bundles {
             let id = bundle.manifest.id.clone();
+            // A declarative bundle (no `[component]`) has no wasm to
+            // compile — its `component_path` is a directory placeholder, so
+            // compiling it always fails. Skip it rather than letting the
+            // attempt fail and log every pass.
+            if bundle.manifest.component.is_none() {
+                continue;
+            }
             match crate::plugins::host::component_plugin_enabled(settings, &id).await {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -2640,4 +2647,63 @@ async fn coordinator_cancelled(
             )
         });
     root_cancelled || session_cancelled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::wasm_provider::install_component_less_bundle_on_disk;
+    use serial_test::serial;
+
+    /// A minimal `ControlPlane` over a fresh temp-file-backed store, with no
+    /// harness/gateway/connector wiring beyond the defaults —
+    /// `build_component_mcp_servers` only ever touches `self.store` and
+    /// `self.telemetry`, so nothing else needs faking.
+    async fn test_plane() -> (Arc<ControlPlane>, SettingsStore, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let plane = ControlPlane::new(store, crate::plugins::Registries::new(), persistence).await;
+        (plane, settings, tmp)
+    }
+
+    // `build_component_mcp_servers` (unlike `wasm_provider`'s
+    // `discover_provider_components`, which takes an explicit root) always
+    // reads the real install root via
+    // `crate::plugins::bundle::installed_bundle_root`, so a hermetic test
+    // must redirect it through the `RYUZI_PLUGINS_ROOT` env var — a
+    // process-global override, hence `#[serial]` (matches `bundle.rs`'s own
+    // convention for this seam).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn component_less_bundle_contributes_no_mcp_server() {
+        let (plane, settings, _tmp) = test_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RYUZI_PLUGINS_ROOT", root.path());
+
+        // A declarative-only bundle (no `[component]` at all — the
+        // atlassian-rovo shape): enabled, so the ONLY reason it could be
+        // skipped is the missing component itself. Its `component_path` is
+        // a directory placeholder (see `bundle.rs`'s `load_active_bundles`),
+        // so a naive `runtime.compile` attempt would always fail —
+        // discovery must skip it before ever reaching `compile`.
+        install_component_less_bundle_on_disk(root.path(), plane.store(), "life-declarative").await;
+        plane
+            .store()
+            .set_setting_raw("plugin.life-declarative.enabled", "true")
+            .await
+            .unwrap();
+
+        let servers = plane.build_component_mcp_servers(&settings).await;
+
+        std::env::remove_var("RYUZI_PLUGINS_ROOT");
+
+        assert!(
+            servers.is_empty(),
+            "a component-less bundle must contribute no MCP server"
+        );
+    }
 }

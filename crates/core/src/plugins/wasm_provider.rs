@@ -730,6 +730,13 @@ pub(crate) async fn discover_provider_components(
     let mut registered = Vec::new();
     for bundle in bundles {
         let id = bundle.manifest.id.clone();
+        // A declarative bundle (no `[component]`) has no wasm to compile —
+        // its `component_path` is a directory placeholder, so compiling it
+        // always fails. Skip it rather than letting the attempt fail and
+        // log every pass.
+        if bundle.manifest.component.is_none() {
+            continue;
+        }
         match crate::plugins::host::component_plugin_enabled(settings, &id).await {
             Ok(true) => {}
             Ok(false) => continue,
@@ -984,6 +991,68 @@ pub(crate) async fn install_bundle_on_disk_signed(
         source_url: "https://example.invalid/x.wasm".to_string(),
         sha256: sha,
         signing_key_id: signing_key_id.to_string(),
+        installed_at: 0,
+        active: false,
+        revoked: false,
+        revocation_reason: None,
+    };
+    store.upsert_component_release(&record).await.unwrap();
+    store
+        .set_active_component_release(plugin_id, version)
+        .await
+        .unwrap();
+}
+
+/// Like [`install_bundle_on_disk`], but lays a DECLARATIVE, component-less
+/// bundle — no `[component]` block and no wasm file at all — the exact
+/// shape `atlassian-rovo` ships (a remote-MCP-over-HTTP manifest, see
+/// `bundle.rs`'s `manifest_toml_without_component`). `record.sha256`/
+/// `source_url` stay empty to match `release.json`'s omitted
+/// `component_sha256`/`component_url`, exactly what `load_active_bundles`'s
+/// metadata-agreement check requires for a component-less bundle. Signed
+/// under the first-party key so discovery reaches the same trust gate a real
+/// component-less install would.
+///
+/// Module-level (not inside `mod tests`) so [`crate::control::lifecycle`]'s
+/// `build_component_mcp_servers` tests can stage the identical shape without
+/// duplicating this staging logic.
+#[cfg(test)]
+pub(crate) async fn install_component_less_bundle_on_disk(
+    root: &std::path::Path,
+    store: &Store,
+    plugin_id: &str,
+) {
+    use crate::store::ComponentPluginReleaseRecord;
+
+    let version = "0.1.0";
+    let version_dir = root.join(plugin_id).join(version);
+    std::fs::create_dir_all(&version_dir).unwrap();
+
+    let manifest = format!(
+        "contract = 2\n\
+         id = \"{plugin_id}\"\n\
+         name = \"{plugin_id}\"\n\
+         version = \"{version}\"\n"
+    );
+    std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
+
+    let release = serde_json::json!({
+        "id": plugin_id,
+        "version": version,
+    });
+    std::fs::write(
+        version_dir.join("release.json"),
+        serde_json::to_vec(&release).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join(plugin_id).join("current"), version).unwrap();
+
+    let record = ComponentPluginReleaseRecord {
+        plugin_id: plugin_id.to_string(),
+        version: version.to_string(),
+        source_url: String::new(),
+        sha256: String::new(),
+        signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
         installed_at: 0,
         active: false,
         revoked: false,
@@ -1796,6 +1865,34 @@ mod tests {
             "a non-provider (gateway) bundle must register nothing: {registered:?}",
         );
         assert!(wasm_provider("disc-gateway").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn component_less_bundle_registers_nothing() {
+        let (store, settings, root, _tmp) = discovery_env().await;
+        // A declarative-only bundle (no `[component]` at all — the
+        // atlassian-rovo shape): enabled, configured, and trusted, so the
+        // ONLY reason discovery could skip it is the missing component
+        // itself. Its `component_path` is a directory placeholder (see
+        // `bundle.rs`'s `load_active_bundles`), so a naive
+        // `runtime.compile` attempt would always fail — discovery must skip
+        // it before ever reaching `compile`.
+        install_component_less_bundle_on_disk(root.path(), &store, "disc-declarative").await;
+        enable(&store, "disc-declarative").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert!(
+            registered.is_empty(),
+            "a component-less bundle must register nothing: {registered:?}",
+        );
+        assert!(wasm_provider("disc-declarative").is_none());
     }
 
     // -----------------------------------------------------------------
