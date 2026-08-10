@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.5.0...core-v0.6.0) (2026-08-10)
+
+
+### Features
+
+* **plugins:** carry an agent's tools through every WASM provider component ([#203](https://github.com/alfin-efendy/ryuzi/issues/203)) ([d8eb04f](https://github.com/alfin-efendy/ryuzi/commit/d8eb04fcf61ff736d79ca767efb5b83e4521f9e9))
+
 ## [0.5.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.4.0...core-v0.5.0) (2026-08-09)
 
 
