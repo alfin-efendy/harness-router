@@ -64,9 +64,10 @@ use crate::store::{PluginAttachStatus, Store};
 /// and refresh their tool lists (preserving any user-set per-tool perm — see
 /// module doc). Never errors on a not-yet-configured or unreachable plugin:
 ///
-/// - a manifest with no `[[mcp]]` entries, or a plugin somehow carrying one
-///   with no connector (shouldn't happen — `declarative_plugin` always
-///   builds a connector when `manifest.mcp` is non-empty) — silent no-op;
+/// - a manifest with no `[[mcp]]` entries — silent no-op (after pruning any
+///   row a prior manifest declared);
+/// - a plugin declaring `[[mcp]]` but registered with NO connector — a
+///   registration bug, LOUDLY logged and skipped, see the body;
 /// - `Connector::ensure_auth` failing (e.g. a missing credential) — logged
 ///   and skipped, no rows written this call; the next enable/install-complete
 ///   retries;
@@ -107,7 +108,28 @@ pub async fn sync_plugin_mcp(
         mcp::prune_plugin_servers(store, &id, &keep_ids).await?;
         return Ok(());
     }
+    // A plugin that declares `[[mcp]]` but was registered with no connector
+    // cannot sync: this function needs `Connector::ensure_auth` +
+    // `Connector::mcp_servers` to resolve the manifest's placeholders, and
+    // there is no way to build one HERE — the registered manifest's
+    // `[[settings]]` keys are already QUALIFIED (`plugin.<id>.<key>`), which
+    // `PluginManifest::validate` — and so `declarative_plugin` — rejects
+    // outright, and which `DeclarativeConnector` would then re-qualify. The
+    // connector must therefore be built at the REGISTRATION boundary, off the
+    // still-bare manifest (`plugins::declarative_connector_for`, used by both
+    // `component_catalog::component_catalog_plugins` and
+    // `install_installed_plugins`) — so reaching this branch means a
+    // registration site skipped that and this plugin's Apps row will never
+    // exist. It used to be a SILENT `return`, which is exactly how
+    // `atlassian-rovo` shipped inert; warn loudly instead.
     let Some(connector) = &plugin.connector else {
+        tracing::warn!(
+            plugin = %id,
+            mcp_entries = plugin.manifest.mcp.len(),
+            "mcp sync: skipping — this plugin declares [[mcp]] but was registered without a \
+             connector, so no Apps row can be created for it (registration bug: see \
+             plugins::declarative_connector_for)"
+        );
         return Ok(());
     };
     // Task 11 tiered trust: an `[[mcp]]` entry is an arbitrary stdio process
@@ -772,6 +794,140 @@ env = { TOKEN = "${auth}" }
         sync_plugin_mcp(&store, &settings, &v2).await.unwrap();
 
         assert!(mcp::list_servers(&store).await.unwrap().is_empty());
+    }
+
+    // ---------- declarative-only ("component-less") first-party bundles ----
+
+    /// PROPERTY (the merge blocker): the REAL, embedded `atlassian-rovo`
+    /// registration — a first-party bundle with no `[component]` at all — must
+    /// sync its remote MCP row, with the manifest's `${setting:...}` Basic
+    /// credential resolved onto it.
+    ///
+    /// Drives the actual registered `CorePlugin` from
+    /// `component_catalog::component_catalog_plugins()` rather than a synthetic
+    /// manifest, so it fails if the bundle is not registered at all (the
+    /// original defect: it was absent from `COMPONENT_BUNDLE_MANIFESTS`), if it
+    /// is registered manifest-only (this function early-returns on
+    /// `connector.is_none()`, writing nothing), or if the settings-key
+    /// qualification happens before the connector is built (the connector would
+    /// then hunt for `plugin.atlassian-rovo.plugin.atlassian-rovo.basic_credential`,
+    /// `ensure_auth` would fail "missing required setting", and no row would be
+    /// written either).
+    ///
+    /// Hermetic: the entry is HTTP transport, so sync marks it `unchecked` and
+    /// never opens a connection to `mcp.atlassian.com`.
+    #[tokio::test]
+    async fn the_embedded_atlassian_rovo_bundle_syncs_its_remote_mcp_row() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (store, settings) = mem_store().await;
+        store
+            .set_setting_raw("plugin.atlassian-rovo.basic_credential", "dXNlcjpwYXNz")
+            .await
+            .unwrap();
+
+        let plugins = crate::plugins::component_catalog::component_catalog_plugins();
+        let plugin = plugins
+            .iter()
+            .find(|p| p.manifest.id == "atlassian-rovo")
+            .expect("atlassian-rovo must be registered in the component catalog");
+
+        sync_plugin_mcp(&store, &settings, plugin).await.unwrap();
+
+        let row = mcp::get_server(&store, "atlassian-rovo-atlassian-rovo")
+            .await
+            .unwrap()
+            .expect("a signed first-party declarative bundle must get an Apps row");
+        assert_eq!(row.plugin_id.as_deref(), Some("atlassian-rovo"));
+        assert_eq!(row.transport, "http");
+        assert_eq!(row.url.as_deref(), Some("https://mcp.atlassian.com/v1/mcp"));
+        assert_eq!(row.status, "unchecked", "an http row is never probed here");
+        assert_eq!(
+            mcp::get_server_headers(&store, "atlassian-rovo-atlassian-rovo")
+                .await
+                .unwrap(),
+            vec![(
+                "Authorization".to_string(),
+                "Basic dXNlcjpwYXNz".to_string()
+            )],
+            "the manifest's ${{setting:...}} Basic credential must resolve onto the row"
+        );
+        assert_eq!(
+            store
+                .get_plugin_attach("atlassian-rovo")
+                .await
+                .unwrap()
+                .expect("attach outcome recorded")
+                .outcome,
+            "ok"
+        );
+    }
+
+    /// PROPERTY: a SIGNED install creates the MCP row. A signed-catalog install
+    /// never runs `install_sources::confirm_plugin_install`'s transient
+    /// post-install syncs (that is the local-folder/git-URL path), so
+    /// `plugins::install_installed_plugins`' boot scan is the only registration
+    /// it ever gets. This drives that exact registration into `sync_plugin_mcp`
+    /// — the same object `toggle_enabled` hands it on enable — and asserts a row
+    /// appears. Before this fix the scan registered `connector: None` and this
+    /// function returned early, silently.
+    #[tokio::test]
+    async fn a_signed_installed_declarative_plugin_syncs_from_its_boot_scan_registration() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (store, settings) = mem_store().await;
+        store
+            .set_setting_raw("plugin.acme-signed.basic_credential", "c2lnbmVk")
+            .await
+            .unwrap();
+
+        // The on-disk layout a verified `ComponentBundleInstaller` install
+        // leaves behind: `<root>/<id>/<version>/ryuzi-plugin.toml` + a `current`
+        // pointer, and NO `install.json` — so `read_install_provenance`
+        // defaults to `Catalog`, i.e. trusted by construction.
+        let root = tempfile::tempdir().unwrap();
+        let version_dir = root.path().join("acme-signed").join("0.1.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join("ryuzi-plugin.toml"),
+            r#"contract = 2
+id = "acme-signed"
+name = "Acme Signed"
+
+[[settings]]
+key = "basic_credential"
+label = "Credential"
+secret = true
+required = true
+
+[[mcp]]
+name = "svc"
+transport = "http"
+url = "https://mcp.acme.example.com/v1/mcp"
+headers = { Authorization = "Basic ${setting:plugin.acme-signed.basic_credential}" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("acme-signed").join("current"), "0.1.0").unwrap();
+
+        let mut regs = crate::plugins::Registries::new();
+        crate::plugins::install_installed_plugins(&mut regs, root.path());
+        let plugin = regs
+            .plugins
+            .get("acme-signed")
+            .expect("the boot scan must register the installed plugin");
+
+        sync_plugin_mcp(&store, &settings, &plugin).await.unwrap();
+
+        let row = mcp::get_server(&store, "acme-signed-svc")
+            .await
+            .unwrap()
+            .expect("a signed install must create its mcp_servers row");
+        assert_eq!(row.plugin_id.as_deref(), Some("acme-signed"));
+        assert_eq!(
+            mcp::get_server_headers(&store, "acme-signed-svc")
+                .await
+                .unwrap(),
+            vec![("Authorization".to_string(), "Basic c2lnbmVk".to_string())]
+        );
     }
 
     #[tokio::test]
