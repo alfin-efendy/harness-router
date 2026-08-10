@@ -23,9 +23,22 @@ pub struct PluginRelease {
     /// The exact WIT contract version this release's component was built
     /// against. Unlike a manifest's `[component] wit-api` (a range), this
     /// is a single concrete [`semver::Version`].
-    #[serde(rename = "wit-api")]
+    ///
+    /// EMPTY (never absent-as-`null` — `#[serde(default)]` lets the key be
+    /// omitted from the JSON entirely) for a declarative-only release with
+    /// no `[component]` at all: a plugin that ships no wasm targets no WIT
+    /// contract. Kept a plain `String` rather than `Option<String>` so this
+    /// stays a purely additive change for every existing construction site
+    /// across the crate — see `validate()` for the actual optionality rule.
+    #[serde(rename = "wit-api", default)]
     pub wit_api: String,
+    /// EMPTY together with `component_sha256` for a component-less release
+    /// (see `wit_api`'s doc) — there is no wasm to download.
+    #[serde(default)]
     pub component_url: String,
+    /// EMPTY together with `component_url` for a component-less release —
+    /// there is no wasm to hash.
+    #[serde(default)]
     pub component_sha256: String,
     #[serde(default)]
     pub size_bytes: Option<u64>,
@@ -67,14 +80,32 @@ impl PluginRelease {
         Ok(release)
     }
 
-    /// Structural validation: id shape, `version` and `wit-api` semver
-    /// parsing, and non-empty download coordinates.
+    /// Structural validation: id shape, `version` semver parsing, and —
+    /// only for a release that actually has a component — `wit-api` semver
+    /// parsing plus non-empty download coordinates.
+    ///
+    /// A release is component-LESS (and skips every check below this point)
+    /// when `wit_api`, `component_url` and `component_sha256` are ALL
+    /// empty: a declarative-only plugin (e.g. a remote-MCP-over-HTTP
+    /// manifest with no `[component]` at all) has no WIT contract, no
+    /// download URL and no checksum to validate, by construction rather
+    /// than by omission. Any OTHER combination — one or two set, the rest
+    /// blank — is a malformed release (a signer bug, not a legitimate
+    /// shape) and falls through to the same per-field checks a
+    /// component-bearing release gets, so it fails loudly instead of
+    /// silently installing a half-described component.
     pub fn validate(&self) -> Result<(), BundleError> {
         if !is_valid_id(&self.id) {
             return Err(BundleError::InvalidId(self.id.clone()));
         }
         semver::Version::parse(&self.version)
             .map_err(|e| BundleError::InvalidVersion(self.version.clone(), e.to_string()))?;
+        let component_less = self.wit_api.is_empty()
+            && self.component_url.is_empty()
+            && self.component_sha256.is_empty();
+        if component_less {
+            return Ok(());
+        }
         semver::Version::parse(&self.wit_api)
             .map_err(|e| BundleError::InvalidWitApi(self.wit_api.clone(), e.to_string()))?;
         if self.component_url.is_empty() {
@@ -198,6 +229,38 @@ mod tests {
         let err = PluginRelease::from_json(json)
             .expect_err("empty component_sha256 should fail validation");
         assert!(matches!(err, BundleError::EmptyComponentSha256));
+    }
+
+    #[test]
+    fn a_release_whose_json_omits_every_component_field_parses_and_validates() {
+        // A declarative-only release (e.g. a remote-MCP-over-HTTP plugin like
+        // atlassian-rovo) — the signer never writes `wit-api`/`component_url`/
+        // `component_sha256` keys at all for it.
+        let json = br#"{
+            "id": "atlassian-rovo",
+            "version": "0.1.0"
+        }"#;
+        let release =
+            PluginRelease::from_json(json).expect("a component-less release must validate");
+        assert_eq!(release.wit_api, "");
+        assert_eq!(release.component_url, "");
+        assert_eq!(release.component_sha256, "");
+    }
+
+    #[test]
+    fn a_release_with_only_wit_api_set_is_rejected_as_malformed() {
+        // Any partial combination (one or two of the three component fields
+        // set, the rest blank) is a signer bug, not a legitimate
+        // component-less shape — it must fail loudly rather than silently
+        // installing a half-described component.
+        let json = br#"{
+            "id": "acme-connector",
+            "version": "0.1.0",
+            "wit-api": "0.1.0"
+        }"#;
+        let err = PluginRelease::from_json(json)
+            .expect_err("a release naming a wit-api but no component_url must be rejected");
+        assert!(matches!(err, BundleError::EmptyComponentUrl));
     }
 
     #[test]

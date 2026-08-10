@@ -111,9 +111,16 @@ pub fn verify_bundle(
         .context("reading ryuzi-plugin.toml")?;
     let manifest =
         PluginManifest::from_toml(&manifest_toml).context("parsing ryuzi-plugin.toml")?;
-    let Some(component) = manifest.component.as_ref() else {
-        bail!("bundle manifest `{}` declares no [component]", manifest.id);
-    };
+    // `[component]` is OPTIONAL — a declarative-only plugin (e.g.
+    // atlassian-rovo, a remote-MCP-over-HTTP manifest with no wasm at all)
+    // ships no component. Steps 3-4 below (path resolution, hashing) are
+    // conditional on it being present; Step 5 (the signature check) is NOT —
+    // it verifies release.json's exact raw bytes either way, so a
+    // component-less bundle is exactly as forgery-proof as a
+    // component-bearing one. This is the load-bearing property of this
+    // whole function: making the component optional must never make
+    // verification optional.
+    let component = manifest.component.as_ref();
 
     let release_bytes =
         std::fs::read(staging_dir.join("release.json")).context("reading release.json")?;
@@ -135,44 +142,68 @@ pub fn verify_bundle(
         );
     }
 
-    // Step 3: safely resolve the component path and require it stays
-    // within the staging root.
-    let canonical_root = staging_dir
-        .canonicalize()
-        .with_context(|| format!("canonicalizing staging dir {}", staging_dir.display()))?;
-    let component_path = staging_dir.join(&component.file);
-    let canonical_component = component_path
-        .canonicalize()
-        .with_context(|| format!("canonicalizing component path {}", component_path.display()))?;
-    if !canonical_component.starts_with(&canonical_root) {
-        bail!(
-            "component path {:?} escapes the staging directory",
-            component.file
-        );
-    }
+    // Steps 3-4: resolve, hash and compare the component — only when the
+    // manifest actually declares one. A manifest/release disagreement about
+    // whether a component exists at all (one says yes, the other no) is
+    // rejected outright rather than silently trusting either side.
+    match component {
+        Some(component) => {
+            if release.component_sha256.is_empty() {
+                bail!(
+                    "bundle manifest `{}` declares a [component] but release.json has no component_sha256",
+                    manifest.id
+                );
+            }
 
-    // Step 4: hash the component and compare against the release's
-    // declared checksum.
-    let component_bytes = std::fs::read(&canonical_component)
-        .with_context(|| format!("reading component {}", canonical_component.display()))?;
-    let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
-    let declared_hash = &release.component_sha256;
-    if declared_hash.len() != 64
-        || !declared_hash
-            .chars()
-            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-    {
-        bail!(
-            "release component_sha256 is malformed: expected exactly 64 lowercase hex characters, got {:?}",
-            declared_hash
-        );
-    }
-    if &actual_hash != declared_hash {
-        bail!("component hash mismatch: expected {declared_hash}, got {actual_hash}");
+            // Step 3: safely resolve the component path and require it stays
+            // within the staging root.
+            let canonical_root = staging_dir
+                .canonicalize()
+                .with_context(|| format!("canonicalizing staging dir {}", staging_dir.display()))?;
+            let component_path = staging_dir.join(&component.file);
+            let canonical_component = component_path.canonicalize().with_context(|| {
+                format!("canonicalizing component path {}", component_path.display())
+            })?;
+            if !canonical_component.starts_with(&canonical_root) {
+                bail!(
+                    "component path {:?} escapes the staging directory",
+                    component.file
+                );
+            }
+
+            // Step 4: hash the component and compare against the release's
+            // declared checksum.
+            let component_bytes = std::fs::read(&canonical_component)
+                .with_context(|| format!("reading component {}", canonical_component.display()))?;
+            let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
+            let declared_hash = &release.component_sha256;
+            if declared_hash.len() != 64
+                || !declared_hash
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+            {
+                bail!(
+                    "release component_sha256 is malformed: expected exactly 64 lowercase hex characters, got {:?}",
+                    declared_hash
+                );
+            }
+            if &actual_hash != declared_hash {
+                bail!("component hash mismatch: expected {declared_hash}, got {actual_hash}");
+            }
+        }
+        None => {
+            if !release.component_sha256.is_empty() || !release.component_url.is_empty() {
+                bail!(
+                    "release.json for `{}` names a component but the manifest declares no [component]",
+                    manifest.id
+                );
+            }
+        }
     }
 
     // Step 5: parse and verify the signature envelope over the exact raw
-    // staged release.json bytes.
+    // staged release.json bytes. UNCONDITIONAL — see the note on `component`
+    // above.
     let sig_bytes = std::fs::read(staging_dir.join("plugin.sig")).context("reading plugin.sig")?;
     let envelope: SignatureEnvelope =
         serde_json::from_slice(&sig_bytes).context("parsing plugin.sig")?;
@@ -512,31 +543,54 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
             {
                 bail!("active bundle metadata mismatch for {plugin_id}");
             }
-            let Some(component) = manifest.component.as_ref() else {
-                bail!("active bundle manifest for {plugin_id} declares no [component]");
+            // `[component]` is OPTIONAL — a declarative-only plugin (no wasm
+            // at all, e.g. atlassian-rovo) is installed through the exact
+            // same signed pipeline and lands in the exact same
+            // `<root>/<id>/<version>/` layout, just without a component file
+            // to hash. The metadata-mismatch check above already guarantees
+            // `record.sha256`/`release.component_sha256` agree either way
+            // (both empty for a component-less bundle), so this only ever
+            // has real hashing work to do when there is a component.
+            let component_path = match manifest.component.as_ref() {
+                Some(component) => {
+                    let component_path = canonical_version_root.join(&component.file);
+                    let canonical_component = component_path.canonicalize()?;
+                    if !canonical_component.starts_with(&canonical_version_root) {
+                        bail!("active component escapes bundle root");
+                    }
+                    let component_bytes =
+                        std::fs::read(&canonical_component).with_context(|| {
+                            format!("reading active component {}", canonical_component.display())
+                        })?;
+                    let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
+                    if actual_hash != release.component_sha256 {
+                        bail!(
+                            "active component hash mismatch: expected {}, got {}",
+                            release.component_sha256,
+                            actual_hash
+                        );
+                    }
+                    canonical_component
+                }
+                None => {
+                    // Nothing to load. `InstalledBundle::component_path` has
+                    // no meaningful file for a component-less bundle; every
+                    // caller that would read it as wasm bytes (the WASM
+                    // component runtime) already gates on
+                    // `manifest.component.is_some()` first, so pointing this
+                    // at the bundle's own version directory rather than a
+                    // fabricated filename is a harmless placeholder: reading
+                    // a directory as a file fails cleanly instead of
+                    // resolving to a real, unrelated file on disk.
+                    canonical_version_root.clone()
+                }
             };
-            let component_path = canonical_version_root.join(&component.file);
-            let canonical_component = component_path.canonicalize()?;
-            if !canonical_component.starts_with(&canonical_version_root) {
-                bail!("active component escapes bundle root");
-            }
-            let component_bytes = std::fs::read(&canonical_component).with_context(|| {
-                format!("reading active component {}", canonical_component.display())
-            })?;
-            let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
-            if actual_hash != release.component_sha256 {
-                bail!(
-                    "active component hash mismatch: expected {}, got {}",
-                    release.component_sha256,
-                    actual_hash
-                );
-            }
             Ok(InstalledBundle {
                 manifest,
                 release,
                 release_record: record,
                 root: canonical_version_root,
-                component_path: canonical_component,
+                component_path,
             })
         }
         .await;
@@ -653,6 +707,65 @@ lifecycle = "singleton"
 }}"#
         )
         .into_bytes()
+    }
+
+    /// A declarative-only manifest (no `[component]` at all) — the shape
+    /// `atlassian-rovo` ships: a remote-MCP-over-HTTP plugin with no wasm.
+    fn manifest_toml_without_component(id: &str, version: &str) -> String {
+        format!(
+            r#"
+contract = 2
+id = "{id}"
+name = "Acme Declarative"
+version = "{version}"
+"#
+        )
+    }
+
+    /// A `release.json` with no `wit-api`/`component_url`/`component_sha256`
+    /// keys at all — the shape the signer writes for a component-less
+    /// manifest (see `manifest_toml_without_component`).
+    fn release_json_without_component(id: &str, version: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+    "id": "{id}",
+    "version": "{version}"
+}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Writes a component-less staging directory (manifest, release.json,
+    /// plugin.sig — no wasm) signed BY `signing_key`, with the envelope
+    /// naming `envelope_key_id`. Separating the two lets a test sign with a
+    /// key that is NOT the one named in the envelope, to prove that
+    /// `verify_bundle` still runs real cryptographic verification against
+    /// the envelope's claimed key — never that it merely trusts the
+    /// component's absence.
+    fn write_component_less_bundle_signed_by(
+        dir: &Path,
+        signing_key: &SigningKey,
+        envelope_key_id: &str,
+        id: &str,
+        version: &str,
+    ) {
+        fs::write(
+            dir.join("ryuzi-plugin.toml"),
+            manifest_toml_without_component(id, version),
+        )
+        .unwrap();
+        let release_bytes = release_json_without_component(id, version);
+        fs::write(dir.join("release.json"), &release_bytes).unwrap();
+        let signature = signing_key.sign(&release_bytes);
+        let envelope = serde_json::json!({
+            "key_id": envelope_key_id,
+            "signature": b64url(&signature.to_bytes()),
+        });
+        fs::write(
+            dir.join("plugin.sig"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
     }
 
     /// Writes a fully valid, signed staging directory (manifest, component,
@@ -1206,6 +1319,123 @@ lifecycle = "singleton"
             verified.staging_dir.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn a_component_less_bundle_verifies_when_its_signature_is_good() {
+        let dir = tempfile::tempdir().unwrap();
+        write_component_less_bundle_signed_by(
+            dir.path(),
+            &signing_key(),
+            KEY_ID,
+            "atlassian-rovo",
+            "0.1.0",
+        );
+
+        let verified = verify_bundle(dir.path(), &trusted_keys())
+            .expect("a signed component-less bundle must verify");
+
+        assert_eq!(verified.manifest.id, "atlassian-rovo");
+        assert!(
+            verified.manifest.component.is_none(),
+            "the manifest genuinely declares no [component]"
+        );
+        assert_eq!(verified.release.id, "atlassian-rovo");
+    }
+
+    /// THE RISK THIS TASK EXISTS TO GUARD AGAINST: making the component
+    /// optional must never make the signature check optional. This bundle
+    /// has no `[component]` at all AND its `plugin.sig` was produced by a
+    /// key that is not the one the envelope claims to be signed by — so if
+    /// `verify_bundle` ever short-circuited signature verification for a
+    /// component-less bundle (e.g. by returning early once it saw
+    /// `manifest.component.is_none()`), this is exactly the case that would
+    /// slip through. It must be rejected, and rejected BECAUSE OF the
+    /// signature — not because of anything about the missing component.
+    #[test]
+    fn a_component_less_bundle_with_a_bad_signature_is_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // The envelope claims the TRUSTED key id, but the bytes were
+        // actually signed with a different key — `verify_strict` against the
+        // trusted pubkey must fail.
+        write_component_less_bundle_signed_by(
+            dir.path(),
+            &other_signing_key(),
+            KEY_ID,
+            "atlassian-rovo",
+            "0.1.0",
+        );
+
+        let err = verify_bundle(dir.path(), &trusted_keys())
+            .expect_err("a bad signature must still fail even with no [component]");
+        assert!(
+            format!("{err:#}").contains("signature"),
+            "rejection must be about the signature, not about the missing component: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_component_less_release_naming_a_component_url_is_rejected() {
+        // The manifest declares no [component], but release.json still names
+        // a component_url/sha256 — a signer bug (or a tamper) that must not
+        // be silently accepted just because the manifest side looks
+        // component-less.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("ryuzi-plugin.toml"),
+            manifest_toml_without_component("atlassian-rovo", "0.1.0"),
+        )
+        .unwrap();
+        let release_bytes = release_json("atlassian-rovo", "0.1.0", &"a".repeat(64));
+        fs::write(dir.path().join("release.json"), &release_bytes).unwrap();
+        let signature = signing_key().sign(&release_bytes);
+        let envelope = serde_json::json!({
+            "key_id": KEY_ID,
+            "signature": b64url(&signature.to_bytes()),
+        });
+        fs::write(
+            dir.path().join("plugin.sig"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_bundle(dir.path(), &trusted_keys()).expect_err(
+            "a release naming a component the manifest doesn't declare must be rejected",
+        );
+        assert!(
+            err.to_string().contains("names a component"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn installs_and_loads_a_component_less_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+
+        let staging = tempfile::tempdir().unwrap();
+        write_component_less_bundle_signed_by(
+            staging.path(),
+            &signing_key(),
+            KEY_ID,
+            "atlassian-rovo",
+            "0.1.0",
+        );
+        let verified = verify_bundle(staging.path(), &trusted_keys()).unwrap();
+        let record = installer.install_verified(verified).await.unwrap();
+        assert!(record.active);
+        assert_eq!(record.sha256, "", "no component means nothing to hash");
+        assert_eq!(
+            record.source_url, "",
+            "no component means no download URL to record"
+        );
+
+        let bundles = load_active_bundles(root.path(), &store).await.unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert!(bundles[0].manifest.component.is_none());
+        assert_eq!(bundles[0].release.id, "atlassian-rovo");
     }
 
     #[test]

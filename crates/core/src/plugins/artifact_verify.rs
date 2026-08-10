@@ -69,13 +69,13 @@ pub fn verify_artifacts_dir(
                 .with_context(|| format!("{stem}: manifest is not UTF-8"))?,
         )
         .with_context(|| format!("{stem}: parsing manifest"))?;
-        let component = manifest
-            .component
-            .as_ref()
-            .with_context(|| format!("{stem}: manifest declares no [component]"))?;
+        // `[component]` is OPTIONAL — a declarative-only release (no wasm at
+        // all, e.g. `atlassian-rovo`) has no component filename to check the
+        // published `component_url` against and no wasm to restage/copy.
+        let component = manifest.component.as_ref();
         let release = PluginRelease::from_json(&release_bytes)
             .with_context(|| format!("{stem}: parsing release.json"))?;
-        if let Some(base) = expect_base {
+        if let (Some(base), Some(component)) = (expect_base, component) {
             let expected = format!("{}/{}", base.trim_end_matches('/'), component.file);
             if release.component_url != expected {
                 bail!(
@@ -85,17 +85,20 @@ pub fn verify_artifacts_dir(
             }
         }
 
-        // Same pre-write guard the install pipeline runs: the component name
-        // must stay inside the restage dir before anything is copied there.
-        super::remote_catalog::sanitize_staged_component(&component.file)
-            .with_context(|| format!("{stem}: component filename"))?;
         let staged = tempfile::tempdir().context("creating restage dir")?;
         std::fs::write(staged.path().join("ryuzi-plugin.toml"), &manifest_bytes)?;
         std::fs::write(staged.path().join("release.json"), &release_bytes)?;
         std::fs::write(staged.path().join("plugin.sig"), &sig_bytes)?;
-        let wasm_src = dir.join(&component.file);
-        std::fs::copy(&wasm_src, staged.path().join(&component.file))
-            .with_context(|| format!("{stem}: copying {}", wasm_src.display()))?;
+        if let Some(component) = component {
+            // Same pre-write guard the install pipeline runs: the component
+            // name must stay inside the restage dir before anything is
+            // copied there.
+            super::remote_catalog::sanitize_staged_component(&component.file)
+                .with_context(|| format!("{stem}: component filename"))?;
+            let wasm_src = dir.join(&component.file);
+            std::fs::copy(&wasm_src, staged.path().join(&component.file))
+                .with_context(|| format!("{stem}: copying {}", wasm_src.display()))?;
+        }
 
         let bundle = crate::plugins::bundle::verify_bundle(staged.path(), trusted_keys)
             .with_context(|| format!("{stem}: verify_bundle"))?;
@@ -160,6 +163,31 @@ mod tests {
         std::fs::write(dir.join(component), &wasm).unwrap();
     }
 
+    /// Write one component-less (no `[component]` at all — the shape
+    /// `atlassian-rovo` ships) signer-layout artifact set into `dir` under
+    /// `stem`, signed by `key`. No wasm file is written.
+    fn write_component_less_artifact_set(
+        dir: &Path,
+        stem: &str,
+        id: &str,
+        version: &str,
+        key: &SigningKey,
+    ) {
+        let manifest = format!(
+            "contract = 2\nid = \"{id}\"\nname = \"Test\"\nversion = \"{version}\"\n\
+             publisher = \"Ryuzi\"\ndescription = \"test\"\n"
+        );
+        let release = format!("{{\n  \"id\": \"{id}\",\n  \"version\": \"{version}\"\n}}\n");
+        let sig = key.sign(release.as_bytes());
+        let envelope = format!(
+            "{{\"key_id\":\"{KEY_ID}\",\"signature\":\"{}\"}}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
+        std::fs::write(dir.join(format!("{stem}.ryuzi-plugin.toml")), &manifest).unwrap();
+        std::fs::write(dir.join(format!("{stem}.release.json")), &release).unwrap();
+        std::fs::write(dir.join(format!("{stem}.release.json.sig")), &envelope).unwrap();
+    }
+
     // Both stems of a dual-stem publish verify independently — the pinned
     // aliases are byte-identical, so one shared wasm satisfies both.
     #[test]
@@ -174,6 +202,51 @@ mod tests {
             .iter()
             .all(|v| v.id == "github" && v.version == "0.1.1"));
         assert!(verified.iter().all(|v| v.signing_key_id == KEY_ID));
+    }
+
+    // A declarative-only stem (no `[component]` at all — the shape
+    // `atlassian-rovo` ships) must verify through this exact CI path too, not
+    // just through the client's own `verify_bundle` — CI's rehearsal must
+    // prove what an install would accept for the pipeline this task adds.
+    #[test]
+    fn verifies_a_component_less_stem() {
+        let key = test_key();
+        let dir = tempfile::tempdir().unwrap();
+        write_component_less_artifact_set(
+            dir.path(),
+            "atlassian-rovo",
+            "atlassian-rovo",
+            "0.1.0",
+            &key,
+        );
+        let verified = verify_artifacts_dir(dir.path(), &trusted(&key), None).unwrap();
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].id, "atlassian-rovo");
+        assert_eq!(verified[0].version, "0.1.0");
+        assert_eq!(verified[0].signing_key_id, KEY_ID);
+    }
+
+    // `--expect-base` pins `component_url` against `<base>/<component.file>` —
+    // a component-less stem has neither, so the check must be a no-op rather
+    // than a spurious rejection.
+    #[test]
+    fn expect_base_is_a_no_op_for_a_component_less_stem() {
+        let key = test_key();
+        let dir = tempfile::tempdir().unwrap();
+        write_component_less_artifact_set(
+            dir.path(),
+            "atlassian-rovo",
+            "atlassian-rovo",
+            "0.1.0",
+            &key,
+        );
+        let verified = verify_artifacts_dir(
+            dir.path(),
+            &trusted(&key),
+            Some("https://example.com/anything"),
+        )
+        .expect("a component-less stem has no component_url to check against expect_base");
+        assert_eq!(verified.len(), 1);
     }
 
     // The placeholder guard: with no trusted key, refuse loudly instead of

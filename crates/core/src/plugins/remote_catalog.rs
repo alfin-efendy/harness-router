@@ -778,6 +778,12 @@ pub async fn install_component_release(
     // only place that ACTS on it before anything is installed.
     require_host_supports_wit_api(&manifest, plugin_id, &release.version)?;
 
+    // `manifest.component` is OPTIONAL — a declarative-only release (no wasm
+    // at all, e.g. `atlassian-rovo`, a remote-MCP-over-HTTP plugin) has
+    // nothing here to fetch, sanitize, or same-origin-check. Everything below
+    // that exists to guard the wasm download/write only runs when there
+    // actually is one.
+    //
     // SECURITY: `manifest.component` and `release.component_url` both come from
     // the fetched, still-UNVERIFIED descriptors. Constrain them BEFORE any
     // outbound fetch or filesystem write — `verify_bundle`'s own containment
@@ -785,16 +791,18 @@ pub async fn install_component_release(
     //   1. Arbitrary-file-write: the staged wasm filename must stay inside the
     //      staging dir (no absolute path / drive-UNC prefix / `..`).
     //   2. SSRF: the wasm must be fetched from the release base's own origin.
-    let Some(component) = manifest.component.as_ref() else {
-        anyhow::bail!("release feed manifest `{plugin_id}` declares no [component]");
+    let component = manifest.component.as_ref();
+    let component_bytes = match component {
+        Some(component) => {
+            sanitize_staged_component(&component.file)?;
+            require_same_origin(base_url, &release.component_url)?;
+            // Download the component wasm named by the release.
+            Some(get_2xx(http, &release.component_url).await?)
+        }
+        None => None,
     };
-    sanitize_staged_component(&component.file)?;
-    require_same_origin(base_url, &release.component_url)?;
 
-    // Download the component wasm named by the release.
-    let component_bytes = get_2xx(http, &release.component_url).await?;
-
-    // Stage all four bundle files into a throwaway dir. On a successful install
+    // Stage the bundle files into a throwaway dir. On a successful install
     // the dir is renamed into place; the `TempDir` guard's drop then removes a
     // path that no longer exists, which is a harmless no-op. On any failure
     // before that, the guard cleans the staging dir up.
@@ -803,13 +811,16 @@ pub async fn install_component_release(
     std::fs::write(staging_path.join("ryuzi-plugin.toml"), &manifest_bytes)?;
     std::fs::write(staging_path.join("release.json"), &release_bytes)?;
     std::fs::write(staging_path.join("plugin.sig"), &sig_bytes)?;
-    // Stage the wasm under the exact filename the manifest names; verify_bundle
-    // resolves and canonicalizes `manifest.component` against the staging root.
-    let component_dest = staging_path.join(&component.file);
-    if let Some(parent) = component_dest.parent() {
-        std::fs::create_dir_all(parent)?;
+    // Stage the wasm under the exact filename the manifest names, when there
+    // is one; verify_bundle resolves and canonicalizes `manifest.component`
+    // against the staging root.
+    if let (Some(component), Some(component_bytes)) = (component, component_bytes) {
+        let component_dest = staging_path.join(&component.file);
+        if let Some(parent) = component_dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&component_dest, &component_bytes)?;
     }
-    std::fs::write(&component_dest, &component_bytes)?;
 
     let verified = crate::plugins::bundle::verify_bundle(staging_path, trusted_keys)
         .context("verifying staged component bundle")?;
@@ -1104,6 +1115,59 @@ mod component_install_tests {
                 .unwrap()
                 .version,
             "0.1.0"
+        );
+    }
+
+    /// A declarative-only release (no `[component]` at all, the shape
+    /// `atlassian-rovo` ships) must install through this exact pipeline with
+    /// NO wasm fetch attempted — the deliberately-unregistered wasm route
+    /// would surface as an "HTTP 404" if the pipeline tried to download one
+    /// anyway.
+    #[tokio::test]
+    async fn install_pipeline_installs_a_component_less_release() {
+        let (store, _tmp) = test_store().await;
+        let root = tempfile::tempdir().unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        let base = "http://feed.test/latest";
+        let http = FakeReleaseHttp::new();
+
+        let manifest_toml =
+            b"contract = 2\nid = \"atlassian-rovo\"\nname = \"Atlassian Rovo\"\nversion = \"0.1.0\"\n"
+                .to_vec();
+        let release_json = br#"{"id":"atlassian-rovo","version":"0.1.0"}"#.to_vec();
+        let signature = bundle_key().sign(&release_json);
+        let sig_json = serde_json::to_vec(&serde_json::json!({
+            "key_id": KEY_ID,
+            "signature": b64url(&signature.to_bytes()),
+        }))
+        .unwrap();
+        http.put(
+            format!("{base}/atlassian-rovo.ryuzi-plugin.toml"),
+            200,
+            manifest_toml,
+        );
+        http.put(
+            format!("{base}/atlassian-rovo.release.json"),
+            200,
+            release_json,
+        );
+        http.put(
+            format!("{base}/atlassian-rovo.release.json.sig"),
+            200,
+            sig_json,
+        );
+
+        let record =
+            install_component_release(&http, &installer, &trusted(), base, "atlassian-rovo", None)
+                .await
+                .expect("a component-less release must install");
+        assert_eq!(record.plugin_id, "atlassian-rovo");
+        assert_eq!(record.version, "0.1.0");
+        assert!(record.active);
+        assert_eq!(record.sha256, "", "no component means no hash to record");
+        assert_eq!(
+            record.source_url, "",
+            "no component means no download URL to record"
         );
     }
 

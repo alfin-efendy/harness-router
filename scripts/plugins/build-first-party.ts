@@ -106,11 +106,19 @@ export const DEFAULT_RELEASE_BASE_URL = "https://github.com/alfin-efendy/ryuzi/r
 const SDK_WIT_DIR = "crates/plugin-sdk/wit";
 const WASM_TARGET = "wasm32-wasip2";
 
-/** One first-party component to build + sign. `crateWasmStem` is cargo's output name (crate name with `-`→`_`). */
+/**
+ * One first-party release to build + sign. `crateWasmStem` is cargo's output
+ * name (crate name with `-`→`_`) — present for a WASM-component plugin,
+ * ABSENT for a declarative-only plugin (no `[component]` at all, e.g.
+ * `atlassian-rovo`, a remote-MCP-over-HTTP manifest with no wasm). Nothing
+ * is built or hashed for a declarative-only entry, and its published
+ * `release.json` carries no component fields — the signature over it is
+ * still mandatory either way.
+ */
 export interface ComponentSpec {
   id: string;
   dir: string;
-  crateWasmStem: string;
+  crateWasmStem?: string;
 }
 
 export const COMPONENTS: ComponentSpec[] = [
@@ -146,35 +154,47 @@ export const COMPONENTS: ComponentSpec[] = [
   { id: "bitbucket", dir: "plugins/bitbucket", crateWasmStem: "ryuzi_plugin_bitbucket" },
 ];
 
-/** The `PluginRelease` JSON shape (crates/plugin-sdk/src/bundle.rs). `wit-api` is kebab in the wire form. */
+/**
+ * The `PluginRelease` JSON shape (crates/plugin-sdk/src/bundle.rs). `wit-api`
+ * is kebab in the wire form. The three component fields are OMITTED
+ * entirely (not written as `null`/`""`) for a declarative-only release —
+ * `crates/plugin-sdk/src/bundle.rs`'s `#[serde(default)]` on all three
+ * accepts the keys being absent, and Rust's `PluginRelease::validate()`
+ * treats "all three absent" as the legitimate component-less shape.
+ */
 export interface PluginReleaseJson {
   id: string;
   version: string;
-  "wit-api": string;
-  component_url: string;
-  component_sha256: string;
+  "wit-api"?: string;
+  component_url?: string;
+  component_sha256?: string;
   size_bytes?: number;
   published_at?: string;
 }
 
 /**
- * The artifact filenames one signed component release publishes. The three
- * descriptor files exist under BOTH stems — `<id>.*` (what an unversioned
+ * The artifact filenames one signed release publishes. The three descriptor
+ * files exist under BOTH stems — `<id>.*` (what an unversioned
  * `release_stem` fetch resolves) and `<id>-<version>.*` (what a pinned fetch
  * resolves) — as byte-identical copies of the same signed bytes. The wasm is
  * published ONCE under `component`: both stems' release.json point at it
  * absolutely via `component_url`, so it needs no versioned alias.
+ *
+ * `component` is omitted for a declarative-only release (no `[component]` at
+ * all) — there is no wasm to publish, so the returned list has six names
+ * instead of seven.
  */
-export function artifactNames(id: string, version: string, component: string): string[] {
-  return [
-    `${id}.ryuzi-plugin.toml`,
-    `${id}.release.json`,
-    `${id}.release.json.sig`,
-    component,
+export function artifactNames(id: string, version: string, component?: string): string[] {
+  const names = [`${id}.ryuzi-plugin.toml`, `${id}.release.json`, `${id}.release.json.sig`];
+  if (component !== undefined) {
+    names.push(component);
+  }
+  names.push(
     `${id}-${version}.ryuzi-plugin.toml`,
     `${id}-${version}.release.json`,
     `${id}-${version}.release.json.sig`,
-  ];
+  );
+  return names;
 }
 
 /** Lowercase-hex SHA-256 of `bytes` (matches `plugins::bundle`'s `format!("{:x}", Sha256::digest(..))`). */
@@ -235,31 +255,47 @@ export function buildComponent(dir: string): void {
   }
 }
 
-/** Minimal fields the signer needs from a component's manifest. */
+/**
+ * Minimal fields the signer needs from a release's manifest. `component`/
+ * `witApiRange` are ABSENT when the manifest declares no `[component]` at
+ * all (a declarative-only plugin, e.g. `atlassian-rovo`) — there is no wasm
+ * filename or WIT range to read.
+ */
 interface ManifestFields {
   id: string;
   version: string;
-  component: string;
+  component?: string;
   /** The `[component] wit-api` RANGE (e.g. `>=0.2.0, <0.3.0`) — see `deriveWitApiVersion`. */
-  witApiRange: string;
+  witApiRange?: string;
 }
 
-/** Read + minimally validate `<dir>/ryuzi-plugin.toml`, returning the id/version/component/wit-api-range the release descriptor mirrors. */
+/**
+ * Read + minimally validate `<dir>/ryuzi-plugin.toml`, returning the
+ * id/version the release descriptor mirrors, plus component/wit-api-range
+ * WHEN the manifest declares a `[component]` table at all — a manifest with
+ * no `[component]` (declarative-only) is a valid shape and returns those two
+ * fields `undefined` rather than throwing.
+ */
 export async function readManifest(dir: string): Promise<ManifestFields> {
   const path = `${dir}/ryuzi-plugin.toml`;
   const parsed = Bun.TOML.parse(await Bun.file(path).text()) as Record<string, unknown>;
   const id = parsed.id;
   const version = parsed.version;
-  // v2 manifests nest the wasm filename + wit-api range under `[component]`
-  // (the top-level `component = "<name>.wasm"` string was a v1-only field —
-  // see Task 2/17's manifest-v2 conversion).
-  const componentTable = parsed.component as Record<string, unknown> | undefined;
-  const component = componentTable?.file;
-  const witApiRange = componentTable?.["wit-api"];
   const contract = parsed.contract;
   if (typeof id !== "string" || id.length === 0) throw new Error(`${path}: missing 'id'`);
   if (typeof version !== "string" || version.length === 0) throw new Error(`${path}: missing 'version'`);
   if (contract !== 2) throw new Error(`${path}: 'contract' must be 2`);
+
+  // v2 manifests nest the wasm filename + wit-api range under `[component]`
+  // (the top-level `component = "<name>.wasm"` string was a v1-only field —
+  // see Task 2/17's manifest-v2 conversion). The table itself is optional —
+  // a declarative-only manifest omits it entirely.
+  const componentTable = parsed.component as Record<string, unknown> | undefined;
+  if (componentTable === undefined) {
+    return { id, version };
+  }
+  const component = componentTable.file;
+  const witApiRange = componentTable["wit-api"];
   if (typeof component !== "string" || component.length === 0) throw new Error(`${path}: missing '[component].file'`);
   if (typeof witApiRange !== "string" || witApiRange.length === 0) {
     throw new Error(`${path}: missing '[component].wit-api'`);
@@ -267,24 +303,45 @@ export async function readManifest(dir: string): Promise<ManifestFields> {
   return { id, version, component, witApiRange };
 }
 
-/** Assemble the `PluginRelease` object — pure, no I/O. `published_at` is only set when given (omitted keeps release.json byte-reproducible for a given wasm). `witApi` is the CONCRETE version (see `deriveWitApiVersion`), not the manifest's range. */
+/**
+ * Assemble the `PluginRelease` object — pure, no I/O. `published_at` is only
+ * set when given (omitted keeps release.json byte-reproducible for a given
+ * wasm). `witApi` is the CONCRETE version (see `deriveWitApiVersion`), not
+ * the manifest's range.
+ *
+ * `witApi`/`componentUrl`/`sha256`/`sizeBytes` are ALL omitted together for a
+ * declarative-only release (no `[component]` at all) — there is no wasm to
+ * name a WIT contract, a download URL, a checksum, or a size for. Passing
+ * some but not all of them is a caller bug (every call site derives them
+ * together from `manifest.component.is_some()`), so this does not attempt to
+ * validate that combination itself — `PluginRelease::validate()` on the Rust
+ * side is the source of truth for what shapes a release may take.
+ */
 export function buildReleaseObject(args: {
   id: string;
   version: string;
-  witApi: string;
-  componentUrl: string;
-  sha256: string;
-  sizeBytes: number;
+  witApi?: string;
+  componentUrl?: string;
+  sha256?: string;
+  sizeBytes?: number;
   publishedAt?: string;
 }): PluginReleaseJson {
   const release: PluginReleaseJson = {
     id: args.id,
     version: args.version,
-    "wit-api": args.witApi,
-    component_url: args.componentUrl,
-    component_sha256: args.sha256,
-    size_bytes: args.sizeBytes,
   };
+  if (args.witApi !== undefined) {
+    release["wit-api"] = args.witApi;
+  }
+  if (args.componentUrl !== undefined) {
+    release.component_url = args.componentUrl;
+  }
+  if (args.sha256 !== undefined) {
+    release.component_sha256 = args.sha256;
+  }
+  if (args.sizeBytes !== undefined) {
+    release.size_bytes = args.sizeBytes;
+  }
   if (args.publishedAt !== undefined && args.publishedAt !== "") {
     release.published_at = args.publishedAt;
   }
@@ -313,7 +370,19 @@ export async function buildSignatureEnvelope(releaseBytes: Uint8Array, privateKe
   return `${JSON.stringify({ key_id: signingKeyId(), signature: base64UrlNoPad(signature) }, null, 2)}\n`;
 }
 
-/** Build + sign one component, writing its seven artifacts (3 descriptors × 2 stems + 1 wasm) into `outDir`. Returns the release descriptor for logging. */
+/**
+ * Build + sign one release, writing its artifacts (3 descriptors × 2 stems,
+ * plus 1 wasm when there is a component) into `outDir`. Returns the release
+ * descriptor for logging.
+ *
+ * `spec.crateWasmStem` decides which of the two shapes this release takes:
+ * present, this builds+hashes a wasm exactly as before; absent, this is a
+ * declarative-only release (e.g. `atlassian-rovo`) — nothing is built, and
+ * the published `release.json` carries no component fields. Either way the
+ * SAME `buildSignatureEnvelope` call below signs `release.json`'s exact
+ * bytes — the signature is never conditional on whether there is a
+ * component.
+ */
 async function processComponent(
   spec: ComponentSpec,
   privateKeySeedBase64: string,
@@ -326,39 +395,66 @@ async function processComponent(
     throw new Error(`${spec.dir}/ryuzi-plugin.toml declares id ${JSON.stringify(manifest.id)}, expected ${JSON.stringify(spec.id)}`);
   }
 
-  await materializeDeps(spec.dir);
-  buildComponent(spec.dir);
+  let release: PluginReleaseJson;
+  let wasmBytes: Uint8Array | undefined;
+  let componentFilename: string | undefined;
 
-  // CI shares one target dir across all 18 standalone bundle workspaces via
-  // CARGO_TARGET_DIR (dep crates compile once, wasm stems never collide);
-  // cargo honors it over the per-workspace `target/`, so the output path must too.
-  const targetRoot = process.env.CARGO_TARGET_DIR ?? `${spec.dir}/target`;
-  const wasmPath = `${targetRoot}/${WASM_TARGET}/release/${spec.crateWasmStem}.wasm`;
-  const wasmBytes = new Uint8Array(await Bun.file(wasmPath).arrayBuffer());
-  const sha256 = await sha256Hex(wasmBytes);
+  if (spec.crateWasmStem !== undefined) {
+    const { component, witApiRange } = manifest;
+    if (component === undefined || witApiRange === undefined) {
+      throw new Error(
+        `${spec.dir}/ryuzi-plugin.toml: COMPONENTS entry ${JSON.stringify(spec.id)} names a crateWasmStem, but the manifest declares no [component]`,
+      );
+    }
 
-  const release = buildReleaseObject({
-    id: manifest.id,
-    version: manifest.version,
-    witApi: deriveWitApiVersion(manifest.witApiRange),
-    componentUrl: `${baseUrl}/${manifest.component}`,
-    sha256,
-    sizeBytes: wasmBytes.byteLength,
-    publishedAt,
-  });
+    await materializeDeps(spec.dir);
+    buildComponent(spec.dir);
+
+    // CI shares one target dir across all 18 standalone bundle workspaces via
+    // CARGO_TARGET_DIR (dep crates compile once, wasm stems never collide);
+    // cargo honors it over the per-workspace `target/`, so the output path must too.
+    const targetRoot = process.env.CARGO_TARGET_DIR ?? `${spec.dir}/target`;
+    const wasmPath = `${targetRoot}/${WASM_TARGET}/release/${spec.crateWasmStem}.wasm`;
+    wasmBytes = new Uint8Array(await Bun.file(wasmPath).arrayBuffer());
+    componentFilename = component;
+
+    release = buildReleaseObject({
+      id: manifest.id,
+      version: manifest.version,
+      witApi: deriveWitApiVersion(witApiRange),
+      componentUrl: `${baseUrl}/${component}`,
+      sha256: await sha256Hex(wasmBytes),
+      sizeBytes: wasmBytes.byteLength,
+      publishedAt,
+    });
+  } else {
+    if (manifest.component !== undefined) {
+      throw new Error(
+        `${spec.dir}/ryuzi-plugin.toml declares a [component], but COMPONENTS entry ${JSON.stringify(spec.id)} names no crateWasmStem to build it from`,
+      );
+    }
+    release = buildReleaseObject({ id: manifest.id, version: manifest.version, publishedAt });
+  }
+
   const releaseBytes = serializeRelease(release);
   const signatureEnvelope = await buildSignatureEnvelope(releaseBytes, privateKeySeedBase64);
 
   const manifestBytes = new Uint8Array(await Bun.file(`${spec.dir}/ryuzi-plugin.toml`).arrayBuffer());
-  const [manifestName, releaseName, sigName, componentName, pinnedManifestName, pinnedReleaseName, pinnedSigName] = artifactNames(
-    spec.id,
-    manifest.version,
-    manifest.component,
-  );
+  // `artifactNames` always puts the 3 unversioned descriptors first and the 3
+  // pinned-stem descriptors last, with the (optional) component name sandwiched
+  // between them — so the first/last three positions are stable regardless of
+  // whether a component name was passed, and there is no positional footgun to
+  // reason about when it is omitted.
+  const names = artifactNames(spec.id, manifest.version, componentFilename);
+  const [manifestName, releaseName, sigName] = names;
+  const [pinnedManifestName, pinnedReleaseName, pinnedSigName] = names.slice(-3);
+
   await Bun.write(`${outDir}/${manifestName}`, manifestBytes);
-  await Bun.write(`${outDir}/${componentName}`, wasmBytes);
   await Bun.write(`${outDir}/${releaseName}`, releaseBytes);
   await Bun.write(`${outDir}/${sigName}`, signatureEnvelope);
+  if (componentFilename !== undefined && wasmBytes !== undefined) {
+    await Bun.write(`${outDir}/${componentFilename}`, wasmBytes);
+  }
   // Pinned-stem aliases: BYTE-IDENTICAL copies of the same signed bytes — the
   // signature is over release.json's exact bytes, so aliasing (not
   // re-serializing) is load-bearing.
@@ -421,9 +517,13 @@ async function main(argv: string[]): Promise<void> {
 
   for (const spec of specs) {
     const release = await processComponent(spec, privateKeySeedBase64, baseUrl, outDir, publishedAt);
+    const artifacts =
+      spec.crateWasmStem !== undefined
+        ? `${spec.id}.{ryuzi-plugin.toml,wasm,release.json,release.json.sig} (sha256 ${release.component_sha256})`
+        : `${spec.id}.{ryuzi-plugin.toml,release.json,release.json.sig} (no component)`;
     console.log(
-      `signed ${spec.id} ${release.version} -> ${outDir}/${spec.id}.{ryuzi-plugin.toml,wasm,release.json,release.json.sig} ` +
-        `+ pinned ${spec.id}-${release.version}.{ryuzi-plugin.toml,release.json,release.json.sig} aliases (sha256 ${release.component_sha256})`,
+      `signed ${spec.id} ${release.version} -> ${outDir}/${artifacts} ` +
+        `+ pinned ${spec.id}-${release.version}.{ryuzi-plugin.toml,release.json,release.json.sig} aliases`,
     );
   }
 }
