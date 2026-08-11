@@ -218,9 +218,11 @@ async fn append_wasm_component_findings(
 
         // Hash first: a tampered component fails signature verification too, so
         // reporting the hash mismatch alone (and skipping signature) avoids a
-        // duplicate finding for the same corruption.
-        let hash_ok = match append_hash_finding(findings, &active, &loaded.component_path) {
-            HashOutcome::Matches => true,
+        // duplicate finding for the same corruption. `NotApplicable` (a
+        // declarative-only bundle, which has no component bytes to hash at
+        // all) must NOT suppress the signature check — see `HashOutcome`.
+        let hash_permits_signature_check = match append_hash_finding(findings, &active, &loaded) {
+            HashOutcome::Matches | HashOutcome::NotApplicable => true,
             HashOutcome::MismatchReported | HashOutcome::Unreadable => false,
         };
         // A structurally-invalid manifest is surfaced as `policy-violation`
@@ -228,7 +230,7 @@ async fn append_wasm_component_findings(
         // inside `verify_bundle`'s own manifest parse and mislabel the manifest
         // defect as a signature defect).
         let manifest_valid = loaded.manifest.validate().is_ok();
-        if hash_ok && manifest_valid {
+        if hash_permits_signature_check && manifest_valid {
             append_signature_finding(findings, &active, &version_dir, &wasm.trusted_keys);
         }
         append_abi_finding(findings, &active, &loaded.manifest);
@@ -297,18 +299,39 @@ enum HashOutcome {
     /// The component file could not be read (its absence is not itself a
     /// hash-tamper finding — the file-based checks simply cannot run).
     Unreadable,
+    /// This bundle declares no `[component]` at all (a declarative-only
+    /// plugin such as `atlassian-rovo`), so there is NO component hash to
+    /// verify — a categorically different answer from [`Self::Unreadable`],
+    /// which means "there should be bytes here and I could not read them".
+    ///
+    /// Load-bearing: `load_installed_release` resolves a component-less
+    /// bundle's `component_path` to the version DIRECTORY, so a
+    /// `std::fs::read` of it fails on every platform. Collapsing that into
+    /// `Unreadable` made the caller's `hash_ok` false, which silently skipped
+    /// [`append_signature_finding`] for EVERY declarative-only plugin — i.e. a
+    /// tampered `release.json`/`plugin.sig` on such a plugin was never
+    /// reported at all. `verify_bundle`'s signature step is unconditional
+    /// (see its Step 5 note); this variant keeps the doctor's mirror of it
+    /// unconditional too.
+    NotApplicable,
 }
 
 /// Finding #2 — hash. SHA-256 the on-disk component (the same lowercase-hex
 /// hashing [`crate::plugins::bundle`] uses) and compare it to the ledger's
 /// recorded `sha256`, the tamper-evident anchor. A mismatch means the installed
-/// component was mutated or corrupted after installation.
+/// component was mutated or corrupted after installation. A bundle that
+/// declares no `[component]` has nothing to hash and yields
+/// [`HashOutcome::NotApplicable`] — never a finding, and never a reason to skip
+/// the signature check.
 fn append_hash_finding(
     findings: &mut Vec<DoctorFinding>,
     record: &ComponentPluginReleaseRecord,
-    component_path: &Path,
+    loaded: &LoadedRelease,
 ) -> HashOutcome {
-    let Ok(bytes) = std::fs::read(component_path) else {
+    if loaded.manifest.component.is_none() {
+        return HashOutcome::NotApplicable;
+    }
+    let Ok(bytes) = std::fs::read(&loaded.component_path) else {
         return HashOutcome::Unreadable;
     };
     let actual = format!("{:x}", Sha256::digest(&bytes));
@@ -922,6 +945,44 @@ pub(crate) mod tests {
             sha
         }
 
+        /// Write a signed `<root>/<id>/<version>/` bundle dir for a
+        /// DECLARATIVE-ONLY plugin: no `[component]` block, no wasm file, and a
+        /// `release.json` that omits `component_url`/`component_sha256`
+        /// entirely — the exact `atlassian-rovo` shape, and the only shape
+        /// `verify_bundle` accepts for a component-less manifest. Signature
+        /// coverage is identical to [`write_bundle`]'s: `plugin.sig` signs
+        /// `release.json`'s exact raw bytes.
+        fn write_component_less_bundle(
+            root: &Path,
+            id: &str,
+            version: &str,
+            key: &SigningKey,
+            sig_key_id: &str,
+        ) {
+            let plugin_root = root.join(id);
+            let version_dir = plugin_root.join(version);
+            fs::create_dir_all(&version_dir).unwrap();
+            fs::write(
+                version_dir.join("ryuzi-plugin.toml"),
+                format!("contract = 2\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+            let release_bytes =
+                format!("{{\"id\":\"{id}\",\"version\":\"{version}\"}}").into_bytes();
+            fs::write(version_dir.join("release.json"), &release_bytes).unwrap();
+            let signature = key.sign(&release_bytes);
+            let envelope = serde_json::json!({
+                "key_id": sig_key_id,
+                "signature": b64url(&signature.to_bytes()),
+            });
+            fs::write(
+                version_dir.join("plugin.sig"),
+                serde_json::to_vec(&envelope).unwrap(),
+            )
+            .unwrap();
+            fs::write(plugin_root.join("current"), version).unwrap();
+        }
+
         fn release_record(
             id: &str,
             version: &str,
@@ -1011,6 +1072,89 @@ pub(crate) mod tests {
             assert!(
                 findings.iter().all(|f| f.kind != "abi-incompatible"),
                 "a release targeting only the host's newer supported ABI must not report abi-incompatible, got: {findings:?}"
+            );
+        }
+
+        // ---------- declarative-only (component-less) bundles ----------
+        //
+        // A bundle with no `[component]` resolves `component_path` to the
+        // version DIRECTORY (see `load_installed_release`), so hashing it can
+        // never succeed. These two pin that the doctor treats that as "no hash
+        // to check" rather than "hash unreadable" — the difference decides
+        // whether signature verification runs at all for such a plugin.
+
+        #[tokio::test]
+        async fn component_less_bundle_with_a_forged_signature_still_reports_signature_invalid() {
+            // THE point of `HashOutcome::NotApplicable`: a declarative-only
+            // plugin whose `plugin.sig` names the trusted `first-party` key id
+            // but was signed by a different key (a forged/tampered envelope, or
+            // a mutated `release.json`) must still be reported. When the
+            // component-less hash read was collapsed into `Unreadable`, the
+            // caller's guard skipped `append_signature_finding` entirely and
+            // this tamper was invisible to the doctor.
+            let (cp, store, _db) = cp_with_store().await;
+            let root = tempfile::tempdir().unwrap();
+            write_component_less_bundle(
+                root.path(),
+                "acme-declarative",
+                "0.1.0",
+                &rogue_key(),
+                FIRST_PARTY,
+            );
+            // The installer records an EMPTY sha256 for a component-less
+            // release (nothing to hash) — mirrored here so the fixture is the
+            // real installed shape, not a hash-mismatch in disguise.
+            seed_active(&store, "acme-declarative", "0.1.0", "", FIRST_PARTY).await;
+
+            let findings =
+                plugin_doctor_with(&cp, &wasm_inputs(root.path(), trusted_keys(), vec![]))
+                    .await
+                    .unwrap();
+            let finding = findings
+                .iter()
+                .find(|f| f.kind == "signature-invalid")
+                .expect(
+                    "a component-less bundle whose signature no longer verifies must still report signature-invalid",
+                );
+            assert_eq!(finding.plugin_id, "acme-declarative");
+            assert_eq!(finding.severity, "error");
+            assert!(
+                finding.message.contains("no longer verifies"),
+                "{}",
+                finding.message
+            );
+            // The missing component must never masquerade as tampering.
+            assert!(
+                findings.iter().all(|f| f.kind != "hash-mismatch"),
+                "a bundle with no component has no hash to mismatch: {findings:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn healthy_component_less_bundle_yields_no_component_findings() {
+            // The other half of the pair: unblocking the signature check must
+            // not make every declarative-only install look broken. A correctly
+            // signed, component-less bundle yields nothing at all — no
+            // `hash-mismatch`, no `signature-invalid`, no `abi-incompatible`
+            // (it targets no WIT contract).
+            let (cp, store, _db) = cp_with_store().await;
+            let root = tempfile::tempdir().unwrap();
+            write_component_less_bundle(
+                root.path(),
+                "acme-declarative",
+                "0.1.0",
+                &signing_key(),
+                FIRST_PARTY,
+            );
+            seed_active(&store, "acme-declarative", "0.1.0", "", FIRST_PARTY).await;
+
+            let findings =
+                plugin_doctor_with(&cp, &wasm_inputs(root.path(), trusted_keys(), vec![]))
+                    .await
+                    .unwrap();
+            assert!(
+                findings.is_empty(),
+                "a validly signed declarative-only bundle must yield no finding, got: {findings:?}"
             );
         }
 

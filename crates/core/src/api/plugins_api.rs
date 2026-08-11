@@ -2308,7 +2308,10 @@ async fn hot_reload_provider_transports(cp: &ControlPlane) {
 /// until reboot. Fail-closed: any load/compile error latches conservatively
 /// (returns true); a missing bundle root or no active bundle for this id
 /// returns false (classic rows, and a first-time install with nothing on
-/// disk yet, have nothing frozen to reload).
+/// disk yet, have nothing frozen to reload). A bundle that declares no
+/// `[component]` at all also returns false, decided from the manifest before
+/// any compile is attempted — it has no code that could export a gateway, so
+/// its (guaranteed) compile failure must not be read as "might be a gateway".
 ///
 /// `root` is a parameter (rather than always
 /// [`crate::plugins::bundle::installed_bundle_root`] internally) for the
@@ -2347,6 +2350,19 @@ async fn installed_bundle_is_gateway(
     let Some(bundle) = bundles.into_iter().find(|b| b.manifest.id == plugin_id) else {
         return false;
     };
+    // A declarative-only bundle (no `[component]` — the `atlassian-rovo`
+    // shape) ships no executable code at all, so it cannot export
+    // `ryuzi:gateway/gateway`. The MANIFEST answers this definitively, and it
+    // must be asked BEFORE the compile below: `load_active_bundles` resolves
+    // such a bundle's `component_path` to the version DIRECTORY, so
+    // `runtime.compile` fails on every platform, and the fail-closed
+    // `Err(_) => true` would then classify EVERY declarative-only plugin as a
+    // gateway — telling the user to restart the engine after uninstalling a
+    // plugin that contains nothing to run. A compile failure is a signal about
+    // the COMPONENT; it is not an answer to "is this a gateway?".
+    if bundle.manifest.component.is_none() {
+        return false;
+    }
     let Ok(runtime) = ComponentRuntime::new() else {
         return true;
     };
@@ -5559,6 +5575,35 @@ description = "does a thing"
         let root = tempfile::tempdir().unwrap();
         let nonexistent = root.path().join("never-created");
         assert!(!installed_bundle_is_gateway(cp.store(), &nonexistent, "discord").await);
+    }
+
+    #[tokio::test]
+    async fn installed_bundle_is_gateway_is_false_for_a_component_less_bundle() {
+        // A DECLARATIVE-only bundle (no `[component]`, no wasm — the
+        // `atlassian-rovo` shape) is present and active on disk, so this gets
+        // all the way past the "nothing to find" early returns above and
+        // reaches the capability decision itself. Its `component_path` is the
+        // version DIRECTORY, so `runtime.compile` cannot succeed; without the
+        // manifest guard the fail-closed `Err(_) => true` reported EVERY such
+        // plugin as a gateway, and `uninstall_and_reconcile`'s "integration"
+        // arm then told the user to restart the engine for a plugin containing
+        // no executable code. No wasm fixture is built here on purpose —
+        // there is no component to compile, which is the whole point.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        let root = tempfile::tempdir().unwrap();
+        crate::plugins::wasm_provider::install_component_less_bundle_on_disk(
+            root.path(),
+            &store,
+            "acme-declarative-fixture",
+        )
+        .await;
+
+        assert!(
+            !installed_bundle_is_gateway(&store, root.path(), "acme-declarative-fixture").await,
+            "a bundle with no component cannot export a gateway — its compile \
+             failure must not be read as `might be a gateway`"
+        );
     }
 
     // Positive path: a REAL bundle that genuinely exports `ryuzi:gateway/

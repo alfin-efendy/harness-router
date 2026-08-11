@@ -730,6 +730,24 @@ pub(crate) async fn discover_provider_components(
     let mut registered = Vec::new();
     for bundle in bundles {
         let id = bundle.manifest.id.clone();
+        // A declarative bundle (no `[component]`) has no wasm to compile —
+        // its `component_path` is a directory placeholder, so compiling it
+        // always fails. Skip it rather than letting the attempt fail and
+        // log every pass.
+        //
+        // The skip is LOGGED, not silent, because it is otherwise
+        // unobservable: reaching `runtime.compile` and failing there produces
+        // the identical "registered nothing" outcome, so a test asserting only
+        // that outcome cannot tell the two apart. This line is what
+        // `component_less_bundle_is_skipped_before_reaching_compile` reads to
+        // prove the skip happens BEFORE compilation.
+        if bundle.manifest.component.is_none() {
+            tracing::debug!(
+                plugin = %id,
+                "wasm provider: skipping {id}: declarative-only bundle, no [component] to compile"
+            );
+            continue;
+        }
         match crate::plugins::host::component_plugin_enabled(settings, &id).await {
             Ok(true) => {}
             Ok(false) => continue,
@@ -984,6 +1002,68 @@ pub(crate) async fn install_bundle_on_disk_signed(
         source_url: "https://example.invalid/x.wasm".to_string(),
         sha256: sha,
         signing_key_id: signing_key_id.to_string(),
+        installed_at: 0,
+        active: false,
+        revoked: false,
+        revocation_reason: None,
+    };
+    store.upsert_component_release(&record).await.unwrap();
+    store
+        .set_active_component_release(plugin_id, version)
+        .await
+        .unwrap();
+}
+
+/// Like [`install_bundle_on_disk`], but lays a DECLARATIVE, component-less
+/// bundle — no `[component]` block and no wasm file at all — the exact
+/// shape `atlassian-rovo` ships (a remote-MCP-over-HTTP manifest, see
+/// `bundle.rs`'s `manifest_toml_without_component`). `record.sha256`/
+/// `source_url` stay empty to match `release.json`'s omitted
+/// `component_sha256`/`component_url`, exactly what `load_active_bundles`'s
+/// metadata-agreement check requires for a component-less bundle. Signed
+/// under the first-party key so discovery reaches the same trust gate a real
+/// component-less install would.
+///
+/// Module-level (not inside `mod tests`) so [`crate::control::lifecycle`]'s
+/// `build_component_mcp_servers` tests can stage the identical shape without
+/// duplicating this staging logic.
+#[cfg(test)]
+pub(crate) async fn install_component_less_bundle_on_disk(
+    root: &std::path::Path,
+    store: &Store,
+    plugin_id: &str,
+) {
+    use crate::store::ComponentPluginReleaseRecord;
+
+    let version = "0.1.0";
+    let version_dir = root.join(plugin_id).join(version);
+    std::fs::create_dir_all(&version_dir).unwrap();
+
+    let manifest = format!(
+        "contract = 2\n\
+         id = \"{plugin_id}\"\n\
+         name = \"{plugin_id}\"\n\
+         version = \"{version}\"\n"
+    );
+    std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
+
+    let release = serde_json::json!({
+        "id": plugin_id,
+        "version": version,
+    });
+    std::fs::write(
+        version_dir.join("release.json"),
+        serde_json::to_vec(&release).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join(plugin_id).join("current"), version).unwrap();
+
+    let record = ComponentPluginReleaseRecord {
+        plugin_id: plugin_id.to_string(),
+        version: version.to_string(),
+        source_url: String::new(),
+        sha256: String::new(),
+        signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
         installed_at: 0,
         active: false,
         revoked: false,
@@ -1554,6 +1634,70 @@ mod tests {
         (store, settings, root, tmp)
     }
 
+    /// A minimal `tracing` subscriber that records every event as
+    /// `"<message> <field>=<value> ..."`, so a discovery test can assert on
+    /// what discovery DID log and — the load-bearing half — what it did NOT.
+    ///
+    /// Hand-rolled over the `tracing-core` types `tracing` re-exports:
+    /// `ryuzi-core` depends on `tracing` alone (there is no
+    /// `tracing-subscriber` anywhere in this workspace), and a log-capture
+    /// seam is not worth a new dependency. `enabled` accepts everything and
+    /// `max_level_hint` is left at its `None` default, which `tracing-core`
+    /// reads as TRACE — so the `debug!` this exists to capture is not filtered
+    /// out by the global max-level fast path.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedLogs {
+        /// Every captured line, newline-joined — the form assertions match on.
+        fn joined(&self) -> String {
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .join("\n")
+        }
+    }
+
+    impl tracing::Subscriber for CapturedLogs {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(&mut FieldCollector(&mut line));
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(line);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Flattens one event's fields into a single string: the `message` field's
+    /// formatted text, plus every other field as ` name=value`. Only
+    /// `record_debug` is implemented — every other `Visit` method defaults to
+    /// forwarding here, so this sees `%`/`?`/`&str`/integer fields alike.
+    struct FieldCollector<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldCollector<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            if field.name() == "message" {
+                // `Debug` for the macro's `fmt::Arguments` renders the
+                // already-formatted message text.
+                let _ = write!(self.0, "{value:?}");
+            } else {
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+        }
+    }
+
     /// Flip a component plugin's enablement on. Writes the raw
     /// `plugin.<id>.enabled` row `component_plugin_enabled` reads (the schema
     /// `SettingsStore::set` path rejects a key for a plugin not registered in a
@@ -1796,6 +1940,67 @@ mod tests {
             "a non-provider (gateway) bundle must register nothing: {registered:?}",
         );
         assert!(wasm_provider("disc-gateway").is_none());
+    }
+
+    #[test]
+    fn component_less_bundle_is_skipped_before_reaching_compile() {
+        // A declarative-only bundle (no `[component]` at all — the
+        // atlassian-rovo shape): enabled, configured, and trusted, so the ONLY
+        // reason discovery could skip it is the missing component itself. Its
+        // `component_path` is a directory placeholder (see `bundle.rs`'s
+        // `load_active_bundles`), so a naive `runtime.compile` attempt would
+        // always fail.
+        //
+        // "Registered nothing" alone cannot prove WHERE it was skipped: delete
+        // the `component.is_none()` guard and the pre-existing
+        // `Err(error) => { warn!; continue }` compile arm produces the
+        // IDENTICAL empty result. So this also asserts on the logs — the skip
+        // reason must be recorded (which proves the capture seam works, so the
+        // absence check below is not vacuous), and the `component compile
+        // failed` warning must be absent, which is only true if
+        // `runtime.compile` was never reached.
+        //
+        // A plain `#[test]` driving an explicit CURRENT-THREAD runtime rather
+        // than `#[tokio::test(flavor = "multi_thread")]`: `with_default`
+        // installs the capture subscriber on THIS thread only, so every poll
+        // of the discovery future must happen on this thread for it to observe
+        // the events.
+        let logs = CapturedLogs::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let registered = tracing::subscriber::with_default(logs.clone(), || {
+            runtime.block_on(async {
+                let (store, settings, root, _tmp) = discovery_env().await;
+                install_component_less_bundle_on_disk(root.path(), &store, "disc-declarative")
+                    .await;
+                enable(&store, "disc-declarative").await;
+                super::discover_provider_components(
+                    store.clone(),
+                    &settings,
+                    Arc::new(NoopTelemetry),
+                    root.path(),
+                )
+                .await
+            })
+        });
+
+        assert!(
+            registered.is_empty(),
+            "a component-less bundle must register nothing: {registered:?}",
+        );
+        assert!(wasm_provider("disc-declarative").is_none());
+
+        let captured = logs.joined();
+        assert!(
+            captured.contains("declarative-only bundle") && captured.contains("disc-declarative"),
+            "discovery must record WHY it skipped the bundle, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("component compile failed"),
+            "discovery must skip a component-less bundle BEFORE compiling it, got: {captured:?}"
+        );
     }
 
     // -----------------------------------------------------------------

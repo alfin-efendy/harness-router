@@ -12,6 +12,11 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::Mutex;
 
+/// The MCP protocol version every native transport speaks. Shared by the
+/// stdio handshake here and the Streamable HTTP handshake in
+/// [`super::mcp_http`] — there is deliberately only one literal in the crate.
+pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
 /// Something that can execute an MCP tool call. Implemented by
 /// [`McpConnection`]; tests use a fake.
 #[async_trait]
@@ -115,7 +120,7 @@ impl McpConnection {
             id,
             "initialize",
             Some(json!({
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": { "name": "ryuzi-native", "version": env!("CARGO_PKG_VERSION") }
             })),

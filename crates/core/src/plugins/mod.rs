@@ -281,6 +281,53 @@ pub(crate) fn build_provider_component_once(plugin_dir: &str) {
     built.insert(plugin_dir.to_string());
 }
 
+/// The live [`crate::connector::Connector`] a manifest's own `[[mcp]]` block
+/// implies — `None` when it declares none.
+///
+/// This is the single seam both registration boundaries in this crate use to
+/// avoid the same silent failure: `mcp_sync::sync_plugin_mcp` is the ONLY code
+/// that ever creates a plugin's `mcp_servers` row, and it early-returns when
+/// `plugin.connector.is_none()`. So a plugin registered manifest-only while
+/// declaring `[[mcp]]` is enableable (`toggle_enabled`/`PluginHost::is_enabled`
+/// both treat a non-empty `manifest.mcp` as a real enablement axis) yet its
+/// enable silently syncs nothing — the plugin looks on and does nothing
+/// forever. Both [`component_catalog::component_catalog_plugins`] (embedded
+/// first-party bundles) and [`install_installed_plugins`] (everything on disk,
+/// including a signed-catalog install) therefore route through here.
+///
+/// `manifest` MUST still carry BARE `[[settings]]` keys: `declarative_plugin`
+/// re-runs `PluginManifest::validate`, which rejects a `plugin.`-prefixed bare
+/// key, and `DeclarativeConnector` qualifies `settings[].key` itself on every
+/// `ensure_auth`. Both callers build the connector before qualifying.
+///
+/// The `PluginSource` handed to `declarative_plugin` is irrelevant and so not a
+/// parameter: only the returned `CorePlugin`'s connector is kept, and
+/// `DeclarativeConnector` captures nothing but the manifest. The caller's own
+/// source is what `mcp_sync`'s trust gate (`component_surfaces_trusted`) reads.
+///
+/// A manifest that declares `[[mcp]]` but fails `validate()` is logged and
+/// yields `None` rather than propagating: the caller still registers the plugin
+/// manifest-only, keeping its identity/enablement bookkeeping alive instead of
+/// making one bad manifest disappear from the Plugins hub entirely.
+pub(crate) fn declarative_connector_for(
+    manifest: &ryuzi_plugin_sdk::PluginManifest,
+) -> Option<std::sync::Arc<dyn crate::connector::Connector>> {
+    if manifest.mcp.is_empty() {
+        return None;
+    }
+    match declarative::declarative_plugin(manifest.clone(), PluginSource::Builtin) {
+        Ok(plugin) => plugin.connector,
+        Err(error) => {
+            tracing::error!(
+                plugin = %manifest.id,
+                "declares [[mcp]] but its manifest failed validation — registering without a \
+                 connector, so its MCP servers will not sync: {error}"
+            );
+            None
+        }
+    }
+}
+
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) — to `regs`. Factored out of
 /// [`install_builtins`] so the daemon composition root can add providers
@@ -296,7 +343,7 @@ pub fn install_providers(regs: &mut Registries) {
 /// `root/<id>/current` — the local-folder/git-URL install pipeline's
 /// counterpart to [`install_builtins`]. Scans `root`, and for each `<id>`
 /// directory whose `current` pointer resolves to a readable, parseable v2
-/// manifest, registers a MANIFEST-ONLY `CorePlugin { source: Installed { dir,
+/// manifest, registers a `CorePlugin { source: Installed { dir,
 /// provenance } }` — `dir` is the resolved version directory (the same path
 /// `bundle::InstalledBundle::root` would use for a component-backed
 /// sibling), and `provenance` comes from that version dir's `install.json`
@@ -309,18 +356,26 @@ pub fn install_providers(regs: &mut Registries) {
 /// exist on disk — this function is purely additive for ids nothing else
 /// already claimed.
 ///
-/// Registered manifest-only (no live harness/gateway/connector/provider): the
-/// real behavioral capabilities are built transiently by
-/// `install_sources::confirm_plugin_install` when it runs the post-install
-/// syncs, and any `[component]` surface goes through the WASM
-/// bundle-discovery path (`bundle::load_active_bundles`) instead. This
-/// registration exists purely for identity/enablement bookkeeping
+/// Registered with no live harness/gateway/provider — every `[component]`
+/// surface goes through the WASM bundle-discovery path
+/// (`bundle::load_active_bundles`) instead. This registration exists mostly for
+/// identity/enablement bookkeeping
 /// (`PluginHost::is_enabled`'s manifest-only "always true" branch is what
 /// keeps an installed plugin's commands/skills/hooks/jobs active without a
 /// separate enable step) and as the fallback source
 /// `control::lifecycle::ControlPlane::enabled_plugin_content_roots`'s union
 /// reads for a declarative-only install (no `[component]`, so
 /// `bundle::load_active_bundles` — which hard-requires one — never sees it).
+///
+/// The ONE live capability it does build is the `[[mcp]]` connector the
+/// manifest itself implies ([`declarative_connector_for`]). Without it a
+/// SIGNED install — which never runs `install_sources::confirm_plugin_install`'s
+/// transient post-install syncs, so this boot scan is the only registration it
+/// ever gets — would be enableable from the hub while
+/// `mcp_sync::sync_plugin_mcp` silently wrote no `mcp_servers` row, because
+/// that function early-returns on `connector.is_none()`. The trust gate is
+/// unaffected: `sync_plugin_mcp` still refuses an unsigned, un-accepted install
+/// via `component_surfaces_trusted`, which reads the `provenance` recorded here.
 ///
 /// Warn-and-skip per plugin directory: an unreadable/unparseable manifest, a
 /// dangling `current` pointer, or a missing version directory must not blind
@@ -372,6 +427,11 @@ pub fn install_installed_plugins(regs: &mut Registries, root: &std::path::Path) 
                 continue;
             }
         };
+        // Built from the still-BARE manifest, BEFORE the qualification below
+        // — see `declarative_connector_for`'s doc for why that order is
+        // load-bearing (validate() rejects a `plugin.`-prefixed bare key, and
+        // the connector qualifies those keys itself).
+        let connector = declarative_connector_for(&manifest);
         // C1 fix: v2 manifests keep `[[settings]]` keys BARE — qualify to
         // `plugin.<id>.<key>` at THIS registration boundary too, exactly as
         // `component_catalog::component_catalog_plugins` already does for
@@ -388,7 +448,7 @@ pub fn install_installed_plugins(regs: &mut Registries, root: &std::path::Path) 
             manifest,
             harness: None,
             gateway: None,
-            connector: None,
+            connector,
             provider: None,
             source: PluginSource::Installed {
                 dir: version_dir,
@@ -1579,5 +1639,66 @@ mod install_installed_plugins_tests {
         let mut regs = Registries::new();
         install_installed_plugins(&mut regs, &missing);
         assert!(regs.plugins.list().is_empty());
+    }
+
+    /// PROPERTY: an installed plugin that declares `[[mcp]]` must be registered
+    /// WITH a connector. A signed-catalog install never runs
+    /// `install_sources::confirm_plugin_install`'s transient post-install syncs,
+    /// so this boot scan is the only registration it ever gets — and without a
+    /// connector `mcp_sync::sync_plugin_mcp` early-returns, so
+    /// `toggle_enabled`'s enable branch (which deliberately routes a
+    /// non-empty-`manifest.mcp` plugin here, see its C2 comment) writes no
+    /// `mcp_servers` row at all. `mcp_sync`'s own tests prove the row end to
+    /// end; this pins the registration shape, including that the registered
+    /// manifest's settings keys are still QUALIFIED (the connector is built off
+    /// the bare manifest first — the opposite order fails `validate()`).
+    #[test]
+    fn an_installed_plugin_declaring_mcp_registers_with_a_connector() {
+        let root = tempfile::tempdir().unwrap();
+        write_plugin_dir(
+            root.path(),
+            "acme-remote",
+            "1.2.3",
+            r#"contract = 2
+id = "acme-remote"
+name = "Acme Remote"
+
+[[settings]]
+key = "basic_credential"
+label = "Credential"
+secret = true
+required = true
+
+[[mcp]]
+name = "svc"
+transport = "http"
+url = "https://mcp.acme.example.com/v1/mcp"
+headers = { Authorization = "Basic ${setting:plugin.acme-remote.basic_credential}" }
+"#,
+        );
+
+        let mut regs = Registries::new();
+        install_installed_plugins(&mut regs, root.path());
+
+        let plugin = regs.plugins.get("acme-remote").expect("must register");
+        assert!(
+            plugin.connector.is_some(),
+            "an installed plugin declaring [[mcp]] must carry a connector, or its enable \
+             silently syncs nothing"
+        );
+        assert_eq!(
+            plugin
+                .manifest
+                .settings
+                .iter()
+                .map(|f| f.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plugin.acme-remote.basic_credential"],
+            "the registered manifest keeps QUALIFIED settings keys"
+        );
+        // Still no component-backed capability from a boot-scan registration.
+        assert!(plugin.harness.is_none());
+        assert!(plugin.gateway.is_none());
+        assert!(plugin.provider.is_none());
     }
 }

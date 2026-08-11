@@ -597,6 +597,36 @@ pub struct AppInfo {
     pub publisher: Option<String>,
     pub auth_kind: String,
     pub auth_detail: Option<String>,
+    /// Whether THIS host owns the server's credential, and therefore whether
+    /// offering an OAuth "Connect" for it tells the truth. `false` for every
+    /// stdio row, and for an http row whose spec already carries an
+    /// `Authorization` header (a manifest `${setting:…}` API token, or an
+    /// owning plugin's own OAuth bearer): for those, `harness::native`'s
+    /// `connect_mcp_tools` uses the manifest credential VERBATIM and never
+    /// reads, uses or refreshes a token connected here.
+    ///
+    /// Derived by applying `harness::native::mcp_http_credential` — the same
+    /// predicate the session path branches on — to the spec
+    /// `mcp::servers_for_session` would attach, never re-derived from
+    /// `transport`/`auth_kind`. Cockpit MUST gate the whole OAuth row on this
+    /// rather than on `transport == "http"`: that comparison merely correlates
+    /// with credential ownership, and where it diverged
+    /// (`plugins/atlassian-rovo`, which authenticates with
+    /// `Authorization: Basic ${setting:…}`) the card claimed "Not connected",
+    /// walked the user through a real Atlassian consent screen, flipped to
+    /// "OAuth connected" — and the session kept sending the Basic header.
+    /// Mirrors `PluginAuthInfo.oauth_connect_available`, which models the same
+    /// thing for a plugin.
+    pub oauth_connect_available: bool,
+    /// A `mcp_oauth_tokens` row exists for this server's id — independent of
+    /// `auth_kind`/`auth_detail` (those describe the manifest/env-derived
+    /// credential, never an interactively-connected OAuth token). Only ever
+    /// true for a `transport: "http"` row.
+    pub oauth_token_stored: bool,
+    /// The stored token's `reconnect_required` flag (Task 8: set when a
+    /// refreshed request still 401s). `false` whenever `oauth_token_stored`
+    /// is `false` — there is nothing to reconnect.
+    pub oauth_reconnect_required: bool,
     pub tools: Vec<ToolInfo>,
     pub agent_access: Vec<AgentAccessInfo>,
     /// The plugin that owns this server, when it was synced from a plugin's
@@ -604,6 +634,30 @@ pub struct AppInfo {
     /// to badge the row and to warn before removing a plugin-managed app —
     /// deleting one only makes it reappear on the plugin's next sync.
     pub plugin_id: Option<String>,
+}
+
+/// `begin_mcp_connect` RPC result — the daemon has already discovered the
+/// remote server's authorization server, registered (or reused) a client id,
+/// and built the authorize URL. Cockpit opens `authorize_url` in the browser
+/// and holds `state`/`verifier` locally until its loopback callback captures
+/// the redirect (see `mcp_oauth::mcp_redirect_uri` and the Task 9 plan
+/// correction on why the callback listener lives in Cockpit's own process,
+/// not the daemon's).
+///
+/// `issuer_token_endpoint` and `client_id` are the token endpoint and client
+/// id of the authorization server this flow actually selected — carried
+/// forward from `harness::native::mcp_oauth::McpAuthorizeStart` so the caller
+/// can hand them straight back to `complete_mcp_connect` instead of
+/// rediscovering them (which could resolve a different authorization server
+/// than the one that issued the code).
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConnectStart {
+    pub authorize_url: String,
+    pub state: String,
+    pub verifier: String,
+    pub issuer_token_endpoint: String,
+    pub client_id: String,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]

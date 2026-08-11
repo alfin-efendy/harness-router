@@ -4,6 +4,7 @@
 //! agent sessions through `SessionCtx.mcp_servers`.
 
 use crate::domain::{McpServerSpec, McpTransport};
+use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::stdio_jsonrpc::{self, ReadError};
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension};
@@ -145,6 +146,102 @@ pub async fn upsert_server(store: &Store, row: McpServerRow) -> anyhow::Result<(
             .map(|_| ())
         })
         .await
+}
+
+/// Encode a resolved HTTP header set into the JSON `mcp_servers.headers_json`
+/// stores, encrypting each header VALUE with [`encrypt_field`] — never the
+/// header NAME (`Authorization`, `X-Api-Key`, ...), which is not a secret and
+/// stays greppable, and never the array as a single opaque blob (that would
+/// make it impossible to encrypt/decrypt values independently the way
+/// `store.rs`'s `upsert_mcp_oauth_token_json`/`decode_mcp_oauth_token` do for
+/// `mcp_oauth_tokens.token_json` — the pattern this mirrors).
+fn encode_server_headers(headers: &[(String, String)]) -> anyhow::Result<String> {
+    let array: Vec<serde_json::Value> = headers
+        .iter()
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": encrypt_field(value) }))
+        .collect();
+    Ok(serde_json::to_string(&serde_json::Value::Array(array))?)
+}
+
+/// Inverse of [`encode_server_headers`]: decrypt each header value back to
+/// plaintext. A malformed row (not an array, or a header missing a field)
+/// is a hard error — silently dropping a header a caller expects to reach the
+/// wire would recreate exactly the kind of silent-auth-failure gap this
+/// column exists to close.
+fn decode_server_headers(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("mcp server headers_json must be a JSON array"))?;
+    array
+        .iter()
+        .map(|item| {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("mcp server header missing name"))?;
+            let value = item
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("mcp server header missing value"))?;
+            Ok((name.to_string(), decrypt_field(value)?))
+        })
+        .collect()
+}
+
+/// Store the resolved HTTP header set for `server_id` — e.g. the
+/// `Authorization` a declarative plugin connector resolved at sync time
+/// (`plugins::mcp_sync::sync_plugin_mcp`), or headers a user typed by hand
+/// for a server added directly in Apps. A resolved header value is a
+/// credential exactly like an MCP OAuth access token, so it is encrypted at
+/// rest the same way (see [`encode_server_headers`]) — never written to
+/// `headers_json` in the clear.
+///
+/// Called with the CURRENT full header set on every sync/save, not just the
+/// changed entries, so a header a plugin update or user edit removes doesn't
+/// linger — an empty slice clears whatever was stored. A no-op (not an
+/// error) if `server_id` doesn't exist yet; callers upsert the row first.
+pub async fn set_server_headers(
+    store: &Store,
+    server_id: &str,
+    headers: &[(String, String)],
+) -> anyhow::Result<()> {
+    let server_id = server_id.to_string();
+    let headers_json = encode_server_headers(headers)?;
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE mcp_servers SET headers_json=?2 WHERE id=?1",
+                params![server_id, headers_json],
+            )
+            .map(|_| ())
+        })
+        .await
+}
+
+/// The decrypted HTTP headers stored for `server_id`. Empty for a stdio row,
+/// for a server with none stored, and for every row that existed before the
+/// `headers_json` column was added (`NULL` decodes to an empty list, not an
+/// error) — never an error just because nothing was ever set.
+pub async fn get_server_headers(
+    store: &Store,
+    server_id: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let server_id = server_id.to_string();
+    let raw: Option<Option<String>> = store
+        .with_conn(move |c| {
+            c.query_row(
+                "SELECT headers_json FROM mcp_servers WHERE id=?1",
+                params![server_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+        })
+        .await?;
+    match raw.flatten() {
+        Some(raw) => decode_server_headers(&raw),
+        None => Ok(Vec::new()),
+    }
 }
 
 pub async fn remove_server(store: &Store, id: &str) -> anyhow::Result<()> {
@@ -338,6 +435,14 @@ pub async fn agent_allowed(store: &Store, server_id: &str, agent_id: &str) -> an
 /// `false` for an absent key — mirrored here directly via a raw settings
 /// read (no `PluginHost` dependency needed) so a missing/never-enabled key
 /// excludes the row, matching that default exactly.
+///
+/// # Credentials
+/// An HTTP row's persisted headers are decoded here, and a plugin-owned row
+/// additionally gets its owning plugin's LIVE OAuth bearer layered on (see
+/// [`with_live_plugin_oauth_bearer`]). Both are per-row best-effort: a row
+/// whose stored headers cannot be decrypted is logged and SKIPPED rather than
+/// failing the call, because failing the call drops every other server too
+/// (the caller has no per-row information to fall back to).
 pub async fn servers_for_session(
     store: &Store,
     agent_id: &str,
@@ -357,11 +462,39 @@ pub async fn servers_for_session(
             }
         }
         let transport = match row.transport.as_str() {
+            // Task 13: read back whatever `set_server_headers` persisted for
+            // this row (a plugin-resolved `Authorization`, or headers a user
+            // typed by hand) instead of hardcoding an empty list — the gap
+            // that made Task 8's manifest-auth precedence rule unreachable
+            // for every plugin-supplied HTTP server. A stdio row never calls
+            // this (no lookup, no cost) since only `McpTransport::Http`
+            // carries headers at all.
             "http" => match &row.url {
-                Some(url) => McpTransport::Http {
-                    url: url.clone(),
-                    headers: vec![],
-                },
+                Some(url) => {
+                    // LOG-AND-SKIP, never `?`: `decode_server_headers`
+                    // deliberately hard-errors on a header it cannot decrypt
+                    // (a rotated/unavailable `llm_router::secrets` key, or a
+                    // hand-edited row), and propagating that here would fail
+                    // the WHOLE call — which the only caller
+                    // (`control::lifecycle`) turns into an empty server list,
+                    // silently dropping every OTHER server, stdio ones
+                    // included. One broken row must cost exactly one row.
+                    let stored = match get_server_headers(store, &row.id).await {
+                        Ok(headers) => headers,
+                        Err(error) => {
+                            tracing::warn!(
+                                server = %row.id,
+                                "mcp: skipping server — its stored headers could not be decoded \
+                                 (rotated/unavailable secret key, or a hand-edited row): {error}"
+                            );
+                            continue;
+                        }
+                    };
+                    McpTransport::Http {
+                        url: url.clone(),
+                        headers: with_live_plugin_oauth_bearer(store, &row, stored).await,
+                    }
+                }
                 None => continue,
             },
             _ => match &row.command {
@@ -379,6 +512,95 @@ pub async fn servers_for_session(
         });
     }
     Ok(out)
+}
+
+/// Layer a plugin's LIVE OAuth bearer onto a plugin-owned HTTP row's stored
+/// headers, resolved fresh at session start.
+///
+/// A plugin whose `[auth] kind = "oauth"` gets its `Authorization: Bearer …`
+/// injected into every HTTP `[[mcp]]` spec by
+/// `plugins::declarative`'s `build_spec`. That value is a short-lived access
+/// token, so `plugins::mcp_sync` deliberately does NOT persist it (see
+/// `mcp_sync::persistable_headers`) and it is re-read here instead — once per
+/// session start, from the same `plugin_oauth_tokens` row the connector reads.
+/// Three properties follow from resolving it here rather than snapshotting it
+/// at sync time (which only runs on plugin enable/install/OAuth completion,
+/// i.e. possibly days earlier):
+///
+/// - a session never starts with a bearer older than the session itself;
+/// - `disconnect_plugin_oauth` deleting the token takes effect on the next
+///   session with nothing to clean up — a revoked account cannot keep sending
+///   its old bearer, structurally, rather than because some other handler
+///   remembered to clear this column;
+/// - a `reconnect_required` token is never used, matching
+///   `resolve_http_oauth_bearer_token`'s refusal and `connect_mcp_tools`'s
+///   identical filter on the MCP-scoped token store.
+///
+/// A header already persisted under the same name always wins and short-
+/// circuits the lookup: that can only be a static manifest credential (a
+/// `${setting:}`/`${env:}` value), which `mcp_sync` DOES persist, and Task 8's
+/// precedence rule is that a manifest-supplied `Authorization` wins verbatim.
+///
+/// Never fails: a store error, a missing token (never connected, or
+/// disconnected), or a `reconnect_required` one all leave `headers` exactly as
+/// stored — refusing to attach the server over a credential problem would be
+/// the same over-reaction the log-and-skip above exists to avoid.
+///
+/// **Known gap (needs `harness/native`):** an EXPIRED bearer is still sent,
+/// with a warning. Refreshing needs the plugin's `Connector`/`ConnectorCtx`
+/// (endpoint + client-id resolution + the store write-back), which this
+/// module has no access to; and because the injected header then looks like
+/// manifest auth, `connect_mcp_tools` passes no `Store` and the transport
+/// refuses to refresh on a 401 either.
+async fn with_live_plugin_oauth_bearer(
+    store: &Store,
+    row: &McpServerRow,
+    mut headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let Some(plugin_id) = row.plugin_id.as_deref() else {
+        return headers;
+    };
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    {
+        return headers;
+    }
+    let token = match store.get_plugin_oauth_token(plugin_id).await {
+        Ok(Some(token)) => token,
+        Ok(None) => return headers,
+        Err(error) => {
+            tracing::warn!(
+                server = %row.id,
+                plugin = %plugin_id,
+                "mcp: could not read this plugin's OAuth token; attaching the server without an \
+                 Authorization header: {error}"
+            );
+            return headers;
+        }
+    };
+    if token.reconnect_required {
+        tracing::info!(
+            server = %row.id,
+            plugin = %plugin_id,
+            "mcp: this plugin's OAuth connection needs to be re-established; attaching the \
+             server without an Authorization header"
+        );
+        return headers;
+    }
+    if crate::plugins::oauth::needs_refresh(crate::paths::now_ms(), token.expires_at) {
+        tracing::warn!(
+            server = %row.id,
+            plugin = %plugin_id,
+            "mcp: this plugin's OAuth access token is expired or about to expire and cannot be \
+             refreshed from here; the server may answer 401 until the plugin re-syncs"
+        );
+    }
+    headers.push((
+        "Authorization".to_string(),
+        format!("Bearer {}", token.access_token),
+    ));
+    headers
 }
 
 // ---------------------------------------------------------------------------
@@ -817,5 +1039,559 @@ mod tests {
 
         // The row itself survives the disable — only session attachment is gated.
         assert!(get_server(&store, "acme-main").await.unwrap().is_some());
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 13: resolved HTTP headers persisted on the mcp_servers row
+    // ---------------------------------------------------------------------
+
+    fn plugin_owned_http_row(id: &str, plugin_id: &str, url: &str) -> McpServerRow {
+        McpServerRow {
+            id: id.into(),
+            name: id.into(),
+            kind: "MCP server".into(),
+            color: "#8B8B8B".into(),
+            description: String::new(),
+            transport: "http".into(),
+            command: None,
+            args: vec![],
+            env: vec![],
+            url: Some(url.into()),
+            scope: "global".into(),
+            scope_gateways: vec![],
+            version: None,
+            publisher: None,
+            status: "unchecked".into(),
+            status_detail: None,
+            auth_kind: "none".into(),
+            auth_detail: None,
+            plugin_id: Some(plugin_id.into()),
+        }
+    }
+
+    /// The tag [`crate::llm_router::secrets`] writes in front of every
+    /// ciphertext (its private `ENC_PREFIX`). Duplicated here rather than
+    /// exported: a test that asserts the REAL scheme's marker must fail if
+    /// that module's format changes, not silently follow it.
+    const ENC_PREFIX: &str = "enc:v1:";
+
+    /// The raw, undecoded `headers_json` column for `server_id` — the whole
+    /// point of the encryption-at-rest tests below is to bypass
+    /// [`get_server_headers`]'s decrypting accessor.
+    async fn raw_headers_json(store: &Store, server_id: &str) -> String {
+        let server_id = server_id.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT headers_json FROM mcp_servers WHERE id=?1",
+                    params![server_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_and_get_server_headers_round_trip() {
+        // Not because encode/decode could be key-sensitive (it is symmetric
+        // under any key), but because the FIRST test in this binary to touch
+        // the process-global cipher decides where its master key comes from:
+        // without this, that would be the developer's real OS keychain, and
+        // every later `use_test_key_file()` in the binary would be a no-op.
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row("acme-http", "acme", "https://acme.example.com/mcp"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get_server_headers(&store, "acme-http").await.unwrap(),
+            Vec::<(String, String)>::new(),
+            "a row with nothing stored yet must decode to an empty list, not error"
+        );
+
+        set_server_headers(
+            &store,
+            "acme-http",
+            &[("Authorization".to_string(), "Basic creds".to_string())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_server_headers(&store, "acme-http").await.unwrap(),
+            vec![("Authorization".to_string(), "Basic creds".to_string())]
+        );
+
+        // Re-setting (what a plugin re-sync does every time) replaces the
+        // full set rather than merging — a header a new manifest drops must
+        // not linger.
+        set_server_headers(&store, "acme-http", &[]).await.unwrap();
+        assert_eq!(
+            get_server_headers(&store, "acme-http").await.unwrap(),
+            Vec::<(String, String)>::new(),
+            "setting an empty header list must clear whatever was stored before"
+        );
+    }
+
+    /// PROPERTY (the test that would have caught Task 13's gap): a
+    /// plugin-resolved `Authorization` header, persisted the way
+    /// `plugins::mcp_sync::sync_plugin_mcp` persists one, must reach
+    /// `servers_for_session`'s output. Before this task `servers_for_session`
+    /// hardcoded `headers: vec![]` for every HTTP row, so this exact
+    /// assertion would have failed even though the header was sitting right
+    /// there in the row.
+    #[tokio::test]
+    async fn servers_for_session_carries_a_plugin_resolved_authorization_header() {
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row(
+                "rovo-main",
+                "atlassian-rovo",
+                "https://mcp.atlassian.com/v1/mcp",
+            ),
+        )
+        .await
+        .unwrap();
+        set_server_headers(
+            &store,
+            "rovo-main",
+            &[(
+                "Authorization".to_string(),
+                "Basic manifest-resolved-creds".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+        store
+            .set_setting_raw("plugin.atlassian-rovo.enabled", "true")
+            .await
+            .unwrap();
+
+        let specs = servers_for_session(&store, "native").await.unwrap();
+
+        assert_eq!(specs.len(), 1);
+        let McpTransport::Http { headers, .. } = &specs[0].transport else {
+            panic!("expected an Http transport, got {:?}", specs[0].transport);
+        };
+        assert_eq!(
+            headers,
+            &vec![(
+                "Authorization".to_string(),
+                "Basic manifest-resolved-creds".to_string()
+            )],
+            "the plugin-resolved Authorization header must reach the session spec, got {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_headers_are_encrypted_at_rest() {
+        // A regression that dropped the encrypt_field/decrypt_field calls
+        // from encode_server_headers would still pass a plain
+        // round-trip-equality test, because decode would simply hand back
+        // whatever was written. This test reads the raw column, bypassing
+        // the decode path, so a dropped encrypt call is caught directly —
+        // same shape as store.rs's mcp_oauth_token_roundtrip_encrypts_at_rest.
+        //
+        // "not stored verbatim" is NOT the property, though: base64, rot13,
+        // or any other reversible obfuscation satisfies that and satisfies
+        // the round-trip below too. So the stored value must additionally
+        // carry the real scheme's `enc:v1:` marker AND decrypt back under
+        // `decrypt_field` — which no non-encryption stand-in can fake.
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row(
+                "rovo-main",
+                "atlassian-rovo",
+                "https://mcp.atlassian.com/v1/mcp",
+            ),
+        )
+        .await
+        .unwrap();
+        set_server_headers(
+            &store,
+            "rovo-main",
+            &[(
+                "Authorization".to_string(),
+                "Basic super-secret-credential".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let raw = raw_headers_json(&store, "rovo-main").await;
+        assert!(
+            !raw.contains("super-secret-credential"),
+            "a resolved header value must not be written to disk in the clear: {raw}"
+        );
+        // The header NAME is not a secret and stays greppable/plain.
+        assert!(
+            raw.contains("Authorization"),
+            "the header name is not a secret and should stay in the clear: {raw}"
+        );
+
+        // The stored value is the REAL cipher's output, not merely "something
+        // other than the plaintext": it carries `encrypt_field`'s version tag
+        // and `decrypt_field` recovers the plaintext from it.
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let stored_value = stored[0]["value"].as_str().unwrap();
+        assert!(
+            stored_value.starts_with(ENC_PREFIX),
+            "a stored header value must be tagged with the real scheme's {ENC_PREFIX} marker, \
+             not merely obfuscated: {stored_value}"
+        );
+        assert_eq!(
+            crate::llm_router::secrets::decrypt_field(stored_value).unwrap(),
+            "Basic super-secret-credential",
+            "the stored value must be this process cipher's ciphertext for the plaintext"
+        );
+
+        let roundtrip = get_server_headers(&store, "rovo-main").await.unwrap();
+        assert_eq!(
+            roundtrip,
+            vec![(
+                "Authorization".to_string(),
+                "Basic super-secret-credential".to_string()
+            )],
+            "decoding must still recover the original plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stdio_rows_headers_are_unaffected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            McpServerRow {
+                id: "github".into(),
+                name: "GitHub".into(),
+                kind: "MCP server".into(),
+                color: "#24292F".into(),
+                description: String::new(),
+                transport: "stdio".into(),
+                command: Some("npx".into()),
+                args: vec![],
+                env: vec![("GITHUB_TOKEN".into(), "x".into())],
+                url: None,
+                scope: "global".into(),
+                scope_gateways: vec![],
+                version: None,
+                publisher: None,
+                status: "unknown".into(),
+                status_detail: None,
+                auth_kind: "env".into(),
+                auth_detail: Some("GITHUB_TOKEN".into()),
+                plugin_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Nothing ever writes headers_json for a stdio row (mcp_sync only
+        // calls set_server_headers for http transport), so the column stays
+        // NULL and must decode to empty, not error.
+        assert_eq!(
+            get_server_headers(&store, "github").await.unwrap(),
+            Vec::<(String, String)>::new()
+        );
+
+        let specs = servers_for_session(&store, "native").await.unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            matches!(specs[0].transport, McpTransport::Stdio { .. }),
+            "a stdio row's transport shape must be unaffected by the headers_json column"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // One undecryptable row must cost exactly that row
+    // ---------------------------------------------------------------------
+
+    /// Write `headers_json` DIRECTLY, bypassing [`encode_server_headers`] —
+    /// the only way to stage a row whose stored header value THIS process
+    /// cannot decrypt. Encrypting under a foreign key is the faithful
+    /// simulation of the real failure mode (the `llm_router::secrets` master
+    /// key rotated, or the keychain unavailable so a different key resolved):
+    /// it fails inside `decrypt_field` itself, exactly where a real one would,
+    /// rather than tripping the JSON-shape checks first.
+    async fn write_undecryptable_headers_json(store: &Store, server_id: &str) {
+        let ciphertext = crate::llm_router::secrets::SecretCipher::from_key([42u8; 32])
+            .encrypt("Bearer minted-under-a-key-this-process-does-not-have");
+        let raw = serde_json::json!([{ "name": "Authorization", "value": ciphertext }]).to_string();
+        let server_id = server_id.to_string();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE mcp_servers SET headers_json=?2 WHERE id=?1",
+                    params![server_id, raw],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn enable_plugin(store: &Store, plugin_id: &str) {
+        store
+            .set_setting_raw(&format!("plugin.{plugin_id}.enabled"), "true")
+            .await
+            .unwrap();
+    }
+
+    /// PROPERTY: a single row whose stored headers cannot be decrypted is
+    /// skipped, and every OTHER server still attaches.
+    ///
+    /// `decode_server_headers` hard-errors by design (silently dropping a
+    /// header a caller expects on the wire is the silent-auth-failure gap the
+    /// column exists to close), but propagating that out of
+    /// `servers_for_session` is strictly worse than the one dropped header:
+    /// its only caller cannot recover per row, so ONE unreadable row used to
+    /// remove every MCP server — stdio ones, which have no headers at all,
+    /// included — from every new session.
+    #[tokio::test]
+    async fn one_undecryptable_row_does_not_strip_every_other_server() {
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // A stdio server: nothing ever writes headers_json for one, so
+        // nothing about it can fail to decrypt — it is pure collateral damage.
+        upsert_server(&store, plugin_owned_row("stdio-row", "acme"))
+            .await
+            .unwrap();
+        enable_plugin(&store, "acme").await;
+        // A healthy HTTP row with a decryptable header.
+        upsert_server(
+            &store,
+            plugin_owned_http_row("http-ok", "acme", "https://ok.example.com/mcp"),
+        )
+        .await
+        .unwrap();
+        set_server_headers(
+            &store,
+            "http-ok",
+            &[("Authorization".to_string(), "Basic good".to_string())],
+        )
+        .await
+        .unwrap();
+        // And the poisoned one.
+        upsert_server(
+            &store,
+            plugin_owned_http_row("http-broken", "acme", "https://broken.example.com/mcp"),
+        )
+        .await
+        .unwrap();
+        write_undecryptable_headers_json(&store, "http-broken").await;
+
+        let specs = servers_for_session(&store, "native")
+            .await
+            .expect("one undecryptable row must not fail the whole call");
+
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"stdio-row"),
+            "a stdio row has no headers to fail on and must always survive, got {names:?}"
+        );
+        assert!(
+            names.contains(&"http-ok"),
+            "a healthy http row must survive an unrelated row's decrypt failure, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"http-broken"),
+            "the row whose headers cannot be decrypted must be skipped rather than attached \
+             with a silently dropped credential, got {names:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // A plugin's OAuth bearer is resolved live, never snapshotted
+    // ---------------------------------------------------------------------
+
+    fn plugin_oauth_token(
+        plugin_id: &str,
+        access_token: &str,
+    ) -> crate::plugins::oauth::PluginOauthToken {
+        crate::plugins::oauth::PluginOauthToken {
+            plugin_id: plugin_id.to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some("refresh".into()),
+            token_type: "Bearer".into(),
+            // Comfortably outside `oauth::needs_refresh`'s 5-minute window so
+            // this test never depends on the near-expiry warning path.
+            expires_at: Some(crate::paths::now_ms() + 3_600_000),
+            scopes: vec![],
+            reconnect_required: false,
+        }
+    }
+
+    /// EVERY `Authorization` header on the spec, not just the first — so a
+    /// regression that appends a second one (rather than honoring the
+    /// persisted header's precedence) is visible instead of hidden behind a
+    /// `find`.
+    fn authorizations_of(spec: &McpServerSpec) -> Vec<String> {
+        let McpTransport::Http { headers, .. } = &spec.transport else {
+            panic!("expected an Http transport, got {:?}", spec.transport);
+        };
+        headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
+    async fn only_spec(store: &Store) -> McpServerSpec {
+        let mut specs = servers_for_session(store, "native").await.unwrap();
+        assert_eq!(specs.len(), 1, "expected exactly one attached server");
+        specs.remove(0)
+    }
+
+    /// PROPERTY: an OAuth plugin's bearer is read from `plugin_oauth_tokens`
+    /// at SESSION START, so (a) a token rotated since the last plugin sync is
+    /// used, and (b) `disconnect_plugin_oauth` — which deletes only that
+    /// table — actually stops the credential, instead of leaving a snapshot in
+    /// `headers_json` that keeps being sent from every new session (a local
+    /// revocation bypass).
+    #[tokio::test]
+    async fn a_plugin_oauth_bearer_is_resolved_per_session_and_dies_with_the_token() {
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row(
+                "acme-oauth-svc",
+                "acme-oauth",
+                "https://acme.example.com/mcp",
+            ),
+        )
+        .await
+        .unwrap();
+        enable_plugin(&store, "acme-oauth").await;
+        // What `mcp_sync` persists for an OAuth plugin: its static headers
+        // only — never the bearer.
+        set_server_headers(
+            &store,
+            "acme-oauth-svc",
+            &[("Accept".to_string(), "application/json".to_string())],
+        )
+        .await
+        .unwrap();
+        store
+            .upsert_plugin_oauth_token(&plugin_oauth_token("acme-oauth", "first-access-token"))
+            .await
+            .unwrap();
+
+        let spec = only_spec(&store).await;
+        assert_eq!(
+            authorizations_of(&spec),
+            vec!["Bearer first-access-token".to_string()],
+            "the live plugin OAuth bearer must reach the session spec"
+        );
+        let McpTransport::Http { headers, .. } = &spec.transport else {
+            unreachable!("checked by authorizations_of")
+        };
+        assert!(
+            headers.contains(&("Accept".to_string(), "application/json".to_string())),
+            "injecting the bearer must not drop the row's persisted static headers: {headers:?}"
+        );
+
+        // A refresh elsewhere (or a reconnect) rotated the token; no plugin
+        // re-sync happened. The next session must use the NEW value.
+        store
+            .upsert_plugin_oauth_token(&plugin_oauth_token("acme-oauth", "rotated-access-token"))
+            .await
+            .unwrap();
+        assert_eq!(
+            authorizations_of(&only_spec(&store).await),
+            vec!["Bearer rotated-access-token".to_string()],
+            "a bearer rotated since the last plugin sync must be picked up at session start"
+        );
+
+        // Exactly what `plugins_api::disconnect_plugin_oauth` does — and
+        // nothing else, in particular nothing to `headers_json`.
+        store.delete_plugin_oauth_token("acme-oauth").await.unwrap();
+        assert!(
+            authorizations_of(&only_spec(&store).await).is_empty(),
+            "after disconnect no new session may carry the revoked account's bearer"
+        );
+    }
+
+    /// PROPERTY: a token the host has already marked unusable is not sent —
+    /// mirroring `declarative`'s `resolve_http_oauth_bearer_token` refusal and
+    /// `connect_mcp_tools`'s identical filter on the MCP-scoped token store.
+    #[tokio::test]
+    async fn a_reconnect_required_plugin_token_is_never_used_as_a_bearer() {
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row(
+                "acme-stale-svc",
+                "acme-stale",
+                "https://acme.example.com/mcp",
+            ),
+        )
+        .await
+        .unwrap();
+        enable_plugin(&store, "acme-stale").await;
+        let mut token = plugin_oauth_token("acme-stale", "unusable-access-token");
+        token.reconnect_required = true;
+        store.upsert_plugin_oauth_token(&token).await.unwrap();
+
+        assert!(
+            authorizations_of(&only_spec(&store).await).is_empty(),
+            "a reconnect_required token must never be turned into a bearer"
+        );
+    }
+
+    /// PROPERTY: the persisted-header path wins and short-circuits the token
+    /// lookup — Task 8's rule is that a manifest-supplied `Authorization`
+    /// (which for a static `${setting:}` credential IS persisted) is used
+    /// verbatim, so live resolution must never overwrite one.
+    #[tokio::test]
+    async fn a_persisted_static_authorization_is_not_overwritten_by_a_live_token() {
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_server(
+            &store,
+            plugin_owned_http_row("acme-both-svc", "acme-both", "https://acme.example.com/mcp"),
+        )
+        .await
+        .unwrap();
+        enable_plugin(&store, "acme-both").await;
+        set_server_headers(
+            &store,
+            "acme-both-svc",
+            &[(
+                "Authorization".to_string(),
+                "Basic manifest-resolved-creds".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+        store
+            .upsert_plugin_oauth_token(&plugin_oauth_token("acme-both", "should-not-be-used"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            authorizations_of(&only_spec(&store).await),
+            vec!["Basic manifest-resolved-creds".to_string()],
+            "a persisted manifest credential must win over a live plugin OAuth token, and must \
+             not be joined by a second Authorization header"
+        );
     }
 }

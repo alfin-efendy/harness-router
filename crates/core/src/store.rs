@@ -70,12 +70,51 @@ CREATE INDEX idx_automation_hooks_plugin ON automation_hooks(plugin_id);
 CREATE INDEX idx_jobs_plugin ON jobs(plugin_id);
 ";
 
+/// v4 -> v5: MCP-scoped OAuth token and registered-client storage, disjoint
+/// from `plugin_oauth_tokens`/`plugin_oauth_clients` by design (Global
+/// Constraints, remote MCP OAuth plan) — an MCP server's token must never be
+/// reachable through a plugin id, and vice versa.
+const MCP_OAUTH_MIGRATION_SQL: &str = "
+CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+  server_name TEXT PRIMARY KEY,
+  token_json  TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+  issuer     TEXT PRIMARY KEY,
+  client_id  TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+";
+
+/// v5 -> v6: a resolved HTTP header set (e.g. a plugin manifest's resolved
+/// `Authorization`) persisted alongside the `mcp_servers` row it belongs to,
+/// so it survives from plugin sync (`plugins::mcp_sync::sync_plugin_mcp`)
+/// through to session start (`mcp::servers_for_session`) instead of being
+/// silently dropped in between. That drop was a real, empirically-proven gap
+/// (Task 13, remote MCP OAuth plan): `servers_for_session` hardcoded
+/// `headers: vec![]` for every HTTP row, so Task 8's auth-precedence rule
+/// could never see a plugin-supplied credential and every such server fell
+/// through to the (empty, for an API-token plugin) stored-token path.
+///
+/// `headers_json` mirrors `mcp_oauth_tokens.token_json`'s shape and
+/// encryption discipline: `mcp::set_server_headers`/`get_server_headers`
+/// encrypt/decrypt each header VALUE with `encrypt_field`/`decrypt_field`
+/// (never the header name, which is not a secret, and never the blob as a
+/// whole) — see those functions' doc for why. `NULL` (every pre-existing row,
+/// and every stdio row, which never gets this column written) decodes to an
+/// empty header list, not an error.
+const MCP_SERVER_HEADERS_MIGRATION_SQL: &str =
+    "ALTER TABLE mcp_servers ADD COLUMN headers_json TEXT;";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
         M::up(AGENT_STATS_MIGRATION_SQL),
         M::up(OAUTH_CLIENT_SECRET_SETTING_MIGRATION_SQL),
         M::up(PLUGIN_ORIGIN_MIGRATION_SQL),
+        M::up(MCP_OAUTH_MIGRATION_SQL),
+        M::up(MCP_SERVER_HEADERS_MIGRATION_SQL),
     ])
 }
 
@@ -429,6 +468,114 @@ fn decode_plugin_oauth_token(plugin_id: &str, raw: &str) -> anyhow::Result<Plugi
     })
 }
 
+/// An MCP server's OAuth token, stored in `mcp_oauth_tokens` and keyed by
+/// `server_name`. Deliberately disjoint from [`PluginOauthToken`]/
+/// `plugin_oauth_tokens`: an MCP server's access must not be revocable by
+/// retiring an unrelated plugin, and vice versa (Global Constraints, remote
+/// MCP OAuth plan). Mirrors `PluginOauthToken` minus `plugin_id`, since the
+/// server name is the row's primary key rather than a field on the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpOauthToken {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_at: Option<i64>,
+    pub scopes: Vec<String>,
+    pub reconnect_required: bool,
+}
+
+fn parse_mcp_oauth_token_json(raw: &str) -> anyhow::Result<Map<String, Value>> {
+    let value: Value = serde_json::from_str(raw)?;
+    let object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("mcp oauth token json must be an object"))?;
+    Ok(object)
+}
+
+fn upsert_mcp_oauth_token_json(
+    existing: Option<&str>,
+    token: &McpOauthToken,
+) -> anyhow::Result<String> {
+    let mut object = match existing {
+        Some(raw) => parse_mcp_oauth_token_json(raw)?,
+        None => Map::new(),
+    };
+    object.insert(
+        "access_token".to_string(),
+        Value::String(encrypt_field(&token.access_token)),
+    );
+    object.insert(
+        "refresh_token".to_string(),
+        token
+            .refresh_token
+            .as_deref()
+            .map(encrypt_field)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "token_type".to_string(),
+        Value::String(token.token_type.clone()),
+    );
+    object.insert(
+        "expires_at".to_string(),
+        token
+            .expires_at
+            .map(Number::from)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "scopes".to_string(),
+        Value::Array(token.scopes.iter().cloned().map(Value::String).collect()),
+    );
+    object.insert(
+        "reconnect_required".to_string(),
+        Value::Bool(token.reconnect_required),
+    );
+    Ok(serde_json::to_string(&Value::Object(object))?)
+}
+
+fn decode_mcp_oauth_token(raw: &str) -> anyhow::Result<McpOauthToken> {
+    let object = parse_mcp_oauth_token_json(raw)?;
+    let access_token = object
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("mcp oauth token missing access_token"))?;
+    let token_type = object
+        .get("token_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("mcp oauth token missing token_type"))?;
+    let expires_at = object.get("expires_at").and_then(Value::as_i64);
+    let scopes = object
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let reconnect_required = object
+        .get("reconnect_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(McpOauthToken {
+        access_token: decrypt_field(access_token)?,
+        refresh_token: match object.get("refresh_token").and_then(Value::as_str) {
+            Some(refresh_token) => Some(decrypt_field(refresh_token)?),
+            None => None,
+        },
+        token_type: token_type.to_string(),
+        expires_at,
+        scopes,
+        reconnect_required,
+    })
+}
+
 /// One row per plugin in `plugin_oauth_clients` — a partial cache that
 /// accretes: discovery fills the endpoint columns, DCR or the user's manual
 /// entry fills `client_id`. `upsert_plugin_oauth_client` merges per column
@@ -631,9 +778,10 @@ impl Store {
         // ahead". Detect it up front and return an actionable error instead.
         // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage, 3 =
         // + plugin_oauth_profile_clients.client_secret_setting, 4 =
-        // + automation_hooks/jobs/mcp_servers.plugin_id origin columns.)
+        // + automation_hooks/jobs/mcp_servers.plugin_id origin columns, 5 =
+        // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 4;
+        const LATEST_VERSION: i64 = 6;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -3246,6 +3394,134 @@ impl Store {
                 params![plugin_id],
             )
             .map(|_| ())
+        })
+        .await
+    }
+
+    /// Upsert an MCP server's OAuth token, keyed by `server_name`. Mirrors
+    /// [`Store::upsert_plugin_oauth_token`], including the per-field
+    /// encrypt-at-rest path — see [`McpOauthToken`] for why this is a
+    /// separate table rather than a row in `plugin_oauth_tokens`.
+    pub async fn upsert_mcp_oauth_token(
+        &self,
+        server: &str,
+        token: &McpOauthToken,
+    ) -> anyhow::Result<()> {
+        let server = server.to_string();
+        let token = token.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let existing: Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![&server],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let token_json = upsert_mcp_oauth_token_json(existing.as_deref(), &token)
+                .map_err(to_sql_json_error)?;
+            c.execute(
+                "INSERT INTO mcp_oauth_tokens(server_name, token_json, updated_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(server_name) DO UPDATE SET \
+                   token_json=excluded.token_json, \
+                   updated_at=excluded.updated_at",
+                params![server, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_mcp_oauth_token(&self, server: &str) -> anyhow::Result<Option<McpOauthToken>> {
+        let server = server.to_string();
+        let raw: Option<String> = self
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![server],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        raw.map(|raw| decode_mcp_oauth_token(&raw)).transpose()
+    }
+
+    pub async fn delete_mcp_oauth_token(&self, server: &str) -> anyhow::Result<()> {
+        let server = server.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM mcp_oauth_tokens WHERE server_name=?1",
+                params![server],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn mark_mcp_oauth_reconnect_required(&self, server: &str) -> anyhow::Result<()> {
+        let server = server.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let Some(raw): Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![&server],
+                    |r| r.get(0),
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let mut token =
+                decode_mcp_oauth_token(&raw).map_err(|err| from_sql_json_error(0, err))?;
+            token.reconnect_required = true;
+            let token_json =
+                upsert_mcp_oauth_token_json(Some(&raw), &token).map_err(to_sql_json_error)?;
+            c.execute(
+                "UPDATE mcp_oauth_tokens SET token_json=?2, updated_at=?3 WHERE server_name=?1",
+                params![server, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Registers (or reuses) the DCR client id for an authorization server,
+    /// keyed by `issuer`. Unlike [`Store::upsert_plugin_oauth_client`] there
+    /// is only one mutable column, so this is a plain upsert rather than a
+    /// per-column COALESCE merge; `created_at` is set once and preserved on
+    /// a later re-upsert.
+    pub async fn upsert_mcp_oauth_client(
+        &self,
+        issuer: &str,
+        client_id: &str,
+    ) -> anyhow::Result<()> {
+        let issuer = issuer.to_string();
+        let client_id = client_id.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(issuer) DO UPDATE SET client_id=excluded.client_id",
+                params![issuer, client_id, created_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_mcp_oauth_client(&self, issuer: &str) -> anyhow::Result<Option<String>> {
+        let issuer = issuer.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT client_id FROM mcp_oauth_clients WHERE issuer=?1",
+                params![issuer],
+                |r| r.get(0),
+            )
+            .optional()
         })
         .await
     }
@@ -8007,6 +8283,300 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn an_mcp_token_round_trips_and_is_scoped_to_its_server() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "tok".into(),
+            refresh_token: Some("ref".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(123),
+            scopes: vec!["read".into()],
+            reconnect_required: false,
+        };
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_token("rovo")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "tok"
+        );
+        assert!(
+            store.get_mcp_oauth_token("other").await.unwrap().is_none(),
+            "a token must not leak to a different MCP server"
+        );
+    }
+
+    async fn raw_mcp_oauth_token_json(store: &Store, server: &str) -> String {
+        let server = server.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM mcp_oauth_tokens WHERE server_name=?1",
+                    params![server],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_token_roundtrip_encrypts_at_rest() {
+        // A regression that dropped the encrypt_field/decrypt_field calls
+        // from upsert_mcp_oauth_token_json would still pass a plain
+        // round-trip-equality test, because decode would simply hand back
+        // whatever was written. This test reads the raw column, bypassing
+        // the decode path, so a dropped encrypt call is caught directly.
+        //
+        // "not stored verbatim" is NOT the property, though: swapping
+        // encrypt_field for base64, rot13, or any other reversible
+        // obfuscation satisfies it — and satisfies the decoding round-trip
+        // below too. So the stored values must additionally carry the real
+        // scheme's `enc:v1:` marker AND decrypt back under `decrypt_field`,
+        // which no non-encryption stand-in can fake.
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "mcp-access-secret".into(),
+            refresh_token: Some("mcp-refresh-secret".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["read".into(), "write".into()],
+            reconnect_required: false,
+        };
+
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+
+        let raw_json = raw_mcp_oauth_token_json(&store, "rovo").await;
+        assert!(
+            !raw_json.contains("mcp-access-secret"),
+            "MCP access tokens are being written to disk in the clear: {raw_json}"
+        );
+        assert!(
+            !raw_json.contains("mcp-refresh-secret"),
+            "MCP refresh tokens are being written to disk in the clear: {raw_json}"
+        );
+
+        // `llm_router::secrets`'s ciphertext tag, duplicated rather than
+        // exported: this assertion must FAIL if that module's format changes,
+        // not silently follow it.
+        const ENC_PREFIX: &str = "enc:v1:";
+        let stored: Value = serde_json::from_str(&raw_json).unwrap();
+        for (field, plaintext) in [
+            ("access_token", "mcp-access-secret"),
+            ("refresh_token", "mcp-refresh-secret"),
+        ] {
+            let stored_value = stored[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be a stored string: {raw_json}"));
+            assert!(
+                stored_value.starts_with(ENC_PREFIX),
+                "{field} must be tagged with the real scheme's {ENC_PREFIX} marker, not merely \
+                 obfuscated: {stored_value}"
+            );
+            assert_eq!(
+                decrypt_field(stored_value).unwrap(),
+                plaintext,
+                "{field} must be this process cipher's ciphertext for the plaintext"
+            );
+        }
+
+        let roundtrip = store.get_mcp_oauth_token("rovo").await.unwrap().unwrap();
+        assert_eq!(roundtrip.access_token, "mcp-access-secret");
+        assert_eq!(
+            roundtrip.refresh_token.as_deref(),
+            Some("mcp-refresh-secret")
+        );
+        assert_eq!(roundtrip.token_type, "Bearer");
+        assert_eq!(roundtrip.expires_at, Some(1_700_000_000_000));
+        assert_eq!(roundtrip.scopes, vec!["read", "write"]);
+        assert!(!roundtrip.reconnect_required);
+    }
+
+    #[tokio::test]
+    async fn an_mcp_token_never_appears_in_the_plugin_token_store() {
+        // The two credential stores stay disjoint so retiring a plugin cannot
+        // revoke an MCP server's access, and vice versa.
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "tok".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        };
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+
+        assert!(store
+            .get_plugin_oauth_token("rovo")
+            .await
+            .unwrap()
+            .is_none());
+
+        // And vice versa: a plugin token must not surface through the MCP
+        // token store either. This direction is structurally guaranteed
+        // today (two separate tables, no shared read path between them), so
+        // this half documents the invariant rather than hunting a live bug.
+        // Uses a fresh identifier ("acme") rather than "rovo" so this
+        // assertion isn't trivially satisfied by the MCP token already
+        // written under "rovo" above.
+        let plugin_token = PluginOauthToken {
+            plugin_id: "acme".into(),
+            access_token: "plugin-tok".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        };
+        store
+            .upsert_plugin_oauth_token(&plugin_token)
+            .await
+            .unwrap();
+
+        assert!(
+            store.get_mcp_oauth_token("acme").await.unwrap().is_none(),
+            "a plugin token must not be readable through the MCP token store — \
+             this is structurally guaranteed by two disjoint tables with no \
+             shared read path, so a failure here means that guarantee broke"
+        );
+    }
+
+    async fn raw_mcp_oauth_client_created_at(store: &Store, issuer: &str) -> i64 {
+        let issuer = issuer.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT created_at FROM mcp_oauth_clients WHERE issuer=?1",
+                    params![issuer],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_registered_client_id_is_reused_per_issuer() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_mcp_oauth_client("https://as.example", "client-1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("client-1")
+        );
+        assert!(store
+            .get_mcp_oauth_client("https://other.example")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Pin created_at to a sentinel far in the past via raw SQL, rather
+        // than relying on two upserts landing in different milliseconds, so
+        // a re-upsert that wrongly resets created_at to "now" is unmistakable.
+        let sentinel_created_at = 1_000_i64;
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE mcp_oauth_clients SET created_at=?1 WHERE issuer='https://as.example'",
+                    params![sentinel_created_at],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        // A second registration for the same issuer (e.g. re-registering
+        // after a client was revoked/rotated) must update the client id
+        // while preserving the original created_at — the upsert deliberately
+        // excludes created_at from its ON CONFLICT ... DO UPDATE SET.
+        store
+            .upsert_mcp_oauth_client("https://as.example", "client-2")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("client-2"),
+            "a second upsert for the same issuer must update the client id"
+        );
+        assert_eq!(
+            raw_mcp_oauth_client_created_at(&store, "https://as.example").await,
+            sentinel_created_at,
+            "created_at must be preserved across a re-upsert, not reset to now"
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_reconnect_required_survives_a_read() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = McpOauthToken {
+            access_token: "tok".into(),
+            refresh_token: Some("ref".into()),
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        };
+        store.upsert_mcp_oauth_token("rovo", &token).await.unwrap();
+        // Inject an unknown JSON field via raw SQL, the way a future field
+        // this table doesn't know about yet would show up, so the assertion
+        // below proves the mark's read-merge-write path doesn't clobber
+        // neighbouring data.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE mcp_oauth_tokens SET token_json = json_set(token_json, '$.resource_metadata', 'https://example.test/.well-known/oauth-protected-resource')",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        store
+            .mark_mcp_oauth_reconnect_required("rovo")
+            .await
+            .unwrap();
+
+        let roundtrip = store.get_mcp_oauth_token("rovo").await.unwrap().unwrap();
+        assert!(roundtrip.reconnect_required);
+        assert_eq!(roundtrip.access_token, "tok");
+        assert_eq!(roundtrip.refresh_token.as_deref(), Some("ref"));
+
+        let raw_json = raw_mcp_oauth_token_json(&store, "rovo").await;
+        let raw_value: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(
+            raw_value["resource_metadata"],
+            "https://example.test/.well-known/oauth-protected-resource"
+        );
+    }
+
     async fn raw_plugin_oauth_profile_token_json(
         store: &Store,
         plugin_id: &str,
@@ -9785,11 +10355,12 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 4 database (v1 squashed baseline + v2
+    // produce a `user_version` 6 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
-    // automation_hooks/jobs/mcp_servers.plugin_id origin columns) whose
-    // schema + seeded rows exactly match the golden fixture.
+    // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
+    // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json)
+    // whose schema + seeded rows exactly match the golden fixture.
     //
     // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
     // version, messages_fts_data blocks), which are artifacts of the bundled
@@ -9802,8 +10373,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 4,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin migrations must be user_version 4"
+            user_version, 6,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers migrations must be user_version 6"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

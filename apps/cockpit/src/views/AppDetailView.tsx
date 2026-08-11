@@ -1,5 +1,7 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { MoreHorizontal, RefreshCw, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import {
   Button,
   Menu,
@@ -16,7 +18,7 @@ import {
 } from "@ryuzi/ui";
 import type { PluginToolEntry } from "@/bindings";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Chip, StatusDot } from "@/components/common/bits";
+import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { NATIVE_AGENT } from "@/constants";
 import { appStatusToHubStatus, statusPresentation } from "@/lib/plugin-hub";
@@ -29,6 +31,17 @@ import { useNav } from "@/store-nav";
 import { visibleTabs, type DetailTab } from "./PluginDetailView";
 
 const rowLabel = "w-[120px] shrink-0 text-[13px] font-medium";
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// How long the post-Connect poll waits between refreshes, and the overall
+// deadline before it gives up and offers "Try again" — the loopback callback
+// server completes the token exchange out-of-band (Cockpit's own Rust
+// process, per the Task 9 plan correction), so this is purely "has the
+// server turned connected yet", not a provider-imposed interval. Mirrors
+// `OauthProfileConnections.tsx`'s PKCE poll constants.
+const CONNECT_POLL_INTERVAL_MS = 2000;
+const CONNECT_POLL_TIMEOUT_MS = 5 * 60_000;
 
 const TAB_LABEL: Record<DetailTab, string> = {
   overview: "Overview",
@@ -47,9 +60,27 @@ const TAB_LABEL: Record<DetailTab, string> = {
 
 export function AppDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent } = useApps();
+  const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent, beginMcpConnect, disconnectMcp } = useApps();
   const gateways = useGateways((s) => s.gateways);
   const [tab, setTab] = useState<DetailTab>("overview");
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [connectPending, setConnectPending] = useState(false);
+  const [connectExpired, setConnectExpired] = useState(false);
+  // The connect flow's IDENTITY, bumped by every Connect and by Cancel. Each
+  // run of `startConnect` captures it and guards every state write with it, so
+  // only the newest flow can write — the flow-identity guard
+  // `OauthProfileConnections.tsx` uses, which this view had dropped in favour
+  // of one shared boolean. That boolean was reset to `false` on entry, so
+  // Cancel-then-Connect inside a single 2 s tick RESURRECTED the cancelled
+  // loop: it woke, read `false`, and polled alongside the new one, then its
+  // own earlier deadline fired `setConnectExpired(true)` — the card claiming
+  // "The sign-in link expired" and hiding Cancel while a live flow and its
+  // Rust loopback listener were still running, and a success double-toasting.
+  const connectGenRef = useRef(0);
+  // Set on unmount and never reset, so a loop that outlives the component
+  // stops touching state after teardown.
+  const unmountedRef = useRef(false);
+  useEffect(() => () => void (unmountedRef.current = true), []);
   const goApps = () => nav.navigate({ kind: "plugins" });
 
   useEffect(() => {
@@ -84,6 +115,64 @@ export function AppDetailView({ id }: { id: string }) {
   const onRemove = () => {
     void remove(app.id);
     nav.goBack();
+  };
+
+  // Remote MCP server OAuth connect (Task 9). `beginMcpConnect` returns the
+  // authorize URL immediately — the daemon has already discovered the
+  // server's authorization server and registered a client. Cockpit's own
+  // Rust process then captures the browser redirect in the background (the
+  // plan's Task 9 correction: the loopback listener lives there, not the
+  // daemon), so there is nothing more for this component to drive except
+  // poll `list_apps` until the server reports connected — same shape as
+  // `OauthProfileConnections.tsx`'s PKCE poll, just reading the refreshed
+  // Apps list instead of `pluginReleaseDetail`.
+  const startConnect = async () => {
+    const gen = ++connectGenRef.current;
+    // This flow is stale the moment Cancel or another Connect bumps the
+    // generation (or the view unmounts) — checked before EVERY state write,
+    // because an abandoned loop writing terminal state over a live flow is
+    // exactly the failure this replaced.
+    const stale = () => unmountedRef.current || connectGenRef.current !== gen;
+    setConnectExpired(false);
+    setConnectBusy(true);
+    const start = await beginMcpConnect(app.id);
+    // `busy` belongs to this flow: a second one cannot start while Connect is
+    // disabled by it, so clearing it here can never un-disable another's.
+    setConnectBusy(false);
+    if (stale() || !start) return; // `!start` ⇒ the store already toasted it
+    void openUrl(start.authorizeUrl);
+    setConnectPending(true);
+
+    const deadline = Date.now() + CONNECT_POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(CONNECT_POLL_INTERVAL_MS);
+      if (stale()) return;
+      await hydrate();
+      if (stale()) return;
+      const fresh = appById(useApps.getState().apps, app.id);
+      if (fresh?.oauthTokenStored && !fresh.oauthReconnectRequired) {
+        toast.success(`Connected ${app.name}`);
+        setConnectPending(false);
+        return;
+      }
+    }
+    if (!stale()) {
+      setConnectPending(false);
+      setConnectExpired(true);
+    }
+  };
+
+  // Abandons the in-flight loop BY IDENTITY rather than by a shared flag a
+  // later Connect could clear, so the loop can never come back to life.
+  const cancelConnect = () => {
+    connectGenRef.current += 1;
+    setConnectPending(false);
+  };
+
+  const onDisconnect = async () => {
+    setConnectBusy(true);
+    await disconnectMcp(app.id);
+    setConnectBusy(false);
   };
 
   return (
@@ -146,15 +235,82 @@ export function AppDetailView({ id }: { id: string }) {
                   {app.transport === "http" ? (app.url ?? "—") : [app.command, ...app.args].filter(Boolean).join(" ")}
                 </span>
               </CardRow>
-              {app.authKind === "env" ? (
+              {app.authKind === "env" && (
                 <CardRow>
                   <span className={rowLabel}>Environment</span>
                   <span className="flex-1 font-mono text-xs text-muted-foreground">{app.authDetail ?? "—"}</span>
                 </CardRow>
-              ) : (
+              )}
+              {/* Gated on `oauthConnectAvailable`, NOT on `transport ===
+                  "http"`. That comparison merely correlates with "the host
+                  owns this server's credential": the daemon resolves auth by
+                  whether the spec already carries an `Authorization` header
+                  (`harness::native::mcp_http_credential`), and when it does —
+                  atlassian-rovo's `Basic ${setting:…}` — a token connected
+                  here is never used, never refreshed, never even read. This
+                  card used to say "Not connected", offer Connect, take the
+                  user through a real Atlassian consent screen, then show
+                  "OAuth connected" while every session went on sending the
+                  Basic header. The field is derived from that same predicate
+                  server-side, so the two cannot drift. */}
+              {app.oauthConnectAvailable ? (
+                <>
+                  <CardRow>
+                    <span className={rowLabel}>OAuth</span>
+                    <span className="flex-1 text-[12.5px] text-muted-foreground">
+                      {app.oauthReconnectRequired
+                        ? "Cockpit has a saved token for this server, but it needs to be reconnected."
+                        : app.oauthTokenStored
+                          ? "Cockpit has a saved OAuth token for this server."
+                          : "Connect this server to an account before agents can use its tools."}
+                    </span>
+                    {app.oauthReconnectRequired ? (
+                      <Pill variant="warn">Reconnect required</Pill>
+                    ) : app.oauthTokenStored ? (
+                      // "OAuth connected", not bare "Connected" — the hero's
+                      // status pill (transport reachability) can ALSO read
+                      // "Connected" at the same time, for a different thing.
+                      <Pill variant="primary">OAuth connected</Pill>
+                    ) : (
+                      <Pill variant="secondary">Not connected</Pill>
+                    )}
+                    {app.oauthTokenStored && (
+                      <Button variant="outline" size="sm" onClick={() => void onDisconnect()} disabled={connectBusy || connectPending}>
+                        Disconnect
+                      </Button>
+                    )}
+                    <Button size="sm" onClick={() => void startConnect()} disabled={connectBusy || connectPending}>
+                      {connectBusy ? "Opening…" : app.oauthReconnectRequired || app.oauthTokenStored ? "Reconnect" : "Connect"}
+                    </Button>
+                  </CardRow>
+                  {connectPending && (
+                    <div className="flex items-center gap-3 border-t border-border px-[18px] py-3">
+                      <span className="text-[12.5px] text-muted-foreground">Waiting for you to finish signing in in the browser…</span>
+                      <Button variant="ghost" size="sm" onClick={cancelConnect}>
+                        Cancel
+                      </Button>
+                    </div>
+                  )}
+                  {connectExpired && !connectPending && (
+                    <div className="flex items-center gap-3 border-t border-border px-[18px] py-3">
+                      <span className="text-[12.5px] text-muted-foreground">The sign-in link expired before you finished.</span>
+                      <Button size="sm" onClick={() => void startConnect()}>
+                        Try again
+                      </Button>
+                    </div>
+                  )}
+                </>
+              ) : app.transport === "http" ? (
                 <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
-                  No authentication configured — runs with the environment it inherits.
+                  Authenticated with a credential from this server's configuration — an API token, or a sign-in its plugin manages. There is
+                  no separate OAuth connection to make here.
                 </div>
+              ) : (
+                app.authKind !== "env" && (
+                  <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+                    No authentication configured — runs with the environment it inherits.
+                  </div>
+                )
               )}
             </Card>
           </div>

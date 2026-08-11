@@ -15,7 +15,14 @@ export function AddAppModal({ onClose }: { onClose: () => void }) {
   const [env, setEnv] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const valid = name.trim().length > 0 && (transport === "stdio" ? command.trim().length > 0 : url.trim().length > 0);
+  // Global Constraint: remote MCP server URLs MUST be https:// (the MCP spec
+  // requires it — see the plan's Global Constraints). The RPC also rejects a
+  // plain http:// URL, but this is the UI's one chance to tell the user WHY
+  // before it bounces off the backend as an opaque error.
+  const trimmedUrl = url.trim();
+  const httpsError = transport === "http" && trimmedUrl.length > 0 && !trimmedUrl.toLowerCase().startsWith("https://");
+
+  const valid = name.trim().length > 0 && (transport === "stdio" ? command.trim().length > 0 : trimmedUrl.length > 0 && !httpsError);
 
   const submit = async () => {
     if (!valid || saving) return;
@@ -86,7 +93,9 @@ export function AddAppModal({ onClose }: { onClose: () => void }) {
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 placeholder="https://mcp.example.com"
+                aria-invalid={httpsError}
               />
+              {httpsError && <p className="mt-1 text-xs text-destructive">Remote MCP servers must use https://.</p>}
             </FormField>
           )}
           <FormField label="Environment (KEY=value, one per line)">

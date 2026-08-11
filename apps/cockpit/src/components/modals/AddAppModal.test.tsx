@@ -67,3 +67,36 @@ test("locks dismissal while connecting and settles after the deferred save", asy
   expect(cancel.disabled).toBe(false);
   expect(onClose).toHaveBeenCalledTimes(1);
 });
+
+// ---------- Task 9: https:// enforcement on the add-server form ----------
+
+test("a plain http:// URL is rejected in the form with a visible message and a disabled submit", () => {
+  render(<AddAppModal onClose={() => {}} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "HTTP" }));
+  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Remote" } });
+  fireEvent.change(screen.getByLabelText("URL"), { target: { value: "http://mcp.example.com" } });
+
+  expect(screen.getByText("Remote MCP servers must use https://.")).toBeTruthy();
+  const submit = screen.getByRole("button", { name: "Add & connect" }) as HTMLButtonElement;
+  expect(submit.disabled).toBe(true);
+  fireEvent.click(submit);
+  expect(addApp).not.toHaveBeenCalled();
+});
+
+test("an https:// URL clears the rejection and lets the form submit with the entered name and URL", async () => {
+  render(<AddAppModal onClose={() => {}} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "HTTP" }));
+  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Remote" } });
+  fireEvent.change(screen.getByLabelText("URL"), { target: { value: "https://mcp.example.com" } });
+
+  expect(screen.queryByText("Remote MCP servers must use https://.")).toBeNull();
+  const submit = screen.getByRole("button", { name: "Add & connect" }) as HTMLButtonElement;
+  expect(submit.disabled).toBe(false);
+
+  fireEvent.click(submit);
+  await waitFor(() =>
+    expect(addApp).toHaveBeenCalledWith(expect.objectContaining({ name: "Remote", transport: "http", url: "https://mcp.example.com" })),
+  );
+});

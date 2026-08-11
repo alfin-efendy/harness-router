@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
-import { readdir } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   artifactNames,
+  buildReleaseObject,
   buildSignatureEnvelope,
   COMPONENTS,
   deriveWitApiVersion,
@@ -67,8 +69,11 @@ test("each COMPONENTS entry's dir exists and its manifest id matches", async () 
 // `crateWasmStem` is cargo's wasm output filename: the crate's `[package] name`
 // with `-` -> `_`. A mismatch makes `processComponent` read a nonexistent
 // `<stem>.wasm` and the release fails — so pin it to each crate's real name.
+// A declarative-only entry (no `crateWasmStem`, e.g. `atlassian-rovo`) has no
+// crate/Cargo.toml to check at all — skip it rather than fail on a missing file.
 test("each COMPONENTS entry's crateWasmStem matches its crate's [package] name", async () => {
   for (const spec of COMPONENTS) {
+    if (spec.crateWasmStem === undefined) continue;
     const parsed = Bun.TOML.parse(await Bun.file(join(REPO_ROOT, spec.dir, "Cargo.toml")).text()) as {
       package?: { name?: unknown };
     };
@@ -88,8 +93,38 @@ test("readManifest accepts every shipped plugins/<id>/ryuzi-plugin.toml as contr
   for (const spec of COMPONENTS) {
     const manifest = await readManifest(join(REPO_ROOT, spec.dir));
     expect(manifest.id).toBe(spec.id);
-    expect(manifest.component.length).toBeGreaterThan(0);
-    expect(manifest.witApiRange.length).toBeGreaterThan(0);
+    // A declarative-only COMPONENTS entry (no `crateWasmStem`, e.g.
+    // `atlassian-rovo`) ships a manifest with no `[component]` table at all —
+    // that component-less shape is covered by the dedicated fixture-based
+    // test below; here just confirm readManifest agrees it has none.
+    if (spec.crateWasmStem === undefined) {
+      expect(manifest.component).toBeUndefined();
+      expect(manifest.witApiRange).toBeUndefined();
+      continue;
+    }
+    const { component, witApiRange } = manifest;
+    if (component === undefined || witApiRange === undefined) {
+      throw new Error(`${spec.id}: expected a component-bearing manifest`);
+    }
+    expect(component.length).toBeGreaterThan(0);
+    expect(witApiRange.length).toBeGreaterThan(0);
+  }
+});
+
+// `readManifest` must accept a manifest with NO `[component]` table at all
+// (the shape `atlassian-rovo` ships) as a valid, component-less shape rather
+// than throwing "missing '[component].file'".
+test("readManifest accepts a manifest with no [component] table", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ryuzi-first-party-readmanifest-test-"));
+  try {
+    await Bun.write(`${dir}/ryuzi-plugin.toml`, 'contract = 2\nid = "declarative-plugin"\nname = "Declarative"\nversion = "0.1.0"\n');
+    const manifest = await readManifest(dir);
+    expect(manifest.id).toBe("declarative-plugin");
+    expect(manifest.version).toBe("0.1.0");
+    expect(manifest.component).toBeUndefined();
+    expect(manifest.witApiRange).toBeUndefined();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -102,8 +137,15 @@ test("readManifest accepts every shipped plugins/<id>/ryuzi-plugin.toml as contr
 // otherwise a real release build would throw.
 test("deriveWitApiVersion interprets every shipped component's manifest wit-api range", async () => {
   for (const spec of COMPONENTS) {
+    // A declarative-only entry (no `crateWasmStem`, e.g. `atlassian-rovo`)
+    // has no `[component] wit-api` range to derive from — nothing to check.
+    if (spec.crateWasmStem === undefined) continue;
     const manifest = await readManifest(join(REPO_ROOT, spec.dir));
-    expect(() => deriveWitApiVersion(manifest.witApiRange)).not.toThrow();
+    const { witApiRange } = manifest;
+    if (witApiRange === undefined) {
+      throw new Error(`${spec.id}: expected a component-bearing manifest`);
+    }
+    expect(() => deriveWitApiVersion(witApiRange)).not.toThrow();
   }
 });
 
@@ -142,6 +184,31 @@ test("artifactNames publishes descriptors under both stems and the wasm once", (
     "github-0.1.1.ryuzi-plugin.toml",
     "github-0.1.1.release.json",
     "github-0.1.1.release.json.sig",
+  ]);
+});
+
+// A component-less release (no `[component]` at all — the shape
+// `atlassian-rovo` ships) must produce a `release.json` with no component
+// fields, and its artifact list must not name a wasm file. `component_url`/
+// `component_sha256`/`wit-api` staying `undefined` — never `""` — matters:
+// `JSON.stringify` OMITS an `undefined` property entirely, which is what
+// lets the Rust side's `#[serde(default)]` treat the keys as genuinely
+// absent rather than present-but-empty.
+test("a component-less manifest produces a release.json with no component fields and still gets signed", () => {
+  const release = buildReleaseObject({ id: "example-declarative", version: "0.1.0" });
+  expect(release.component_url).toBeUndefined();
+  expect(release.component_sha256).toBeUndefined();
+  expect(release["wit-api"]).toBeUndefined();
+  expect(JSON.stringify(release)).not.toContain("component");
+
+  expect(artifactNames("example-declarative", "0.1.0")).not.toContain("example-declarative.wasm");
+  expect(artifactNames("example-declarative", "0.1.0")).toEqual([
+    "example-declarative.ryuzi-plugin.toml",
+    "example-declarative.release.json",
+    "example-declarative.release.json.sig",
+    "example-declarative-0.1.0.ryuzi-plugin.toml",
+    "example-declarative-0.1.0.release.json",
+    "example-declarative-0.1.0.release.json.sig",
   ]);
 });
 
