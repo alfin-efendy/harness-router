@@ -791,7 +791,7 @@ declares: **Tools** (component `[[tools]]` + synced `[[mcp]]`), **Contents**
 **Automations** (hooks + jobs, gated on `hooks.length + jobs.length > 0`),
 and **Versions** — all independent of whether the plugin is currently
 installed. Component-backed plugins (including every one of the twelve
-provider bundles and the six embedded component-catalog entries) are
+provider bundles and the seven embedded component-catalog entries) are
 first-class rows in `list_plugins` — `componentBacked`/`toolCount` are
 populated for them the same as any other plugin, not a separate,
 UI-invisible mechanism.
