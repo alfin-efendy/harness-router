@@ -33,7 +33,7 @@ CREATE TABLE mcp_oauth_clients (
   issuer     TEXT PRIMARY KEY,
   client_id  TEXT NOT NULL,
   created_at INTEGER NOT NULL
-);
+, token_endpoint TEXT);
 CREATE TABLE mcp_oauth_tokens (
   server_name TEXT PRIMARY KEY,
   token_json  TEXT NOT NULL,

@@ -2213,7 +2213,25 @@ oauthTokenStored: boolean;
  * refreshed request still 401s). `false` whenever `oauth_token_stored`
  * is `false` — there is nothing to reconnect.
  */
-oauthReconnectRequired: boolean; tools: ToolInfo[]; agentAccess: AgentAccessInfo[];
+oauthReconnectRequired: boolean;
+/**
+ * Why this server's last OAuth connect attempt failed, if one did —
+ * cleared when a connect starts and when one succeeds. Mirrors
+ * `PluginAuthInfo.oauth_connect_error`, which models the same thing for
+ * a plugin.
+ *
+ * This exists because the token exchange runs in a BACKGROUND task that
+ * no user-initiated RPC is awaiting: Cockpit's loopback listener
+ * captures the browser redirect and calls `complete_mcp_connect` from a
+ * spawned task whose only error path was an `eprintln!`. Cockpit's card
+ * polls `list_apps` until a five-minute deadline and then says the
+ * sign-in link expired — so a connect refused in the first second
+ * (a token endpoint the binding gate would not accept, an authorization
+ * server returning 400) was indistinguishable from a user who wandered
+ * off, and the real reason reached nobody. Persisting it here is what
+ * lets the poll stop early and say what actually happened.
+ */
+oauthConnectError: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[];
 /**
  * The plugin that owns this server, when it was synced from a plugin's
  * `[[mcp]]` declaration rather than added by the user. Cockpit uses it

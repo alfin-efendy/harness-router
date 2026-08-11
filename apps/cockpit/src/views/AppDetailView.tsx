@@ -155,6 +155,18 @@ export function AppDetailView({ id }: { id: string }) {
         setConnectPending(false);
         return;
       }
+      // The exchange is refused/failed, and the daemon said why. Stopping
+      // here is the difference between "the sign-in link expired" five
+      // minutes from now and the actual reason, right now: the completion
+      // runs in Cockpit's own background task, which discards the RPC error
+      // (`apps_cmd.rs`'s `complete_local_mcp_callback`), so this persisted
+      // field is the only thing that ever reaches the user. Rendered below,
+      // straight off the row rather than into local state, so it survives
+      // navigating away and back.
+      if (fresh?.oauthConnectError) {
+        setConnectPending(false);
+        return;
+      }
     }
     if (!stale()) {
       setConnectPending(false);
@@ -291,13 +303,29 @@ export function AppDetailView({ id }: { id: string }) {
                       </Button>
                     </div>
                   )}
-                  {connectExpired && !connectPending && (
-                    <div className="flex items-center gap-3 border-t border-border px-[18px] py-3">
-                      <span className="text-[12.5px] text-muted-foreground">The sign-in link expired before you finished.</span>
+                  {/* A real failure outranks the timeout copy: "expired" is
+                      what this card says when nothing at all came back, and
+                      saying it over a refusal the daemon explained is how a
+                      token exchange rejected in the first second read as a
+                      five-minute hang. Hidden while a flow is pending, so the
+                      previous attempt's reason never captions a live one. */}
+                  {app.oauthConnectError && !connectPending ? (
+                    <div className="flex items-start gap-3 border-t border-border px-[18px] py-3">
+                      <span className="flex-1 text-[12.5px] text-muted-foreground">Sign-in failed: {app.oauthConnectError}</span>
                       <Button size="sm" onClick={() => void startConnect()}>
                         Try again
                       </Button>
                     </div>
+                  ) : (
+                    connectExpired &&
+                    !connectPending && (
+                      <div className="flex items-center gap-3 border-t border-border px-[18px] py-3">
+                        <span className="text-[12.5px] text-muted-foreground">The sign-in link expired before you finished.</span>
+                        <Button size="sm" onClick={() => void startConnect()}>
+                          Try again
+                        </Button>
+                      </div>
+                    )
                   )}
                 </>
               ) : app.transport === "http" ? (
