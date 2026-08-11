@@ -2002,6 +2002,7 @@ test("an installed + trusted plugin with a matching MCP app row shows full mcp__
       oauthConnectAvailable: false,
       oauthTokenStored: false,
       oauthReconnectRequired: false,
+      oauthConnectError: null,
       tools: [{ name: "create_issue", desc: "Open an issue", perm: "ask" }],
       agentAccess: [],
       pluginId: "acme-suite",

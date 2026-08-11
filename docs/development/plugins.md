@@ -376,7 +376,19 @@ expiry, scopes, a `reconnect_required` flag) lives in its own
 `mcp_oauth_tokens` table, keyed by server name, with the same per-field
 encryption the plugin-token path uses. `mcp_oauth_clients` similarly stores
 one registered DCR client id per authorization-server issuer, reused across
-every MCP server behind the same issuer rather than re-registering.
+every MCP server behind the same issuer rather than re-registering, alongside
+the `token_endpoint` that issuer's RFC 8414 metadata advertised.
+
+That `token_endpoint` column is a security binding, not a cache.
+`complete_mcp_connect` takes the endpoint as an RPC parameter, so
+`apps_api::require_registered_token_endpoint` requires it to EQUAL one
+recorded by a real discovery run before the daemon POSTs an authorization
+code to it. It must never be inferred from the endpoint's URL shape: RFC 8414
+does not require a `token_endpoint` to live under its issuer's path, and
+Atlassian's does not — issuer `https://auth.atlassian.com/<resource-id>`,
+token endpoint `https://auth.atlassian.com/oauth/token`. Several path-scoped
+issuers at one provider legitimately share a single endpoint while each holds
+its own client id, so the lookup returns every match and accepts on any.
 
 This is a **deliberately separate store from `plugin_oauth_tokens`** — the
 table a declarative connector's own `[auth]` / `[[oauth]]` flow already

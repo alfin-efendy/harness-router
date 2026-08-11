@@ -291,13 +291,20 @@ pub async fn begin_mcp_connect(
                     server.name
                 )
             })?;
-            let id =
-                crate::plugins::oauth::register_oauth_client(http, registration, &redirect_uri)
-                    .await?;
-            store.upsert_mcp_oauth_client(&issuer, &id).await?;
-            id
+            crate::plugins::oauth::register_oauth_client(http, registration, &redirect_uri).await?
         }
     };
+    // Written on EVERY connect, reused client id included, because the row is
+    // what `api::apps_api::require_registered_token_endpoint` consults to
+    // decide whether the endpoint `complete_mcp_connect` is handed may be
+    // POSTed to — and this is the only place the authorization server's own
+    // RFC 8414 metadata is in hand to record it from. Writing it only on the
+    // registration branch would leave every client registered before the
+    // `token_endpoint` column existed permanently unable to complete a
+    // connect; re-upserting here backfills such a row on the next attempt.
+    store
+        .upsert_mcp_oauth_client(&issuer, &client_id, &metadata.token_endpoint)
+        .await?;
     build_authorize_url(
         &metadata,
         &client_id,

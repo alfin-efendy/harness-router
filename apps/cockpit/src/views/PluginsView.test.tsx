@@ -110,6 +110,7 @@ const slackApp: AppInfo = {
   oauthConnectAvailable: false,
   oauthTokenStored: false,
   oauthReconnectRequired: false,
+  oauthConnectError: null,
   tools: [],
   agentAccess: [],
   pluginId: null,

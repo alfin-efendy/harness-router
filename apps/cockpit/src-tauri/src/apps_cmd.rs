@@ -314,8 +314,18 @@ pub async fn begin_mcp_connect(
 /// There is no dedicated event/toast for this background completion (unlike
 /// the plugin install wizard's `PluginOauthCompletedMsg`) — Cockpit's polling
 /// loop (mirroring `OauthProfileConnections.tsx`'s PKCE poll) is what notices
-/// the server turn "connected"; a failure here, rejection included, is only
-/// logged, and the server simply stays disconnected for the user to retry.
+/// the server turn "connected".
+///
+/// That makes this task's error handling load-bearing, and the two arms below
+/// are NOT equivalent. `complete_mcp_connect` persists its own failure onto
+/// the server row (`AppInfo::oauth_connect_error`), so the `eprintln!` there
+/// is a developer convenience and the poll stops early with a real reason.
+/// The `state`-rejection arm has no such channel: it never reaches the
+/// daemon, so it is genuinely only logged and the card waits out its
+/// five-minute deadline before offering a retry. That is tolerable only
+/// because reaching it means a forged or mangled loopback request rather than
+/// a real redirect — do not copy the pattern to a failure a user can hit
+/// normally.
 async fn complete_local_mcp_callback(
     engine: &EngineClient,
     id: &str,

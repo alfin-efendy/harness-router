@@ -107,6 +107,30 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
 const MCP_SERVER_HEADERS_MIGRATION_SQL: &str =
     "ALTER TABLE mcp_servers ADD COLUMN headers_json TEXT;";
 
+/// v6 -> v7: the `token_endpoint` of the authorization server a
+/// `mcp_oauth_clients` row was registered with, recorded at
+/// `mcp_oauth::begin_mcp_connect` time when the RFC 8414 metadata is in hand.
+///
+/// This exists because `api::apps_api::require_registered_token_endpoint` has
+/// to decide whether a caller-supplied token endpoint belongs to an
+/// authorization server this host really discovered, and before this column
+/// there was nothing to compare against: the gate DERIVED candidate issuers
+/// from the endpoint URL's own path prefixes and looked those up. RFC 8414
+/// requires no relationship whatsoever between an issuer and where its
+/// `token_endpoint` lives, and Atlassian's hosted MCP endpoint is the
+/// counterexample — issuer `https://auth.atlassian.com/<resource-id>`,
+/// `token_endpoint` `https://auth.atlassian.com/oauth/token` at the bare
+/// origin. No derived candidate matched, so every completion was refused and
+/// the connect flow hung until its five-minute deadline.
+///
+/// Nullable, and left NULL on every pre-existing row: `begin_mcp_connect` now
+/// writes it on EVERY connect (reused client id included), so a row from
+/// before this migration backfills itself the next time the user presses
+/// Connect. A NULL row simply cannot authorize an exchange in the meantime,
+/// which is the safe direction to fail.
+const MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL: &str =
+    "ALTER TABLE mcp_oauth_clients ADD COLUMN token_endpoint TEXT;";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -115,6 +139,7 @@ fn migrations() -> Migrations<'static> {
         M::up(PLUGIN_ORIGIN_MIGRATION_SQL),
         M::up(MCP_OAUTH_MIGRATION_SQL),
         M::up(MCP_SERVER_HEADERS_MIGRATION_SQL),
+        M::up(MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL),
     ])
 }
 
@@ -779,9 +804,10 @@ impl Store {
         // (0 = fresh file, 1 = squashed baseline, 2 = + agent_tool_usage, 3 =
         // + plugin_oauth_profile_clients.client_secret_setting, 4 =
         // + automation_hooks/jobs/mcp_servers.plugin_id origin columns, 5 =
-        // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json.)
+        // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json,
+        // 7 = + mcp_oauth_clients.token_endpoint.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 6;
+        const LATEST_VERSION: i64 = 7;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -3489,24 +3515,35 @@ impl Store {
     }
 
     /// Registers (or reuses) the DCR client id for an authorization server,
-    /// keyed by `issuer`. Unlike [`Store::upsert_plugin_oauth_client`] there
-    /// is only one mutable column, so this is a plain upsert rather than a
-    /// per-column COALESCE merge; `created_at` is set once and preserved on
-    /// a later re-upsert.
+    /// keyed by `issuer`, together with the `token_endpoint` that
+    /// authorization server's RFC 8414 metadata advertised. Unlike
+    /// [`Store::upsert_plugin_oauth_client`] both mutable columns are always
+    /// supplied, so this is a plain upsert rather than a per-column COALESCE
+    /// merge; `created_at` is set once and preserved on a later re-upsert.
+    ///
+    /// `token_endpoint` is not decoration and must be the endpoint of the
+    /// SAME metadata document `client_id` was registered against — it is what
+    /// `api::apps_api::require_registered_token_endpoint` compares a
+    /// caller-supplied endpoint to before the daemon POSTs an authorization
+    /// code to it. Writing an endpoint here that this host did not discover
+    /// widens that gate.
     pub async fn upsert_mcp_oauth_client(
         &self,
         issuer: &str,
         client_id: &str,
+        token_endpoint: &str,
     ) -> anyhow::Result<()> {
         let issuer = issuer.to_string();
         let client_id = client_id.to_string();
+        let token_endpoint = token_endpoint.to_string();
         let created_at = now_ms();
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(issuer) DO UPDATE SET client_id=excluded.client_id",
-                params![issuer, client_id, created_at],
+                "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at, token_endpoint) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(issuer) DO UPDATE SET \
+                    client_id=excluded.client_id, token_endpoint=excluded.token_endpoint",
+                params![issuer, client_id, created_at, token_endpoint],
             )
             .map(|_| ())
         })
@@ -3522,6 +3559,35 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()
+        })
+        .await
+    }
+
+    /// Every client id registered against an authorization server whose
+    /// metadata named EXACTLY this `token_endpoint`. The lookup runs on the
+    /// endpoint rather than on the issuer because an issuer cannot be
+    /// recovered from an endpoint URL — RFC 8414 does not require a
+    /// `token_endpoint` to live under its issuer's path, and Atlassian's does
+    /// not (see `MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL`).
+    ///
+    /// A `Vec`, not an `Option`: several path-scoped issuers at one provider
+    /// legitimately share a single token endpoint while each holding its OWN
+    /// registered client (Atlassian mints a per-resource issuer with its own
+    /// `dcr/register`, all pointing at `https://auth.atlassian.com/oauth/token`).
+    /// Returning only one would refuse every connect but the first server's.
+    /// Rows written before the `token_endpoint` column existed hold NULL and
+    /// match nothing, which is the safe direction.
+    pub async fn mcp_oauth_client_ids_for_token_endpoint(
+        &self,
+        token_endpoint: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let token_endpoint = token_endpoint.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT client_id FROM mcp_oauth_clients WHERE token_endpoint=?1 ORDER BY issuer",
+            )?;
+            let rows = stmt.query_map(params![token_endpoint], |r| r.get::<_, String>(0))?;
+            rows.collect()
         })
         .await
     }
@@ -8472,7 +8538,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         store
-            .upsert_mcp_oauth_client("https://as.example", "client-1")
+            .upsert_mcp_oauth_client("https://as.example", "client-1", "https://as.example/token")
             .await
             .unwrap();
 
@@ -8510,7 +8576,11 @@ mod tests {
         // while preserving the original created_at — the upsert deliberately
         // excludes created_at from its ON CONFLICT ... DO UPDATE SET.
         store
-            .upsert_mcp_oauth_client("https://as.example", "client-2")
+            .upsert_mcp_oauth_client(
+                "https://as.example",
+                "client-2",
+                "https://as.example/oauth2/token",
+            )
             .await
             .unwrap();
 
@@ -8527,6 +8597,88 @@ mod tests {
             raw_mcp_oauth_client_created_at(&store, "https://as.example").await,
             sentinel_created_at,
             "created_at must be preserved across a re-upsert, not reset to now"
+        );
+        // The token endpoint moves with the client id: an authorization
+        // server that relocates its endpoint would otherwise leave the row
+        // pointing at the old one, and `require_registered_token_endpoint`
+        // compares against exactly this value.
+        assert_eq!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://as.example/oauth2/token")
+                .await
+                .unwrap(),
+            vec!["client-2".to_string()],
+            "a re-upsert must move the row to the token endpoint it was given"
+        );
+        assert!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://as.example/token")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the superseded token endpoint must no longer authorize anything"
+        );
+    }
+
+    /// PROPERTY: the token-endpoint lookup returns EVERY issuer's client at
+    /// that endpoint, matches on the exact string, and never matches a row
+    /// that predates the column (NULL). One provider legitimately hosts many
+    /// path-scoped issuers behind a single `token_endpoint`
+    /// (`https://auth.atlassian.com/oauth/token`), each with its own DCR
+    /// client — see `api::apps_api::require_registered_token_endpoint`.
+    ///
+    /// Verified by observed failure: dropping the `WHERE token_endpoint=?1`
+    /// clause turns the "unrelated endpoint" assertion red; keeping the query
+    /// but returning only the first row turns the two-client assertion red.
+    #[tokio::test]
+    async fn client_ids_for_a_token_endpoint_cover_every_issuer_sharing_it() {
+        const SHARED: &str = "https://auth.example/oauth/token";
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_mcp_oauth_client("https://auth.example/aaa", "client-a", SHARED)
+            .await
+            .unwrap();
+        store
+            .upsert_mcp_oauth_client("https://auth.example/bbb", "client-b", SHARED)
+            .await
+            .unwrap();
+        // A row from before the column existed: NULL token endpoint.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at) \
+                     VALUES ('https://legacy.example', 'legacy-client', 1)",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint(SHARED)
+                .await
+                .unwrap(),
+            vec!["client-a".to_string(), "client-b".to_string()],
+            "both issuers behind one token endpoint must be returned"
+        );
+        assert!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://auth.example/oauth/token/other")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the match is on the whole endpoint, never on a prefix of it"
+        );
+        assert!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://legacy.example/token")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a NULL token_endpoint must match nothing at all"
         );
     }
 
@@ -10355,12 +10507,17 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 6 database (v1 squashed baseline + v2
+    // produce a `user_version` 7 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
     // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
-    // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json)
+    // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json + v7
+    // mcp_oauth_clients.token_endpoint)
     // whose schema + seeded rows exactly match the golden fixture.
+    //
+    // The fixture is also what proves a FRESH database and an UPGRADED one
+    // converge: every migration runs in order on a fresh file too, so a
+    // column added by ALTER TABLE has to land in the same shape either way.
     //
     // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
     // version, messages_fts_data blocks), which are artifacts of the bundled
@@ -10373,8 +10530,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 6,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers migrations must be user_version 6"
+            user_version, 7,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint migrations must be user_version 7"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

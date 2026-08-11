@@ -50,6 +50,7 @@ const slackApp: AppInfo = {
   oauthConnectAvailable: false,
   oauthTokenStored: false,
   oauthReconnectRequired: false,
+  oauthConnectError: null,
   tools: [{ name: "channels_list", desc: "List channels the bot can see", perm: "ask" }],
   agentAccess: [],
   pluginId: null,
@@ -335,6 +336,41 @@ test("the connect poll picks up a completed connection and reports success", asy
   await screen.findByText(/Waiting for you to finish signing in in the browser/);
   await waitFor(() => expect(screen.getByText("OAuth connected")).toBeTruthy(), { timeout: 12_000 });
   expect(screen.queryByText(/Waiting for you to finish/)).toBeNull();
+  listApps.mockImplementation(async () => ({ status: "ok" as const, data: appsFixture }));
+}, 15_000);
+
+// PROPERTY: a connect the daemon refused stops the poll and says WHY,
+// instead of waiting out the five-minute deadline and blaming an expired
+// link.
+//
+// This is the user-visible half of the path-scoped-issuer bug. The token
+// exchange runs in Cockpit's own background Rust task, which discards the
+// RPC error (`apps_cmd.rs`'s `complete_local_mcp_callback` only
+// `eprintln!`s it), so the daemon's persisted `oauthConnectError` on the
+// server row is the only channel that reaches this view at all.
+//
+// Verified by observed failure: reverting the `fresh?.oauthConnectError`
+// early-return in `startConnect` leaves "Waiting for you to finish signing
+// in…" on screen and the `findByText` times out.
+test("a refused connect stops the poll and shows the daemon's reason instead of waiting out the deadline", async () => {
+  appsFixture = [remoteApp];
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+  const reason = "the OAuth token endpoint does not belong to an authorization server this server has a registered client for";
+  listApps.mockImplementation(async () => ({
+    status: "ok" as const,
+    data: [{ ...remoteApp, oauthConnectError: reason }],
+  }));
+
+  render(<AppDetailView id="remote" />);
+  await screen.findByText("Remote MCP");
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  await screen.findByText(/Waiting for you to finish signing in in the browser/);
+
+  expect(await screen.findByText(new RegExp(`Sign-in failed: ${reason}`), {}, { timeout: 12_000 })).toBeTruthy();
+  expect(screen.queryByText(/Waiting for you to finish/)).toBeNull();
+  expect(screen.queryByText(/The sign-in link expired/)).toBeNull();
+  expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
   listApps.mockImplementation(async () => ({ status: "ok" as const, data: appsFixture }));
 }, 15_000);
 

@@ -1485,7 +1485,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .upsert_mcp_oauth_client(&fixture.as_url, "client-1")
+            .upsert_mcp_oauth_client(
+                &fixture.as_url,
+                "client-1",
+                &format!("{}/token", fixture.as_url),
+            )
             .await
             .unwrap();
         let target_spec = spec(&fixture.mcp_url);
@@ -1546,7 +1550,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .upsert_mcp_oauth_client(&fixture.as_url, "client-1")
+            .upsert_mcp_oauth_client(
+                &fixture.as_url,
+                "client-1",
+                &format!("{}/token", fixture.as_url),
+            )
             .await
             .unwrap();
         let target_spec = spec(&fixture.mcp_url);
@@ -1610,7 +1618,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .upsert_mcp_oauth_client(&fixture.as_url, "client-1")
+            .upsert_mcp_oauth_client(
+                &fixture.as_url,
+                "client-1",
+                &format!("{}/token", fixture.as_url),
+            )
             .await
             .unwrap();
 

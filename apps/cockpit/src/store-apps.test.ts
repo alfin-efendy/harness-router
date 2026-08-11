@@ -27,6 +27,7 @@ function makeApp(overrides: Partial<AppInfo> = {}): AppInfo {
     oauthConnectAvailable: false,
     oauthTokenStored: false,
     oauthReconnectRequired: false,
+    oauthConnectError: null,
     tools: [],
     agentAccess: [{ agentId: "native", allowed: true }],
     pluginId: null,

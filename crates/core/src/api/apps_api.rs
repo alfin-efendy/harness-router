@@ -159,7 +159,7 @@ fn require_https(url: &str) -> Result<(), ApiError> {
 /// `automation::validate_webhook_url` already makes for outbound HTTP in this
 /// crate. Only literal loopback IPs and `localhost` qualify; unlike
 /// `automation`'s check this does not re-resolve `localhost` to confirm it
-/// lands on a loopback address, because the registered-issuer gate in
+/// lands on a loopback address, because the registered-endpoint gate in
 /// [`require_registered_token_endpoint`] — not this one — is what actually
 /// decides whether an endpoint may be POSTed to.
 fn is_loopback_url(url: &url::Url) -> bool {
@@ -169,27 +169,6 @@ fn is_loopback_url(url: &url::Url) -> bool {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         None => false,
     }
-}
-
-/// Every URL prefix of `endpoint` that could be its authorization server's
-/// `issuer`, shortest first: the bare origin, then each successive path
-/// segment. RFC 8414 §3 derives an authorization server's metadata URL from
-/// its issuer, and an issuer may carry a path (multi-tenant deployments do),
-/// so a token endpoint like `https://as.example/tenant1/oauth/token` can
-/// legitimately belong to issuer `https://as.example` OR
-/// `https://as.example/tenant1` — both have to be considered. Shortest-first
-/// only fixes the probe order; [`require_registered_token_endpoint`] accepts
-/// on the first candidate whose registered client id MATCHES, so a longer
-/// tenant-scoped issuer is still reachable when a bare-origin row also exists.
-fn issuer_candidates(endpoint: &url::Url) -> Vec<String> {
-    let mut acc = endpoint.origin().ascii_serialization();
-    let mut out = vec![acc.clone()];
-    for segment in endpoint.path().split('/').filter(|s| !s.is_empty()) {
-        acc.push('/');
-        acc.push_str(segment);
-        out.push(acc.clone());
-    }
-    out
 }
 
 /// Gate an `issuer_token_endpoint` before the daemon POSTs an authorization
@@ -206,13 +185,28 @@ fn issuer_candidates(endpoint: &url::Url) -> Vec<String> {
 ///
 /// 1. Transport — `https://`, per [`require_https`], with the loopback
 ///    carve-out [`is_loopback_url`] documents.
-/// 2. Binding — the endpoint must sit under an issuer that ALREADY has a
-///    client row in `mcp_oauth_clients`, and `client_id` must be exactly that
-///    row's client id. Only `mcp_oauth::begin_mcp_connect` writes those rows,
-///    and only for an authorization server it reached through the MCP server's
-///    own RFC 9728 metadata — so this is what ties the endpoint back to a real
-///    discovery run instead of to the caller's say-so. This is the gate doing
-///    the real work; the transport one is hygiene.
+/// 2. Binding — the endpoint must EQUAL the `token_endpoint` recorded on some
+///    `mcp_oauth_clients` row, and `client_id` must be that row's client id.
+///    Only `mcp_oauth::begin_mcp_connect` writes those rows, and only from the
+///    RFC 8414 metadata of an authorization server it reached through the MCP
+///    server's own RFC 9728 document — so this is what ties the endpoint back
+///    to a real discovery run instead of to the caller's say-so. This is the
+///    gate doing the real work; the transport one is hygiene.
+///
+/// The binding used to be checked by DERIVING candidate issuers from the
+/// endpoint URL's own path prefixes (bare origin, then each segment) and
+/// looking those up. That silently assumed a `token_endpoint` lives under its
+/// issuer's path. RFC 8414 requires no such thing, and Atlassian's hosted MCP
+/// endpoint is the live counterexample: issuer
+/// `https://auth.atlassian.com/<resource-id>`, `token_endpoint`
+/// `https://auth.atlassian.com/oauth/token` at the bare origin. No derived
+/// candidate could match the registered row, so every completion was refused
+/// and the browser flow hung to its five-minute deadline. Comparing against
+/// the endpoint the flow actually recorded is both correct for a path-scoped
+/// issuer and STRICTER than what it replaces: a caller can no longer name any
+/// endpoint that merely shares a prefix with a registered issuer
+/// (`https://as.example/tenant1/../../anything` no longer being the point —
+/// `https://as.example/token` used to pass on a bare-origin row alone).
 async fn require_registered_token_endpoint(
     store: &crate::store::Store,
     issuer_token_endpoint: &str,
@@ -227,25 +221,23 @@ async fn require_registered_token_endpoint(
         require_https(issuer_token_endpoint)
             .map_err(|_| ApiError::bad_request("the OAuth token endpoint must use https://"))?;
     }
-    let mut saw_registered_issuer = false;
-    for candidate in issuer_candidates(&parsed) {
-        // A PRM's `authorization_servers` entry is stored verbatim, so an
-        // issuer published with a trailing slash is keyed with one.
-        for key in [format!("{candidate}/"), candidate] {
-            if let Some(registered) = store.get_mcp_oauth_client(&key).await? {
-                if registered == client_id {
-                    return Ok(());
-                }
-                saw_registered_issuer = true;
-            }
-        }
+    let registered = store
+        .mcp_oauth_client_ids_for_token_endpoint(issuer_token_endpoint)
+        .await?;
+    if registered.is_empty() {
+        return Err(ApiError::bad_request(
+            "the OAuth token endpoint does not belong to an authorization server this \
+             server has a registered client for",
+        ));
     }
-    Err(ApiError::bad_request(if saw_registered_issuer {
-        "the supplied client_id is not the one registered with that authorization server"
-    } else {
-        "the OAuth token endpoint does not belong to an authorization server this \
-         server has a registered client for"
-    }))
+    // Any match, not the first row's: several path-scoped issuers at one
+    // provider share a token endpoint while each holds its own client id.
+    if registered.iter().any(|registered| registered == client_id) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "the supplied client_id is not the one registered with that authorization server",
+    ))
 }
 
 /// Validate a captured MCP OAuth loopback callback against the `state` this
@@ -389,6 +381,38 @@ async fn http_session_spec(
     }
 }
 
+/// The settings key holding the last OAuth connect failure for a server, in
+/// the same `<namespace>.<id>.<field>` shape
+/// `crate::plugins::qualified_setting_key` uses for a plugin's own settings.
+/// A settings row rather than a column on `mcp_servers`: `status`/
+/// `status_detail` there describe the last PROBE and are overwritten by the
+/// re-probe that every connect attempt ends with, which would erase this the
+/// moment it was written.
+fn connect_error_key(server_id: &str) -> String {
+    format!("mcp.{server_id}.connect_error")
+}
+
+/// Record why a connect attempt failed, so `assemble` can hand it to the card
+/// that is polling. Best-effort by construction: this runs on an error path
+/// that is already being returned to the caller, and losing the annotation
+/// must never replace that error with a storage one.
+async fn note_connect_failure(cp: &ControlPlane, server_id: &str, reason: &str) {
+    if let Err(e) = cp
+        .store()
+        .set_setting_raw(&connect_error_key(server_id), reason)
+        .await
+    {
+        tracing::warn!("apps: could not record the connect failure for {server_id}: {e:#}");
+    }
+}
+
+async fn clear_connect_failure(cp: &ControlPlane, server_id: &str) -> Result<(), ApiError> {
+    cp.store()
+        .delete_setting_raw(&connect_error_key(server_id))
+        .await?;
+    Ok(())
+}
+
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
     let mut out = Vec::new();
     // Fetched once, not per row — see `http_session_spec`.
@@ -432,6 +456,10 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
         } else {
             false
         };
+        let oauth_connect_error = cp
+            .store()
+            .get_setting_raw(&connect_error_key(&row.id))
+            .await?;
         out.push(AppInfo {
             initial: initial_of(&row.name),
             id: row.id,
@@ -454,6 +482,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
             oauth_connect_available,
             oauth_token_stored,
             oauth_reconnect_required,
+            oauth_connect_error,
             tools,
             agent_access,
             plugin_id: row.plugin_id,
@@ -646,6 +675,9 @@ async fn begin_mcp_connect(state: &ApiState, id: &str) -> Result<McpConnectStart
         .clone()
         .ok_or_else(|| ApiError::bad_request(format!("{id} has no URL configured")))?;
     require_https(&url)?;
+    // A new attempt starts clean — otherwise the card would render the
+    // previous attempt's failure over a flow that is only just beginning.
+    clear_connect_failure(cp, id).await?;
     let spec = McpServerSpec {
         name: row.id.clone(),
         transport: McpTransport::Http {
@@ -710,11 +742,27 @@ async fn complete_mcp_connect(
         .clone()
         .ok_or_else(|| ApiError::bad_request(format!("{id} has no URL configured")))?;
     // Before anything leaves the machine: the caller named this endpoint.
-    require_registered_token_endpoint(cp.store(), issuer_token_endpoint, client_id).await?;
+    //
+    // Every failure below is annotated onto the server row before it is
+    // returned. The sole production caller is a spawned Cockpit task that
+    // discards this Result (`complete_local_mcp_callback`), so the returned
+    // error reaches no user on its own — see `AppInfo::oauth_connect_error`.
+    if let Err(e) = require_registered_token_endpoint(cp.store(), issuer_token_endpoint, client_id)
+        .await
+        .map_err(|e| {
+            // The endpoint is named because a refusal here is nearly always a
+            // discovery/registration mismatch, and without it the message is
+            // unactionable.
+            ApiError::bad_request(format!("{}: {issuer_token_endpoint}", e.message))
+        })
+    {
+        note_connect_failure(cp, id, &e.message).await;
+        return Err(e);
+    }
     // Hardened, not bare — the token exchange POSTs `code`/`code_verifier` in a
     // form body, which redirect header-stripping cannot protect at all.
     let http = crate::harness::native::mcp_http::hardened_http_client()?;
-    crate::harness::native::mcp_oauth::complete_mcp_connect(
+    if let Err(e) = crate::harness::native::mcp_oauth::complete_mcp_connect(
         cp.store(),
         &http,
         id,
@@ -724,7 +772,14 @@ async fn complete_mcp_connect(
         code,
         verifier,
     )
-    .await?;
+    .await
+    {
+        // `{e:#}` — the whole chain. The outer layer here is usually just
+        // "token exchange failed", with the HTTP status underneath it.
+        note_connect_failure(cp, id, &format!("{e:#}")).await;
+        return Err(e.into());
+    }
+    clear_connect_failure(cp, id).await?;
     // Re-probe with the token that was just stored, before returning the list
     // this RPC's caller renders. Without it a successful connect left the card
     // showing whatever the last (unauthenticated, therefore failed) probe
@@ -744,6 +799,9 @@ async fn complete_mcp_connect(
 async fn disconnect_mcp(state: &ApiState, id: &str) -> Result<Vec<AppInfo>, ApiError> {
     let cp = &state.cp;
     cp.store().delete_mcp_oauth_token(id).await?;
+    // A deliberate disconnect ends whatever the last attempt's failure was
+    // saying, so it must not survive to caption the "Not connected" state.
+    clear_connect_failure(cp, id).await?;
     Ok(assemble(cp).await?)
 }
 
@@ -1059,7 +1117,7 @@ mod tests {
         let s = state().await;
         let store = s.cp.store();
         store
-            .upsert_mcp_oauth_client("http://attacker.test", "c")
+            .upsert_mcp_oauth_client("http://attacker.test", "c", "http://attacker.test/token")
             .await
             .unwrap();
         let err = require_registered_token_endpoint(store, "http://attacker.test/token", "c")
@@ -1076,7 +1134,7 @@ mod tests {
         // Loopback is the documented carve-out (and what every mock
         // authorization server in this crate binds).
         store
-            .upsert_mcp_oauth_client("http://127.0.0.1:9", "c")
+            .upsert_mcp_oauth_client("http://127.0.0.1:9", "c", "http://127.0.0.1:9/token")
             .await
             .unwrap();
         require_registered_token_endpoint(store, "http://127.0.0.1:9/token", "c")
@@ -1093,7 +1151,11 @@ mod tests {
         let s = state().await;
         let store = s.cp.store();
         store
-            .upsert_mcp_oauth_client("https://as.example", "registered-client")
+            .upsert_mcp_oauth_client(
+                "https://as.example",
+                "registered-client",
+                "https://as.example/token",
+            )
             .await
             .unwrap();
 
@@ -1126,47 +1188,140 @@ mod tests {
             .expect("the real pairing must still be accepted");
     }
 
-    /// A tenant-scoped issuer (a path, not just an origin) and an issuer
-    /// published with a trailing slash both still resolve — the candidate walk
-    /// exists so this gate rejects attackers, not multi-tenant authorization
-    /// servers.
+    /// PROPERTY (the regression this gate shipped with): a `token_endpoint`
+    /// that does NOT live under its issuer's path must still complete.
+    ///
+    /// These are Atlassian's real, live values. Its protected-resource
+    /// metadata for `https://mcp.atlassian.com/v1/mcp` names authorization
+    /// server `https://auth.atlassian.com/<resource-id>` — an issuer with a
+    /// PATH — and that issuer's RFC 8414 document puts `token_endpoint` at
+    /// `https://auth.atlassian.com/oauth/token`, on the bare origin. RFC 8414
+    /// nowhere requires the endpoint to sit under the issuer, so the earlier
+    /// gate — which derived candidate issuers from the endpoint's own path
+    /// prefixes (`https://auth.atlassian.com`, `…/oauth`, `…/oauth/token`)
+    /// and looked each up — could never match the row DCR had written under
+    /// the resource-scoped issuer. Every completion was refused, and because
+    /// the caller is a background task that discards the error, the card sat
+    /// on "Waiting for you to finish signing in…" until its deadline.
+    ///
+    /// Verified by observed failure: this test was written FIRST and run
+    /// against the prefix-matching gate, where it failed with "the OAuth
+    /// token endpoint does not belong to an authorization server this server
+    /// has a registered client for".
     #[tokio::test]
-    async fn issuer_lookup_handles_a_path_scoped_issuer_and_a_trailing_slash() {
+    async fn a_token_endpoint_outside_its_issuers_path_is_accepted() {
+        const ISSUER: &str = "https://auth.atlassian.com/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3";
+        const TOKEN_ENDPOINT: &str = "https://auth.atlassian.com/oauth/token";
         let s = state().await;
         let store = s.cp.store();
         store
-            .upsert_mcp_oauth_client("https://as.example/tenant1", "tenant1-client")
-            .await
-            .unwrap();
-        store
-            .upsert_mcp_oauth_client("https://slash.example/", "slash-client")
+            .upsert_mcp_oauth_client(ISSUER, "atlassian-client", TOKEN_ENDPOINT)
             .await
             .unwrap();
 
-        require_registered_token_endpoint(
-            store,
-            "https://as.example/tenant1/oauth/token",
-            "tenant1-client",
-        )
-        .await
-        .expect("a path-scoped issuer must resolve from its token endpoint");
-        require_registered_token_endpoint(store, "https://slash.example/token", "slash-client")
+        require_registered_token_endpoint(store, TOKEN_ENDPOINT, "atlassian-client")
             .await
-            .expect("an issuer stored with a trailing slash must resolve too");
+            .expect("the endpoint this flow recorded must be accepted for its own client");
+    }
 
-        // A bare-origin row for a DIFFERENT client must not shadow the
-        // tenant-scoped one that actually matches.
+    /// PROPERTY: one provider's several path-scoped issuers share a token
+    /// endpoint while each holds its OWN registered client — Atlassian mints a
+    /// per-resource issuer with its own `dcr/register` — so the lookup must
+    /// consider every row at that endpoint, not just one.
+    ///
+    /// Verified by observed failure: narrowing
+    /// `mcp_oauth_client_ids_for_token_endpoint` to `LIMIT 1` turns the second
+    /// assertion red (the second server's client id never being the row the
+    /// query happens to return first).
+    #[tokio::test]
+    async fn two_issuers_sharing_a_token_endpoint_each_authorize_their_own_client() {
+        const TOKEN_ENDPOINT: &str = "https://auth.atlassian.com/oauth/token";
+        let s = state().await;
+        let store = s.cp.store();
         store
-            .upsert_mcp_oauth_client("https://as.example", "other-client")
+            .upsert_mcp_oauth_client("https://auth.atlassian.com/aaa", "client-a", TOKEN_ENDPOINT)
             .await
             .unwrap();
-        require_registered_token_endpoint(
+        store
+            .upsert_mcp_oauth_client("https://auth.atlassian.com/bbb", "client-b", TOKEN_ENDPOINT)
+            .await
+            .unwrap();
+
+        require_registered_token_endpoint(store, TOKEN_ENDPOINT, "client-a")
+            .await
+            .expect("the first issuer's client must be accepted");
+        require_registered_token_endpoint(store, TOKEN_ENDPOINT, "client-b")
+            .await
+            .expect("the second issuer's client must be accepted at the shared endpoint");
+        require_registered_token_endpoint(store, TOKEN_ENDPOINT, "client-c")
+            .await
+            .expect_err("a client id registered at neither issuer must still be refused");
+    }
+
+    /// PROPERTY: binding to the RECORDED endpoint is strictly stronger than
+    /// the prefix matching it replaces. Under the old rule a registered
+    /// bare-origin issuer authorized ANY path at that origin, so a caller
+    /// could name an endpoint the flow never discovered and have the daemon
+    /// POST `code` + `code_verifier` to it. It must now be refused.
+    ///
+    /// Verified by observed failure: this passes trivially under the new gate,
+    /// and fails under the old one — `issuer_candidates` yields the bare
+    /// origin for `https://as.example/not-the-token-endpoint`, whose row
+    /// matches, so the old gate returned `Ok`.
+    #[tokio::test]
+    async fn an_endpoint_that_only_shares_a_prefix_with_a_registered_issuer_is_refused() {
+        let s = state().await;
+        let store = s.cp.store();
+        store
+            .upsert_mcp_oauth_client(
+                "https://as.example",
+                "registered-client",
+                "https://as.example/oauth/token",
+            )
+            .await
+            .unwrap();
+
+        let err = require_registered_token_endpoint(
             store,
-            "https://as.example/tenant1/oauth/token",
-            "tenant1-client",
+            "https://as.example/not-the-token-endpoint",
+            "registered-client",
         )
         .await
-        .expect("a shorter non-matching row must not shadow a longer matching one");
+        .expect_err("only the endpoint the flow recorded may be POSTed to");
+        assert!(err.message.contains("does not belong"), "{}", err.message);
+
+        require_registered_token_endpoint(
+            store,
+            "https://as.example/oauth/token",
+            "registered-client",
+        )
+        .await
+        .expect("the recorded endpoint itself stays usable");
+    }
+
+    /// A row written before the `token_endpoint` column existed (NULL) must
+    /// authorize nothing — failing closed rather than matching every endpoint
+    /// SQL's NULL comparison would otherwise leave undecided. `begin_mcp_connect`
+    /// re-upserts on every connect, so such a row backfills on the next attempt.
+    #[tokio::test]
+    async fn a_client_row_predating_the_token_endpoint_column_authorizes_nothing() {
+        let s = state().await;
+        let store = s.cp.store();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at) \
+                     VALUES ('https://legacy.example', 'legacy-client', 1)",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        require_registered_token_endpoint(store, "https://legacy.example/token", "legacy-client")
+            .await
+            .expect_err("a row with no recorded token endpoint must authorize nothing");
     }
 
     #[tokio::test]
@@ -1439,7 +1594,11 @@ mod tests {
             .await
             .unwrap();
         s.cp.store()
-            .upsert_mcp_oauth_client(&as2_url, "as2-preexisting-client")
+            .upsert_mcp_oauth_client(
+                &as2_url,
+                "as2-preexisting-client",
+                &format!("{as2_url}/token"),
+            )
             .await
             .unwrap();
 
@@ -1794,6 +1953,9 @@ mod tests {
                 .await
                 .expect("the 401 + PRM + AS-metadata + DCR chain must resolve");
 
+        // A previous attempt's failure, left over for this one to clear.
+        note_connect_failure(&s.cp, "remote", "a stale failure from a previous attempt").await;
+
         let out = dispatch(
             &s,
             "complete_mcp_connect",
@@ -1826,6 +1988,70 @@ mod tests {
             "and the tools the now-authenticated handshake found must be there, so the Tools tab \
              appears without the user hunting for the Probe button"
         );
+        assert_eq!(
+            apps[0].oauth_connect_error, None,
+            "a completed connect must clear the previous attempt's failure, not leave the card \
+             captioned with it"
+        );
+    }
+
+    /// PROPERTY: a refused completion says WHY, on the server row the card is
+    /// polling.
+    ///
+    /// The token exchange runs in a spawned Cockpit task that throws this
+    /// handler's `Result` away — `complete_local_mcp_callback` only
+    /// `eprintln!`s it, and `tracing` has no subscriber anywhere in this
+    /// workspace, so neither reaches a user. The card polls `list_apps` for
+    /// five minutes and then reports that the sign-in link expired. That is
+    /// how a gate refusal in the first second (the whole
+    /// path-scoped-issuer bug) presented as a hang: the failure was known
+    /// immediately and stored nowhere.
+    ///
+    /// Verified by observed failure: removing the `note_connect_failure` call
+    /// from `complete_mcp_connect`'s gate arm leaves `oauth_connect_error`
+    /// `None` and turns the second assertion red — the RPC still returns its
+    /// error either way, which is exactly the signal nobody was reading.
+    #[tokio::test]
+    async fn a_refused_completion_is_recorded_on_the_row_the_card_polls() {
+        let s = state().await;
+        mcp::upsert_server(s.cp.store(), http_row("remote", "https://mcp.example.com"))
+            .await
+            .unwrap();
+
+        let err = dispatch(
+            &s,
+            "complete_mcp_connect",
+            json!({
+                "id": "remote",
+                "code": "the-code",
+                "verifier": "the-verifier",
+                "issuer_token_endpoint": "https://auth.atlassian.com/oauth/token",
+                "client_id": "some-client",
+            }),
+        )
+        .await
+        .expect_err("no client row is registered, so the exchange must be refused");
+        assert_eq!(err.status, 400);
+
+        let out = dispatch(&s, "list_apps", json!({})).await.unwrap();
+        let apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+        let reason = apps[0]
+            .oauth_connect_error
+            .as_deref()
+            .expect("the refusal must be readable from the list the card polls");
+        assert!(reason.contains("does not belong"), "{reason}");
+        assert!(
+            reason.contains("https://auth.atlassian.com/oauth/token"),
+            "the message must name the endpoint that was refused, or it is unactionable: {reason}"
+        );
+
+        // Disconnect ends the attempt, so the reason must not outlive it.
+        dispatch(&s, "disconnect_mcp", json!({ "id": "remote" }))
+            .await
+            .unwrap();
+        let out = dispatch(&s, "list_apps", json!({})).await.unwrap();
+        let apps: Vec<AppInfo> = serde_json::from_value(out).unwrap();
+        assert_eq!(apps[0].oauth_connect_error, None);
     }
 
     // ---------- the OAuth affordance must not lie about who owns the credential ----------
