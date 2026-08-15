@@ -657,20 +657,24 @@ impl ComponentRuntime {
     ) -> Result<(), PluginRuntimeError> {
         let module = wasmtime::Module::new(&self.engine, wat)
             .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
-        let mut store = Store::new(&self.engine, ());
+        let mut store = Store::new(
+            &self.engine,
+            PluginResourceLimiter::new(&ResourceLimits::default()),
+        );
+        store.limiter(|state| state as &mut dyn wasmtime::ResourceLimiter);
         store
             .set_fuel(fuel)
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
         store.set_epoch_deadline(1);
-        let linker = wasmtime::Linker::<()>::new(&self.engine);
+        let linker = wasmtime::Linker::<PluginResourceLimiter>::new(&self.engine);
         linker
             .instantiate(&mut store, &module)
             .map(|_| ())
             .map_err(|error| match error.downcast_ref::<wasmtime::Trap>() {
                 Some(wasmtime::Trap::OutOfFuel) => {
-                    PluginRuntimeError::FuelExhausted(error.to_string())
+                    PluginRuntimeError::FuelExhausted(format!("{error:#}"))
                 }
-                _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
+                _ => PluginRuntimeError::InstantiationFailed(format!("{error:#}")),
             })
     }
 }
@@ -681,9 +685,13 @@ impl ComponentRuntime {
 /// as [`PluginRuntimeError::TimeoutExceeded`] before it is ever surfaced)
 /// becomes [`PluginRuntimeError::InstantiationFailed`].
 fn map_component_error(error: wasmtime::Error) -> PluginRuntimeError {
+    // `{error:#}` (the alternate Display) renders the WHOLE cause chain,
+    // colon-separated. Plain `to_string()` shows only the outermost context,
+    // which drops host-authored messages raised deep inside a callback — such
+    // as `PluginResourceLimiter`'s memory/table refusals.
     match error.downcast_ref::<wasmtime::Trap>() {
-        Some(wasmtime::Trap::OutOfFuel) => PluginRuntimeError::FuelExhausted(error.to_string()),
-        _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
+        Some(wasmtime::Trap::OutOfFuel) => PluginRuntimeError::FuelExhausted(format!("{error:#}")),
+        _ => PluginRuntimeError::InstantiationFailed(format!("{error:#}")),
     }
 }
 
@@ -783,6 +791,7 @@ impl CompiledComponent {
         let component = self.component.clone();
         let fuel = self.policy.limits.fuel;
         let timeout = self.policy.limits.timeout;
+        let limiter = PluginResourceLimiter::new(&self.policy.limits);
         let allow_network = self.policy.allow_network;
         let allow_settings = self.policy.allow_settings;
         let allow_storage = self.policy.allow_storage;
@@ -822,8 +831,13 @@ impl CompiledComponent {
                 wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
                 wasi_table: wasmtime::component::ResourceTable::new(),
                 ws: WsRegistry::new(),
+                limits: limiter,
             };
             let mut store = Store::new(&engine, state);
+            // Bound ALLOCATION. `set_fuel` below bounds instructions and
+            // `set_epoch_deadline` bounds wall clock; neither stops a guest
+            // from growing linear memory until the daemon is OOM-killed.
+            store.limiter(|state| &mut state.limits);
             store
                 .set_fuel(fuel)
                 .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
@@ -1102,6 +1116,11 @@ pub(crate) struct CapabilityState {
     /// aborts each reader task and closes each socket — see
     /// `capabilities::websocket`.
     ws: WsRegistry,
+    /// This instance's allocation budget, applied to the `Store` via
+    /// `Store::limiter` in `CompiledComponent::instantiate`. It must live
+    /// inside the store's data `T`, which is why it is a field here rather
+    /// than a local.
+    limits: PluginResourceLimiter,
 }
 
 impl wasmtime_wasi::WasiView for CapabilityState {
