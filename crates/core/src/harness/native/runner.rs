@@ -6164,7 +6164,7 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
             .await
             .unwrap();
         run_turn(
@@ -6259,7 +6259,7 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
             .await
             .unwrap();
         let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10374,7 +10374,7 @@ mod tests {
 
         let llm = Arc::new(V2RecordingLlm::new(vec![]));
         let mut deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
             .await
             .unwrap();
         enable_v2(&mut deps);
@@ -13439,7 +13439,7 @@ mod tests {
         ];
         let llm = Arc::new(V2RecordingLlm::new(vec![tool_turn]));
         let mut deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
             .await
             .unwrap();
         enable_v2(&mut deps);

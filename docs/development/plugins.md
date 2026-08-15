@@ -703,6 +703,15 @@ whose path differs from the project's `workdir`, and the Cockpit surface only
 knows the latter; content keying guarantees that the bytes the user reviewed
 are exactly the bytes that run, in either location.
 
+The acceptance is bound to the digest the user was **shown**, not to whatever
+is on disk when they click. `trust_worktree_hooks` takes the `digest` from the
+`WorktreeHookStatus` the client rendered, re-hashes the scripts, and records
+nothing unless the two still match — otherwise a `git pull`, a background sync
+or the agent's own file write landing while the modal was open would be trusted
+on the strength of a script list nobody read. A refusal comes back as the typed
+`{ outcome: "changed", status }` result carrying the NEW set, which Project
+settings renders in place of the old list with a prompt to review it again.
+
 ### Untrusted behaviour
 
 An untrusted set is discovered and listed in Project settings, but never

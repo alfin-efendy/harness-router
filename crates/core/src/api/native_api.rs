@@ -42,6 +42,18 @@ struct SessionPkP {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustWorktreeHooksP {
+    project_id: String,
+    /// The hook-set digest the client actually displayed to the user. The
+    /// acceptance is refused unless the scripts on disk still hash to it —
+    /// otherwise a `git pull` (or the agent's own write) landing while the
+    /// modal was open would get trusted on the strength of a script list the
+    /// user never saw.
+    digest: String,
+}
+
+#[derive(Deserialize)]
 struct SlashCatalogP {
     #[serde(default)]
     project_id: Option<String>,
@@ -114,10 +126,15 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             ok(worktree_hook_status(cp.store(), Path::new(&workdir)).await)
         }
         "trust_worktree_hooks" => {
-            let a: ProjectIdP = params(p)?;
+            let a: TrustWorktreeHooksP = params(p)?;
             let workdir = project_workdir(cp, &a.project_id).await?;
-            crate::harness::native::hooks::trust_hooks(cp.store(), Path::new(&workdir)).await?;
-            ok(worktree_hook_status(cp.store(), Path::new(&workdir)).await)
+            let outcome = crate::harness::native::hooks::trust_hooks(
+                cp.store(),
+                Path::new(&workdir),
+                &a.digest,
+            )
+            .await?;
+            ok(worktree_hook_trust_result(outcome))
         }
         "session_todos" => {
             let a: SessionPkP = params(p)?;
@@ -142,26 +159,41 @@ async fn project_workdir(cp: &ControlPlane, project_id: &str) -> Result<String, 
 
 /// Project the engine's `HookTrust` onto the Cockpit-facing DTO.
 async fn worktree_hook_status(store: &crate::store::Store, work_dir: &Path) -> WorktreeHookStatus {
-    match crate::harness::native::hooks::hook_trust(store, work_dir).await {
-        crate::harness::native::hooks::HookTrust::NoHooks => WorktreeHookStatus {
+    hook_status_dto(crate::harness::native::hooks::hook_trust(store, work_dir).await)
+}
+
+fn hook_status_dto(trust: crate::harness::native::hooks::HookTrust) -> WorktreeHookStatus {
+    use crate::harness::native::hooks::HookTrust;
+    match trust {
+        HookTrust::NoHooks => WorktreeHookStatus {
             scripts: Vec::new(),
             digest: None,
             trusted: false,
         },
-        crate::harness::native::hooks::HookTrust::Trusted { digest, scripts } => {
-            WorktreeHookStatus {
-                scripts,
-                digest: Some(digest),
-                trusted: true,
-            }
-        }
-        crate::harness::native::hooks::HookTrust::Untrusted { digest, scripts } => {
-            WorktreeHookStatus {
-                scripts,
-                digest: Some(digest),
-                trusted: false,
-            }
-        }
+        HookTrust::Trusted { digest, scripts } => WorktreeHookStatus {
+            scripts,
+            digest: Some(digest),
+            trusted: true,
+        },
+        HookTrust::Untrusted { digest, scripts } => WorktreeHookStatus {
+            scripts,
+            digest: Some(digest),
+            trusted: false,
+        },
+    }
+}
+
+/// Project the engine's `TrustOutcome` onto the Cockpit-facing DTO. A refused
+/// acceptance is a typed *success* payload rather than an RPC error: the client
+/// has to tell "the scripts changed under you, review again" apart from a
+/// transport failure, and it needs the new script list to show.
+fn worktree_hook_trust_result(
+    outcome: crate::harness::native::hooks::TrustOutcome,
+) -> WorktreeHookTrustResult {
+    use crate::harness::native::hooks::TrustOutcome;
+    match outcome {
+        TrustOutcome::Recorded(trust) => WorktreeHookTrustResult::Recorded(hook_status_dto(trust)),
+        TrustOutcome::Changed(trust) => WorktreeHookTrustResult::Changed(hook_status_dto(trust)),
     }
 }
 

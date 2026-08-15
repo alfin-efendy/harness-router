@@ -48,8 +48,13 @@ export function ProjectSettingsModal() {
 // is the only place that acceptance can be granted.
 function HookScripts({ projectId }: { projectId: string }) {
   const [status, setStatus] = useState<WorktreeHookStatus | null>(null);
+  // Set when the engine refused the last acceptance because the scripts on disk
+  // no longer matched the digest listed above — the list has been swapped for
+  // the new one and needs reviewing again.
+  const [changedUnderReview, setChangedUnderReview] = useState(false);
   useEffect(() => {
     let live = true;
+    setChangedUnderReview(false);
     void commands.worktreeHookStatus(LOCAL_RUNNER, projectId).then((res) => {
       // An RPC failure renders nothing rather than an alarming empty widget —
       // the engine still fails closed, so nothing runs either way.
@@ -60,11 +65,17 @@ function HookScripts({ projectId }: { projectId: string }) {
     };
   }, [projectId]);
 
-  if (!status || status.scripts.length === 0) return null;
+  const digest = status?.digest;
+  if (!status || !digest || status.scripts.length === 0) return null;
 
+  // The digest of the set rendered right now travels with the click, so the
+  // engine can refuse if a `git pull` or the agent's own write replaced these
+  // scripts while they were being read.
   const trust = async () => {
-    const res = await commands.trustWorktreeHooks(LOCAL_RUNNER, projectId);
-    if (res.status === "ok") setStatus(res.data);
+    const res = await commands.trustWorktreeHooks(LOCAL_RUNNER, projectId, digest);
+    if (res.status !== "ok") return;
+    setChangedUnderReview(res.data.outcome === "changed");
+    setStatus(res.data.status);
   };
 
   return (
@@ -81,8 +92,10 @@ function HookScripts({ projectId }: { projectId: string }) {
         <span className="text-xs text-muted-foreground">Trusted. Editing any of these scripts will revoke this and stop them running.</span>
       ) : (
         <>
-          <span className="text-xs text-muted-foreground">
-            These scripts have not been trusted and will not run. Review them before trusting.
+          <span className={`text-xs ${changedUnderReview ? "text-destructive" : "text-muted-foreground"}`}>
+            {changedUnderReview
+              ? "These scripts changed while you were reviewing them, so nothing was trusted. The list above is the new one — review it again before trusting."
+              : "These scripts have not been trusted and will not run. Review them before trusting."}
           </span>
           <div className="flex">
             <Button onClick={trust}>Trust these scripts</Button>

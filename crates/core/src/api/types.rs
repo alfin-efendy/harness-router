@@ -707,8 +707,25 @@ pub struct WorktreeHookStatus {
     /// `"<event>/<file>"` for every discovered script, sorted.
     pub scripts: Vec<String>,
     /// Content digest of the whole set; `None` when there are no scripts.
+    /// This is the value the client must hand back to `trust_worktree_hooks`
+    /// so the acceptance binds to the bytes that were actually reviewed.
     pub digest: Option<String>,
     pub trusted: bool,
+}
+
+/// The result of a `trust_worktree_hooks` attempt. Mirrors
+/// `crate::harness::native::hooks::TrustOutcome`; both variants carry the
+/// freshly re-read status, so a client can render the outcome without a second
+/// round trip.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", tag = "outcome", content = "status")]
+pub enum WorktreeHookTrustResult {
+    /// The reviewed digest still matched disk; the acceptance was recorded.
+    Recorded(WorktreeHookStatus),
+    /// The scripts changed between being reviewed and being trusted, so
+    /// **nothing was recorded**. The payload is the NEW set for the user to
+    /// review afresh.
+    Changed(WorktreeHookStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
