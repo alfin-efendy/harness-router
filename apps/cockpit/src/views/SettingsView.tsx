@@ -284,6 +284,18 @@ export function SettingsView() {
     await saveArtifactValue(ARTIFACT_ROOT_KEY, dir);
   };
 
+  const [cleanupRunning, setCleanupRunning] = useState(false);
+  const runArtifactCleanup = async () => {
+    setCleanupRunning(true);
+    const result = await commands.runArtifactRetention(LOCAL_RUNNER);
+    setCleanupRunning(false);
+    if (result.status === "error") {
+      toast.error("Artifact cleanup failed: " + result.error.message);
+      return;
+    }
+    toast.success(result.data === 1 ? "Cleaned up 1 archived session." : `Cleaned up ${result.data} archived sessions.`);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[640px]">
@@ -400,6 +412,20 @@ export function SettingsView() {
               />
             </CardRow>
           ))}
+        </Card>
+
+        <Card className="mt-3">
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13.5px] font-semibold">Artifact cleanup</div>
+              <div className="mt-0.5 text-[12.5px] text-muted-foreground">
+                Apply the retention window now to archived sessions, instead of waiting for the hourly pass.
+              </div>
+            </div>
+            <Button variant="outline" disabled={cleanupRunning} onClick={() => void runArtifactCleanup()}>
+              {cleanupRunning ? "Cleaning up…" : "Run cleanup now"}
+            </Button>
+          </div>
         </Card>
 
         <AuditCard />
