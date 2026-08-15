@@ -697,6 +697,20 @@ pub struct AddAppInput {
 
 // --- native_api (moved verbatim from apps/cockpit/src-tauri/src/native_cmd.rs) ---
 
+/// The worktree hook-script trust state for one project — what
+/// `.ryuzi/hooks/<event>/` scripts exist and whether the user has accepted
+/// this exact set of bytes. Mirrors
+/// `crate::harness::native::hooks::HookTrust`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeHookStatus {
+    /// `"<event>/<file>"` for every discovered script, sorted.
+    pub scripts: Vec<String>,
+    /// Content digest of the whole set; `None` when there are no scripts.
+    pub digest: Option<String>,
+    pub trusted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInfo {
