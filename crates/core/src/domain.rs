@@ -635,6 +635,31 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
+/// One parked approval, persisted so a surface that reconnects (a reloaded
+/// Cockpit webview) can re-list what is still waiting on the user. Mirrors the
+/// fields of `CoreEvent::ApprovalRequested`, plus `created_at`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingApprovalRow {
+    pub session_pk: String,
+    /// Durable run that owns this request; required to resolve it.
+    pub run_id: String,
+    pub request_id: String,
+    pub requesting_agent_id: String,
+    pub requesting_agent_name: String,
+    pub tool: String,
+    pub summary: String,
+    pub approval_kind: ApprovalKind,
+    /// Raw kind-specific payload: the tool's input JSON (Tool), the plan
+    /// markdown (Plan), or the questions spec (Question).
+    pub input: serde_json::Value,
+    /// Which plugin's MCP tool this approval is for; `None` for built-in tools
+    /// and Plan/Question prompts.
+    pub principal: Option<Principal>,
+    /// Epoch milliseconds when the call parked.
+    pub created_at: i64,
+}
+
 /// One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]

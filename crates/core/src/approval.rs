@@ -1,4 +1,5 @@
-use crate::domain::ApprovalResponse;
+use crate::domain::{ApprovalKind, ApprovalResponse, PendingApprovalRow, Principal};
+use crate::store::Store;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::sync::oneshot;
@@ -118,9 +119,207 @@ impl Default for ApprovalHub {
     }
 }
 
+/// Stable on-disk spelling of an approval kind. Explicit rather than reusing
+/// serde so the DB text can never drift with a serde attribute change.
+fn kind_to_db(kind: ApprovalKind) -> &'static str {
+    match kind {
+        ApprovalKind::Tool => "tool",
+        ApprovalKind::Plan => "plan",
+        ApprovalKind::Question => "question",
+    }
+}
+
+fn kind_from_db(s: &str) -> ApprovalKind {
+    match s {
+        "plan" => ApprovalKind::Plan,
+        "question" => ApprovalKind::Question,
+        // Unknown/legacy text falls back to the most restrictive kind, which is
+        // also the overwhelmingly common one.
+        _ => ApprovalKind::Tool,
+    }
+}
+
+/// Record a parked approval so a reconnecting surface can re-list it.
+/// Best-effort by contract: the caller logs and continues on error — a failed
+/// write must never change the permission verdict.
+pub async fn persist_pending(store: &Store, row: PendingApprovalRow) -> anyhow::Result<()> {
+    let input_json = serde_json::to_string(&row.input).unwrap_or_else(|_| "null".to_string());
+    let principal_json = row
+        .principal
+        .as_ref()
+        .and_then(|p| serde_json::to_string(p).ok());
+    let kind = kind_to_db(row.approval_kind).to_string();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "INSERT INTO pending_approvals(run_id,request_id,session_pk,requesting_agent_id,\
+                 requesting_agent_name,tool,summary,approval_kind,input_json,principal_json,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT(run_id,request_id) DO NOTHING",
+                rusqlite::params![
+                    row.run_id,
+                    row.request_id,
+                    row.session_pk,
+                    row.requesting_agent_id,
+                    row.requesting_agent_name,
+                    row.tool,
+                    row.summary,
+                    kind,
+                    input_json,
+                    principal_json,
+                    row.created_at,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+}
+
+/// Forget a parked approval. Called by the parking call site once its
+/// `tokio::select!` returns, whatever ended the park.
+pub async fn delete_pending(store: &Store, run_id: &str, request_id: &str) -> anyhow::Result<()> {
+    let run_id = run_id.to_string();
+    let request_id = request_id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "DELETE FROM pending_approvals WHERE run_id=?1 AND request_id=?2",
+                rusqlite::params![run_id, request_id],
+            )
+            .map(|_| ())
+        })
+        .await
+}
+
+/// Every still-parked approval, oldest first.
+pub async fn list_pending(store: &Store) -> anyhow::Result<Vec<PendingApprovalRow>> {
+    store
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT session_pk,run_id,request_id,requesting_agent_id,requesting_agent_name,\
+                 tool,summary,approval_kind,input_json,principal_json,created_at \
+                 FROM pending_approvals ORDER BY created_at ASC, run_id ASC, request_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let kind: String = r.get(7)?;
+                    let input: String = r.get(8)?;
+                    let principal: Option<String> = r.get(9)?;
+                    Ok(PendingApprovalRow {
+                        session_pk: r.get(0)?,
+                        run_id: r.get(1)?,
+                        request_id: r.get(2)?,
+                        requesting_agent_id: r.get(3)?,
+                        requesting_agent_name: r.get(4)?,
+                        tool: r.get(5)?,
+                        summary: r.get(6)?,
+                        approval_kind: kind_from_db(&kind),
+                        input: serde_json::from_str(&input).unwrap_or(serde_json::Value::Null),
+                        principal: principal
+                            .as_deref()
+                            .and_then(|p| serde_json::from_str::<Principal>(p).ok()),
+                        created_at: r.get(10)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+}
+
+/// Drop every persisted parked approval. Called once by
+/// `daemon::build_daemon`: a reply channel cannot survive a process restart, so
+/// rows from a previous boot are unanswerable and must not resurface as
+/// un-actionable cards. Returns how many rows were removed.
+pub async fn clear_all_pending(store: &Store) -> anyhow::Result<usize> {
+    store
+        .with_conn(|c| c.execute("DELETE FROM pending_approvals", []))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_store() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).await.unwrap();
+        // The tempdir must outlive the store in the caller; leak it for the
+        // duration of the test process instead of threading a guard around.
+        std::mem::forget(dir);
+        store
+    }
+
+    fn row(run_id: &str, request_id: &str) -> PendingApprovalRow {
+        PendingApprovalRow {
+            session_pk: "s1".into(),
+            run_id: run_id.into(),
+            request_id: request_id.into(),
+            requesting_agent_id: "agent-1".into(),
+            requesting_agent_name: "Agent One".into(),
+            tool: "bash".into(),
+            summary: "Bash: rm".into(),
+            approval_kind: ApprovalKind::Tool,
+            input: serde_json::json!({"command": "rm -rf ./x"}),
+            principal: None,
+            created_at: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_pending_approval_round_trips_and_deletes() {
+        let store = test_store().await;
+        persist_pending(&store, row("run-1", "req-1")).await.unwrap();
+        let listed = list_pending(&store).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, "run-1");
+        assert_eq!(listed[0].approval_kind, ApprovalKind::Tool);
+        assert_eq!(listed[0].input["command"], "rm -rf ./x");
+
+        delete_pending(&store, "run-1", "req-1").await.unwrap();
+        assert!(list_pending(&store).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_is_idempotent_and_delete_is_key_scoped() {
+        let store = test_store().await;
+        persist_pending(&store, row("run-a", "req-1")).await.unwrap();
+        persist_pending(&store, row("run-a", "req-1")).await.unwrap();
+        persist_pending(&store, row("run-b", "req-1")).await.unwrap();
+        assert_eq!(list_pending(&store).await.unwrap().len(), 2);
+
+        delete_pending(&store, "run-a", "req-1").await.unwrap();
+        let listed = list_pending(&store).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, "run-b");
+    }
+
+    #[tokio::test]
+    async fn clear_all_pending_empties_the_table() {
+        let store = test_store().await;
+        persist_pending(&store, row("run-1", "req-1")).await.unwrap();
+        persist_pending(&store, row("run-2", "req-2")).await.unwrap();
+        assert_eq!(clear_all_pending(&store).await.unwrap(), 2);
+        assert!(list_pending(&store).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn principal_and_non_tool_kind_survive_the_round_trip() {
+        let store = test_store().await;
+        let mut r = row("run-p", "req-p");
+        r.approval_kind = ApprovalKind::Question;
+        r.principal = Some(Principal {
+            plugin_id: "acme-connector".into(),
+            plugin_name: "Acme Connector".into(),
+        });
+        persist_pending(&store, r).await.unwrap();
+        let listed = list_pending(&store).await.unwrap();
+        assert_eq!(listed[0].approval_kind, ApprovalKind::Question);
+        assert_eq!(
+            listed[0].principal.as_ref().unwrap().plugin_id,
+            "acme-connector"
+        );
+    }
 
     #[tokio::test]
     async fn register_then_resolve_completes_the_receiver() {

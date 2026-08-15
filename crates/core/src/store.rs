@@ -169,6 +169,34 @@ DROP INDEX IF EXISTS idx_messages_session;
 DROP INDEX IF EXISTS idx_provider_turns_session;
 ";
 
+/// v9 -> v10: parked tool/plan/question approvals, so a Cockpit reload can
+/// re-list what is waiting on the user instead of stranding the turn. Written
+/// by `crate::approval::persist_pending` when a call parks and deleted by
+/// `crate::approval::delete_pending` the moment that call site wakes (user
+/// answer, gateway answer, timeout, or cancel all complete the same `oneshot`).
+///
+/// Deliberately NOT foreign-keyed to `sessions`: rows are short-lived, are
+/// deleted by the parking call site, and the whole table is wiped by
+/// `daemon::build_daemon` on every boot (a `oneshot` sender cannot survive a
+/// process restart, so a row from a previous boot is unanswerable).
+const PENDING_APPROVALS_MIGRATION_SQL: &str = "
+CREATE TABLE pending_approvals (
+  run_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  session_pk TEXT NOT NULL,
+  requesting_agent_id TEXT NOT NULL,
+  requesting_agent_name TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  approval_kind TEXT NOT NULL,
+  input_json TEXT NOT NULL,
+  principal_json TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, request_id)
+);
+CREATE INDEX pending_approvals_session_idx ON pending_approvals(session_pk);
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -180,6 +208,7 @@ fn migrations() -> Migrations<'static> {
         M::up(MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL),
         M::up(GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL),
         M::up(DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL),
+        M::up(PENDING_APPROVALS_MIGRATION_SQL),
     ])
 }
 
@@ -847,9 +876,9 @@ impl Store {
         // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json,
         // 7 = + mcp_oauth_clients.token_endpoint, 8 = + gateways.fs_mode
         // permissive default, 9 = duplicate primary-key indexes on
-        // messages/provider_turns dropped.)
+        // messages/provider_turns dropped, 10 = + pending_approvals.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 9;
+        const LATEST_VERSION: i64 = 10;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -10782,8 +10811,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 9,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes migrations must be user_version 9"
+            user_version, 10,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes + pending-approvals migrations must be user_version 10"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(
