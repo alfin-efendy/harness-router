@@ -789,6 +789,45 @@ test("refresh hydrates pending approvals from the runner", async () => {
   listPendingHydrate.mockRestore();
 });
 
+// A runner too old to know `list_pending_approvals` rejects the call. That must
+// neither sink the whole refresh (the session list is what every view reads)
+// nor prune the cards that runner already has on screen.
+test("refresh survives a runner that cannot answer listPendingApprovals", async () => {
+  reset();
+  useStore.setState({
+    pendingApprovals: [
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "run-live",
+        requestId: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        kind: "tool",
+        input: {},
+        principal: null,
+      },
+    ],
+  });
+  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "ryuzi/s1" };
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
+  const listGatewaysRej = mockGateways();
+  const listPendingRej = spyOn(commands, "listPendingApprovals").mockRejectedValue(new Error("unknown method"));
+
+  await useStore.getState().refresh();
+
+  // Sessions still landed...
+  expect(useStore.getState().sessions[0].branch).toBe("ryuzi/s1");
+  // ...and the un-answerable runner's live card was NOT pruned.
+  expect(useStore.getState().pendingApprovals.map((a) => a.runId)).toEqual(["run-live"]);
+
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+  listGatewaysRej.mockRestore();
+  listPendingRej.mockRestore();
+});
+
 const liveApproval = (runnerId: string, runId: string, requestId: string) => ({
   runnerId,
   sessionPk: "s1",

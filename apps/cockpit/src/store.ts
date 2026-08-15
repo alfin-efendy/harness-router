@@ -467,32 +467,50 @@ export const useStore = create<State>((set, get) => ({
     // Parked approvals live only in engine memory + a one-shot event, so a
     // reloaded webview would otherwise never see them again. Re-list them
     // from each runner alongside the sessions.
+    //
+    // A rejection here must never sink the whole refresh: a remote runner on a
+    // build predating `list_pending_approvals` rejects the call outright, and
+    // the session list — which every view depends on — must not go stale
+    // because one runner cannot answer an approval query.
+    // A runner that did NOT answer is deliberately left out of
+    // `refreshedRunnerIds` below: "the query failed" is not evidence that the
+    // engine has nothing parked, so its live cards must survive untouched
+    // rather than be pruned as answered.
     const perRunnerApprovals = await Promise.all(
-      runnerList.map(async (runnerId): Promise<PendingApproval[]> => {
-        const res = await commands.listPendingApprovals(runnerId);
-        if (res.status !== "ok") return [];
-        return res.data.map((a) => ({
-          runnerId,
-          sessionPk: a.sessionPk,
-          runId: a.runId,
-          requestId: a.requestId,
-          tool: a.tool,
-          summary: a.summary,
-          kind: a.approvalKind,
-          input: a.input,
-          principal: a.principal ?? null,
-        }));
+      runnerList.map(async (runnerId): Promise<{ runnerId: string; approvals: PendingApproval[] } | null> => {
+        try {
+          const res = await commands.listPendingApprovals(runnerId);
+          if (res.status !== "ok") return null;
+          return {
+            runnerId,
+            approvals: res.data.map((a) => ({
+              runnerId,
+              sessionPk: a.sessionPk,
+              runId: a.runId,
+              requestId: a.requestId,
+              tool: a.tool,
+              summary: a.summary,
+              kind: a.approvalKind,
+              input: a.input,
+              principal: a.principal ?? null,
+            })),
+          };
+        } catch {
+          // Rejected IPC, or a shell that does not expose the command at all.
+          return null;
+        }
       }),
     );
+    const answered = perRunnerApprovals.filter((r) => r !== null);
     const sessions = perRunner.flat();
-    const fetched = perRunnerApprovals.flat();
+    const fetched = answered.flatMap((r) => r.approvals);
     set((st) => ({
       sessions,
       pendingApprovals: mergePendingApprovals({
         live: st.pendingApprovals,
         before,
         fetched,
-        refreshedRunnerIds: runnerList,
+        refreshedRunnerIds: answered.map((r) => r.runnerId),
       }),
     }));
     useUi.getState().seedReadState(sessions);
