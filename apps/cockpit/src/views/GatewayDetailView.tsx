@@ -1,17 +1,15 @@
-import { Plus, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
+import { RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 import { useEffect } from "react";
 import { toast } from "sonner";
-import { GW_FS_MODES, quotaColor, type GatewayFsMode } from "@/constants";
+import { quotaColor } from "@/constants";
 import { eventColor, formatLastSeen, gatewayById, useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
-import { commands } from "@/bindings";
 import { statusMeta } from "@/lib/status";
 import { sessionTitle } from "@/lib/sidebar";
 import { refOf } from "@/lib/session-key";
 import {
   Button,
-  Segmented,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
   SettingsCardHint as CardHint,
@@ -33,7 +31,7 @@ function HealthRow({ label, value }: { label: string; value: string }) {
 
 export function GatewayDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { gateways, eventsById, probing, probe, remove, updateFs, loadEvents } = useGateways();
+  const { gateways, eventsById, probing, probe, remove, loadEvents } = useGateways();
   const sessions = useStore((s) => s.sessions);
   const setFocused = useStore((s) => s.setFocused);
 
@@ -50,16 +48,10 @@ export function GatewayDetailView({ id }: { id: string }) {
 
   const online = g.status === "connected";
   const statusColor = online ? "#22C55E" : "var(--muted-foreground)";
-  const fsDesc = GW_FS_MODES.find((m) => m.id === g.fsMode)?.desc;
 
   // Sessions are stamped with the runner (gateway) that owns them — this gateway's
   // route id IS a runner id (LOCAL_RUNNER for the local one, gateway.id for a remote).
   const gwSessions = sessions.filter((s) => s.runnerId === id && s.status !== "ended");
-
-  const addFolder = async () => {
-    const dir = await commands.pickDirectory();
-    if (dir && !g.paths.includes(dir)) void updateFs(g.id, g.fsMode, [...g.paths, dir]);
-  };
 
   const copyLog = () => {
     const text = events.map((e) => `[${new Date(e.at).toLocaleTimeString()}] ${e.text}`).join("\n");
@@ -221,49 +213,21 @@ export function GatewayDetailView({ id }: { id: string }) {
               </span>
             )}
           </div>
+          {/* Filesystem scoping is NOT enforced anywhere in the engine yet.
+              Until it is (see docs/plans/004-gateway-filesystem-access-control.md),
+              this card must not offer a control that implies a guarantee: a
+              Security card that silently does nothing is worse than no
+              control at all. The persisted `fsMode`/`paths` fields are
+              deliberately left in place for the enforcement work. */}
           <div className="flex flex-col gap-2 px-[18px] py-3">
             <div className="flex items-center gap-3">
               <span className="flex-1 text-[12.5px] font-medium">Filesystem access</span>
-              <Segmented
-                options={GW_FS_MODES.map((m) => ({ id: m.id, label: m.label }))}
-                value={g.fsMode as GatewayFsMode}
-                onChange={(m) => void updateFs(g.id, m, g.paths)}
-              />
+              <span className="shrink-0 text-[12.5px] text-muted-foreground">Not enforced yet</span>
             </div>
-            <div className="text-right text-[11.5px] text-muted-foreground">{fsDesc}</div>
-            {g.fsMode === "projects" && (
-              <div className="flex flex-wrap gap-1.5">
-                {g.paths.map((p) => (
-                  <Button
-                    key={p}
-                    variant="outline"
-                    size="xs"
-                    title="Remove folder"
-                    onClick={() =>
-                      void updateFs(
-                        g.id,
-                        g.fsMode,
-                        g.paths.filter((x) => x !== p),
-                      )
-                    }
-                    className="rounded-full font-mono"
-                  >
-                    {p}
-                  </Button>
-                ))}
-                {g.kind === "local" && (
-                  <Button
-                    variant="outline"
-                    size="xs"
-                    onClick={() => void addFolder()}
-                    className="rounded-full border-dashed text-muted-foreground"
-                  >
-                    <Plus aria-hidden size={10} strokeWidth={2} className="size-2.5" />
-                    Add folder
-                  </Button>
-                )}
-              </div>
-            )}
+            <div className="text-[11.5px] leading-[1.55] text-muted-foreground">
+              Ryuzi does not scope filesystem access per gateway yet. File tools stay inside the session worktree, and the bash tool starts
+              there but can reach anything the daemon user can.
+            </div>
           </div>
         </Card>
 

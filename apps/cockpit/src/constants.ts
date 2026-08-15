@@ -16,6 +16,11 @@ export const ARTIFACT_SESSION_MAX_BYTES_KEY = "artifact_session_max_bytes";
 export const ARTIFACT_READ_MAX_BYTES_KEY = "artifact_read_max_bytes";
 export const ARTIFACT_RETENTION_DAYS_KEY = "artifact_retention_days";
 
+// Gateway filesystem-access modes. NOT ENFORCED: nothing in the engine reads
+// the persisted `fs_mode`/`paths`, so no view may present these as an active
+// security guarantee. Kept here (unused by any view for now) as the vocabulary
+// the enforcement work will wire up — see
+// docs/plans/004-gateway-filesystem-access-control.md.
 export type GatewayFsMode = "full" | "projects" | "read";
 
 export const GW_FS_MODES: { id: GatewayFsMode; label: string; desc: string }[] = [
