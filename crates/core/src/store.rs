@@ -149,6 +149,26 @@ const MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL: &str =
 const GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL: &str =
     "UPDATE gateways SET fs_mode='full' WHERE fs_mode='projects';";
 
+/// v8 -> v9: drop the two hand-written indexes that duplicated their own
+/// table's primary key. `messages` and `provider_turns` are both ordinary
+/// rowid tables declared `PRIMARY KEY (session_pk, seq)`, so SQLite already
+/// materialises an automatic index over that exact tuple in that exact order;
+/// `idx_messages_session` / `idx_provider_turns_session` added a second,
+/// identical B-tree. These are the two hottest write paths in the engine (one
+/// `messages` row per streamed block, one `provider_turns` row per model turn),
+/// so the duplication cost every insert a redundant index write and every
+/// database a redundant copy of the index on disk, for no read-plan benefit.
+///
+/// `IF EXISTS` because a database can reach v9 from either direction: a fresh
+/// install creates both indexes from `BASELINE_SQL` and then drops them here,
+/// while a database created by a future build that no longer has them must not
+/// fail. The indexes stay in `store_baseline.sql` for the same reason every
+/// other post-squash change does — that file is pinned pre-squash history.
+const DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL: &str = "
+DROP INDEX IF EXISTS idx_messages_session;
+DROP INDEX IF EXISTS idx_provider_turns_session;
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -159,6 +179,7 @@ fn migrations() -> Migrations<'static> {
         M::up(MCP_SERVER_HEADERS_MIGRATION_SQL),
         M::up(MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL),
         M::up(GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL),
+        M::up(DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL),
     ])
 }
 
@@ -825,9 +846,10 @@ impl Store {
         // + automation_hooks/jobs/mcp_servers.plugin_id origin columns, 5 =
         // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json,
         // 7 = + mcp_oauth_clients.token_endpoint, 8 = + gateways.fs_mode
-        // permissive default.)
+        // permissive default, 9 = duplicate primary-key indexes on
+        // messages/provider_turns dropped.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 8;
+        const LATEST_VERSION: i64 = 9;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -10736,13 +10758,13 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 8 database (v1 squashed baseline + v2
+    // produce a `user_version` 9 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
     // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
     // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json + v7
     // mcp_oauth_clients.token_endpoint + v8 gateways.fs_mode permissive
-    // default)
+    // default + v9 duplicate-pk-index drop)
     // whose schema + seeded rows exactly match the golden fixture.
     //
     // The fixture is also what proves a FRESH database and an UPGRADED one
@@ -10760,13 +10782,102 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 8,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default migrations must be user_version 8"
+            user_version, 9,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes migrations must be user_version 9"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(
             dump, golden,
             "baseline schema/seed drifted from the pre-squash golden fixture"
+        );
+    }
+
+    // `messages` and `provider_turns` are rowid tables declared
+    // `PRIMARY KEY (session_pk, seq)`, so SQLite's automatic index already
+    // covers that tuple; the old `idx_*_session` indexes were an identical
+    // second B-tree taxing the two hottest insert paths. v8 -> v9 drops them.
+    // This pins BOTH directions: a fresh install (baseline creates them, the
+    // migration removes them) and an in-place upgrade from a v8 database.
+    #[tokio::test]
+    async fn duplicate_primary_key_indexes_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup-idx.db");
+
+        {
+            let store = Store::open(&path).await.unwrap();
+            let leftovers: Vec<String> = store
+                .with_conn(|c| {
+                    let mut stmt = c.prepare(
+                        "SELECT name FROM sqlite_master WHERE type='index' \
+                         AND name IN ('idx_messages_session','idx_provider_turns_session') \
+                         ORDER BY name",
+                    )?;
+                    let names = stmt
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(names)
+                })
+                .await
+                .unwrap();
+            assert!(
+                leftovers.is_empty(),
+                "a fresh database must not carry the duplicate indexes: {leftovers:?}"
+            );
+
+            // Rebuild a pre-v9 database: both indexes present, version pinned
+            // back to 8 so reopening has to run the new migration.
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        "CREATE INDEX idx_messages_session ON messages(session_pk, seq);\
+                         CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);",
+                    )?;
+                    c.pragma_update(None, "user_version", 8)
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(&path).await.unwrap();
+        let (duplicates, version) = store
+            .with_conn(|c| {
+                let duplicates: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                     AND name IN ('idx_messages_session','idx_provider_turns_session')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                Ok((duplicates, version))
+            })
+            .await
+            .unwrap();
+        assert_eq!(duplicates, 0, "v8 -> v9 must drop both duplicate indexes");
+        assert_eq!(version, 9, "the upgrade must land on schema version 9");
+
+        // Coverage is unchanged: each table keeps exactly one index, the
+        // primary key's automatic one over (session_pk, seq).
+        let remaining: Vec<String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index' \
+                     AND tbl_name IN ('messages','provider_turns') ORDER BY name",
+                )?;
+                let names = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "expected one automatic index per table, got {remaining:?}"
+        );
+        assert!(
+            remaining.iter().all(|n| n.starts_with("sqlite_autoindex_")),
+            "only primary-key automatic indexes should remain: {remaining:?}"
         );
     }
 
