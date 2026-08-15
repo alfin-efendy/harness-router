@@ -23,7 +23,7 @@ import { useAgentConfigurationCatalog } from "./store-agent-catalog";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
-import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
+import { notifier, notifyIntentForEvent, jobNotifyIntentForEvent, isSchedulerSession, isWindowFocused } from "@/lib/notify";
 import { LOCAL_RUNNER, sessKey, refKey, isSession, sameRef, refOf, type SessionRef, type UiSession } from "@/lib/session-key";
 
 export type PendingApproval = {
@@ -651,14 +651,27 @@ export const useStore = create<State>((set, get) => ({
       // Keep the actively-viewed session marked read as its activity streams in.
       markFocusedSessionReadOnEvent(event, runnerId, get().focusedSession);
       // OS notification for attention events (suppressed while focused).
-      const intent = notifyIntentForEvent(event, runnerId, isWindowFocused());
       const evtPk = (event as { session_pk?: string }).session_pk;
+      const evtSession = evtPk ? get().sessions.find((s) => isSession(s, { runnerId, pk: evtPk })) : undefined;
+      // A scheduler-started session's per-turn notification is suppressed —
+      // the jobRunChanged branch below notifies instead, with the job's name,
+      // its notify switches and the real run outcome. Without this the user
+      // gets two notifications for every scheduled run.
+      const intent = isSchedulerSession(evtSession) ? null : notifyIntentForEvent(event, runnerId, isWindowFocused());
       if (evtPk) notifier.cancelSettle(runnerId, evtPk); // any activity supersedes a pending settle
-      if (intent)
-        notifier.handle(
-          intent,
-          get().sessions.find((s) => isSession(s, { runnerId: intent.runnerId, pk: intent.sessionPk })),
-        );
+      if (intent) notifier.handle(intent, evtSession);
+      // A scheduled job finished and its own switches say to tell the user:
+      // in-app toast when they are looking, OS notification when they are not.
+      const jobIntent = jobNotifyIntentForEvent(event);
+      if (jobIntent) {
+        const line = `${jobIntent.title}: ${jobIntent.body}`;
+        if (isWindowFocused()) {
+          if (jobIntent.level === "error") toast.error(line);
+          else toast.success(line);
+        } else {
+          notifier.notifyNow({ title: jobIntent.title, body: jobIntent.body });
+        }
+      }
       if (event.kind === "sessionQueueChanged") void useNative.getState().loadQueue(runnerId, event.session_pk);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.

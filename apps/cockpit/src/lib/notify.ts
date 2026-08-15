@@ -39,6 +39,39 @@ export function notifyIntentForEvent(event: CoreEvent, runnerId: string, windowF
   }
 }
 
+export type JobNotifyIntent = { title: string; body: string; level: "success" | "error" } | null;
+
+/** What (if anything) to raise for a `jobRunChanged` event. The engine has
+ *  already applied the job's own notify-on-success / notify-on-failure
+ *  switches and the run's `[SILENT]` opt-out — `event.notify` is that whole
+ *  decision, so this function only formats it. Unlike per-turn intents this
+ *  is NOT suppressed while the window is focused: the caller turns a focused
+ *  one into an in-app toast instead. */
+export function jobNotifyIntentForEvent(event: CoreEvent): JobNotifyIntent {
+  if (event.kind !== "jobRunChanged") return null;
+  if (!event.notify) return null;
+  if (event.status !== "success" && event.status !== "failed") return null;
+  // `job_name`/`notify`/`detail` are `#[serde(default)]` on the Rust side (a
+  // remote daemon on an older version omits them), which specta renders as
+  // optional here — so every read of them must tolerate `undefined`. A missing
+  // `notify` is already handled above: falsy means "do not notify", the safe
+  // fallback for an engine too old to have made the decision.
+  const title = event.job_name?.trim() || "Scheduled job";
+  if (event.status === "failed") {
+    return { title, body: `Run failed — ${event.detail ?? "no error reported"}`, level: "error" };
+  }
+  return { title, body: `Run finished${event.detail ? ` — ${event.detail}` : ""}`, level: "success" };
+}
+
+/** A session the scheduler started. Its per-turn `result`/`error` events must
+ *  NOT raise the generic "Turn finished" notification — the matching
+ *  `jobRunChanged` event notifies instead, and that one knows the job's name,
+ *  its notify switches and the real run outcome. Without this guard every
+ *  scheduled run notifies twice. */
+export function isSchedulerSession(session: Session | undefined): boolean {
+  return session?.startedBy === "scheduler";
+}
+
 export const SETTLE_MS = 3000;
 
 export type NotifierDeps = {
@@ -51,6 +84,9 @@ export type NotifierDeps = {
 };
 
 export type Notifier = {
+  /** Send a notification immediately, bypassing session keying and settles —
+   *  for events that are not tied to one session's turn (scheduled job runs). */
+  notifyNow(text: { title: string; body: string }): void;
   handle(intent: NonNullable<NotifyIntent>, session: Session | undefined): void;
   cancelSettle(runnerId: string, sessionPk: string): void;
   cancelAllSettles(): void;
@@ -94,6 +130,12 @@ export function createNotifier(deps: NotifierDeps): Notifier {
   };
 
   return {
+    notifyNow(text) {
+      if (!deps.isEnabled()) return;
+      void deps.ensurePermission().then((ok) => {
+        if (ok) deps.sendNotification(text);
+      });
+    },
     handle(intent, session) {
       const key = sessKey(intent.runnerId, intent.sessionPk);
       // Any new event for a session supersedes its pending "finished" settle.
