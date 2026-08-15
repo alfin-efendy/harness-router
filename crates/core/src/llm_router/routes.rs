@@ -1333,6 +1333,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_robin_visits_every_account_before_repeating() {
+        let store = mem_store().await;
+        save_provider_account_route(&store, "openai", ModelRouteStrategy::RoundRobin)
+            .await
+            .unwrap();
+        let ids = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
+
+        let mut heads = Vec::new();
+        for _ in 0..4 {
+            let ordered = ordered_provider_connection_ids(&store, "openai", "gpt", &ids)
+                .await
+                .unwrap();
+            heads.push(ordered[0].clone());
+        }
+
+        // Three sequential routes must land on three DISTINCT accounts, then wrap.
+        assert_eq!(heads, vec!["c1", "c2", "c3", "c1"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_round_robin_advances_never_collide() {
+        let store = mem_store().await;
+        save_provider_account_route(&store, "openai", ModelRouteStrategy::RoundRobin)
+            .await
+            .unwrap();
+        let ids = vec![
+            "c1".to_string(),
+            "c2".to_string(),
+            "c3".to_string(),
+            "c4".to_string(),
+        ];
+
+        // This is deterministic rather than flaky: each advance is now a single
+        // `Store::with_conn` closure and the store's pool holds exactly one
+        // connection (`crates/core/src/store.rs`), so the four closures cannot
+        // interleave — each one reads and writes the cursor before the next can
+        // acquire the connection. Before this fix the read and the write were two
+        // separate pool acquisitions and the four heads collided.
+        let (a, b, c, d) = tokio::join!(
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+        );
+
+        let heads = [a, b, c, d]
+            .into_iter()
+            .map(|ordered| ordered.unwrap()[0].clone())
+            .collect::<std::collections::HashSet<String>>();
+        assert_eq!(heads.len(), 4, "concurrent advances collided: {heads:?}");
+    }
+
+    #[tokio::test]
     async fn peek_helpers_preserve_round_robin_cursors() {
         let store = mem_store().await;
         save_provider_account_route(&store, "openai", ModelRouteStrategy::RoundRobin)

@@ -736,4 +736,57 @@ mod tests {
         assert!(meta.reasoning_efforts.is_empty());
         assert_eq!(meta.default_reasoning_effort, None);
     }
+
+    /// `resolve` is a purely informational lookup — it must never consume a slot
+    /// in the round-robin rotation. This test fails (the setting becomes
+    /// `Some("1")`) if `resolve` is ever pointed back at the advancing router
+    /// entry point `route_model_for_anthropic_messages`.
+    #[tokio::test]
+    async fn resolve_does_not_advance_the_round_robin_cursor() {
+        use crate::llm_router::routes::{
+            save_model_route, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        // No provider connections are needed: the advancing path bumps the cursor
+        // before it ever looks at connections, which is what makes this tight.
+        save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: "r1".into(),
+                name: "fable".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "m1".into(),
+                        effort: None,
+                    },
+                    ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "m2".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..5 {
+            let _ = resolve(&store, "fable").await;
+        }
+
+        assert_eq!(
+            store
+                .get_setting("llm_model_route_round_robin_cursor.r1")
+                .await
+                .unwrap(),
+            None
+        );
+    }
 }
