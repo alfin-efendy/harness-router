@@ -168,7 +168,7 @@ impl Drop for HttpsEnforcedGuard {
     }
 }
 
-fn plaintext_allowed() -> bool {
+pub(crate) fn plaintext_allowed() -> bool {
     #[cfg(test)]
     {
         PLAINTEXT_ALLOWED.with(std::cell::Cell::get)
@@ -617,7 +617,8 @@ impl McpHttpConnection {
             .ok_or_else(|| anyhow::anyhow!("401 carried no WWW-Authenticate header"))?;
         let metadata_url = crate::plugins::oauth::parse_www_authenticate_resource(&header)
             .ok_or_else(|| anyhow::anyhow!("WWW-Authenticate names no resource metadata"))?;
-        let issuers = mcp_oauth::protected_resource_metadata(&self.http, &metadata_url).await?;
+        let issuers =
+            mcp_oauth::protected_resource_metadata(&self.http, &self.url, &metadata_url).await?;
         let (issuer, metadata) =
             mcp_oauth::select_authorization_server(&self.http, &issuers).await?;
         let client_id = store
@@ -1421,8 +1422,12 @@ pub(crate) mod tests {
         }
 
         async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            // The bound port is unknown when this router is built, and the
+            // client now VERIFIES the `resource` claim against the configured
+            // server URL — so it has to be the real URL by the time it is served.
+            let mcp_url = state.mcp_url.lock().unwrap().clone();
             axum::Json(json!({
-                "resource": "placeholder",
+                "resource": mcp_url,
                 "authorization_servers": [state.as_url],
             }))
         }
