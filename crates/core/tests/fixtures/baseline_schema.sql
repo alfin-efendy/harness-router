@@ -123,8 +123,6 @@ CREATE INDEX idx_context_checkpoints_session ON context_checkpoints(session_pk, 
 CREATE INDEX idx_gateway_events ON gateway_events(gateway_id, at);
 CREATE INDEX idx_job_runs_job ON job_runs(job_id, started_at);
 CREATE INDEX idx_jobs_plugin ON jobs(plugin_id);
-CREATE INDEX idx_messages_session ON messages(session_pk, seq);
-CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);
 CREATE INDEX idx_request_log_conn ON request_log(connection_id, ts);
 CREATE INDEX idx_request_log_ts ON request_log(ts);
 CREATE INDEX idx_session_prompt_queue_pending ON session_prompt_queue(session_pk, status, position);
