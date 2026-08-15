@@ -19,6 +19,7 @@ pub mod cost;
 pub mod delegation;
 pub mod file_reference;
 pub mod format;
+pub mod fs_access;
 pub mod hooks;
 pub mod iteration_budget;
 pub mod ledger;

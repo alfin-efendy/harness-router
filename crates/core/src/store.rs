@@ -131,6 +131,24 @@ const MCP_SERVER_HEADERS_MIGRATION_SQL: &str =
 const MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL: &str =
     "ALTER TABLE mcp_oauth_clients ADD COLUMN token_endpoint TEXT;";
 
+/// v7 -> v8: default every EXISTING gateway row to the permissive `full`
+/// filesystem-access mode.
+///
+/// `gateways.fs_mode` shipped with a `'projects'` column default and every
+/// row-creation site in `api::gateways_api` hardcoded `"projects"` — but
+/// nothing in the engine ever READ the column, so the value was inert for its
+/// entire life. `harness::native::fs_access` now enforces it. Without this
+/// migration, switching enforcement on would retroactively block file edits
+/// and shell commands on every install that never touched the setting, for a
+/// choice the user never actually made. Rows are therefore moved to `full`
+/// (today's real behavior) and the user opts back in from the Gateways screen.
+///
+/// The column DEFAULT stays `'projects'`: SQLite cannot alter a default
+/// without rebuilding the table, and it is unreachable anyway — every INSERT
+/// supplies `fs_mode` explicitly (`gateways::upsert_row`).
+const GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL: &str =
+    "UPDATE gateways SET fs_mode='full' WHERE fs_mode='projects';";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -140,6 +158,7 @@ fn migrations() -> Migrations<'static> {
         M::up(MCP_OAUTH_MIGRATION_SQL),
         M::up(MCP_SERVER_HEADERS_MIGRATION_SQL),
         M::up(MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL),
+        M::up(GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL),
     ])
 }
 
@@ -805,9 +824,10 @@ impl Store {
         // + plugin_oauth_profile_clients.client_secret_setting, 4 =
         // + automation_hooks/jobs/mcp_servers.plugin_id origin columns, 5 =
         // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json,
-        // 7 = + mcp_oauth_clients.token_endpoint.)
+        // 7 = + mcp_oauth_clients.token_endpoint, 8 = + gateways.fs_mode
+        // permissive default.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 7;
+        const LATEST_VERSION: i64 = 8;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -10716,12 +10736,13 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 7 database (v1 squashed baseline + v2
+    // produce a `user_version` 8 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
     // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
     // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json + v7
-    // mcp_oauth_clients.token_endpoint)
+    // mcp_oauth_clients.token_endpoint + v8 gateways.fs_mode permissive
+    // default)
     // whose schema + seeded rows exactly match the golden fixture.
     //
     // The fixture is also what proves a FRESH database and an UPGRADED one
@@ -10739,8 +10760,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 7,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint migrations must be user_version 7"
+            user_version, 8,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default migrations must be user_version 8"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(

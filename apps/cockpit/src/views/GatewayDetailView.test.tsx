@@ -118,7 +118,7 @@ test("loads daemon events on mount and renders the log card", async () => {
   expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
 });
 
-test("switching filesystem access persists the mode and re-renders from the IPC result", async () => {
+test("switching filesystem access on the local gateway persists the mode", async () => {
   seed();
   render(<GatewayDetailView id="local" />);
   await screen.findByText(/Daemon handshake complete/);
@@ -129,7 +129,19 @@ test("switching filesystem access persists the mode and re-renders from the IPC 
   expect(updateGateway).toHaveBeenCalledWith(LOCAL_RUNNER, "local", "read", ["/home/dev/projects"]);
   // Health re-renders from the mocked updateGateway response.
   expect(await screen.findByText("0.9 ms")).toBeTruthy();
-  expect(screen.getByText("Agents can inspect files but never write outside a worktree.")).toBeTruthy();
+  expect(screen.getByText("Agents may inspect files, but file edits and shell commands are refused.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "/home/dev/projects" })).toBeNull();
+});
+
+test("a remote gateway offers no filesystem control — it is enforced on that machine", async () => {
+  const remote: GatewayInfo = { ...localGateway, id: "remote-1", kind: "remote", badge: "RMT", fsMode: "projects" };
+  useGateways.setState({ gateways: [remote], eventsById: {}, loaded: true, probing: false });
+  useStore.setState({ sessions: [], focusedSession: null });
+  render(<GatewayDetailView id="remote-1" />);
+  await screen.findByText(/Daemon handshake complete/);
+
+  expect(screen.getByText("Configured on that machine")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Projects only" })).toBeNull();
   expect(screen.queryByRole("button", { name: "/home/dev/projects" })).toBeNull();
 });
 

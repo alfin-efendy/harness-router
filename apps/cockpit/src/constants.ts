@@ -16,12 +16,21 @@ export const ARTIFACT_SESSION_MAX_BYTES_KEY = "artifact_session_max_bytes";
 export const ARTIFACT_READ_MAX_BYTES_KEY = "artifact_read_max_bytes";
 export const ARTIFACT_RETENTION_DAYS_KEY = "artifact_retention_days";
 
+// Gateway filesystem-access modes, enforced by the engine in
+// `crates/core/src/harness/native/fs_access.rs` at the tool-call boundary.
+// The descriptions below are a CONTRACT with that module — if you change one,
+// change the other. Only mutating tools (`tool_kind` edit/execute) are gated;
+// read and search tools are already confined to the session worktree.
 export type GatewayFsMode = "full" | "projects" | "read";
 
 export const GW_FS_MODES: { id: GatewayFsMode; label: string; desc: string }[] = [
-  { id: "full", label: "Full", desc: "Agents may read and write anywhere the daemon user can." },
-  { id: "projects", label: "Projects only", desc: "Agents are sandboxed to the connected project folders." },
-  { id: "read", label: "Read-only", desc: "Agents can inspect files but never write outside a worktree." },
+  { id: "full", label: "Full", desc: "Agents may edit files and run commands anywhere the daemon user can." },
+  {
+    id: "projects",
+    label: "Projects only",
+    desc: "Agents may edit files and run commands only in sessions whose folder is inside one of the folders below.",
+  },
+  { id: "read", label: "Read-only", desc: "Agents may inspect files, but file edits and shell commands are refused." },
 ];
 
 // Command entries surfaced by the ⌘K palette.

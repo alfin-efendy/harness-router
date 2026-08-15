@@ -3025,6 +3025,38 @@ async fn execute_tool_call(
         .provider_result;
     }
 
+    // Gateway filesystem-access scope (Gateways screen → "Filesystem access").
+    // Checked before the permission gate so a blocked call never prompts the
+    // user for something the machine's policy already refuses.
+    if let super::fs_access::FsVerdict::Deny(code, message) =
+        super::fs_access::decide_for_session(&deps.store, &deps.work_dir, tool_kind).await
+    {
+        return complete_tool_call(
+            deps,
+            tool_call_id,
+            ToolCompletionContext {
+                version,
+                planned,
+                tool_name,
+                tool_kind,
+                trace_id,
+                duration_ms: 0,
+                normalization,
+                preflight,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::new(
+                    ToolErrorCategory::Permission,
+                    code,
+                    "Tool call was denied by the gateway filesystem policy",
+                ),
+                legacy_text: message,
+            },
+        )
+        .await
+        .provider_result;
+    }
+
     let perm_mode = deps.current_perm_mode();
     let spec = tool.permission(&input);
     let gate = super::permission::PermGate {
