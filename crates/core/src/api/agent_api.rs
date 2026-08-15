@@ -8,17 +8,19 @@ use crate::agents::knowledge::AgentLearningSnapshot;
 use crate::agents::learning_queue::{LearningEventPayload, RollbackEvent};
 use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, KnowledgeScope};
 use crate::agents::personality::{AgentPersonality, PersonalityPreset};
+use crate::agents::portable::{self, AgentBundle, KnowledgeFile};
 use crate::agents::types::{
     AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentRegistrySnapshot,
     AgentSnapshot, AgentTools, NativeToolDecision, PermissionDecision, PermissionRule,
 };
 use crate::api::types::{
-    AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
-    AgentMutationInfo, AgentPersonalityInfo, AgentRecoveryInfo, AgentRegistryInfo,
-    AgentSkillUsageInfo, AgentStatsInfo, AgentStatsLite, AgentSummaryInfo, AgentToolUsageInfo,
-    AgentValidationInfo, CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
-    JourneyMilestoneInfo, KnowledgeConceptInfo, KnowledgeConceptMutationInfo, LearningReviewInfo,
-    NativeToolDecisionInfo, PermissionRuleInfo, SessionRuntimeInfo,
+    AgentConfigurationCatalogInfo, AgentDetailInfo, AgentExportInfo, AgentImportResultInfo,
+    AgentLearningInfo, AgentModelInfo, AgentMutationInfo, AgentPersonalityInfo, AgentRecoveryInfo,
+    AgentRegistryInfo, AgentSkillUsageInfo, AgentStatsInfo, AgentStatsLite, AgentSummaryInfo,
+    AgentToolUsageInfo, AgentValidationInfo, CuratorHistorySnapshotInfo, CuratorStateInfo,
+    InvalidKnowledgeConceptInfo, JourneyMilestoneInfo, KnowledgeConceptInfo,
+    KnowledgeConceptMutationInfo, LearningReviewInfo, NativeToolDecisionInfo, PermissionRuleInfo,
+    SessionRuntimeInfo,
 };
 use crate::llm_router::model_effort::{
     self, EffectiveEffortSource, ModelDefaultSource, ModelPreferenceKey, ProjectRuntimeInfo,
@@ -63,6 +65,8 @@ pub(crate) const HANDLES: &[&str] = &[
     "create_agent",
     "update_agent",
     "duplicate_agent",
+    "export_agent",
+    "import_agent",
     "delete_agent",
     "set_default_agent",
     "get_subagent_model",
@@ -119,6 +123,11 @@ struct UpdateSessionRuntimeP {
 #[derive(Deserialize)]
 struct AgentIdP {
     agent_id: String,
+}
+
+#[derive(Deserialize)]
+struct ImportAgentP {
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -1121,6 +1130,191 @@ async fn agent_configuration_catalog(
     crate::agents::catalog::build_live_catalog(state.cp.store(), state.cp.plugins()).await
 }
 
+/// Walks one agent's knowledge bundle and returns every exportable OKF
+/// document plus the count of per-project memory files deliberately left
+/// out. Dot-directories (`.knowledge-transactions`, `.learning-events`)
+/// and anything that fails `validate_concept_relative_path` are skipped.
+fn collect_knowledge_files(root: &std::path::Path) -> anyhow::Result<(Vec<KnowledgeFile>, u32)> {
+    fn walk(
+        directory: &std::path::Path,
+        prefix: &str,
+        files: &mut Vec<KnowledgeFile>,
+        skipped: &mut u32,
+    ) -> anyhow::Result<()> {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // `.knowledge-transactions` / `.learning-events` and any other
+            // internal dot-entry are never part of a portable bundle.
+            if name.starts_with('.') {
+                continue;
+            }
+            // Build the bundle-relative path component by component: on
+            // Windows a whole-path `to_string_lossy()` would emit `\`, which
+            // `validate_concept_relative_path` rejects outright.
+            let relative = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(&entry.path(), &relative, files, skipped)?;
+                continue;
+            }
+            if !kind.is_file() || !name.ends_with(".md") {
+                continue;
+            }
+            if portable::is_project_memory_path(&relative) {
+                *skipped += 1;
+                continue;
+            }
+            if crate::agents::okf::validate_concept_relative_path(&relative).is_err() {
+                continue;
+            }
+            files.push(KnowledgeFile {
+                relative_path: relative,
+                markdown: std::fs::read_to_string(entry.path())?,
+            });
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    let mut skipped = 0;
+    walk(root, "", &mut files, &mut skipped)?;
+    // Deterministic ordering so exporting the same agent twice byte-matches.
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok((files, skipped))
+}
+
+/// Export one agent as a portable, credential-free bundle: its profile YAML
+/// plus every exportable OKF document. Local file out — nothing here reads
+/// SQLite, connections, tokens, or the network.
+async fn export_agent(state: &ApiState, agent_id: &str) -> Result<AgentExportInfo, ApiError> {
+    let snapshot = state
+        .agents
+        .get(agent_id)
+        .await
+        .map_err(|_| ApiError::not_found(format!("unknown agent: {agent_id}")))?;
+    let profile_yaml = crate::agents::yaml::render_agent_profile(&snapshot.profile)?;
+    let root = knowledge_store(state, agent_id)?.root().to_path_buf();
+    let (knowledge, project_memory_files_skipped) = collect_knowledge_files(&root)?;
+    let bundle = AgentBundle {
+        bundle_version: portable::AGENT_BUNDLE_VERSION,
+        schema_version: snapshot.profile.schema_version,
+        exported_at: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        source_agent_id: snapshot.profile.id.clone(),
+        source_agent_name: snapshot.profile.name.clone(),
+        profile_yaml,
+        knowledge,
+    };
+    Ok(AgentExportInfo {
+        file_name: portable::bundle_file_name(&snapshot.profile.name),
+        data: portable::render_bundle(&bundle)?,
+        knowledge_files: bundle.knowledge.len() as u32,
+        project_memory_files_skipped,
+    })
+}
+
+/// Import a portable agent bundle under a freshly generated id. A bundle is
+/// untrusted input: every knowledge path is validated before the registry is
+/// touched and again before it is written.
+async fn import_agent(state: &ApiState, data: &str) -> Result<AgentImportResultInfo, ApiError> {
+    let bundle = portable::parse_bundle(data)
+        .map_err(|e| ApiError::bad_request(format!("invalid agent bundle: {e:#}")))?;
+    let profile = crate::agents::yaml::parse_agent_profile(&bundle.profile_yaml)
+        .map_err(|e| ApiError::bad_request(format!("invalid agent profile in bundle: {e:#}")))?;
+
+    // Reject unsafe or non-portable knowledge paths BEFORE the registry is
+    // touched, so a hand-edited bundle can never half-import.
+    for entry in &bundle.knowledge {
+        crate::agents::okf::validate_concept_relative_path(&entry.relative_path).map_err(|e| {
+            ApiError::bad_request(format!(
+                "invalid knowledge path in bundle `{}`: {e:#}",
+                entry.relative_path
+            ))
+        })?;
+        if portable::is_project_memory_path(&entry.relative_path) {
+            return Err(ApiError::bad_request(format!(
+                "per-project memory is not portable: `{}`",
+                entry.relative_path
+            )));
+        }
+    }
+
+    let requested_name = profile.name.trim().to_owned();
+    let outcome = state.agents.import(profile).await?;
+    let agent_id = outcome.snapshot.profile.id.clone();
+    let agent_name = outcome.snapshot.profile.name.clone();
+
+    // Plain `std::fs` is safe here and only here: the agent id was just
+    // minted by the registry, so no other task can hold a `KnowledgeStore`
+    // reference to this agent yet and there is nothing to race.
+    let store = knowledge_store(state, &agent_id)?;
+    let mut knowledge_files_written = 0u32;
+    for entry in &bundle.knowledge {
+        // Defence in depth: re-validate at write time, and build the target
+        // by joining one component at a time rather than concatenating the
+        // raw string onto the root.
+        crate::agents::okf::validate_concept_relative_path(&entry.relative_path).map_err(|e| {
+            ApiError::bad_request(format!(
+                "invalid knowledge path in bundle `{}`: {e:#}",
+                entry.relative_path
+            ))
+        })?;
+        let mut target = store.root().to_path_buf();
+        for component in entry.relative_path.split('/') {
+            target.push(component);
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(anyhow::Error::from)?;
+        }
+        std::fs::write(&target, &entry.markdown).map_err(anyhow::Error::from)?;
+        knowledge_files_written += 1;
+    }
+
+    // Catalog issues (unknown skill / plugin tool / app / native tool) are
+    // invisible to the registry validator, so merge them in here — they are
+    // exactly what makes an imported agent show up flagged for repair.
+    let catalog = agent_configuration_catalog(state).await?;
+    let mut tolerated = outcome.tolerated;
+    for issue in
+        AgentConfigurationCatalog::validate_profile_references(&outcome.snapshot.profile, &catalog)
+    {
+        if !tolerated
+            .iter()
+            .any(|seen| seen.field == issue.field && seen.message == issue.message)
+        {
+            tolerated.push(issue);
+        }
+    }
+
+    Ok(AgentImportResultInfo {
+        renamed: agent_name != requested_name,
+        agent_id,
+        agent_name,
+        knowledge_files_written,
+        // The exporter already dropped per-project memory, and the loop above
+        // rejects any bundle that still carries it, so an import never skips.
+        project_memory_files_skipped: 0,
+        tolerated: tolerated
+            .iter()
+            .map(|issue| AgentValidationInfo {
+                field: issue.field.clone(),
+                message: issue.message.clone(),
+            })
+            .collect(),
+    })
+}
+
 /// Merge every parseable `cost_models` blob for `agent_id` started at or
 /// after `since_ms` into one token tally. Parses each blob the same way
 /// [`crate::store::Store::get_agent_run_cost_models`] does (plain
@@ -1414,6 +1608,18 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let registry = state.agents.snapshot().await;
             let catalog = agent_configuration_catalog(state).await?;
             ok(post_commit_detail_info(state, snapshot, &registry, &catalog).await)
+        }
+        "export_agent" => {
+            let a: AgentIdP = params(p)?;
+            let agent_id = a.agent_id.trim().to_string();
+            if agent_id == FRESH_AGENT_ID {
+                return Err(ApiError::conflict("fresh agent is built-in"));
+            }
+            ok(export_agent(state, &agent_id).await?)
+        }
+        "import_agent" => {
+            let a: ImportAgentP = params(p)?;
+            ok(import_agent(state, &a.data).await?)
         }
         "delete_agent" => {
             let a: AgentIdP = params(p)?;
@@ -2871,6 +3077,131 @@ mod tests {
         assert_eq!(detail["pluginTools"], json!([]));
         assert_eq!(detail["apps"], json!([]));
         assert_eq!(detail["permissionRules"], json!([]));
+    }
+
+    /// The smallest bundle envelope the reader accepts, carrying `profile_yaml`
+    /// verbatim so a test can hand-craft an invalid one.
+    fn bundle_json(bundle_version: u32, profile_yaml: &str, knowledge: Value) -> String {
+        json!({
+            "bundle_version": bundle_version,
+            "schema_version": 2,
+            "exported_at": "2026-08-15T10:00:00Z",
+            "source_agent_id": "agent-source",
+            "source_agent_name": "Reviewer",
+            "profile_yaml": profile_yaml,
+            "knowledge": knowledge,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn export_then_import_round_trips_a_profile_under_a_new_id() {
+        let _skill_guard = InstalledSkillGuard::new();
+        let s = state_with_agents().await;
+        let created = dispatch(
+            &s,
+            "create_agent",
+            json!({"input": reviewer_input("Reviewer")}),
+        )
+        .await
+        .unwrap();
+        let id = created["summary"]["id"].as_str().unwrap().to_owned();
+
+        let exported = dispatch(&s, "export_agent", json!({"agent_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(exported["fileName"], "reviewer.ryuzi-agent.json");
+        let data = exported["data"].as_str().unwrap().to_owned();
+
+        let imported = dispatch(&s, "import_agent", json!({"data": data}))
+            .await
+            .unwrap();
+        let new_id = imported["agentId"].as_str().unwrap().to_owned();
+        assert_ne!(new_id, id);
+        assert_eq!(imported["agentName"], "Reviewer Copy");
+        assert_eq!(imported["renamed"], true);
+
+        let list = dispatch(&s, "list_agents", json!({})).await.unwrap();
+        let ids = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&id), "{ids:?}");
+        assert!(ids.contains(&new_id), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn import_rejects_a_malformed_bundle() {
+        let s = state_with_agents().await;
+        let error = dispatch(&s, "import_agent", json!({"data": "not json"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 400);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_a_future_bundle_version() {
+        let s = state_with_agents().await;
+        let data = bundle_json(99, "schema_version: 2\n", json!([]));
+        let error = dispatch(&s, "import_agent", json!({"data": data}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(
+            error.message.contains("unsupported agent bundle version"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn import_rejects_a_traversing_knowledge_path() {
+        let _skill_guard = InstalledSkillGuard::new();
+        let s = state_with_agents().await;
+        let created = dispatch(
+            &s,
+            "create_agent",
+            json!({"input": reviewer_input("Reviewer")}),
+        )
+        .await
+        .unwrap();
+        let id = created["summary"]["id"].as_str().unwrap().to_owned();
+        let exported = dispatch(&s, "export_agent", json!({"agent_id": id}))
+            .await
+            .unwrap();
+        let mut bundle: Value = serde_json::from_str(exported["data"].as_str().unwrap()).unwrap();
+        bundle["knowledge"] = json!([{"relative_path": "../../escape.md", "markdown": "pwn"}]);
+
+        let before = dispatch(&s, "list_agents", json!({})).await.unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .len();
+        let error = dispatch(&s, "import_agent", json!({"data": bundle.to_string()}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 400);
+        let after = dispatch(&s, "list_agents", json!({})).await.unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(
+            after, before,
+            "no agent may be created by a rejected import"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_of_the_fresh_agent_is_rejected() {
+        let s = state_with_agents().await;
+        let error = dispatch(&s, "export_agent", json!({"agent_id": "fresh"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 409);
+        assert_eq!(error.message, "fresh agent is built-in");
     }
 
     #[tokio::test]

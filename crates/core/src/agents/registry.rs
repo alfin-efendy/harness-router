@@ -13,6 +13,7 @@ use crate::paths;
 use crate::store::Store;
 
 use super::learning_queue::LearningQueue;
+use super::portable;
 #[cfg(test)]
 use super::transaction::TransactionFailpoint;
 use super::transaction::{recover_transactions, registry_generation, AgentTransaction};
@@ -167,6 +168,15 @@ impl std::fmt::Display for AgentRegistryError {
 }
 
 impl std::error::Error for AgentRegistryError {}
+
+/// The result of committing an imported agent profile.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentImportOutcome {
+    pub snapshot: AgentSnapshot,
+    /// Reference/environment issues that were tolerated. Non-empty means the
+    /// imported agent is present but not executable until repaired.
+    pub tolerated: Vec<AgentValidationIssue>,
+}
 
 impl From<anyhow::Error> for AgentRegistryError {
     fn from(value: anyhow::Error) -> Self {
@@ -477,6 +487,80 @@ impl AgentRegistry {
             .expect("committed duplicate"))
     }
 
+    /// Commits an imported profile under a freshly generated id. Structural
+    /// defects reject the import; reference/environment issues (unknown
+    /// model, skill, plugin tool, or app) are tolerated so the agent lands
+    /// visible and flagged for repair, exactly like a profile whose
+    /// references went stale on disk.
+    pub async fn import(
+        &self,
+        profile: AgentProfile,
+    ) -> Result<AgentImportOutcome, AgentRegistryError> {
+        // Held for the whole method: the id is minted, validated and committed
+        // under one lock, so no concurrent mutation can land between the
+        // candidate's validation and its commit.
+        let _guard = self.mutations.lock().await;
+        crate::agents::bootstrap::ensure_default_routes(&self.store).await?;
+        let state = self.state.read().await.clone();
+
+        let id = new_agent_id();
+        let mut profile = profile;
+        profile.id = id.clone();
+        profile.schema_version = AGENT_SCHEMA_VERSION;
+        let name_is_taken = state.agents.values().any(|agent| {
+            agent
+                .profile
+                .name
+                .trim()
+                .eq_ignore_ascii_case(profile.name.trim())
+        });
+        if name_is_taken {
+            profile.name = unique_copy_name(profile.name.trim(), &state.agents);
+        }
+
+        let mut profiles = typed_profiles(&state);
+        profiles.insert(id.clone(), profile.clone());
+        let mut index = state.index.clone();
+        index.order.push(id.clone());
+
+        let issues =
+            validate_registry_candidate(&self.store, &index, &profiles, &state.subagents).await;
+        // Only the imported agent's own issues gate the import. Agents that
+        // were already invalid on disk stay invalid and must not block it.
+        let mine = issues.get(&id).cloned().unwrap_or_default();
+        let (tolerated, structural): (Vec<_>, Vec<_>) = mine
+            .into_iter()
+            .partition(|value| portable::issue_is_tolerable_on_import(&value.field));
+        if !structural.is_empty() {
+            return Err(AgentRegistryError::Invalid(structural));
+        }
+
+        // Publish every agent with the issues it actually has: the import's
+        // tolerated set for the new id, and the pre-existing set for anyone
+        // who was already flagged, so an import never silently clears another
+        // agent's repair flag.
+        let snapshot = self
+            .commit_disk_image(
+                index,
+                profiles,
+                state.subagents.clone(),
+                Vec::new(),
+                &HashMap::new(),
+                None,
+                issues,
+            )
+            .await?;
+        let committed = snapshot
+            .agents
+            .into_iter()
+            .find(|agent| agent.profile.id == id)
+            .expect("committed import");
+        Ok(AgentImportOutcome {
+            snapshot: committed,
+            tolerated,
+        })
+    }
+
     pub async fn delete(
         &self,
         agent_id: &str,
@@ -650,12 +734,40 @@ impl AgentRegistry {
     ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
         self.validate_candidate(&index, &profiles, &subagents)
             .await?;
+        // Every existing caller commits a fully-validated candidate, so no id
+        // carries tolerated issues and each is published clean.
+        self.commit_disk_image(
+            index,
+            profiles,
+            subagents,
+            deleted_agent_ids,
+            &profile_sources,
+            commit_marker,
+            IndexMap::new(),
+        )
+        .await
+    }
+
+    /// Renders, atomically commits, and publishes a candidate registry image.
+    /// `validation` carries per-agent issues that were deliberately tolerated
+    /// (import only); every id absent from it is published as clean.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_disk_image(
+        &self,
+        index: AgentIndex,
+        profiles: IndexMap<AgentId, AgentProfile>,
+        subagents: SubagentConfig,
+        deleted_agent_ids: Vec<AgentId>,
+        profile_sources: &HashMap<AgentId, AgentId>,
+        commit_marker: Option<Arc<std::sync::atomic::AtomicBool>>,
+        validation: IndexMap<AgentId, Vec<AgentValidationIssue>>,
+    ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
         let disk_image = self.render_disk_image(
             &index,
             &profiles,
             &subagents,
             deleted_agent_ids,
-            &profile_sources,
+            profile_sources,
         )?;
         let expected_generation = self.state.read().await.generation.clone();
         let transaction =
@@ -689,12 +801,13 @@ impl AgentRegistry {
         let agents = profiles
             .into_iter()
             .map(|(id, profile)| {
+                let issues = validation.get(&id).cloned().unwrap_or_default();
                 (
                     id,
                     Arc::new(AgentSnapshot {
                         profile,
-                        executable: true,
-                        validation: Vec::new(),
+                        executable: issues.is_empty(),
+                        validation: issues,
                     }),
                 )
             })
@@ -1389,6 +1502,102 @@ mod tests {
             .validation
             .iter()
             .any(|issue| issue.field == "profile"));
+    }
+
+    /// A single-agent fixture registry plus the profile an import carries.
+    async fn import_fixture() -> (RegistryFixture, AgentRegistry) {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        (fixture, registry)
+    }
+
+    fn imported_profile(name: &str, model: &str) -> AgentProfile {
+        parse_agent_profile(&profile_yaml("agent-from-bundle", name, model, None)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn import_with_unknown_model_lands_non_executable_and_visible() {
+        let (fixture, registry) = import_fixture().await;
+        let outcome = registry
+            .import(imported_profile("Imported", "unknown/missing"))
+            .await
+            .unwrap();
+
+        assert!(!outcome.snapshot.executable);
+        assert!(outcome
+            .tolerated
+            .iter()
+            .any(|issue| issue.field == "model.name"));
+        let new_id = outcome.snapshot.profile.id.clone();
+        // The LIVE in-memory snapshot, not a reload: the tolerated issues must
+        // be published immediately, not only after the next process start.
+        let live = registry.get(&new_id).await.unwrap();
+        assert!(!live.executable);
+        assert!(live
+            .validation
+            .iter()
+            .any(|issue| issue.field == "model.name"));
+        assert!(fixture
+            .root
+            .path()
+            .join(format!("agents/{new_id}/agent.yaml"))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn import_with_blank_name_is_rejected_and_writes_nothing() {
+        let (_fixture, registry) = import_fixture().await;
+        let before = registry.snapshot().await.agents.len();
+        let mut profile = imported_profile("Imported", "anthropic/claude-opus-4-8");
+        profile.name = "   ".into();
+
+        let error = registry.import(profile).await.unwrap_err();
+        assert!(
+            matches!(&error, AgentRegistryError::Invalid(issues) if issues.iter().any(|issue| issue.field == "name")),
+            "{error:?}"
+        );
+        assert_eq!(registry.snapshot().await.agents.len(), before);
+    }
+
+    #[tokio::test]
+    async fn import_renames_only_on_a_name_collision() {
+        let (_fixture, registry) = import_fixture().await;
+        let collided = registry
+            .import(imported_profile("Ryuzi", "anthropic/claude-opus-4-8"))
+            .await
+            .unwrap();
+        assert_eq!(collided.snapshot.profile.name, "Ryuzi Copy");
+        assert!(collided.tolerated.is_empty());
+
+        let fresh = registry
+            .import(imported_profile("Reviewer", "anthropic/claude-opus-4-8"))
+            .await
+            .unwrap();
+        assert_eq!(fresh.snapshot.profile.name, "Reviewer");
+    }
+
+    #[tokio::test]
+    async fn import_always_assigns_a_new_id() {
+        let (_fixture, registry) = import_fixture().await;
+        let first = registry
+            .import(imported_profile("One", "anthropic/claude-opus-4-8"))
+            .await
+            .unwrap();
+        let second = registry
+            .import(imported_profile("Two", "anthropic/claude-opus-4-8"))
+            .await
+            .unwrap();
+        assert_ne!(first.snapshot.profile.id, second.snapshot.profile.id);
+        assert_ne!(first.snapshot.profile.id, "agent-from-bundle");
+        assert_ne!(second.snapshot.profile.id, "agent-from-bundle");
     }
 
     #[test]
