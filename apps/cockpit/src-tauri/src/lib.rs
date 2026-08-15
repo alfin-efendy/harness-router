@@ -53,6 +53,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::fetch_attachment,
             artifacts_cmd::list_session_artifacts,
             artifacts_cmd::fetch_artifact,
+            artifacts_cmd::run_artifact_retention,
             commands::pick_directory,
             commands::pick_files,
             commands::backdrop_capability,

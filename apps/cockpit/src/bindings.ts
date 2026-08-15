@@ -202,6 +202,20 @@ async fetchArtifact(runnerId: string | null, sessionPk: string, artifactId: stri
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Run the engine's artifact-retention pass immediately, instead of waiting
+ * for the daemon's hourly timer. Sends no `retentionDays`, so the engine
+ * resolves the operator's configured `artifact_retention_days`. Returns the
+ * number of archived sessions purged.
+ */
+async runArtifactRetention(runnerId: string | null) : Promise<Result<number, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("run_artifact_retention", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pickDirectory() : Promise<string | null> {
     return await TAURI_INVOKE("pick_directory");
 },

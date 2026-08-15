@@ -12,6 +12,7 @@ const getSetting = mock(
 );
 const setSetting = mock(async (_runnerId: string, _key: string, _value: string) => ok(null));
 const pickDirectory = mock((): Promise<string | null> => Promise.resolve(null));
+const runArtifactRetention = mock(async (_runnerId: string) => ok(3));
 const listAudit = mock(async (_limit: number) => ok([]));
 const getAgent = mock(async () => ok(null));
 const updateAgent = mock(async () => ok(null));
@@ -22,6 +23,7 @@ mock.module("@/bindings", () => ({
     getSetting,
     setSetting,
     pickDirectory,
+    runArtifactRetention,
     listAudit,
     getAgent,
     updateAgent,
@@ -41,7 +43,8 @@ mock.module("@tauri-apps/plugin-autostart", () => ({
 const { SettingsView } = await import("./SettingsView");
 
 beforeEach(() => {
-  for (const fn of [getSetting, setSetting, pickDirectory, listAudit, getAgent, updateAgent, listToolPolicies]) fn.mockClear();
+  for (const fn of [getSetting, setSetting, pickDirectory, listAudit, getAgent, updateAgent, listToolPolicies, runArtifactRetention])
+    fn.mockClear();
 });
 
 afterEach(cleanup);
@@ -80,4 +83,11 @@ test("Worktree folder shows the configured path and Browse saves a new one", asy
   fireEvent.click(within(card).getByRole("button", { name: "Browse" }));
 
   await waitFor(() => expect(setSetting).toHaveBeenCalledWith(LOCAL_RUNNER, WORKTREE_DIR_KEY, "E:\\other-wt"));
+});
+
+test("Run cleanup now triggers artifact retention on the local runner", async () => {
+  render(<SettingsView />);
+  const button = await screen.findByRole("button", { name: "Run cleanup now" });
+  fireEvent.click(button);
+  await waitFor(() => expect(runArtifactRetention).toHaveBeenCalledWith(LOCAL_RUNNER));
 });
