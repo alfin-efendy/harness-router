@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, test } from "bun:test";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { GatewayEventInfo, GatewayInfo, Session } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
@@ -118,22 +118,31 @@ test("loads daemon events on mount and renders the log card", async () => {
   expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
 });
 
-test("does not offer a filesystem-access control while scoping is unenforced", async () => {
+test("switching filesystem access on the local gateway persists the mode", async () => {
   seed();
   render(<GatewayDetailView id="local" />);
   await screen.findByText(/Daemon handshake complete/);
+  expect(screen.getByRole("button", { name: "/home/dev/projects" })).toBeTruthy();
 
-  // The honest replacement copy is present …
-  expect(screen.getByText("Not enforced yet")).toBeTruthy();
-  expect(screen.getByText(/Ryuzi does not scope filesystem access per gateway yet/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Read-only" }));
 
-  // … and none of the mode buttons or folder chips are rendered, so nothing
-  // can persist a setting the engine never reads.
-  expect(screen.queryByRole("button", { name: "Full" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Projects only" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Read-only" })).toBeNull();
+  expect(updateGateway).toHaveBeenCalledWith(LOCAL_RUNNER, "local", "read", ["/home/dev/projects"]);
+  // Health re-renders from the mocked updateGateway response.
+  expect(await screen.findByText("0.9 ms")).toBeTruthy();
+  expect(screen.getByText("Agents may inspect files, but file edits and shell commands are refused.")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "/home/dev/projects" })).toBeNull();
-  expect(updateGateway).not.toHaveBeenCalled();
+});
+
+test("a remote gateway offers no filesystem control — it is enforced on that machine", async () => {
+  const remote: GatewayInfo = { ...localGateway, id: "remote-1", kind: "remote", badge: "RMT", fsMode: "projects" };
+  useGateways.setState({ gateways: [remote], eventsById: {}, loaded: true, probing: false });
+  useStore.setState({ sessions: [], focusedSession: null });
+  render(<GatewayDetailView id="remote-1" />);
+  await screen.findByText(/Daemon handshake complete/);
+
+  expect(screen.getByText("Configured on that machine")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Projects only" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "/home/dev/projects" })).toBeNull();
 });
 
 test("shows the not-found state for an unknown gateway id", async () => {
