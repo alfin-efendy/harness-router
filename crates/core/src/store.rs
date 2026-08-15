@@ -10275,6 +10275,171 @@ mod tests {
             .is_some());
     }
 
+    /// Seed one row in every session-keyed child table for `pk`. Uses raw SQL
+    /// rather than the typed writers so the test stays pinned to the schema
+    /// this purge has to clean, not to ten unrelated APIs.
+    async fn seed_session_child_rows(store: &Store, pk: &'static str) {
+        store
+            .insert_message(NewMessage::block(
+                pk,
+                "user",
+                "text",
+                serde_json::json!({ "text": format!("{pk} transcript body") }),
+            ))
+            .await
+            .unwrap();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "INSERT INTO provider_turns(session_pk,seq,role,payload,created_at) \
+                     VALUES(?1,1,'user','{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO todos(session_pk,pos,content,status,created_at) \
+                     VALUES(?1,1,'ship it','pending',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_context(session_pk,payload,updated_at) \
+                     VALUES(?1,'{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO context_checkpoints(session_pk,boundary_seq,window_number,payload,created_at) \
+                     VALUES(?1,1,1,'{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_surfaces(gateway,conversation_id,session_pk) \
+                     VALUES('local',?1,?1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_prompt_queue(id,session_pk,position,payload,created_at) \
+                     VALUES(?1 || '-queued',?1,1,'{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_route_state(session_pk,requested_model,resolved_provider,\
+                     resolved_family,resolved_model,connection_id,updated_at) \
+                     VALUES(?1,'sol','openai','openai','gpt-5.6-sol','conn-1',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_automation_origins(session_pk,kind,hook_id,run_id,depth) \
+                     VALUES(?1,'webhook','hook-1','run-1',0)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO background_events(id,target_session_pk,kind,payload,created_at) \
+                     VALUES(?1 || '-event',?1,'note','{}',1)",
+                    params![pk],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn count_rows(store: &Store, sql: String) -> i64 {
+        store
+            .with_conn(move |c| c.query_row(&sql, [], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn purging_a_session_deletes_every_session_keyed_child_row() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        let mut bystander = sample_session();
+        bystander.session_pk = "s2".into();
+        store.insert_session(bystander).await.unwrap();
+        seed_session_child_rows(&store, "s1").await;
+        seed_session_child_rows(&store, "s2").await;
+
+        // A live artifact blocks the purge, and nothing may be deleted.
+        store
+            .insert_artifact(&sample_artifact("art-1", "s1", ArtifactStatus::Available))
+            .await
+            .unwrap();
+        assert!(!store
+            .delete_session_after_artifact_purge("s1")
+            .await
+            .unwrap());
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE session_pk='s1'".into()
+            )
+            .await,
+            1,
+            "a blocked purge must not touch child rows"
+        );
+
+        store
+            .mark_source_artifacts_deleted("s1", 2_000)
+            .await
+            .unwrap();
+        assert!(store
+            .delete_session_after_artifact_purge("s1")
+            .await
+            .unwrap());
+        assert!(store.get_session("s1").await.unwrap().is_none());
+
+        for &(table, column) in SESSION_CHILD_TABLES {
+            let purged = count_rows(
+                &store,
+                format!("SELECT COUNT(*) FROM {table} WHERE {column}='s1'"),
+            )
+            .await;
+            assert_eq!(
+                purged, 0,
+                "{table} still holds rows for the purged session s1"
+            );
+            let kept = count_rows(
+                &store,
+                format!("SELECT COUNT(*) FROM {table} WHERE {column}='s2'"),
+            )
+            .await;
+            assert_eq!(kept, 1, "{table} lost rows for the untouched session s2");
+        }
+
+        // The messages_fts_ad trigger must have cleared the FTS5 shadow rows
+        // for s1 while leaving s2's indexed.
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 's1'".into()
+            )
+            .await,
+            0,
+            "the FTS shadow index still holds the purged session's transcript"
+        );
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 's2'".into()
+            )
+            .await,
+            1,
+            "the FTS shadow index lost an untouched session's transcript"
+        );
+
+        // The artifact tombstone and any cross-session references survive.
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM artifacts WHERE id='art-1'".into()
+            )
+            .await,
+            1,
+            "artifact tombstones must outlive the purged session"
+        );
+    }
+
     #[tokio::test]
     async fn source_artifact_status_updates_only_exact_transitions() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
