@@ -291,6 +291,19 @@ test("a rejected stats batch load never crashes the roster render and leaves row
   expect(screen.queryByText(/sessions ·/)).toBeNull();
 });
 
+test("the Import agent button invokes the store's import action exactly once", async () => {
+  const realImportAgent = useAgents.getState().importAgent;
+  const importAgent = mock(async () => null);
+  useAgents.setState({ importAgent });
+  try {
+    render(<AgentsView />);
+    fireEvent.click(screen.getByRole("button", { name: "Import agent" }));
+    await waitFor(() => expect(importAgent).toHaveBeenCalledTimes(1));
+  } finally {
+    useAgents.setState({ importAgent: realImportAgent });
+  }
+});
+
 test("no list row has an actions menu — Start chat/Duplicate/Delete live on the detail page", () => {
   render(<AgentsView />);
   expect(screen.queryByRole("button", { name: /^Actions for/ })).toBeNull();

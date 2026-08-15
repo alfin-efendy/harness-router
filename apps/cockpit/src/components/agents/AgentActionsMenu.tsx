@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Copy, MessageCircle, MoreHorizontal, Trash2 } from "lucide-react";
+import { Copy, Download, MessageCircle, MoreHorizontal, Trash2 } from "lucide-react";
 import { Button, MenuPanel, MenuPanelItem } from "@ryuzi/ui";
 import type { AgentSummaryInfo } from "@/bindings";
 import { useAgents } from "@/store-agents";
@@ -87,6 +87,15 @@ export function AgentActionsMenu({ agent, onDeleteSuccess }: { agent: AgentSumma
             <MenuPanelItem onClick={() => void duplicate()}>
               <Copy aria-hidden size={14} strokeWidth={2} />
               Duplicate
+            </MenuPanelItem>
+            <MenuPanelItem
+              onClick={() => {
+                setOpen(false);
+                void useAgents.getState().exportAgent(agent.id);
+              }}
+            >
+              <Download aria-hidden size={14} strokeWidth={2} />
+              Export…
             </MenuPanelItem>
             <MenuPanelItem
               className="text-destructive hover:text-destructive"
