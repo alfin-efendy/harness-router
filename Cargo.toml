@@ -43,6 +43,11 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 tokio-util = "0.7"
 webpki-roots = "1"
 toml = "0.8"
+tracing = "0.1"
+# `env-filter` is what makes RYUZI_LOG work; `fmt` is the stderr writer. No
+# default features: the default set pulls `ansi`, which would write terminal
+# colour escapes into daemon.log.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 wasmtime = { version = "46.0.1", features = ["component-model"] }
 wasmtime-wasi = "46.0.1"
 
