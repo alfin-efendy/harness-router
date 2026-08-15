@@ -1883,6 +1883,31 @@ pub struct AgentValidationInfo {
     pub message: String,
 }
 
+/// What `import_agent` landed: the new agent, plus every reference the
+/// bundle carried that does not exist on this machine. A non-empty
+/// `tolerated` means the agent is present but not executable until repaired.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentImportResultInfo {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub renamed: bool,
+    pub knowledge_files_written: u32,
+    pub project_memory_files_skipped: u32,
+    pub tolerated: Vec<AgentValidationInfo>,
+}
+
+/// What `export_agent` produced: the bundle JSON plus the suggested file
+/// name, so the shell can offer it in the save dialog.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentExportInfo {
+    pub file_name: String,
+    pub data: String,
+    pub knowledge_files: u32,
+    pub project_memory_files_skipped: u32,
+}
+
 /// One startup-recovery note surfaced to the UI (for example a quarantined
 /// agent file that failed to parse and was set aside).
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

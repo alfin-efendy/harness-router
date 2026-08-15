@@ -751,6 +751,7 @@ impl AgentRegistry {
     /// Renders, atomically commits, and publishes a candidate registry image.
     /// `validation` carries per-agent issues that were deliberately tolerated
     /// (import only); every id absent from it is published as clean.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_disk_image(
         &self,
         index: AgentIndex,
