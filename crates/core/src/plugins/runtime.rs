@@ -226,10 +226,7 @@ impl wasmtime::ResourceLimiter for PluginResourceLimiter {
         // The module's own declared maximum still applies; refusing it is a
         // plain `Ok(false)` because that is the guest's own contract, not a
         // host policy violation.
-        let allow = match maximum {
-            Some(max) if desired > max => false,
-            _ => true,
-        };
+        let allow = !matches!(maximum, Some(max) if desired > max);
         if allow {
             self.granted_memory_bytes = projected;
         }
@@ -249,10 +246,7 @@ impl wasmtime::ResourceLimiter for PluginResourceLimiter {
                 self.max_table_elements
             );
         }
-        let allow = match maximum {
-            Some(max) if desired > max => false,
-            _ => true,
-        };
+        let allow = !matches!(maximum, Some(max) if desired > max);
         Ok(allow)
     }
 }
