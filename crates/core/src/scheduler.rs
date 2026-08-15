@@ -441,6 +441,31 @@ pub async fn has_running_run(store: &Store, job_id: &str) -> anyhow::Result<bool
         .await
 }
 
+/// On boot: close every `job_runs` row a dead process left mid-flight. The
+/// scheduler-side twin of [`crate::automation::fail_incomplete_runs_on_restart`].
+///
+/// A row stuck at `running` is exactly the condition [`has_running_run`]
+/// reports, and that guard is what both the scheduler tick and the "Run now"
+/// path consult before firing a job — so a crash mid-run would otherwise wedge
+/// that job forever, with no in-product recovery. Unlike the automation twin
+/// there is no `queued` state to sweep here (`job_runs.status` is only
+/// `running` | `success` | `failed`), so this clears precisely the wedging
+/// condition and nothing else. Returns the number of rows closed.
+pub async fn fail_incomplete_runs_on_restart(store: &Store) -> anyhow::Result<u64> {
+    let now = crate::paths::now_ms();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE job_runs
+                 SET status='failed', error='restart interrupted', finished_at=?1
+                 WHERE status='running'",
+                params![now],
+            )
+            .map(|changed| changed as u64)
+        })
+        .await
+}
+
 // ---------------------------------------------------------------------------
 // Silence + wake gates (hermes-agent cron conventions)
 // ---------------------------------------------------------------------------
@@ -1254,6 +1279,77 @@ mod tests {
         delete_job(&store, "j1").await.unwrap();
         assert!(get_job(&store, "j1").await.unwrap().is_none());
         assert!(list_runs(&store, "j1", 10).await.unwrap().is_empty());
+    }
+
+    // A daemon restart mid-run used to leave `job_runs.status='running'`
+    // forever, which `has_running_run` reads as "still executing" — so the
+    // scheduler tick skipped the job and "Run now" refused. Reconciliation
+    // must close exactly those rows and leave terminal ones alone.
+    #[tokio::test]
+    async fn restart_closes_running_job_runs_and_unblocks_the_job() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        upsert_job(&store, sample_job("j1")).await.unwrap();
+
+        insert_run(
+            &store,
+            RunRow {
+                id: "r-stale".into(),
+                job_id: "j1".into(),
+                status: "running".into(),
+                started_at: 1000,
+                finished_at: None,
+                session_pk: None,
+                error: None,
+                add_lines: None,
+                del_lines: None,
+                note: None,
+                log: None,
+            },
+        )
+        .await
+        .unwrap();
+        insert_run(
+            &store,
+            RunRow {
+                id: "r-done".into(),
+                job_id: "j1".into(),
+                status: "success".into(),
+                started_at: 500,
+                finished_at: Some(900),
+                session_pk: Some("s-1".into()),
+                error: None,
+                add_lines: Some(3),
+                del_lines: Some(1),
+                note: None,
+                log: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let done_before = list_runs(&store, "j1", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == "r-done")
+            .unwrap();
+        assert!(has_running_run(&store, "j1").await.unwrap());
+
+        assert_eq!(fail_incomplete_runs_on_restart(&store).await.unwrap(), 1);
+
+        let runs = list_runs(&store, "j1", 10).await.unwrap();
+        let stale = runs.iter().find(|run| run.id == "r-stale").unwrap();
+        assert_eq!(stale.status, "failed");
+        assert_eq!(stale.error.as_deref(), Some("restart interrupted"));
+        assert!(stale.finished_at.is_some());
+        let done_after = runs.into_iter().find(|run| run.id == "r-done").unwrap();
+        assert_eq!(done_after, done_before);
+
+        // The job is eligible to fire again — this is the whole point.
+        assert!(!has_running_run(&store, "j1").await.unwrap());
+        // Idempotent: a second boot closes nothing.
+        assert_eq!(fail_incomplete_runs_on_restart(&store).await.unwrap(), 0);
     }
 
     /// A minimal, otherwise-boring job row — tests that only care about one

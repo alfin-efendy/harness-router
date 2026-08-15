@@ -4601,6 +4601,69 @@ async fn reconcile_fails_queued_automation_runs_while_resuming_running_sessions(
     assert!(stored.finished_at.is_some());
 }
 
+// A crash or restart mid-job left `job_runs.status='running'` forever, and
+// `scheduler::has_running_run` reads that as "still executing" — so the job
+// never fired again and "Run now" refused, with no in-product recovery.
+// Boot reconciliation must clear it.
+#[tokio::test]
+async fn reconcile_fails_job_runs_left_running_by_a_restart() {
+    let (cp, store, _prompt_log, _db_guard) = fake_control_plane().await;
+
+    let job = crate::scheduler::JobRow {
+        id: "j1".into(),
+        name: "Nightly audit".into(),
+        cron: "0 2 * * *".into(),
+        mode: "cron".into(),
+        natural_text: String::new(),
+        project_id: "p1".into(),
+        branch: "main".into(),
+        gateway: "local".into(),
+        enabled: true,
+        prompt: "do the thing".into(),
+        notify_success: false,
+        notify_fail: false,
+        pre_check: String::new(),
+        model_override: None,
+        plugin_id: None,
+    };
+    crate::scheduler::upsert_job(&store, job).await.unwrap();
+    crate::scheduler::insert_run(
+        &store,
+        crate::scheduler::RunRow {
+            id: "r-stale".into(),
+            job_id: "j1".into(),
+            status: "running".into(),
+            started_at: 1000,
+            finished_at: None,
+            session_pk: None,
+            error: None,
+            add_lines: None,
+            del_lines: None,
+            note: None,
+            log: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(crate::scheduler::has_running_run(&store, "j1")
+        .await
+        .unwrap());
+
+    cp.reconcile().await.unwrap();
+
+    let runs = crate::scheduler::list_runs(&store, "j1", 10).await.unwrap();
+    let stale = runs.iter().find(|run| run.id == "r-stale").unwrap();
+    assert_eq!(stale.status, "failed");
+    assert_eq!(stale.error.as_deref(), Some("restart interrupted"));
+    assert!(stale.finished_at.is_some());
+    assert!(
+        !crate::scheduler::has_running_run(&store, "j1")
+            .await
+            .unwrap(),
+        "after reconcile the job must be eligible to fire again"
+    );
+}
+
 #[tokio::test]
 async fn reconcile_resumes_running_session_with_nudge_and_increments_attempts() {
     let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
