@@ -21,6 +21,7 @@ pub mod harness;
 pub(crate) mod install_common;
 pub mod learning;
 pub mod llm_router;
+pub mod logging;
 pub mod mcp;
 pub mod mentions;
 pub mod oauth_loopback;

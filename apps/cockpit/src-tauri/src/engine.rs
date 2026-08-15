@@ -288,10 +288,14 @@ async fn try_attach(dir: &std::path::Path) -> Option<EngineClient> {
 /// `setup()` dies before the window is ever shown.
 fn open_daemon_log(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(dir)?;
+    let path = dir.join("daemon.log");
+    // Rotate before the handle is handed to the spawned child: afterwards this
+    // file is the child's inherited stdout/stderr fd and cannot be swapped.
+    ryuzi_core::logging::rotate_if_large(&path, ryuzi_core::logging::MAX_DAEMON_LOG_BYTES);
     std::fs::File::options()
         .append(true)
         .create(true)
-        .open(dir.join("daemon.log"))
+        .open(path)
 }
 
 fn spawn_engine_daemon(dir: &std::path::Path) -> anyhow::Result<()> {
