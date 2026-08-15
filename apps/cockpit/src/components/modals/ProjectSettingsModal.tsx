@@ -1,4 +1,7 @@
 import { FolderOpen } from "lucide-react";
+import { useEffect, useState } from "react";
+import { commands, type WorktreeHookStatus } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
@@ -29,11 +32,76 @@ export function ProjectSettingsModal() {
             <span className="text-xs font-semibold">Local path</span>
             <div className={`${field} font-mono text-xs text-muted-foreground`}>{project.workdir}</div>
           </div>
+          <HookScripts projectId={projectId} />
         </div>
       </ModalBody>
       <ModalFooter>
         <Button onClick={() => close(null)}>Done</Button>
       </ModalFooter>
     </Modal>
+  );
+}
+
+// `.ryuzi/hooks/<event>/` executables live in the repository, so anyone who can
+// send a pull request can propose code that runs on this machine. The engine
+// refuses to execute them until the exact bytes are accepted here; this section
+// is the only place that acceptance can be granted.
+function HookScripts({ projectId }: { projectId: string }) {
+  const [status, setStatus] = useState<WorktreeHookStatus | null>(null);
+  // Set when the engine refused the last acceptance because the scripts on disk
+  // no longer matched the digest listed above — the list has been swapped for
+  // the new one and needs reviewing again.
+  const [changedUnderReview, setChangedUnderReview] = useState(false);
+  useEffect(() => {
+    let live = true;
+    setChangedUnderReview(false);
+    void commands.worktreeHookStatus(LOCAL_RUNNER, projectId).then((res) => {
+      // An RPC failure renders nothing rather than an alarming empty widget —
+      // the engine still fails closed, so nothing runs either way.
+      if (live && res.status === "ok") setStatus(res.data);
+    });
+    return () => {
+      live = false;
+    };
+  }, [projectId]);
+
+  const digest = status?.digest;
+  if (!status || !digest || status.scripts.length === 0) return null;
+
+  // The digest of the set rendered right now travels with the click, so the
+  // engine can refuse if a `git pull` or the agent's own write replaced these
+  // scripts while they were being read.
+  const trust = async () => {
+    const res = await commands.trustWorktreeHooks(LOCAL_RUNNER, projectId, digest);
+    if (res.status !== "ok") return;
+    setChangedUnderReview(res.data.outcome === "changed");
+    setStatus(res.data.status);
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-xs font-semibold">Hook scripts</span>
+      <div className="flex flex-col gap-1 rounded-md border border-input bg-background px-3 py-2">
+        {status.scripts.map((script) => (
+          <div className="font-mono text-xs text-muted-foreground" key={script}>
+            {script}
+          </div>
+        ))}
+      </div>
+      {status.trusted ? (
+        <span className="text-xs text-muted-foreground">Trusted. Editing any of these scripts will revoke this and stop them running.</span>
+      ) : (
+        <>
+          <span className={`text-xs ${changedUnderReview ? "text-destructive" : "text-muted-foreground"}`}>
+            {changedUnderReview
+              ? "These scripts changed while you were reviewing them, so nothing was trusted. The list above is the new one — review it again before trusting."
+              : "These scripts have not been trusted and will not run. Review them before trusting."}
+          </span>
+          <div className="flex">
+            <Button onClick={trust}>Trust these scripts</Button>
+          </div>
+        </>
+      )}
+    </div>
   );
 }

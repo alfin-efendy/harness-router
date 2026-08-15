@@ -501,6 +501,7 @@ impl Harness for NativeHarness {
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates).
         let _ = hooks::fire_hook(
+            &ctx.store,
             &ctx.work_dir,
             hooks::HookEvent::SessionStart,
             &json!({
@@ -509,6 +510,7 @@ impl Harness for NativeHarness {
                 "model": model.clone(),
                 "work_dir": ctx.work_dir.display().to_string(),
             }),
+            None,
         )
         .await;
         crate::automation::dispatch_lifecycle_observation(
@@ -733,9 +735,11 @@ impl HarnessSession for NativeSession {
         // interrupt (which cancels but does not `end()`).
         let deps = self.deps.lock().unwrap().clone();
         let _ = hooks::fire_hook(
+            &deps.store,
             &deps.work_dir,
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
+            None,
         )
         .await;
         crate::automation::dispatch_lifecycle_observation(
@@ -1481,6 +1485,9 @@ pub(crate) mod tests {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        crate::harness::native::hooks::trust_current_hooks(&store, dir.path())
+            .await
+            .unwrap();
         let factory = Arc::new(ScriptedFactory { turns: vec![] });
         let plugin = native_plugin_with_llm_factory(factory);
         let harness = plugin.harness.unwrap().create().unwrap();
@@ -1525,6 +1532,9 @@ pub(crate) mod tests {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        crate::harness::native::hooks::trust_current_hooks(&store, dir.path())
+            .await
+            .unwrap();
         let factory = Arc::new(ScriptedFactory { turns: vec![] });
         let plugin = native_plugin_with_llm_factory(factory);
         let harness = plugin.harness.unwrap().create().unwrap();

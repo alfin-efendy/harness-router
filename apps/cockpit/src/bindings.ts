@@ -1387,6 +1387,35 @@ async nativeAgents(runnerId: string | null, projectId: string) : Promise<Result<
 }
 },
 /**
+ * The `.ryuzi/hooks` scripts present in a project's worktree and whether the
+ * user has trusted this exact set. Untrusted scripts are never executed.
+ */
+async worktreeHookStatus(runnerId: string | null, projectId: string) : Promise<Result<WorktreeHookStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("worktree_hook_status", { runnerId, projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Record the user's explicit acceptance of the hook scripts currently on
+ * disk in a project's worktree. Editing any of them revokes the acceptance.
+ *
+ * `digest` is the hook-set digest the caller DISPLAYED (`WorktreeHookStatus.
+ * digest`). The engine refuses to record anything if the scripts on disk no
+ * longer hash to it, so the acceptance can only ever bind to bytes the user
+ * actually reviewed.
+ */
+async trustWorktreeHooks(runnerId: string | null, projectId: string, digest: string) : Promise<Result<WorktreeHookTrustResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("trust_worktree_hooks", { runnerId, projectId, digest }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The unified "/" autocomplete catalog for a project/agent pairing.
  */
 async slashCatalog(runnerId: string | null, projectId: string | null, agentId: string | null) : Promise<Result<SlashEntryInfo[], CmdError>> {
@@ -3356,6 +3385,40 @@ export type UpdateOutcomeDto = { kind: "updated" } | { kind: "alreadyCurrent" } 
 export type UpdateOutcomeEntry = { id: string; outcome: UpdateOutcomeDto }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
 export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }
+/**
+ * The worktree hook-script trust state for one project — what
+ * `.ryuzi/hooks/<event>/` scripts exist and whether the user has accepted
+ * this exact set of bytes. Mirrors
+ * `crate::harness::native::hooks::HookTrust`.
+ */
+export type WorktreeHookStatus = {
+/**
+ * `"<event>/<file>"` for every discovered script, sorted.
+ */
+scripts: string[];
+/**
+ * Content digest of the whole set; `None` when there are no scripts.
+ * This is the value the client must hand back to `trust_worktree_hooks`
+ * so the acceptance binds to the bytes that were actually reviewed.
+ */
+digest: string | null; trusted: boolean }
+/**
+ * The result of a `trust_worktree_hooks` attempt. Mirrors
+ * `crate::harness::native::hooks::TrustOutcome`; both variants carry the
+ * freshly re-read status, so a client can render the outcome without a second
+ * round trip.
+ */
+export type WorktreeHookTrustResult =
+/**
+ * The reviewed digest still matched disk; the acceptance was recorded.
+ */
+{ outcome: "recorded"; status: WorktreeHookStatus } |
+/**
+ * The scripts changed between being reviewed and being trusted, so
+ * **nothing was recorded**. The payload is the NEW set for the user to
+ * review afresh.
+ */
+{ outcome: "changed"; status: WorktreeHookStatus }
 export type WorktreeState = {
 /**
  * Uncommitted work (staged, unstaged, or untracked).
