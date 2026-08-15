@@ -744,17 +744,10 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
 /// prevent the daemon from serving sessions.
 fn spawn_artifact_retention(cp: Arc<ControlPlane>, store: Arc<Store>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let settings = SettingsStore::new(store);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
         loop {
             interval.tick().await;
-            let retention_days = settings
-                .get("artifact_retention_days")
-                .await
-                .ok()
-                .flatten()
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(30);
+            let retention_days = crate::artifacts::configured_retention_days(&store).await;
             if let Err(error) = cp
                 .artifacts()
                 .purge_expired_archives(crate::paths::now_ms(), retention_days)
