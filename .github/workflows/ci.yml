@@ -114,21 +114,61 @@ jobs:
       - name: cargo test
         run: cargo test -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk
         timeout-minutes: 20
-      # The shared provider wire-logic crates are standalone workspaces, not
-      # members of the root workspace, so the `-p ryuzi-core ...` run above never
+      # Every first-party plugin crate is its own standalone workspace, NOT a
+      # member of the root workspace, so the `-p ryuzi-core ...` run above never
       # executes their `#[cfg(test)]` unit tests — only the ryuzi-core
-      # conformance batteries exercise them end-to-end through a built component.
-      # Run their native unit tests directly (tiny host-target rlibs, no wasm) so
-      # the request/response/error wire mapping is covered by its own fast tests.
-      - name: cargo test — shared provider wire-logic crates
+      # conformance batteries exercise a few of them end-to-end through a built
+      # component. Their host bindings live behind `#[cfg(target_arch = "wasm32")]`
+      # (see any plugins/<id>/src/lib.rs), so the pure `logic` modules — tool
+      # confirmation gates, gateway state machines, provider request/response/error
+      # wire mapping — compile and test natively, fast, with no wasm host.
+      # One shared CARGO_TARGET_DIR (as in plugins-dry-run.yml) so the common
+      # serde_json / wit-bindgen dependencies compile once, not once per crate.
+      - name: cargo test — first-party plugin crates
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-plugins
         run: |
-          cargo test --manifest-path plugins/openai-format/Cargo.toml
-          cargo test --manifest-path plugins/anthropic-format/Cargo.toml
+          for manifest in plugins/*/Cargo.toml; do
+            echo "::group::cargo test $manifest"
+            cargo test --manifest-path "$manifest"
+            echo "::endgroup::"
+          done
       - name: Build + smoke the runner binary (absorbs the old build-smoke job)
         run: |
           cargo build -p ryuzi-runner
           ./target/debug/ryuzi --version
           ./target/debug/ryuzi --help
+
+  # `ryuzi-cockpit` (apps/cockpit/src-tauri) is a root-workspace member that the
+  # `rust` job above does not name, so nothing on a PR ever compiled it — a broken
+  # engine.rs / *_cmd.rs merged green and only failed hours later in the nightly
+  # cockpit-desktop bundling workflow. Own job because Tauri needs Linux webkit
+  # system packages (same list cockpit-desktop.yml installs) and because it can
+  # run in parallel with `rust`. Debug profile means Tauri resolves `devUrl`, so
+  # no frontend `dist/` build is needed here.
+  cockpit-rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+      - name: Install Linux system deps (Tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - run: cargo clippy -p ryuzi-cockpit --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test -p ryuzi-cockpit
+        timeout-minutes: 20
 
   e2e-cockpit:
     needs: changes
@@ -181,7 +221,7 @@ jobs:
           exit 1
 
   report:
-    needs: [changes, lint, ts, rust, e2e-cockpit, osv]
+    needs: [changes, lint, ts, rust, cockpit-rust, e2e-cockpit, osv]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -211,7 +251,7 @@ jobs:
   # Post-merge safety net: PRs get the sticky comment, main/nightly gets an
   # issue so macOS-only or nightly-only breakage cannot pass silently.
   watchdog:
-    needs: [changes, lint, ts, rust, e2e-cockpit, osv]
+    needs: [changes, lint, ts, rust, cockpit-rust, e2e-cockpit, osv]
     if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -247,7 +287,7 @@ jobs:
   # reports under one stable name and fails iff any needed job failed or was
   # cancelled (skipped = fine by design).
   ci-ok:
-    needs: [changes, lint, ts, rust, e2e-cockpit, osv]
+    needs: [changes, lint, ts, rust, cockpit-rust, e2e-cockpit, osv]
     if: always()
     runs-on: ubuntu-latest
     steps:
