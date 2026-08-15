@@ -203,7 +203,7 @@ session runs as — under the cross-platform Ryuzi config directory
 ```text
 agents/index.yaml            # agent order + the default (primary) agent id
 agents/subagents.yaml        # shared model/effort config for memoryless subagents
-agents/<agent-id>.yaml       # one profile per main agent: model, permissions, tools, skills
+agents/<agent-id>/agent.yaml # one profile per main agent: model, permissions, tools, skills
 agents/<agent-id>/knowledge/ # that agent's own OKF memory, skill, review, and journey concepts
 ```
 
@@ -212,6 +212,17 @@ The YAML profiles and per-agent OKF (On-disk Knowledge Format) Markdown are
 SQLite (`~/.local/share/ryuzi/ryuzi.sqlite`) stays authoritative for
 everything else: projects, provider accounts/routes, sessions, transcripts,
 runs, queues, and provenance.
+
+**Export / import.** An agent's profile and its knowledge bundle can be
+written to a single `<name>.ryuzi-agent.json` file from the agent's `⋯` menu
+in Cockpit, and imported from the **Import agent** button on the Agents
+screen. The file contains the profile YAML and the agent's OKF Markdown and
+**never contains credentials, provider connections, or session history**;
+per-project memory is left out because project ids are machine-local. An
+imported agent always gets a fresh id, and any skill, plugin tool, app, or
+model it references that this machine does not have is imported as a
+validation issue — the agent appears in the list flagged **Invalid** with the
+missing references listed on its detail page, ready to repair.
 
 > **Agent data reset on first upgrade:** The first launch of this agent schema permanently removes the previous global agent settings, freeform memory files, Learning/curator state, and orchestration DAG data, then creates one main agent named **Ryuzi**. Projects, provider accounts/routes, and historical sessions/transcripts are preserved. Pre-upgrade sessions appear as read-only **Legacy agent** history and are not assigned to Ryuzi.
 
