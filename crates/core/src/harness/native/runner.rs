@@ -54,7 +54,7 @@ const TEXT_FLUSH_BYTES: usize = 120;
 /// own `for_model` text is already model-facing (not raw secret material),
 /// but an external hook script is a different trust boundary than the LLM,
 /// so the observational payload still gets a hard size ceiling.
-const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
+pub(crate) const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
 const PERSISTED_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const TOOL_DISPLAY_SUMMARY_BYTES: usize = 240;
 
@@ -2982,9 +2982,11 @@ async fn execute_tool_call(
     cancel: &CancellationToken,
 ) -> Value {
     let hook = super::hooks::fire_hook(
+        &deps.store,
         &deps.work_dir,
         super::hooks::HookEvent::ToolBefore,
         &json!({ "tool": tool_name, "input": input }),
+        Some(cancel),
     )
     .await;
     crate::automation::dispatch_lifecycle_observation(
@@ -3446,9 +3448,11 @@ async fn fire_tool_after_observation(
 ) {
     let after_payload = json!({ "tool": tool_name, "input": input, "result": hook_summary });
     let _ = super::hooks::fire_hook(
+        &deps.store,
         &deps.work_dir,
         super::hooks::HookEvent::ToolAfter,
         &after_payload,
+        None,
     )
     .await;
     crate::automation::dispatch_lifecycle_observation(
@@ -6160,6 +6164,9 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+            .await
+            .unwrap();
         run_turn(
             &deps,
             TurnPrompt::text("go", "go"),
@@ -6252,6 +6259,9 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+            .await
+            .unwrap();
         let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let sink = Arc::new(BlockingAutomationSink {
@@ -10364,6 +10374,9 @@ mod tests {
 
         let llm = Arc::new(V2RecordingLlm::new(vec![]));
         let mut deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+            .await
+            .unwrap();
         enable_v2(&mut deps);
         deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
         let compiled = crate::harness::native::tool_plan::compile_candidate(
@@ -13426,6 +13439,9 @@ mod tests {
         ];
         let llm = Arc::new(V2RecordingLlm::new(vec![tool_turn]));
         let mut deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_hooks(&deps.store, dir.path())
+            .await
+            .unwrap();
         enable_v2(&mut deps);
         deps.agent.tools = crate::harness::native::agents::ToolFilter::All;
         deps.tools = Arc::new(ToolRegistry::with_extra(vec![

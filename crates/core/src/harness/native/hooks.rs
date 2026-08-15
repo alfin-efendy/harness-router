@@ -9,13 +9,25 @@
 //!
 //! [`run`] is the ONE sink: on-disk scripts. Every call site in
 //! `harness::native` fires through [`fire_hook`] rather than `run` directly,
-//! which today is a thin pass-through — kept as the stable call-site name so
-//! a future additional sink (if any) has one seam to extend.
+//! which is both the seam a future additional sink would extend and the TRUST
+//! GATE: a worktree's scripts are discovered and reported but never executed
+//! until the user explicitly accepts that exact set of bytes (see
+//! [`hook_trust`] / [`trust_hooks`]).
 
+use crate::store::Store;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
+
+/// Longest any single hook script may run before it is killed. A gating
+/// (`tool.before`) hook that hits this DENIES the call; an observational one
+/// is ignored, matching its fire-and-forget contract.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The typed vocabulary of hook events the native runtime dispatches. The
 /// string form (`as_str`) is a stable wire contract, not an implementation
@@ -99,33 +111,195 @@ fn hook_scripts(work_dir: &Path, event: &str) -> Vec<PathBuf> {
     scripts
 }
 
+/// Every hook script in `work_dir`, across ALL four event dirs, keyed by its
+/// `"<event>/<file>"` relative name — the same layout
+/// `crate::skills_install::list_pack_hook_scripts` reports inside a
+/// `TrustPrompt`, so what the user sees here reads identically to what the
+/// skill-pack install prompt shows.
+fn all_hook_scripts(work_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut out = BTreeMap::new();
+    for event in HookEvent::ALL {
+        for path in hook_scripts(work_dir, event.as_str()) {
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            out.insert(format!("{}/{file}", event.as_str()), path);
+        }
+    }
+    out
+}
+
+/// A content digest over the WHOLE discovered hook set (relative name plus
+/// the SHA-256 of each script's bytes, in sorted order). `None` when the
+/// worktree has no hook scripts at all.
+///
+/// Adding, removing or editing any script changes this digest, which is what
+/// makes a previously granted trust lapse and forces a fresh decision. A
+/// script that cannot be read digests as empty bytes rather than being
+/// skipped, so an unreadable file can never silently keep an old digest
+/// valid.
+pub fn hook_set_digest(work_dir: &Path) -> Option<String> {
+    let scripts = all_hook_scripts(work_dir);
+    if scripts.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for (name, path) in &scripts {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        let body = std::fs::read(path).unwrap_or_default();
+        hasher.update(format!("{:x}", Sha256::digest(&body)).as_bytes());
+        hasher.update(b"\n");
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// The one place the trust settings key is spelled. Mirrors the existing
+/// `plugin.<id>.trusted = "true"` convention (see
+/// `crate::plugins::host::qualified_setting_key`): the key names WHAT is
+/// trusted, the value is the literal `"true"`.
+pub fn trust_setting_key(digest: &str) -> String {
+    format!("worktree.hooks.trust.{digest}")
+}
+
+/// Whether the hook scripts currently on disk in `work_dir` may be executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookTrust {
+    /// No `.ryuzi/hooks/<event>/` scripts at all — nothing to decide.
+    NoHooks,
+    /// The user has explicitly accepted this exact set of script bytes.
+    Trusted {
+        digest: String,
+        scripts: Vec<String>,
+    },
+    /// Scripts exist but this exact set has never been accepted (never
+    /// trusted, or trusted and then edited). They must NOT be executed.
+    Untrusted {
+        digest: String,
+        scripts: Vec<String>,
+    },
+}
+
+/// Resolve the trust state of `work_dir`'s hook scripts. A store read failure
+/// resolves to `Untrusted` — fail closed, never execute on a broken read.
+pub async fn hook_trust(store: &Store, work_dir: &Path) -> HookTrust {
+    let scripts: Vec<String> = all_hook_scripts(work_dir).keys().cloned().collect();
+    let Some(digest) = hook_set_digest(work_dir) else {
+        return HookTrust::NoHooks;
+    };
+    let trusted = matches!(
+        store.get_setting_raw(&trust_setting_key(&digest)).await,
+        Ok(Some(value)) if value == "true"
+    );
+    if trusted {
+        HookTrust::Trusted { digest, scripts }
+    } else {
+        HookTrust::Untrusted { digest, scripts }
+    }
+}
+
+/// Record the user's explicit acceptance of the hook scripts currently on
+/// disk in `work_dir`. This is the ONLY function that writes a
+/// `worktree.hooks.trust.*` row; it must only ever be called from a path the
+/// user deliberately triggered. Returns the resulting state (`NoHooks` when
+/// there was nothing to trust).
+pub async fn trust_hooks(store: &Store, work_dir: &Path) -> anyhow::Result<HookTrust> {
+    let Some(digest) = hook_set_digest(work_dir) else {
+        return Ok(HookTrust::NoHooks);
+    };
+    store
+        .set_setting_raw(&trust_setting_key(&digest), "true")
+        .await?;
+    Ok(hook_trust(store, work_dir).await)
+}
+
 /// Run all hooks registered for `event`, feeding `payload` as JSON on stdin.
+///
+/// The caller is responsible for having established that this worktree's hook
+/// set is TRUSTED — [`fire_hook`] is the gate, this is the mechanics.
+///
+/// Each script is bounded three ways:
+/// * `HOOK_TIMEOUT` — on expiry the child is killed. Gating event: deny with
+///   a message naming the script. Observational event: ignored, continue.
+/// * `cancel` — on cancellation the child is killed and the whole dispatch
+///   returns `allow`; the runner's own cancellation handling owns the
+///   outcome of the call from there, so a hook "denial" would be misleading.
+/// * captured stdout is truncated to `TOOL_AFTER_OUTPUT_BYTES` before it can
+///   become a user-visible denial message.
+///
 /// For a gating event, the first non-zero exit denies and returns its stdout
 /// as the message. For an observational event, a non-zero exit is ignored
 /// (the remaining scripts still run) — it can never deny. Missing hook dir /
 /// spawn failures are treated as allow.
-pub async fn run(work_dir: &Path, event: HookEvent, payload: &Value) -> HookResult {
+pub async fn run(
+    work_dir: &Path,
+    event: HookEvent,
+    payload: &Value,
+    cancel: Option<&CancellationToken>,
+) -> HookResult {
     let input = serde_json::to_vec(payload).unwrap_or_default();
     for script in hook_scripts(work_dir, event.as_str()) {
         let mut cmd = tokio::process::Command::new(&script);
         cmd.current_dir(work_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            // The timeout/cancel arms below drop the child; this is what
+            // actually kills the process rather than leaking it.
+            .kill_on_drop(true);
         crate::process_util::no_window(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(_) => continue, // not executable / not runnable — skip
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&input).await;
-            drop(stdin); // close so the hook sees EOF
-        }
-        let Ok(out) = child.wait_with_output().await else {
-            continue;
+        let payload_bytes = input.clone();
+        // The stdin write is INSIDE the bound: a hook that never reads stdin
+        // would otherwise block `write_all` forever on a full pipe buffer.
+        let feed_and_wait = async move {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(&payload_bytes).await;
+                drop(stdin); // close so the hook sees EOF
+            }
+            child.wait_with_output().await
+        };
+        let cancelled = async {
+            match cancel {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let out = tokio::select! {
+            biased;
+            () = cancelled => return HookResult::allow(),
+            result = tokio::time::timeout(HOOK_TIMEOUT, feed_and_wait) => match result {
+                Ok(Ok(out)) => out,
+                Ok(Err(_)) => continue,
+                Err(_) => {
+                    tracing::warn!(
+                        "hook {} timed out after {}s and was killed",
+                        script.display(),
+                        HOOK_TIMEOUT.as_secs()
+                    );
+                    if event.is_gating() {
+                        return HookResult {
+                            allowed: false,
+                            message: Some(format!(
+                                "hook {} timed out after {}s and was killed; denying the call",
+                                script.display(),
+                                HOOK_TIMEOUT.as_secs()
+                            )),
+                        };
+                    }
+                    continue;
+                }
+            },
         };
         if !out.status.success() && event.is_gating() {
-            let msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let msg = super::tool_contract::truncate_utf8_bytes(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                super::runner::TOOL_AFTER_OUTPUT_BYTES,
+            );
             return HookResult {
                 allowed: false,
                 message: Some(if msg.is_empty() {
@@ -139,12 +313,38 @@ pub async fn run(work_dir: &Path, event: HookEvent, payload: &Value) -> HookResu
     HookResult::allow()
 }
 
-/// Fire `event` to the on-disk-script sink (`run`). This is the single point
-/// every `harness::native` fire site calls instead of `run` directly, so a
-/// future additional sink has one seam to extend without touching call
-/// sites.
-pub async fn fire_hook(work_dir: &Path, event: HookEvent, payload: &Value) -> HookResult {
-    run(work_dir, event, payload).await
+/// Fire `event` to the on-disk-script sink. This is the single point every
+/// `harness::native` fire site calls instead of `run` directly, and it is the
+/// TRUST GATE: scripts in a worktree whose hook set the user has not
+/// explicitly accepted are discovered and reported but never executed.
+///
+/// An untrusted set ALLOWS even for a gating event: a hook that has never
+/// been permitted to run is not enforcing any policy, so refusing to run it
+/// cannot weaken protection the user actually had — while denying every tool
+/// call in a freshly cloned repo would make the product unusable and train
+/// users to blanket-trust. The user grants trust from Cockpit's Project
+/// settings, which calls [`trust_hooks`].
+pub async fn fire_hook(
+    store: &Store,
+    work_dir: &Path,
+    event: HookEvent,
+    payload: &Value,
+    cancel: Option<&CancellationToken>,
+) -> HookResult {
+    match hook_trust(store, work_dir).await {
+        HookTrust::NoHooks => HookResult::allow(),
+        HookTrust::Trusted { .. } => run(work_dir, event, payload, cancel).await,
+        HookTrust::Untrusted { digest, scripts } => {
+            tracing::warn!(
+                "skipping {} untrusted hook script(s) in {} (digest {digest}): {}. \
+                 Review and trust them in Cockpit → Project settings.",
+                scripts.len(),
+                work_dir.display(),
+                scripts.join(", ")
+            );
+            HookResult::allow()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -164,10 +364,38 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worktree_with_no_hooks_has_no_digest_and_no_trust_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(hook_set_digest(dir.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editing_a_script_changes_the_hook_set_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(dir.path(), "tool.before", "a.sh", "#!/bin/sh\nexit 0\n");
+        let first = hook_set_digest(dir.path()).unwrap();
+        write_hook(dir.path(), "tool.before", "a.sh", "#!/bin/sh\nexit 1\n");
+        let second = hook_set_digest(dir.path()).unwrap();
+        assert_ne!(first, second, "editing a script must invalidate trust");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adding_a_script_under_a_different_event_changes_the_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(dir.path(), "tool.before", "a.sh", "#!/bin/sh\nexit 0\n");
+        let first = hook_set_digest(dir.path()).unwrap();
+        write_hook(dir.path(), "session.start", "b.sh", "#!/bin/sh\nexit 0\n");
+        assert_ne!(first, hook_set_digest(dir.path()).unwrap());
+    }
+
     #[tokio::test]
     async fn no_hooks_dir_allows() {
         let dir = tempfile::tempdir().unwrap();
-        let r = run(dir.path(), HookEvent::ToolBefore, &json!({})).await;
+        let r = run(dir.path(), HookEvent::ToolBefore, &json!({}), None).await;
         assert_eq!(r, HookResult::allow());
     }
 
@@ -181,7 +409,13 @@ mod tests {
             "deny.sh",
             "#!/bin/sh\necho 'bash is not allowed here'\nexit 1\n",
         );
-        let r = run(dir.path(), HookEvent::ToolBefore, &json!({"tool": "bash"})).await;
+        let r = run(
+            dir.path(),
+            HookEvent::ToolBefore,
+            &json!({"tool": "bash"}),
+            None,
+        )
+        .await;
         assert!(!r.allowed);
         assert_eq!(r.message.as_deref(), Some("bash is not allowed here"));
     }
@@ -196,7 +430,13 @@ mod tests {
             "ok.sh",
             "#!/bin/sh\ncat >/dev/null\nexit 0\n",
         );
-        let r = run(dir.path(), HookEvent::ToolBefore, &json!({"tool": "read"})).await;
+        let r = run(
+            dir.path(),
+            HookEvent::ToolBefore,
+            &json!({"tool": "read"}),
+            None,
+        )
+        .await;
         assert!(r.allowed);
     }
 
@@ -214,12 +454,77 @@ mod tests {
             "loud.sh",
             "#!/bin/sh\ncat >/dev/null\necho 'i tried to block this'\nexit 1\n",
         );
-        let r = run(dir.path(), HookEvent::ToolAfter, &json!({"tool": "bash"})).await;
+        let r = run(
+            dir.path(),
+            HookEvent::ToolAfter,
+            &json!({"tool": "bash"}),
+            None,
+        )
+        .await;
         assert!(
             r.allowed,
             "observational hook must never deny: {:?}",
             r.message
         );
+    }
+
+    /// A gating hook that hangs must not wedge the turn: it is killed at
+    /// `HOOK_TIMEOUT` and the call is DENIED (fail closed — the user trusted
+    /// this hook and is relying on it).
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_gating_hook_times_out_and_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(
+            dir.path(),
+            "tool.before",
+            "hang.sh",
+            "#!/bin/sh\nsleep 600\n",
+        );
+        let r = run(dir.path(), HookEvent::ToolBefore, &json!({}), None).await;
+        assert!(!r.allowed);
+        assert!(
+            r.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out"),
+            "message must say why: {:?}",
+            r.message
+        );
+    }
+
+    /// The same hang on an OBSERVATIONAL event is killed but ignored — the
+    /// fire-and-forget contract is unchanged.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_observational_hook_times_out_and_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(
+            dir.path(),
+            "tool.after",
+            "hang.sh",
+            "#!/bin/sh\nsleep 600\n",
+        );
+        let r = run(dir.path(), HookEvent::ToolAfter, &json!({}), None).await;
+        assert!(r.allowed);
+    }
+
+    /// An already-cancelled token short-circuits the dispatch and allows —
+    /// the runner's own cancellation handling owns the call's outcome.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_token_kills_the_hook_and_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(
+            dir.path(),
+            "tool.before",
+            "deny.sh",
+            "#!/bin/sh\nsleep 600\necho no\nexit 1\n",
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let r = run(dir.path(), HookEvent::ToolBefore, &json!({}), Some(&cancel)).await;
+        assert!(r.allowed);
     }
 
     #[test]
@@ -255,7 +560,9 @@ mod tests {
     #[tokio::test]
     async fn fire_hook_with_no_scripts_allows() {
         let dir = tempfile::tempdir().unwrap();
-        let r = fire_hook(dir.path(), HookEvent::ToolBefore, &json!({})).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let r = fire_hook(&store, dir.path(), HookEvent::ToolBefore, &json!({}), None).await;
         assert_eq!(r, HookResult::allow());
     }
 
@@ -269,13 +576,88 @@ mod tests {
             "deny.sh",
             "#!/bin/sh\necho 'bash is not allowed here'\nexit 1\n",
         );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        trust_hooks(&store, dir.path()).await.unwrap();
         let r = fire_hook(
+            &store,
             dir.path(),
             HookEvent::ToolBefore,
             &json!({ "tool": "bash" }),
+            None,
         )
         .await;
         assert!(!r.allowed);
         assert_eq!(r.message.as_deref(), Some("bash is not allowed here"));
+    }
+
+    /// The gate: an UNTRUSTED denying hook must not run at all. If it had
+    /// run, `allowed` would be false and the message would be its stdout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fire_hook_does_not_execute_an_untrusted_hook_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran.txt");
+        write_hook(
+            dir.path(),
+            "tool.before",
+            "deny.sh",
+            &format!("#!/bin/sh\ntouch {}\necho nope\nexit 1\n", marker.display()),
+        );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let r = fire_hook(&store, dir.path(), HookEvent::ToolBefore, &json!({}), None).await;
+        assert!(
+            r.allowed,
+            "an untrusted gating hook allows, it does not deny"
+        );
+        assert!(
+            !marker.exists(),
+            "an untrusted hook script must never execute"
+        );
+    }
+
+    /// After explicit trust, the same hook runs and can deny.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fire_hook_executes_the_hook_set_once_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(
+            dir.path(),
+            "tool.before",
+            "deny.sh",
+            "#!/bin/sh\necho 'bash is not allowed here'\nexit 1\n",
+        );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        trust_hooks(&store, dir.path()).await.unwrap();
+        let r = fire_hook(&store, dir.path(), HookEvent::ToolBefore, &json!({}), None).await;
+        assert!(!r.allowed);
+        assert_eq!(r.message.as_deref(), Some("bash is not allowed here"));
+    }
+
+    /// Editing a trusted script invalidates the trust — it must stop running
+    /// until the user accepts the new bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn editing_a_trusted_script_revokes_its_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(
+            dir.path(),
+            "tool.before",
+            "deny.sh",
+            "#!/bin/sh\necho first\nexit 1\n",
+        );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        trust_hooks(&store, dir.path()).await.unwrap();
+        write_hook(
+            dir.path(),
+            "tool.before",
+            "deny.sh",
+            "#!/bin/sh\necho second\nexit 1\n",
+        );
+        let r = fire_hook(&store, dir.path(), HookEvent::ToolBefore, &json!({}), None).await;
+        assert!(r.allowed, "the edited script must not run until re-trusted");
     }
 }
