@@ -468,14 +468,13 @@ export const useStore = create<State>((set, get) => ({
     // reloaded webview would otherwise never see them again. Re-list them
     // from each runner alongside the sessions.
     //
-    // A rejection here must never sink the whole refresh: a remote runner on a
-    // build predating `list_pending_approvals` rejects the call outright, and
-    // the session list — which every view depends on — must not go stale
-    // because one runner cannot answer an approval query.
-    // A runner that did NOT answer is deliberately left out of
-    // `refreshedRunnerIds` below: "the query failed" is not evidence that the
-    // engine has nothing parked, so its live cards must survive untouched
-    // rather than be pruned as answered.
+    // A runner that cannot answer must degrade quietly on BOTH axes. It must
+    // not sink the whole refresh — a remote runner paired from a build
+    // predating `list_pending_approvals` rejects the call outright, and the
+    // session list, which every view reads, cannot go stale over an approval
+    // query. And it is deliberately left out of `refreshedRunnerIds` below:
+    // "the query failed" is not evidence that the engine has nothing parked,
+    // so its live cards must survive rather than be pruned as answered.
     const perRunnerApprovals = await Promise.all(
       runnerList.map(async (runnerId): Promise<{ runnerId: string; approvals: PendingApproval[] } | null> => {
         try {
