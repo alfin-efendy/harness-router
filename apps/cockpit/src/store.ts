@@ -750,16 +750,7 @@ export const useStore = create<State>((set, get) => ({
       // the jobRunChanged branch below notifies instead, with the job's name,
       // its notify switches and the real run outcome. Without this the user
       // gets two notifications for every scheduled run.
-      //
-      // An APPROVAL is exempt from that guard. A parked approval is not a
-      // terminal state, so `jobRunChanged` never fires for it — the run is
-      // blocked, not finished — which means there is no second notification to
-      // deduplicate against. Suppressing it would make an unattended run that
-      // parks for tool approval completely silent, the exact deadlock the
-      // durable `pending_approvals` work exists to surface.
-      const rawIntent = notifyIntentForEvent(event, runnerId, isWindowFocused());
-      const suppressedAsScheduled = isSchedulerSession(evtSession) && rawIntent?.kind !== "approval";
-      const intent = suppressedAsScheduled ? null : rawIntent;
+      const intent = isSchedulerSession(evtSession) ? null : notifyIntentForEvent(event, runnerId, isWindowFocused());
       if (evtPk) notifier.cancelSettle(runnerId, evtPk); // any activity supersedes a pending settle
       if (intent) notifier.handle(intent, evtSession);
       // A scheduled job finished and its own switches say to tell the user:
