@@ -35,7 +35,11 @@ Rows do NOT survive a daemon restart: the reply channel is process-local, so
 Unattended runs: a session whose `started_by` is `scheduler` or `automation` has
 nobody watching Cockpit, so an approval it parks is auto-rejected after
 `approval_timeout_ms` (default 300000). Interactive sessions are unaffected and
-park indefinitely.
+park indefinitely. An approval notification is deliberately exempt from the
+scheduler-session notification guard in `store.ts` (which suppresses the
+per-turn `result`/`error` notification that `jobRunChanged` would duplicate): a
+park is not a terminal state, so no `jobRunChanged` ever fires for it and there
+is nothing to deduplicate against.
 
 MCP tools are gated per-tool: the permission key is the tool's own full name
 (`mcp__server__tool`), so "don't ask again" rules never span multiple MCP
