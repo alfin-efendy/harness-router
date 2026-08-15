@@ -8012,6 +8012,83 @@ mod tests {
         assert!(deps.steer.take_block().is_none());
     }
 
+    /// Regression: a steer that lands while a `task` sub-agent is in flight
+    /// must be consumed by the PARENT drive, not by the child. A child runs
+    /// against a `ContextManager::ephemeral` and the steer path writes no
+    /// message row, so a child that drained the buffer would destroy the
+    /// user's instruction with no trace anywhere.
+    #[tokio::test]
+    async fn steer_during_a_subagent_lands_in_the_parent_not_the_child() {
+        use super::super::steer::{STEER_MARKER_CLOSE, STEER_MARKER_OPEN};
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Parent calls task -> child explore runs -> parent closes.
+        let parent = vec![
+            tool_use_start(0, "c1", "task"),
+            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"look\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let sub = vec![
+            text_delta("found"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let parent_end = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        // Only consumed if the CHILD wrongly drains the steer and takes an
+        // extra round, which shifts every later response by one. Scripted so
+        // the regression fails on the request-count assertion below instead of
+        // on a "no more scripted turns" error.
+        let spare = vec![
+            text_delta("extra"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![parent, sub, parent_end, spare]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+
+        // Queued before the turn starts: `take_block()` picks up whatever is
+        // buffered the instant a drive reaches a drain point, so this is
+        // equivalent to a `steer` RPC landing while the child is running.
+        deps.steer.push("stop and check the tests first".into());
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            3,
+            "expected parent tool round, child round, parent continuation — a 4th \
+             request means the sub-agent drained the steer and took an extra round"
+        );
+        // The child's request must not carry the steer in its MESSAGES. Never
+        // assert on a whole body here: the system prompt teaches the marker
+        // verbatim, so the marker is present in every request's `system`.
+        let child_messages = serde_json::to_string(&bodies[1]["messages"]).unwrap();
+        assert!(
+            !child_messages.contains("stop and check the tests first"),
+            "the sub-agent must never receive the parent's steer: {child_messages}"
+        );
+        // The parent's continuation carries it, wrapped in the verbatim marker.
+        let parent_messages = bodies[2]["messages"].as_array().unwrap();
+        let last = parent_messages.last().expect("at least one message");
+        assert_eq!(last["role"], "user");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(rendered.contains(STEER_MARKER_OPEN));
+        assert!(rendered.contains(STEER_MARKER_CLOSE));
+        assert!(rendered.contains("stop and check the tests first"));
+    }
+
     #[tokio::test]
     async fn stream_error_propagates() {
         let dir = tempfile::tempdir().unwrap();
@@ -11154,6 +11231,31 @@ mod tests {
         assert_eq!(child.work_dir, parent.work_dir);
         assert_eq!(child.project_id, parent.project_id);
         assert!(child.app_control.is_none());
+    }
+
+    /// The parent's steer buffer must not be shared with a `task` child: a
+    /// sub-agent drive that drained it would swallow a user instruction the
+    /// parent never sees (the child's history is ephemeral and unpersisted).
+    #[tokio::test]
+    async fn subagent_deps_get_a_fresh_steer_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(testutil::RecordingLlm::new(vec![]));
+        let parent = deps_at(dir.path(), llm).await;
+        parent.steer.push("parent-only steer".into());
+
+        let child = deps_for_subagent(&parent).await.unwrap();
+
+        assert!(
+            child.steer.take_block().is_none(),
+            "the child must start with an EMPTY, independent steer buffer"
+        );
+        assert!(
+            parent
+                .steer
+                .take_block()
+                .is_some_and(|block| block.contains("parent-only steer")),
+            "draining the child must not consume the parent's queued steer"
+        );
     }
 
     #[tokio::test]
