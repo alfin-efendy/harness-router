@@ -297,21 +297,51 @@ pub struct ContextCheckpoint {
     pub payload: serde_json::Value,
 }
 
+/// Probe `workdir` for git-ness — the read-time source of truth for
+/// [`crate::domain::Project::is_git`], which is not a database column.
+///
+/// Deliberately NOT called from inside a `with_conn` closure. `Store` runs a
+/// single pooled connection (see `Store::open`), so filesystem work performed
+/// there serializes behind every other database read and write in the process.
+fn probe_is_git(workdir: &str) -> bool {
+    git2::Repository::open(workdir).is_ok()
+}
+
+/// Fill `is_git` on project rows that have already been read from the
+/// database, on a blocking-pool thread rather than the store connection.
+///
+/// One `spawn_blocking` for the whole batch: `list_projects` is refreshed
+/// after every finished turn, so this must never be one task per row.
+async fn fill_is_git(mut projects: Vec<Project>) -> anyhow::Result<Vec<Project>> {
+    if projects.is_empty() {
+        return Ok(projects);
+    }
+    Ok(tokio::task::spawn_blocking(move || {
+        for p in &mut projects {
+            p.is_git = probe_is_git(&p.workdir);
+        }
+        projects
+    })
+    .await?)
+}
+
+/// Map one `PROJECT_COLS` row. `is_git` is NOT a column and is deliberately
+/// left `false` here: every public reader fills it via [`fill_is_git`] AFTER
+/// the store connection has been released. Do not reintroduce a filesystem
+/// probe in this function — it runs on the store's single serialized
+/// connection thread and would block every other query behind it.
 fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
     let perm: String = r.get(6)?;
-    let workdir: String = r.get(2)?;
     Ok(Project {
         project_id: r.get(0)?,
         name: r.get(1)?,
-        // Read-time git-ness: cheap repo-open probe. Runs on the store's
-        // blocking connection thread, so sync git2 is fine here.
-        is_git: git2::Repository::open(&workdir).is_ok(),
-        workdir,
+        workdir: r.get(2)?,
         source: r.get(3)?,
         model: r.get(4)?,
         effort: r.get(5)?,
         perm_mode: PermMode::from_db(&perm),
         created_at: r.get(7)?,
+        is_git: false,
     })
 }
 
@@ -1081,28 +1111,35 @@ impl Store {
 
     pub async fn get_project(&self, id: &str) -> anyhow::Result<Option<Project>> {
         let id = id.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!("SELECT {PROJECT_COLS} FROM projects WHERE project_id=?1"),
-                params![id],
-                row_to_project,
-            )
-            .optional()
+        let row = self
+            .with_conn(move |c| {
+                c.query_row(
+                    &format!("SELECT {PROJECT_COLS} FROM projects WHERE project_id=?1"),
+                    params![id],
+                    row_to_project,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(match row {
+            Some(p) => fill_is_git(vec![p]).await?.pop(),
+            None => None,
         })
-        .await
     }
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
-        self.with_conn(|c| -> rusqlite::Result<Vec<Project>> {
-            let mut stmt = c.prepare(&format!(
-                "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at"
-            ))?;
-            let items = stmt
-                .query_map([], row_to_project)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(items)
-        })
-        .await
+        let items = self
+            .with_conn(|c| -> rusqlite::Result<Vec<Project>> {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at"
+                ))?;
+                let items = stmt
+                    .query_map([], row_to_project)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(items)
+            })
+            .await?;
+        fill_is_git(items).await
     }
 
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
@@ -3097,19 +3134,24 @@ impl Store {
     ) -> anyhow::Result<Option<Project>> {
         let gateway = gateway.to_string();
         let workspace_id = workspace_id.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!(
-                    "SELECT p.{PROJECT_COLS} FROM projects p \
-                     JOIN project_bindings b ON b.project_id = p.project_id \
-                     WHERE b.gateway = ?1 AND b.workspace_id = ?2"
-                ),
-                params![gateway, workspace_id],
-                row_to_project,
-            )
-            .optional()
+        let row = self
+            .with_conn(move |c| {
+                c.query_row(
+                    &format!(
+                        "SELECT p.{PROJECT_COLS} FROM projects p \
+                         JOIN project_bindings b ON b.project_id = p.project_id \
+                         WHERE b.gateway = ?1 AND b.workspace_id = ?2"
+                    ),
+                    params![gateway, workspace_id],
+                    row_to_project,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(match row {
+            Some(p) => fill_is_git(vec![p]).await?.pop(),
+            None => None,
         })
-        .await
     }
 
     /// Insert one request_log row and upsert its usage_daily rollup atomically.
@@ -5877,6 +5919,48 @@ mod tests {
             listed.iter().map(|p| p.is_git).collect::<Vec<_>>(),
             vec![false, true],
             "list_projects must compute the flag per row"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_project_by_workspace_fills_is_git() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // A workdir that really is a repo — every public project reader must
+        // report is_git=true for it, including the workspace-binding path.
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let mut p = sample_project();
+        p.workdir = repo_dir.path().to_string_lossy().into_owned();
+        store.insert_project(p).await.unwrap();
+        store.bind_project("acme-gw", "guild1", "p1").await.unwrap();
+
+        let resolved = store
+            .resolve_project_by_workspace("acme-gw", "guild1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.project_id, "p1");
+        assert!(
+            resolved.is_git,
+            "resolve_project_by_workspace must fill is_git like the other readers"
+        );
+
+        // The plain-folder direction, so a hardcoded `true` cannot pass.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let mut q = sample_project();
+        q.project_id = "p2".into();
+        q.workdir = plain_dir.path().to_string_lossy().into_owned();
+        store.insert_project(q).await.unwrap();
+        store.bind_project("acme-gw", "guild2", "p2").await.unwrap();
+        assert!(
+            !store
+                .resolve_project_by_workspace("acme-gw", "guild2")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_git
         );
     }
 
