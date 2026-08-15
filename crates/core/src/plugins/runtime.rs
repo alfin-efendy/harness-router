@@ -118,18 +118,22 @@ pub(crate) fn host_satisfies_wit_api_range(wit_api_range: &str) -> bool {
 
 /// Default resource budget a plugin runtime may consume.
 ///
-/// **Enforcement note:** `max_memory_bytes` and `max_concurrency` are declared
-/// here so callers can configure them ahead of time, but their runtime
-/// enforcement intentionally arrives with the later supervision / capability
-/// slice.  The current slice validates structure only; no guarantee is made
-/// that these limits are applied during component execution.
+/// **Enforcement note:** `max_memory_bytes` and `max_table_elements` are
+/// enforced at runtime by [`PluginResourceLimiter`], which every `Store`
+/// built in this module installs via `Store::limiter`. `fuel` and `timeout`
+/// are enforced by `Store::set_fuel` and epoch interruption. `max_concurrency`
+/// is still declared-only — it is not a wasmtime store limit and has no
+/// `ResourceLimiter` hook; enforcing it needs a separate supervision slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
-    /// Hard memory ceiling in bytes.
-    ///
-    /// Not yet enforced — enforcement will be introduced together with the
-    /// runtime supervision slice.
+    /// Hard ceiling, in bytes, on the TOTAL linear memory this component's
+    /// store may grow to across all of its linear memories. Enforced by
+    /// [`PluginResourceLimiter::memory_growing`].
     pub max_memory_bytes: u64,
+    /// Hard ceiling on the number of elements in any one table this
+    /// component's store creates or grows. Enforced by
+    /// [`PluginResourceLimiter::table_growing`].
+    pub max_table_elements: usize,
     pub fuel: u64,
     pub timeout: Duration,
     /// Maximum concurrent tasks a component may spawn.
@@ -143,6 +147,7 @@ impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
             max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
             fuel: 10_000_000,
             timeout: Duration::from_secs(30),
             max_concurrency: 4,
@@ -1934,6 +1939,7 @@ mod tests {
             ResourceLimits::default(),
             ResourceLimits {
                 max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
                 fuel: 10_000_000,
                 timeout: Duration::from_secs(30),
                 max_concurrency: 4,
