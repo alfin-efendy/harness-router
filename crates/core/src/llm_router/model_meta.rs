@@ -740,7 +740,7 @@ mod tests {
     /// `resolve` is a purely informational lookup — it must never consume a slot
     /// in the round-robin rotation. This test fails (the setting becomes
     /// `Some("1")`) if `resolve` is ever pointed back at the advancing router
-    /// entry point `route_model_for_anthropic_messages`.
+    /// entry point instead of the peek one.
     #[tokio::test]
     async fn resolve_does_not_advance_the_round_robin_cursor() {
         use crate::llm_router::routes::{
