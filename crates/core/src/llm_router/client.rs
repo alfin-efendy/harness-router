@@ -147,6 +147,34 @@ pub async fn route_models_for_anthropic_messages(
     )
 }
 
+/// Same resolution as [`route_model_for_anthropic_messages`], but a PEEK: it
+/// never advances the model-route or provider-account round-robin cursors.
+///
+/// Read-only callers that only want to learn *which* upstream model/target a
+/// name resolves to (per-model metadata, cost accounting, "is this model
+/// routable at all?" checks) must use this. Routing through the advancing
+/// entry point from those paths burns 2-3 rotation slots per turn, which with
+/// N accounts turns the effective stride into `2 mod N` or `3 mod N` — and at
+/// N == 3 that pins every turn to the same account.
+pub async fn peek_model_for_anthropic_messages(
+    store: &Store,
+    requested: &str,
+) -> anyhow::Result<Option<RouteTarget>> {
+    let mut provider_order_cache = ProviderOrderCache::new();
+    Ok(route_models_for_body_matching_with_cache(
+        store,
+        requested,
+        None,
+        anthropic_messages_target_allowed,
+        &mut provider_order_cache,
+        RouteOrderMode::Peek,
+    )
+    .await?
+    .into_iter()
+    .next()
+    .map(|annotated| annotated.target))
+}
+
 /// Read the adapter-level tool envelope for every target the current routing
 /// rules may try before content is delivered. This is deliberately a peek:
 /// it never advances model-route or provider-account round-robin cursors.

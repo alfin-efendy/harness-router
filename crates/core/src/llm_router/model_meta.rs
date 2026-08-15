@@ -419,7 +419,7 @@ pub fn spawn_refresh() {
 pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
     let mut candidates: Vec<String> = vec![requested.to_string()];
     if let Ok(Some(target)) =
-        crate::llm_router::client::route_model_for_anthropic_messages(store, requested).await
+        crate::llm_router::client::peek_model_for_anthropic_messages(store, requested).await
     {
         if !candidates.contains(&target.upstream_model) {
             candidates.push(target.upstream_model);
