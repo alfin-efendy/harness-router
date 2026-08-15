@@ -10853,13 +10853,22 @@ mod tests {
                 "a fresh database must not carry the duplicate indexes: {leftovers:?}"
             );
 
-            // Rebuild a pre-v9 database: both indexes present, version pinned
-            // back to 8 so reopening has to run the new migration.
+            // Rebuild a pre-v9 database: both indexes present, everything a
+            // LATER migration created torn back down, and the version pinned
+            // back to 8 so reopening has to replay v9 onward.
+            //
+            // Tearing down the post-v8 objects is what makes the fixture
+            // faithful: a real v8 database has none of them, and `to_latest`
+            // replays EVERY migration above the pinned version. Rewinding the
+            // pragma alone would leave v10's `pending_approvals` in place and
+            // that migration would then fail with "table already exists".
+            // Any future migration must extend this teardown the same way.
             store
                 .with_conn(|c| {
                     c.execute_batch(
                         "CREATE INDEX idx_messages_session ON messages(session_pk, seq);\
-                         CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);",
+                         CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);\
+                         DROP TABLE IF EXISTS pending_approvals;",
                     )?;
                     c.pragma_update(None, "user_version", 8)
                 })
@@ -10882,7 +10891,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(duplicates, 0, "v8 -> v9 must drop both duplicate indexes");
-        assert_eq!(version, 9, "the upgrade must land on schema version 9");
+        assert_eq!(
+            version, 10,
+            "the upgrade must replay every migration above v8 and land on the latest version"
+        );
+        let has_pending_approvals: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                     AND name='pending_approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            has_pending_approvals, 1,
+            "the same replay must also re-apply v9 -> v10"
+        );
 
         // Coverage is unchanged: each table keeps exactly one index, the
         // primary key's automatic one over (session_pk, seq).
