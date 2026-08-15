@@ -5186,19 +5186,42 @@ impl Store {
         .await
     }
 
+    /// Remove an expired archived session and everything keyed to it.
+    ///
+    /// The `NOT EXISTS` guard keeps the session row alive until every artifact
+    /// it produced has already been tombstoned, so a caller that has not yet
+    /// run `mark_source_artifacts_deleted` gets `false` and no child row is
+    /// touched. Child rows are deleted in the same immediate transaction as
+    /// the session row: several session-keyed tables declare no foreign key
+    /// back to `sessions`, so without this they would be orphaned forever
+    /// (see `SESSION_CHILD_TABLES`).
+    ///
+    /// Returns `true` when the session row (and therefore its children) was
+    /// deleted.
     pub async fn delete_session_after_artifact_purge(
         &self,
         session_pk: &str,
     ) -> anyhow::Result<bool> {
         let session_pk = session_pk.to_string();
-        self.with_conn(move |c| {
-            c.execute(
+        self.with_conn(move |c| -> rusqlite::Result<bool> {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let deleted = tx.execute(
                 "DELETE FROM sessions WHERE session_pk=?1 AND NOT EXISTS (\
                    SELECT 1 FROM artifacts WHERE source_session_pk=?1 AND status <> 'deleted'\
                  )",
                 params![session_pk],
-            )
-            .map(|count| count == 1)
+            )?;
+            if deleted != 1 {
+                return Ok(false);
+            }
+            for &(table, column) in SESSION_CHILD_TABLES {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE {column}=?1"),
+                    params![session_pk],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
         })
         .await
     }
@@ -5226,6 +5249,27 @@ impl Store {
         .await
     }
 }
+
+/// Session-keyed tables that declare no `REFERENCES sessions(...)` clause, so
+/// SQLite cannot cascade them when a `sessions` row is removed. Each entry is
+/// `(table, session-key column)`. Tables that DO declare the cascade
+/// (`agent_runs`, `session_runtime_settings`, `native_tool_session_versions`,
+/// and `agent_run_messages` via `agent_runs`/`messages`) are deliberately
+/// absent — the database already handles them. `messages_fts` is absent too:
+/// the `messages_fts_ad` trigger clears the FTS5 shadow rows on every
+/// `messages` delete.
+const SESSION_CHILD_TABLES: &[(&str, &str)] = &[
+    ("messages", "session_pk"),
+    ("provider_turns", "session_pk"),
+    ("todos", "session_pk"),
+    ("session_context", "session_pk"),
+    ("context_checkpoints", "session_pk"),
+    ("session_surfaces", "session_pk"),
+    ("session_prompt_queue", "session_pk"),
+    ("session_route_state", "session_pk"),
+    ("session_automation_origins", "session_pk"),
+    ("background_events", "target_session_pk"),
+];
 
 const ARTIFACT_COLS: &str = "id,source_session_pk,source_message_seq,source_run_id,creator,\
     creator_id,name,description,content_type,size_bytes,sha256,storage_key,status,created_at,\
