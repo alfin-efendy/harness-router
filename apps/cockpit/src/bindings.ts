@@ -414,6 +414,46 @@ async duplicateAgent(runnerId: string | null, agentId: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
+async exportAgent(agentId: string) : Promise<Result<AgentExportInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("export_agent", { agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async importAgent(data: string) : Promise<Result<AgentImportResultInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("import_agent", { data }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Prompts for a save location and writes an exported agent bundle there.
+ * Returns the chosen path, or `None` when the user cancelled.
+ */
+async saveAgentBundle(fileName: string, data: string) : Promise<Result<string | null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_agent_bundle", { fileName, data }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Prompts for an agent bundle file and returns its text. `None` when the
+ * user cancelled.
+ */
+async readAgentBundle() : Promise<Result<string | null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_agent_bundle") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async deleteAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentRegistryInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_agent", { runnerId, agentId }) };
@@ -2138,6 +2178,11 @@ export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentConfigurationCatalogInfo = { skills: CatalogEntryInfo[]; nativeTools: CatalogEntryInfo[]; pluginTools: CatalogEntryInfo[]; apps: CatalogEntryInfo[] }
 export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: NativeToolDecisionInfo[]; pluginTools: string[]; apps: string[]; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
 /**
+ * What `export_agent` produced: the bundle JSON plus the suggested file
+ * name, so the shell can offer it in the save dialog.
+ */
+export type AgentExportInfo = { fileName: string; data: string; knowledgeFiles: number; projectMemoryFilesSkipped: number }
+/**
  * An immutable identity captured when an agent becomes the primary owner of a session.
  */
 export type AgentIdentitySnapshot = { id: string; name: string; avatarColor: string;
@@ -2148,6 +2193,12 @@ export type AgentIdentitySnapshot = { id: string; name: string; avatarColor: str
  * field existed still parses (as `None`) rather than failing to load.
  */
 avatarPet?: string | null }
+/**
+ * What `import_agent` landed: the new agent, plus every reference the
+ * bundle carried that does not exist on this machine. A non-empty
+ * `tolerated` means the agent is present but not executable until repaired.
+ */
+export type AgentImportResultInfo = { agentId: string; agentName: string; renamed: boolean; knowledgeFilesWritten: number; projectMemoryFilesSkipped: number; tolerated: AgentValidationInfo[] }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AgentLearningInfo = { concepts: KnowledgeConceptInfo[]; invalid: InvalidKnowledgeConceptInfo[]; journey: JourneyMilestoneInfo[]; skillUsage: AgentSkillUsageInfo[]; reviews: LearningReviewInfo[]; curator: CuratorStateInfo; curatorHistory: CuratorHistorySnapshotInfo[] }
 export type AgentMention = { agentId: string; labelSnapshot: string; startUtf16: number; endUtf16: number }
