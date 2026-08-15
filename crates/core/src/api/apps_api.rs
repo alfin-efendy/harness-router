@@ -525,14 +525,20 @@ async fn probe_and_persist(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
                 match opened {
                     // `open_http_mcp` has already done `initialize` +
                     // `tools/list`.
-                    Ok(Ok(conn)) => (
-                        true,
-                        None,
-                        conn.tools
+                    Ok(Ok(conn)) => {
+                        let tools = conn
+                            .tools
                             .iter()
                             .map(|t| (t.name.clone(), t.description.clone()))
-                            .collect::<Vec<_>>(),
-                    ),
+                            .collect::<Vec<_>>();
+                        // The probe is finished with this server the moment it
+                        // has the tool list. Without this DELETE every Probe
+                        // click — and every re-probe after an OAuth connect —
+                        // leaves a session allocated on the remote server
+                        // until that server's own idle timeout expires.
+                        conn.terminate().await;
+                        (true, None, tools)
+                    }
                     // `{e:#}` — the whole error chain. The single-line "check
                     // the URL" this replaced was actively misleading for the
                     // failure it saw most: a 401 from a server whose URL was
