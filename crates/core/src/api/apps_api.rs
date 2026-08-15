@@ -1539,8 +1539,12 @@ mod tests {
         }
 
         async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            // The bound port is unknown when this router is built, and the
+            // client now VERIFIES the `resource` claim against the configured
+            // server URL — so it has to be the real URL by the time it is served.
+            let mcp_url = state.mcp_url.lock().unwrap().clone();
             axum::Json(json!({
-                "resource": "placeholder",
+                "resource": mcp_url,
                 "authorization_servers": [state.as1_url, state.as2_url],
             }))
         }
@@ -1802,8 +1806,12 @@ mod tests {
         }
 
         async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            // The bound port is unknown when this router is built, and the
+            // client now VERIFIES the `resource` claim against the configured
+            // server URL — so it has to be the real URL by the time it is served.
+            let mcp_url = state.mcp_url.lock().unwrap().clone();
             axum::Json(json!({
-                "resource": "placeholder",
+                "resource": mcp_url,
                 "authorization_servers": [state.as_url],
             }))
         }
