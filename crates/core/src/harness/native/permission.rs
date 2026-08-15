@@ -1021,27 +1021,29 @@ mod tests {
         let input = serde_json::json!({"command": "rm -rf /"});
         let gate = f.gate(PermMode::Default, None);
         let bash = spec("bash");
-        let fut = evaluate(&bash, &input, &gate);
-        tokio::pin!(fut);
-        // The persist is an await point inside `evaluate`, so poll until the
-        // row lands rather than assuming one poll is enough.
-        let mut listed = Vec::new();
-        for _ in 0..50 {
-            assert!(futures::poll!(fut.as_mut()).is_pending());
-            listed = crate::approval::list_pending(&f.store).await.unwrap();
-            if !listed.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(listed.len(), 1, "a parked approval must be persisted");
-        assert_eq!(listed[0].run_id, "run-1");
-        assert_eq!(listed[0].request_id, "call-1");
-        assert_eq!(listed[0].tool, "bash");
-        assert_eq!(listed[0].input["command"], "rm -rf /");
+        // `evaluate` and the observer MUST be driven together by `join!`, which
+        // polls both on every wake. Polling `evaluate` only between COMPLETED
+        // store calls deadlocks instead: its in-flight `persist_pending` holds
+        // a pool connection that the observer's query would wait on forever.
+        let observe = async {
+            let listed = loop {
+                let listed = crate::approval::list_pending(&f.store).await.unwrap();
+                if !listed.is_empty() {
+                    break listed;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(listed.len(), 1, "a parked approval must be persisted");
+            assert_eq!(listed[0].run_id, "run-1");
+            assert_eq!(listed[0].request_id, "call-1");
+            assert_eq!(listed[0].tool, "bash");
+            assert_eq!(listed[0].input["command"], "rm -rf /");
+            // End the park via the arm that does NOT go through `apply_response`.
+            f.cancel.cancel();
+        };
 
-        f.cancel.cancel();
-        assert_eq!(fut.await, PermDecision::Deny);
+        let (decision, ()) = tokio::join!(evaluate(&bash, &input, &gate), observe);
+        assert_eq!(decision, PermDecision::Deny);
         assert!(
             crate::approval::list_pending(&f.store)
                 .await
