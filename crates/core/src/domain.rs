@@ -870,6 +870,21 @@ pub enum CoreEvent {
         job_id: String,
         run_id: String,
         status: String,
+        /// The job's display name, so a notification can name the job instead
+        /// of the session it happened to run in.
+        #[serde(default)]
+        job_name: String,
+        /// Whether this terminal run should raise a user-facing notification —
+        /// the job's own `notify_success`/`notify_fail` switches composed with
+        /// the run's `[SILENT]` opt-out. Decided in
+        /// `crate::scheduler::should_notify_terminal`; always `false` for a
+        /// non-terminal status.
+        #[serde(default)]
+        notify: bool,
+        /// One-line outcome for the notification body: the error text for a
+        /// failed run, the `+adds −dels` diff summary for a successful one.
+        #[serde(default)]
+        detail: Option<String>,
     },
     /// Per-response context usage for a native session (drives the
     /// "% context left" indicator).
