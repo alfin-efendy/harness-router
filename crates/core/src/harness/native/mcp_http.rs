@@ -617,10 +617,10 @@ impl McpHttpConnection {
             .ok_or_else(|| anyhow::anyhow!("401 carried no WWW-Authenticate header"))?;
         let metadata_url = crate::plugins::oauth::parse_www_authenticate_resource(&header)
             .ok_or_else(|| anyhow::anyhow!("WWW-Authenticate names no resource metadata"))?;
-        let issuers =
+        let prm =
             mcp_oauth::protected_resource_metadata(&self.http, &self.url, &metadata_url).await?;
         let (issuer, metadata) =
-            mcp_oauth::select_authorization_server(&self.http, &issuers).await?;
+            mcp_oauth::select_authorization_server(&self.http, &prm.authorization_servers).await?;
         let client_id = store
             .get_mcp_oauth_client(&issuer)
             .await?

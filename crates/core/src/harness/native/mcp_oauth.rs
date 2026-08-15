@@ -189,6 +189,32 @@ pub fn protected_resource_from_prm(doc: &Value, server_url: &str) -> anyhow::Res
     Ok(servers)
 }
 
+/// The `scopes_supported` list of a PRM document (RFC 9728 §2), or empty when
+/// the document names none. Unlike `authorization_servers`, this is optional:
+/// a protected resource that advertises no scopes is legal, and the caller
+/// falls back to the authorization server's own list.
+pub fn scopes_supported_from_prm(doc: &Value) -> Vec<String> {
+    doc.get("scopes_supported")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The two fields this client reads out of an RFC 9728 protected-resource
+/// metadata document.
+#[derive(Debug, Clone)]
+pub struct ProtectedResourceMetadata {
+    /// Non-empty by construction — [`protected_resource_from_prm`] errors when
+    /// the document names none.
+    pub authorization_servers: Vec<String>,
+    /// Possibly empty; see [`scopes_supported_from_prm`].
+    pub scopes_supported: Vec<String>,
+}
+
 /// Fetch and parse the RFC 9728 document at `metadata_url`.
 ///
 /// The explicit per-request `timeout` is not redundant with the client's own:
@@ -207,7 +233,7 @@ pub async fn protected_resource_metadata(
     http: &reqwest::Client,
     server_url: &str,
     metadata_url: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<ProtectedResourceMetadata> {
     // BEFORE the request, not after: the point is that this URL is never
     // fetched at all unless it belongs to the server being connected.
     validate_metadata_url(server_url, metadata_url)?;
@@ -222,10 +248,11 @@ pub async fn protected_resource_metadata(
             response.status()
         );
     }
-    protected_resource_from_prm(
-        &read_json_capped(response, "protected-resource metadata").await?,
-        server_url,
-    )
+    let doc = read_json_capped(response, "protected-resource metadata").await?;
+    Ok(ProtectedResourceMetadata {
+        authorization_servers: protected_resource_from_prm(&doc, server_url)?,
+        scopes_supported: scopes_supported_from_prm(&doc),
+    })
 }
 
 /// Take the candidates IN DOCUMENT ORDER and use the first whose RFC 8414
@@ -281,6 +308,24 @@ pub struct McpAuthorizeStart {
     /// The client id registered (or reused) for that same authorization
     /// server. Thread this to [`complete_mcp_connect`] verbatim.
     pub client_id: String,
+}
+
+/// The scopes to request on the authorize call.
+///
+/// An authorization server with no default scope mints a token with NO
+/// permissions when the request names none — consent succeeds, a token comes
+/// back, and every later MCP call 403s with `insufficient_scope`, which is
+/// invisible at connect time. So ask for what the deployment advertises: the
+/// protected resource's own `scopes_supported` first, since RFC 9728 has it
+/// describe THIS resource specifically, and the authorization server's
+/// broader RFC 8414 list only as a fallback. Both empty means send no `scope`
+/// parameter at all and let the server apply its default — the only remaining
+/// option, and the pre-existing behavior.
+pub fn requested_scopes(prm_scopes: &[String], as_scopes: &[String]) -> Vec<String> {
+    if prm_scopes.is_empty() {
+        return as_scopes.to_vec();
+    }
+    prm_scopes.to_vec()
 }
 
 /// Build the authorization URL. `resource` MUST be the canonical MCP server
@@ -432,8 +477,8 @@ pub async fn begin_mcp_connect(
         )
         })?;
 
-    let issuers = protected_resource_metadata(http, url, &metadata_url).await?;
-    let (issuer, metadata) = select_authorization_server(http, &issuers).await?;
+    let prm = protected_resource_metadata(http, url, &metadata_url).await?;
+    let (issuer, metadata) = select_authorization_server(http, &prm.authorization_servers).await?;
 
     let redirect_uri = mcp_redirect_uri(&server.name);
     // A client id already registered for this issuer (by this server or any
@@ -463,12 +508,13 @@ pub async fn begin_mcp_connect(
     store
         .upsert_mcp_oauth_client(&issuer, &client_id, &metadata.token_endpoint)
         .await?;
+    let scopes = requested_scopes(&prm.scopes_supported, &metadata.scopes_supported);
     build_authorize_url(
         &metadata,
         &client_id,
         &redirect_uri,
         &canonical_resource_uri(url)?,
-        &[],
+        &scopes,
     )
 }
 
@@ -694,6 +740,55 @@ mod tests {
             protected_resource_from_prm(&serde_json::json!({}), "https://mcp.example.com").is_err(),
             "a PRM document missing every field must fail — here on the absent `resource` claim, \
              before the authorization_servers check is even reached"
+        );
+    }
+
+    #[test]
+    fn prm_scopes_are_parsed_and_a_document_without_them_yields_an_empty_list() {
+        let with_scopes = json!({
+            "resource": "https://mcp.example.com",
+            "authorization_servers": ["https://as.example"],
+            "scopes_supported": ["mcp:read", "mcp:write"]
+        });
+        assert_eq!(
+            scopes_supported_from_prm(&with_scopes),
+            vec!["mcp:read".to_string(), "mcp:write".to_string()],
+            "the resource's advertised scopes must be read in document order — they are what the \
+             authorize request asks for"
+        );
+        assert!(
+            scopes_supported_from_prm(&json!({
+                "resource": "https://mcp.example.com",
+                "authorization_servers": ["https://as.example"]
+            }))
+            .is_empty(),
+            "a PRM document with no scopes_supported must yield an empty list, NOT an error — a \
+             resource that advertises no scopes is legal and must fall back to the AS's list"
+        );
+    }
+
+    #[test]
+    fn the_resources_scopes_win_over_the_authorization_servers_and_neither_means_none() {
+        let prm = vec!["mcp:read".to_string()];
+        let as_scopes = vec!["everything".to_string(), "openid".to_string()];
+        assert_eq!(
+            requested_scopes(&prm, &as_scopes),
+            prm,
+            "RFC 9728's scopes_supported describes THIS resource, so it must win over the \
+             authorization server's broader catalogue — asking for `everything` here would \
+             request permissions the MCP server never needed"
+        );
+        assert_eq!(
+            requested_scopes(&[], &as_scopes),
+            as_scopes,
+            "when the resource advertises nothing, the AS's own list is the only signal left — \
+             falling through to no scope at all is what mints the unusable token this exists to \
+             prevent"
+        );
+        assert!(
+            requested_scopes(&[], &[]).is_empty(),
+            "neither document naming a scope must send NO scope parameter, so the server applies \
+             its default — inventing a scope value here would be guessing"
         );
     }
 
@@ -1216,7 +1311,16 @@ mod tests {
         registration_hits: Arc<Mutex<usize>>,
     }
 
+    /// The default fixture: neither the protected resource nor the
+    /// authorization server advertises any scope.
     async fn spawn_oauth_fixture() -> OauthFixture {
+        spawn_oauth_fixture_with_scopes(&[], &[]).await
+    }
+
+    async fn spawn_oauth_fixture_with_scopes(
+        prm_scopes: &[&str],
+        as_scopes: &[&str],
+    ) -> OauthFixture {
         use axum::extract::{Json, State};
         use axum::routing::{get, post};
         use axum::Router;
@@ -1226,16 +1330,24 @@ mod tests {
             as_url: String,
             registration_hits: Arc<Mutex<usize>>,
             token_request_bodies: Arc<Mutex<Vec<String>>>,
+            scopes_supported: Vec<String>,
         }
 
         async fn handle_as_metadata(State(state): State<AsState>) -> axum::Json<Value> {
             let as_url = &state.as_url;
-            axum::Json(json!({
+            let mut doc = json!({
                 "issuer": as_url,
                 "authorization_endpoint": format!("{as_url}/authorize"),
                 "token_endpoint": format!("{as_url}/token"),
                 "registration_endpoint": format!("{as_url}/register"),
-            }))
+            });
+            // Only emitted when there is something to emit: an ABSENT field and
+            // an empty array must both be exercisable, and absent is the
+            // realistic shape.
+            if !state.scopes_supported.is_empty() {
+                doc["scopes_supported"] = json!(state.scopes_supported);
+            }
+            axum::Json(doc)
         }
 
         async fn handle_register(
@@ -1270,6 +1382,7 @@ mod tests {
             as_url: as_url.clone(),
             registration_hits: registration_hits.clone(),
             token_request_bodies: token_request_bodies.clone(),
+            scopes_supported: as_scopes.iter().map(|s| s.to_string()).collect(),
         };
         let as_app = Router::new()
             .route(
@@ -1283,11 +1396,14 @@ mod tests {
             axum::serve(as_listener, as_app).await.unwrap();
         });
 
-        let mcp_url = spawn_mcp_401_with_prm(json!({
+        let mut prm = json!({
             "resource": "placeholder",
             "authorization_servers": [as_url.clone()],
-        }))
-        .await;
+        });
+        if !prm_scopes.is_empty() {
+            prm["scopes_supported"] = json!(prm_scopes);
+        }
+        let mcp_url = spawn_mcp_401_with_prm(prm).await;
 
         OauthFixture {
             mcp_url,
@@ -1415,6 +1531,128 @@ mod tests {
             1,
             "a second connect for the SAME issuer must reuse the stored client id — the \
              registration endpoint must not see a second hit"
+        );
+    }
+
+    /// The `scope` parameter on an authorize URL, if any. `query_pairs`
+    /// percent-decodes, so a space-joined scope list comes back with real
+    /// spaces.
+    fn scope_param(authorize_url: &str) -> Option<String> {
+        url::Url::parse(authorize_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_resources_advertised_scopes_land_on_the_authorize_url() {
+        // PROPERTY: what the PRM advertises is what gets requested. Without
+        // this, an authorization server with no default scope mints a token
+        // with no permissions — consent succeeds, the card goes green, and
+        // every tool call afterwards 403s.
+        let fixture =
+            spawn_oauth_fixture_with_scopes(&["mcp:read", "mcp:write"], &["everything"]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+
+        assert_eq!(
+            scope_param(&start.url).as_deref(),
+            Some("mcp:read mcp:write"),
+            "the PRM's scopes must be requested, space-joined per RFC 6749 §3.3, and must beat \
+             the AS's broader `everything`: {}",
+            start.url
+        );
+    }
+
+    #[tokio::test]
+    async fn the_authorization_servers_scopes_are_requested_when_the_resource_names_none() {
+        // PROPERTY: the fallback leg. A PRM with no scopes_supported is
+        // common; the AS's own RFC 8414 list is then the only signal, and
+        // dropping through to no scope at all is the bug.
+        let fixture = spawn_oauth_fixture_with_scopes(&[], &["jira:read", "confluence:read"]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+
+        assert_eq!(
+            scope_param(&start.url).as_deref(),
+            Some("jira:read confluence:read"),
+            "with no resource-level scopes the AS's scopes_supported must be requested: {}",
+            start.url
+        );
+    }
+
+    #[tokio::test]
+    async fn no_scope_parameter_is_sent_when_neither_document_advertises_one() {
+        // PROPERTY: when there is nothing to ask for, ask for nothing and let
+        // the server apply its default — an empty `scope=` or an invented
+        // value would be rejected by servers that validate the parameter.
+        let fixture = spawn_oauth_fixture_with_scopes(&[], &[]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+
+        assert_eq!(
+            scope_param(&start.url),
+            None,
+            "no advertised scope anywhere means the parameter must be absent entirely, not \
+             present and empty: {}",
+            start.url
+        );
+    }
+
+    #[tokio::test]
+    async fn the_granted_scope_from_the_token_response_is_persisted_not_the_requested_one() {
+        // PROPERTY: an authorization server may downgrade what it grants
+        // (RFC 6749 §5.1 allows the response `scope` to differ from the
+        // request). The stored token must record what was GRANTED. The
+        // fixture's token endpoint answers `"scope": "read write"` while the
+        // request asks for `mcp:read`, so a regression that echoed the
+        // requested scopes back into the row would fail here.
+        let fixture = spawn_oauth_fixture_with_scopes(&["mcp:read"], &[]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+        complete_mcp_connect(
+            &store,
+            &http,
+            "rovo",
+            &fixture.mcp_url,
+            &start.issuer_token_endpoint,
+            &start.client_id,
+            "the-code",
+            &start.verifier,
+        )
+        .await
+        .expect("the token exchange must succeed");
+
+        let stored = store
+            .get_mcp_oauth_token("rovo")
+            .await
+            .unwrap()
+            .expect("a token must be stored after a successful exchange");
+        assert_eq!(
+            stored.scopes,
+            vec!["read".to_string(), "write".to_string()],
+            "the row must carry the scopes the AS actually granted, not the ones we asked for"
         );
     }
 
