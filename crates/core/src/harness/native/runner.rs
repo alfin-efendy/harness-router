@@ -1014,24 +1014,12 @@ enum DisplayMode {
     /// thinking, notices, and context usage stay internal (the report arrives
     /// via the parent's `task` tool output).
     ToolsOnly { label: String },
-    /// Fully silent drive: no text/thinking/notice/context-usage display, no
-    /// auto-continue, no compaction. Retained (with its `text()`/compaction
-    /// plumbing) for a headless drive with no transcript surface; it has no
-    /// constructor since the background review fork that used it was removed.
-    #[allow(dead_code)]
-    Silent,
 }
 
 impl DisplayMode {
     /// Text/thought/notice/context/compaction rows are shown (parent only).
     fn text(&self) -> bool {
         matches!(self, DisplayMode::Full)
-    }
-    /// Whether the auto-continue re-grant applies. Parent turns and delegated
-    /// sub-agents (`ToolsOnly`) both continue past a spent budget window; a
-    /// fully-silent drive keeps the hard stop.
-    fn auto_continues(&self) -> bool {
-        matches!(self, DisplayMode::Full | DisplayMode::ToolsOnly { .. })
     }
     /// Whether this drive owns the session's mid-turn steer buffer. Only the
     /// user-visible session turn (`Full`) may drain it: a steer is a message
@@ -1048,7 +1036,7 @@ impl DisplayMode {
     fn subagent(&self) -> Option<&str> {
         match self {
             DisplayMode::ToolsOnly { label } => Some(label),
-            DisplayMode::Full | DisplayMode::Silent => None,
+            DisplayMode::Full => None,
         }
     }
 }
@@ -1279,7 +1267,7 @@ async fn drive(
     // each auto-continue (`agent.max_provider_turns`). The parent budget itself
     // is seeded from the same setting in `run_turn`; this read defaults to the
     // same [`PARENT_MAX_ITERS`] ceiling and is consulted on both the top-level
-    // and delegated-sub-agent auto-continue paths (see `auto_continues()`).
+    // and delegated-sub-agent auto-continue paths (see `auto_budget` below).
     // Intentional split: a sub-agent's INITIAL window is the
     // [`SUBAGENT_MAX_ITERS`] constant (set where its budget is constructed at
     // delegation), while every RE-GRANT here — parent or sub-agent — comes from
@@ -1289,20 +1277,17 @@ async fn drive(
     let max_turns =
         crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
             .await;
-    // Auto-continue applies to the parent and to delegated sub-agents
-    // (`DisplayMode::auto_continues()`); a fully-silent drive keeps the hard
-    // stop. Read without usize_setting's floor so "0" can disable it.
-    let auto_budget = if display.auto_continues() {
-        deps.store
-            .get_setting("agent.auto_continue_budget")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4)
-    } else {
-        0
-    };
+    // Auto-continue applies to every drive — the parent turn and delegated
+    // sub-agents alike. Read without usize_setting's floor so "0" can disable
+    // it.
+    let auto_budget = deps
+        .store
+        .get_setting("agent.auto_continue_budget")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
 
     // Composition of two loop-control features:
     //   * The consumable `IterationBudget` (Phase 2) is THE turn cap — the
@@ -1321,8 +1306,7 @@ async fn drive(
                 return Ok(final_text);
             }
             // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
-            // A fully-silent drive (`DisplayMode::Silent`) never compacts.
-            if !matches!(display, DisplayMode::Silent) && cm.status().needs_compaction {
+            if cm.status().needs_compaction {
                 let trigger = if provider_turn == 0 {
                     "pre_turn"
                 } else {
@@ -1577,7 +1561,6 @@ async fn drive(
                     emit_run_context_usage(deps, cm).await;
                     emit_run_cost(deps, cm).await;
                 }
-                DisplayMode::Silent => {}
             }
             if !turn.text.is_empty() {
                 final_text = turn.text.clone();
@@ -1718,8 +1701,8 @@ async fn drive(
         }
         // Budget window exhausted without an end_turn. Auto-continue (#100)
         // applies to the parent and to delegated sub-agents alike
-        // (`display.auto_continues()`; only a fully-silent drive has
-        // auto_budget == 0): re-grant a fresh budget window and loop back into
+        // (`auto_budget`, from `agent.auto_continue_budget`, is 0 only when an
+        // operator disables it): re-grant a fresh budget window and loop into
         // `while budget.try_consume()`. The visible notice below is gated on
         // `display.text()` separately, so sub-agents auto-continue silently —
         // no transcript-notice row, no fake user message appended for them to
@@ -5820,16 +5803,6 @@ mod tests {
         assert!(full.text() && full.subagent().is_none());
         assert!(!sub.text());
         assert_eq!(sub.subagent(), Some("explore"));
-    }
-
-    #[test]
-    fn display_mode_auto_continues_covers_parent_and_subagent_not_silent() {
-        assert!(DisplayMode::Full.auto_continues());
-        assert!(DisplayMode::ToolsOnly {
-            label: "sub".into()
-        }
-        .auto_continues());
-        assert!(!DisplayMode::Silent.auto_continues());
     }
 
     /// Narrow one native tool's decision on `deps.primary_agent`'s profile to
@@ -10132,7 +10105,7 @@ mod tests {
                     input_json: String::new(),
                     input_overflowed: false,
                 },
-                &DisplayMode::Silent,
+                &DisplayMode::Full,
                 &None,
                 &CancellationToken::new(),
             )
@@ -10165,7 +10138,7 @@ mod tests {
                 input_json: String::new(),
                 input_overflowed: false,
             },
-            &DisplayMode::Silent,
+            &DisplayMode::Full,
             &None,
             &CancellationToken::new(),
         )
@@ -10212,7 +10185,7 @@ mod tests {
                     deps,
                     &deps.agent,
                     validated,
-                    &DisplayMode::Silent,
+                    &DisplayMode::Full,
                     &None,
                     &CancellationToken::new(),
                     plan,
@@ -10220,7 +10193,7 @@ mod tests {
                 .await
             }
             V2BatchCall::Rejected(rejected) => {
-                complete_rejected_v2_call(deps, rejected, &DisplayMode::Silent, plan).await
+                complete_rejected_v2_call(deps, rejected, &DisplayMode::Full, plan).await
             }
         }
     }
@@ -10643,7 +10616,7 @@ mod tests {
             &deps,
             &deps.agent,
             validated,
-            &DisplayMode::Silent,
+            &DisplayMode::Full,
             &None,
             &CancellationToken::new(),
             &plan,
@@ -12008,8 +11981,8 @@ mod tests {
     /// Asserts (a) the drive auto-continued rather than hard-stopping, and
     /// (b) NOTHING was emitted to the transcript for the auto-continue: no
     /// `notice` row and no assistant `text` row, because `display.text()` is
-    /// false for `ToolsOnly` (a pure enum test on `auto_continues()` can't
-    /// catch either property — only driving the loop end-to-end can).
+    /// false for `ToolsOnly` (a pure enum test can't catch either property —
+    /// only driving the loop end-to-end can).
     #[tokio::test]
     async fn subagent_tools_only_auto_continues_silently() {
         use testutil::RecordingLlm;
