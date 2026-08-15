@@ -269,7 +269,9 @@ mod tests {
     #[tokio::test]
     async fn persisted_pending_approval_round_trips_and_deletes() {
         let store = test_store().await;
-        persist_pending(&store, row("run-1", "req-1")).await.unwrap();
+        persist_pending(&store, row("run-1", "req-1"))
+            .await
+            .unwrap();
         let listed = list_pending(&store).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, "run-1");
@@ -283,9 +285,15 @@ mod tests {
     #[tokio::test]
     async fn persist_is_idempotent_and_delete_is_key_scoped() {
         let store = test_store().await;
-        persist_pending(&store, row("run-a", "req-1")).await.unwrap();
-        persist_pending(&store, row("run-a", "req-1")).await.unwrap();
-        persist_pending(&store, row("run-b", "req-1")).await.unwrap();
+        persist_pending(&store, row("run-a", "req-1"))
+            .await
+            .unwrap();
+        persist_pending(&store, row("run-a", "req-1"))
+            .await
+            .unwrap();
+        persist_pending(&store, row("run-b", "req-1"))
+            .await
+            .unwrap();
         assert_eq!(list_pending(&store).await.unwrap().len(), 2);
 
         delete_pending(&store, "run-a", "req-1").await.unwrap();
@@ -297,8 +305,12 @@ mod tests {
     #[tokio::test]
     async fn clear_all_pending_empties_the_table() {
         let store = test_store().await;
-        persist_pending(&store, row("run-1", "req-1")).await.unwrap();
-        persist_pending(&store, row("run-2", "req-2")).await.unwrap();
+        persist_pending(&store, row("run-1", "req-1"))
+            .await
+            .unwrap();
+        persist_pending(&store, row("run-2", "req-2"))
+            .await
+            .unwrap();
         assert_eq!(clear_all_pending(&store).await.unwrap(), 2);
         assert!(list_pending(&store).await.unwrap().is_empty());
     }

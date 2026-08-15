@@ -40,6 +40,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "stage_attachment",
     "attachments_root",
     "list_tool_policies",
+    "list_pending_approvals",
     "delete_tool_policy",
 ];
 
@@ -283,6 +284,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             .to_string_lossy()
             .into_owned()),
         "list_tool_policies" => ok(cp.list_tool_policies().await?),
+        "list_pending_approvals" => ok(crate::approval::list_pending(cp.store()).await?),
         "delete_tool_policy" => {
             let a: DeleteToolPolicyP = params(p)?;
             ok(cp.delete_tool_policy(&a.project_id, &a.tool).await?)
@@ -576,6 +578,46 @@ mod tests {
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
     use serial_test::serial;
+
+    /// The RPC a reconnecting Cockpit calls to re-list what is still parked.
+    /// Empty when nothing is waiting; otherwise one camelCase row per park.
+    #[tokio::test]
+    async fn list_pending_approvals_returns_what_is_parked() {
+        let s = state().await;
+        let out = dispatch(&s, "list_pending_approvals", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 0);
+
+        crate::approval::persist_pending(
+            s.cp.store(),
+            crate::domain::PendingApprovalRow {
+                session_pk: "s1".into(),
+                run_id: "run-1".into(),
+                request_id: "req-1".into(),
+                requesting_agent_id: "agent-1".into(),
+                requesting_agent_name: "Agent One".into(),
+                tool: "bash".into(),
+                summary: "Bash: ls".into(),
+                approval_kind: crate::domain::ApprovalKind::Tool,
+                input: json!({"command": "ls"}),
+                principal: None,
+                created_at: 7,
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = dispatch(&s, "list_pending_approvals", json!({}))
+            .await
+            .unwrap();
+        let rows = out.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["runId"], "run-1");
+        assert_eq!(rows[0]["requestId"], "req-1");
+        assert_eq!(rows[0]["approvalKind"], "tool");
+        assert_eq!(rows[0]["input"]["command"], "ls");
+    }
 
     #[tokio::test]
     #[serial]

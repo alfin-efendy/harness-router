@@ -413,6 +413,23 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
+    // A parked approval's reply channel is a `tokio::sync::oneshot` that dies
+    // with the process, so any `pending_approvals` row written by a previous
+    // boot is permanently unanswerable. Drop them rather than resurfacing
+    // un-actionable cards in Cockpit. Non-propagating: a failure here must
+    // never refuse to start the daemon.
+    match crate::approval::clear_all_pending(&store).await {
+        Ok(0) => {}
+        Ok(cleared) => {
+            tracing::info!(
+                cleared,
+                "approvals: dropped parked approvals from a previous boot"
+            )
+        }
+        Err(error) => {
+            tracing::warn!("approvals: failed to clear stale parked approvals: {error}")
+        }
+    }
     // v1 -> v2 first-upgrade migration (plugins v2 Task 5): drop any
     // contract-1 component install trees (+ their release-ledger rows) and
     // carry a legacy `enabled_gateways` CSV value forward into per-plugin
@@ -869,6 +886,21 @@ fn spawn_approval_fanout(
                     input: _,
                     principal,
                 }) => {
+                    // Every kind, including Plan/Question, which the Tool
+                    // filter below drops before the gateway fan-out ever sees
+                    // them. Clones first: `session_pk`/`run_id`/`request_id`
+                    // are moved into the `handle_approval` spawn further down.
+                    {
+                        let cp = Arc::clone(&cp);
+                        let store = Arc::clone(&store);
+                        let session_pk = session_pk.clone();
+                        let run_id = run_id.clone();
+                        let request_id = request_id.clone();
+                        inflight.spawn(async move {
+                            auto_reject_unattended(&cp, &store, &session_pk, &run_id, &request_id)
+                                .await;
+                        });
+                    }
                     if approval_kind != crate::domain::ApprovalKind::Tool {
                         continue;
                     }
@@ -898,6 +930,59 @@ fn spawn_approval_fanout(
             }
         }
     })
+}
+
+/// `sessions.started_by` values that mark a run as UNATTENDED — started by the
+/// scheduler (`crate::scheduler`) or an automation hook
+/// (`ControlPlane::dispatch_automation_event`), with no human watching Cockpit.
+/// A Cockpit-started session writes `"cockpit"` and is never in this set.
+pub(crate) const UNATTENDED_STARTED_BY: &[&str] = &["scheduler", "automation"];
+
+/// Pure half of the unattended policy, so the decision is unit-testable
+/// without a store.
+pub(crate) fn is_unattended(started_by: Option<&str>) -> bool {
+    started_by.is_some_and(|s| UNATTENDED_STARTED_BY.contains(&s))
+}
+
+/// Unattended-run watchdog: an approval parked by a scheduler/automation
+/// session has no surface that will ever answer it (the gateway fan-out below
+/// returns early when the session has no known surface), so without this the
+/// run deadlocks forever. Auto-reject after `approval_timeout_ms` — the same
+/// setting and 300000 ms default the gateway race uses. No-op for every other
+/// session: interactive runs keep parking indefinitely, exactly as before.
+pub(crate) async fn auto_reject_unattended(
+    cp: &Arc<ControlPlane>,
+    store: &Arc<Store>,
+    session_pk: &str,
+    run_id: &str,
+    request_id: &str,
+) {
+    let started_by = store
+        .get_session(session_pk)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.started_by);
+    if !is_unattended(started_by.as_deref()) {
+        return;
+    }
+    let settings = SettingsStore::new(Arc::clone(store));
+    let timeout_ms: u64 = settings
+        .get("approval_timeout_ms")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000);
+    tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+    if cp.resolve_approval_bool(run_id, request_id, false) {
+        tracing::warn!(
+            session_pk,
+            run_id,
+            request_id,
+            "approvals: auto-rejected a parked approval on an unattended run"
+        );
+    }
 }
 
 /// Core approval fan-out decision, callable directly (no broadcast loop
@@ -2168,6 +2253,64 @@ mod tests {
     }
 
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------
+
+    #[test]
+    fn only_scheduler_and_automation_sessions_count_as_unattended() {
+        assert!(is_unattended(Some("scheduler")));
+        assert!(is_unattended(Some("automation")));
+        assert!(!is_unattended(Some("cockpit")));
+        assert!(!is_unattended(Some("import")));
+        assert!(!is_unattended(None));
+    }
+
+    /// The deadlock this plan fixes: a scheduler run parks for approval, has no
+    /// gateway surface that could answer it, and nobody is watching Cockpit.
+    /// Without the watchdog the run waits forever.
+    #[tokio::test]
+    async fn an_unattended_sessions_parked_approval_is_auto_rejected() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s-sched", "p1", Some("scheduler")).await;
+        store
+            .set_setting_raw("approval_timeout_ms", "20")
+            .await
+            .unwrap();
+        let approval = cp.approvals_for_test_register("run-sched", "req-sched");
+
+        auto_reject_unattended(&cp, &store, "s-sched", "run-sched", "req-sched").await;
+
+        let resp = approval.await.expect("watchdog must resolve the approval");
+        assert!(!resp.allowed(), "an unattended park must auto-REJECT");
+    }
+
+    /// The mirror: an interactive Cockpit session keeps today's behaviour and
+    /// parks indefinitely, so the watchdog must not touch it.
+    #[tokio::test]
+    async fn an_interactive_sessions_parked_approval_is_left_alone() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s-cockpit", "p1", Some("cockpit")).await;
+        store
+            .set_setting_raw("approval_timeout_ms", "20")
+            .await
+            .unwrap();
+        let mut approval = cp.approvals_for_test_register("run-cockpit", "req-cockpit");
+
+        // Returns promptly (no sleep is ever entered) and leaves the park.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            auto_reject_unattended(&cp, &store, "s-cockpit", "run-cockpit", "req-cockpit"),
+        )
+        .await
+        .expect("an interactive session must not make the watchdog wait");
+        assert!(
+            approval.try_recv().is_err(),
+            "an interactive session's approval must stay parked"
+        );
+        // Still resolvable by the user, exactly as before.
+        assert!(cp.resolve_approval_bool("run-cockpit", "req-cockpit", true));
+        assert!(approval.await.unwrap().allowed());
+    }
 
     #[tokio::test]
     async fn handle_approval_without_gateway_surface_stays_pending_until_cockpit_resolves() {

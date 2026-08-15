@@ -155,6 +155,48 @@ function nextGeneration(generations: Map<string, number>, projectId: string): nu
   return generation;
 }
 
+/** Stable identity of a pending approval across runners. */
+export function approvalKey(a: { runnerId: string; runId: string; requestId: string }): string {
+  return `${a.runnerId}:${a.runId}:${a.requestId}`;
+}
+
+/**
+ * Reconcile the live `pendingApprovals` array with a freshly fetched
+ * snapshot. Rules, in order:
+ *  1. every fetched entry is kept (it is what the engine still has parked);
+ *  2. a live entry from a runner that was NOT refreshed is kept untouched;
+ *  3. a live entry from a refreshed runner is kept ONLY if it arrived while
+ *     the fetch was in flight — i.e. its key is absent from `before`, the
+ *     snapshot of live keys taken before the RPCs were issued. That is what
+ *     stops a slow snapshot from dropping a card that just came in, without
+ *     resurrecting one the user already answered.
+ * Deduped by `approvalKey`; first occurrence wins.
+ */
+export function mergePendingApprovals(args: {
+  live: PendingApproval[];
+  before: string[];
+  fetched: PendingApproval[];
+  refreshedRunnerIds: string[];
+}): PendingApproval[] {
+  const { live, before, fetched, refreshedRunnerIds } = args;
+  const refreshed = new Set(refreshedRunnerIds);
+  const beforeKeys = new Set(before);
+  const out: PendingApproval[] = [];
+  const seen = new Set<string>();
+  const push = (a: PendingApproval) => {
+    const key = approvalKey(a);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(a);
+  };
+  for (const a of fetched) push(a);
+  for (const a of live) {
+    if (!refreshed.has(a.runnerId)) push(a);
+    else if (!beforeKeys.has(approvalKey(a))) push(a);
+  }
+  return out;
+}
+
 export const useStore = create<State>((set, get) => ({
   projects: [],
   sessions: [],
@@ -411,14 +453,48 @@ export const useStore = create<State>((set, get) => ({
       }
     }
 
+    // Snapshot the live approval keys BEFORE any of the RPCs below go out, so
+    // the merge can tell "the engine no longer has it" apart from "it arrived
+    // while this fetch was in flight".
+    const before = get().pendingApprovals.map(approvalKey);
+    const runnerList = [...runnerIds];
     const perRunner = await Promise.all(
-      [...runnerIds].map(async (runnerId): Promise<UiSession[]> => {
+      runnerList.map(async (runnerId): Promise<UiSession[]> => {
         const res = await commands.listSessions(runnerId, null);
         return res.status === "ok" ? res.data.map((s) => ({ ...s, runnerId })) : [];
       }),
     );
+    // Parked approvals live only in engine memory + a one-shot event, so a
+    // reloaded webview would otherwise never see them again. Re-list them
+    // from each runner alongside the sessions.
+    const perRunnerApprovals = await Promise.all(
+      runnerList.map(async (runnerId): Promise<PendingApproval[]> => {
+        const res = await commands.listPendingApprovals(runnerId);
+        if (res.status !== "ok") return [];
+        return res.data.map((a) => ({
+          runnerId,
+          sessionPk: a.sessionPk,
+          runId: a.runId,
+          requestId: a.requestId,
+          tool: a.tool,
+          summary: a.summary,
+          kind: a.approvalKind,
+          input: a.input,
+          principal: a.principal ?? null,
+        }));
+      }),
+    );
     const sessions = perRunner.flat();
-    set({ sessions });
+    const fetched = perRunnerApprovals.flat();
+    set((st) => ({
+      sessions,
+      pendingApprovals: mergePendingApprovals({
+        live: st.pendingApprovals,
+        before,
+        fetched,
+        refreshedRunnerIds: runnerList,
+      }),
+    }));
     useUi.getState().seedReadState(sessions);
   },
 
@@ -657,7 +733,16 @@ export const useStore = create<State>((set, get) => ({
       // the jobRunChanged branch below notifies instead, with the job's name,
       // its notify switches and the real run outcome. Without this the user
       // gets two notifications for every scheduled run.
-      const intent = isSchedulerSession(evtSession) ? null : notifyIntentForEvent(event, runnerId, isWindowFocused());
+      //
+      // An APPROVAL is exempt from that guard. A parked approval is not a
+      // terminal state, so `jobRunChanged` never fires for it — the run is
+      // blocked, not finished — which means there is no second notification to
+      // deduplicate against. Suppressing it would make an unattended run that
+      // parks for tool approval completely silent, the exact deadlock the
+      // durable `pending_approvals` work exists to surface.
+      const rawIntent = notifyIntentForEvent(event, runnerId, isWindowFocused());
+      const suppressedAsScheduled = isSchedulerSession(evtSession) && rawIntent?.kind !== "approval";
+      const intent = suppressedAsScheduled ? null : rawIntent;
       if (evtPk) notifier.cancelSettle(runnerId, evtPk); // any activity supersedes a pending settle
       if (intent) notifier.handle(intent, evtSession);
       // A scheduled job finished and its own switches say to tell the user:

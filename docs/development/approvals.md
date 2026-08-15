@@ -25,6 +25,22 @@ cross-session Inbox, where approvals wait for an explicit response. Headless
 gateway binary Tool approvals wait for an explicit gateway answer. Non-tool
 Plan/Question prompts have no supported gateway UI.
 
+Durability: a parked approval is also written to the `pending_approvals` table
+and deleted the moment the parked call site wakes (user answer, gateway answer,
+timeout, or cancel). Cockpit re-lists them through the `list_pending_approvals`
+RPC on every `refresh()`, so reloading the webview no longer strands the turn.
+Rows do NOT survive a daemon restart: the reply channel is process-local, so
+`build_daemon` wipes the table at boot.
+
+Unattended runs: a session whose `started_by` is `scheduler` or `automation` has
+nobody watching Cockpit, so an approval it parks is auto-rejected after
+`approval_timeout_ms` (default 300000). Interactive sessions are unaffected and
+park indefinitely. An approval notification is deliberately exempt from the
+scheduler-session notification guard in `store.ts` (which suppresses the
+per-turn `result`/`error` notification that `jobRunChanged` would duplicate): a
+park is not a terminal state, so no `jobRunChanged` ever fires for it and there
+is nothing to deduplicate against.
+
 MCP tools are gated per-tool: the permission key is the tool's own full name
 (`mcp__server__tool`), so "don't ask again" rules never span multiple MCP
 tools or servers.

@@ -137,6 +137,19 @@ async resolveApproval(runnerId: string | null, runId: string, requestId: string,
     return await TAURI_INVOKE("resolve_approval", { runnerId, runId, requestId, response });
 },
 /**
+ * Every approval still parked on this runner. Cockpit calls it on connect
+ * and on every refresh so a reloaded webview re-lists what is waiting on
+ * the user instead of stranding the turn.
+ */
+async listPendingApprovals(runnerId: string | null) : Promise<Result<PendingApprovalRow[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_pending_approvals", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Write pasted bytes into the attachments staging area and return the
  * absolute path — from there the file flows through the normal attachment
  * pipeline on send. Staging is wiped on app start (see lib.rs setup).
@@ -2839,6 +2852,30 @@ export type ModelStatusInfo = { model: string; status: string; message: string; 
 export type NativeToolDecisionInfo = { tool: string; decision: string }
 export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
+/**
+ * One parked approval, persisted so a surface that reconnects (a reloaded
+ * Cockpit webview) can re-list what is still waiting on the user. Mirrors the
+ * fields of `CoreEvent::ApprovalRequested`, plus `created_at`.
+ */
+export type PendingApprovalRow = { sessionPk: string;
+/**
+ * Durable run that owns this request; required to resolve it.
+ */
+runId: string; requestId: string; requestingAgentId: string; requestingAgentName: string; tool: string; summary: string; approvalKind: ApprovalKind;
+/**
+ * Raw kind-specific payload: the tool's input JSON (Tool), the plan
+ * markdown (Plan), or the questions spec (Question).
+ */
+input: JsonValue;
+/**
+ * Which plugin's MCP tool this approval is for; `None` for built-in tools
+ * and Plan/Question prompts.
+ */
+principal: Principal | null;
+/**
+ * Epoch milliseconds when the call parked.
+ */
+createdAt: number }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PermissionRuleInfo = { id: string; tool: string; decision: string; commandPrefix: string | null }
 /**

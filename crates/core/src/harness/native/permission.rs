@@ -234,6 +234,30 @@ pub async fn evaluate(
     let rx = gate
         .approvals
         .register_for_session(gate.session_pk, approval_key.clone());
+    // Durability: the reply channel above lives only in this process, so a
+    // reloaded Cockpit would otherwise lose the card while this call stays
+    // parked. Record the request; the delete below runs on EVERY exit path.
+    // Best-effort — a failed write must never change the verdict.
+    if let Err(error) = crate::approval::persist_pending(
+        gate.store,
+        crate::domain::PendingApprovalRow {
+            session_pk: gate.session_pk.to_string(),
+            run_id: gate.run_id.to_string(),
+            request_id: gate.tool_call_id.to_string(),
+            requesting_agent_id: gate.requesting_agent_id.to_string(),
+            requesting_agent_name: gate.requesting_agent_name.to_string(),
+            tool: spec.key.clone(),
+            summary: spec.summary.clone(),
+            approval_kind: ApprovalKind::Tool,
+            input: input.clone(),
+            principal: spec.principal.clone(),
+            created_at: crate::paths::now_ms(),
+        },
+    )
+    .await
+    {
+        tracing::warn!("approvals: failed to persist a parked tool approval: {error}");
+    }
     let _ = gate.events.send(CoreEvent::ApprovalRequested {
         session_pk: gate.session_pk.to_string(),
         run_id: gate.run_id.to_string(),
@@ -246,7 +270,7 @@ pub async fn evaluate(
         input: input.clone(),
         principal: spec.principal.clone(),
     });
-    tokio::select! {
+    let decision = tokio::select! {
         biased;
         // Turn stopped while parked: deny, and deregister the abandoned
         // prompt so a later resolve() can't hit a stale entry.
@@ -258,7 +282,15 @@ pub async fn evaluate(
             Ok(resp) => apply_response(gate, tool, resp).await,
             Err(_) => PermDecision::Deny,
         },
+    };
+    // Answered, cancelled, gateway-resolved or timed out — all of them
+    // complete the oneshot above, so this one delete covers every exit path.
+    if let Err(error) =
+        crate::approval::delete_pending(gate.store, gate.run_id, gate.tool_call_id).await
+    {
+        tracing::warn!("approvals: failed to clear a resolved parked approval: {error}");
     }
+    decision
 }
 
 /// Record a `*Always` reply at its scope, then return the call's verdict.
@@ -977,6 +1009,46 @@ mod tests {
         )
         .await;
         assert_eq!(d, PermDecision::Deny);
+    }
+
+    /// The regression this plan exists for: while `evaluate` is parked the
+    /// request must be listable from the store (so a reloaded webview can
+    /// re-list it), and it must be gone once the park ends — here via cancel,
+    /// the arm that does NOT go through `apply_response`.
+    #[tokio::test]
+    async fn a_parked_approval_is_listable_from_the_store_and_cleared_on_cancel() {
+        let f = Fixture::new().await;
+        let input = serde_json::json!({"command": "rm -rf /"});
+        let gate = f.gate(PermMode::Default, None);
+        let bash = spec("bash");
+        let fut = evaluate(&bash, &input, &gate);
+        tokio::pin!(fut);
+        // The persist is an await point inside `evaluate`, so poll until the
+        // row lands rather than assuming one poll is enough.
+        let mut listed = Vec::new();
+        for _ in 0..50 {
+            assert!(futures::poll!(fut.as_mut()).is_pending());
+            listed = crate::approval::list_pending(&f.store).await.unwrap();
+            if !listed.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(listed.len(), 1, "a parked approval must be persisted");
+        assert_eq!(listed[0].run_id, "run-1");
+        assert_eq!(listed[0].request_id, "call-1");
+        assert_eq!(listed[0].tool, "bash");
+        assert_eq!(listed[0].input["command"], "rm -rf /");
+
+        f.cancel.cancel();
+        assert_eq!(fut.await, PermDecision::Deny);
+        assert!(
+            crate::approval::list_pending(&f.store)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a resolved approval must not stay persisted"
+        );
     }
 
     #[tokio::test]
