@@ -445,7 +445,7 @@ async fn resolve_native_model(
     configured: Option<String>,
 ) -> Option<String> {
     if let Some(model) = configured.filter(|m| !m.trim().is_empty()) {
-        if crate::llm_router::client::route_model_for_anthropic_messages(store, &model)
+        if crate::llm_router::client::peek_model_for_anthropic_messages(store, &model)
             .await
             .ok()
             .flatten()
