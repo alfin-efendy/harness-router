@@ -345,6 +345,21 @@ struct ConnectedMcp {
     remote: Vec<Arc<mcp_http::McpHttpConnection>>,
 }
 
+/// One connected MCP server, as the per-server connect task yields it: the
+/// server name, its tool definitions, the transport-erased caller its tools
+/// dispatch through, and — for a remote HTTP server only — the concrete
+/// connection whose server-side session teardown must later terminate.
+/// `None` in that last slot means stdio, which owns no HTTP session.
+///
+/// A named alias rather than the tuple inline: `clippy::type_complexity`
+/// rejects the four-slot form, and this is the one place its shape matters.
+type OpenedMcpServer = (
+    String,
+    Vec<mcp_client::McpToolDef>,
+    Arc<dyn mcp_client::McpCaller>,
+    Option<Arc<mcp_http::McpHttpConnection>>,
+);
+
 /// Connect the session's enabled MCP servers — stdio (`mcp_client`) and
 /// remote Streamable HTTP (`mcp_http`) alike — and build native tool
 /// wrappers for their tools. Servers connect CONCURRENTLY (`join_all` — each
@@ -370,12 +385,7 @@ async fn connect_mcp_tools(
     principals: &std::collections::HashMap<String, crate::domain::Principal>,
 ) -> ConnectedMcp {
     let connections = futures::future::join_all(mcp_servers.iter().map(|spec| async move {
-        let opened: anyhow::Result<(
-            String,
-            Vec<mcp_client::McpToolDef>,
-            Arc<dyn mcp_client::McpCaller>,
-            Option<Arc<mcp_http::McpHttpConnection>>,
-        )> = match &spec.transport {
+        let opened: anyhow::Result<OpenedMcpServer> = match &spec.transport {
             crate::domain::McpTransport::Stdio { .. } => {
                 mcp_client::McpConnection::connect_stdio(spec)
                     .await
