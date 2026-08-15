@@ -35,13 +35,35 @@ fn lifecycle(entry: &str) {
     let config_home = tmp.path().join("config");
     let plugins_root = tmp.path().join("plugins-root");
 
+    // The two platform-independent seams. Deliberately spelled as the exact
+    // paths `XDG_DATA_HOME`/`XDG_CONFIG_HOME` would resolve to, so this
+    // redirection is a no-op change on Linux (daemon.json keeps landing in the
+    // same place) while still being authoritative on platforms where `dirs`
+    // ignores the environment.
+    let state_dir = data_home.join("ryuzi");
+    let config_dir = config_home.join("ryuzi");
+
     // Redirect ryuzi_core::paths::state_dir() (and thus db_path()) into the
     // tempdir on both Linux (XDG_DATA_HOME) and macOS (HOME) — same
     // XDG_DATA_HOME/HOME redirection pattern used throughout this crate's
     // integration tests (see e.g. crates/runner/tests/e2e_journey.rs).
+    //
+    // Those two are NOT sufficient on Windows: `dirs::data_dir()` /
+    // `dirs::config_dir()` resolve `FOLDERID_RoamingAppData` through the
+    // known-folder API there and ignore every environment variable, so this
+    // test used to open and migrate the developer's live
+    // `%APPDATA%\ryuzi\ryuzi.sqlite` — the same class of bug the
+    // `RYUZI_PLUGINS_ROOT` comment below describes, one directory over.
+    // `RYUZI_STATE_DIR`/`RYUZI_CONFIG_DIR` are honored by
+    // `ryuzi_core::paths` itself (a runtime check, not `cfg(test)`, precisely
+    // so it reaches the spawned binary), so they work on every platform. Set
+    // both here for this process AND on the child below; neither replaces the
+    // XDG/HOME pair, which stays correct for everything else that reads it.
     std::env::set_var("XDG_DATA_HOME", &data_home);
     std::env::set_var("HOME", &home);
     std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    std::env::set_var("RYUZI_STATE_DIR", &state_dir);
+    std::env::set_var("RYUZI_CONFIG_DIR", &config_dir);
     std::env::set_var("RYUZI_PLUGINS_ROOT", &plugins_root);
 
     let db_path = ryuzi_core::paths::db_path();
@@ -68,6 +90,8 @@ fn lifecycle(entry: &str) {
         .env("XDG_DATA_HOME", &data_home)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("RYUZI_STATE_DIR", &state_dir)
+        .env("RYUZI_CONFIG_DIR", &config_dir)
         .env("RYUZI_PLUGINS_ROOT", &plugins_root)
         .stdin(Stdio::null())
         .spawn()
