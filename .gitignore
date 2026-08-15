@@ -81,6 +81,10 @@ skills-lock.json
 # Design specs/plans are kept as a local-only artifact (not tracked in origin)
 docs/design/
 
+# Advisor-generated implementation plans: local-only working artifacts, same
+# rationale as docs/design/ — never committed, never pushed.
+docs/plans/
+
 # playwright output (apps/cockpit e2e)
 apps/cockpit/playwright-report/
 apps/cockpit/test-results/
