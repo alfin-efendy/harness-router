@@ -165,6 +165,12 @@ pub struct RunnerDeps {
     /// call reaches whichever turn is currently draining it. Survives across
     /// turns: `refresh_turn_model` clones the whole `RunnerDeps` per turn, but
     /// `SteerBuffer`'s clone shares the underlying `Arc<Mutex<Vec<_>>>`.
+    ///
+    /// Sub-agents are the exception: `deps_for_subagent` and
+    /// `RunnerMainAgentSpawner::execute_child` install a FRESH empty buffer, and
+    /// `drive` only drains when `DisplayMode::owns_steer()`. A child drive runs
+    /// against an ephemeral `ContextManager` and writes no message row, so a
+    /// child that consumed a steer would destroy a user instruction silently.
     pub steer: SteerBuffer,
     /// Shared async-delegation capacity gate (spec §6.2), from `SessionCtx`.
     pub background: Arc<super::background::BackgroundRegistry>,
@@ -1027,6 +1033,17 @@ impl DisplayMode {
     fn auto_continues(&self) -> bool {
         matches!(self, DisplayMode::Full | DisplayMode::ToolsOnly { .. })
     }
+    /// Whether this drive owns the session's mid-turn steer buffer. Only the
+    /// user-visible session turn (`Full`) may drain it: a steer is a message
+    /// from the user to THIS session, and a sub-agent drive (`ToolsOnly`) runs
+    /// against a `ContextManager::ephemeral` whose history is discarded, so a
+    /// child that drained it would destroy the instruction with no transcript
+    /// row and no way to recover it. Deliberately separate from `text()` even
+    /// though both are `Full`-only today: display policy and steer ownership
+    /// are different concerns and must be able to change independently.
+    fn owns_steer(&self) -> bool {
+        matches!(self, DisplayMode::Full)
+    }
     /// Sub-agent attribution label for tool rows, if any.
     fn subagent(&self) -> Option<&str> {
         match self {
@@ -1623,10 +1640,12 @@ async fn drive(
                 // message and loop once more so the model actually responds to the
                 // steer, instead of losing it — or leaking it, stale, into a later
                 // unrelated turn's tool-result batch.
-                if let Some(block) = deps.steer.take_block() {
-                    cm.append_user_text(&block).await?;
-                    provider_turn += 1;
-                    continue;
+                if display.owns_steer() {
+                    if let Some(block) = deps.steer.take_block() {
+                        cm.append_user_text(&block).await?;
+                        provider_turn += 1;
+                        continue;
+                    }
                 }
                 return Ok(final_text); // end_turn
             }
@@ -1686,8 +1705,10 @@ async fn drive(
             // alongside — so the model sees it on the NEXT iteration's request,
             // wrapped in the verbatim marker the system prompt teaches it to
             // trust as a direct user instruction.
-            if let Some(block) = deps.steer.take_block() {
-                cm.append_user_text(&block).await?;
+            if display.owns_steer() {
+                if let Some(block) = deps.steer.take_block() {
+                    cm.append_user_text(&block).await?;
+                }
             }
 
             if cancel.is_cancelled() {
@@ -1763,8 +1784,10 @@ async fn drive(
     // Fold it into `cm` so the terminal summary call (and, when no model is
     // configured, the ledger the next turn resumes from) sees it rather than
     // dropping it silently.
-    if let Some(block) = deps.steer.take_block() {
-        cm.append_user_text(&block).await?;
+    if display.owns_steer() {
+        if let Some(block) = deps.steer.take_block() {
+            cm.append_user_text(&block).await?;
+        }
     }
     // Budget exhausted with tool calls still pending: make one tool-less
     // call asking the model for a final summary instead of leaving the user
@@ -1963,7 +1986,9 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         memory: None,
         snapshots: deps.snapshots.clone(),
         snapshot_taker: deps.snapshot_taker.clone(),
-        steer: deps.steer.clone(),
+        // A fresh, EMPTY buffer: a steer belongs to the user's session turn,
+        // never to a memoryless `task` child whose history is ephemeral.
+        steer: SteerBuffer::new(),
         background: deps.background.clone(),
         app_control: None,
         activated_tools: None,
@@ -2155,6 +2180,9 @@ impl RunnerMainAgentSpawner {
             // A delegated target may advertise its configured app tool but
             // never receives the parent's app-control facade to execute it.
             child_deps.app_control = None;
+            // Same rule as `deps_for_subagent`: a delegated child never shares
+            // the parent session's steer buffer.
+            child_deps.steer = SteerBuffer::new();
             child_deps.perm_overrides = Arc::new(std::sync::Mutex::new(Default::default()));
             child_deps.perm_mode = Arc::new(std::sync::Mutex::new(primary_turn.perm_mode));
             child_deps.model = primary_turn.model;
