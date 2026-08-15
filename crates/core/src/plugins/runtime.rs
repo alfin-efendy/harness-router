@@ -2041,6 +2041,66 @@ mod tests {
         );
     }
 
+    /// A core module whose DECLARED minimum linear memory is already over the
+    /// budget is rejected while the memory is being created — the limiter's
+    /// `memory_growing` callback fires with `current == 0` at instantiation,
+    /// not only on a later `memory.grow`.
+    #[test]
+    fn core_module_declaring_an_oversized_memory_is_rejected() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        // 2000 wasm pages = 131,072,000 bytes, over the 64 MiB default budget.
+        let error = runtime
+            .execute_core_module_with_fuel("(module (memory 2000))", 1_000_000)
+            .expect_err("a 2000-page memory must exceed the 64 MiB budget");
+        let PluginRuntimeError::InstantiationFailed(message) = &error else {
+            panic!("expected InstantiationFailed, got {error:?}");
+        };
+        assert!(
+            message.contains(MEMORY_LIMIT_MESSAGE),
+            "the failure must name the plugin memory budget, got: {message}"
+        );
+    }
+
+    /// The security case this enforcement exists for: `memory.grow` costs
+    /// almost no fuel and no measurable wall clock, so before the limiter a
+    /// guest could walk linear memory up to wasmtime's default ceiling and
+    /// OOM-kill the daemon. Now it traps THIS instantiation with a legible
+    /// host-authored error and the process survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instantiate_rejects_a_component_that_grows_past_its_memory_budget() {
+        // WAT component: one core module with a 1-page memory whose start
+        // function immediately asks for 4000 more pages (~262 MB total), far
+        // over the 64 MiB default budget. No component-level imports or
+        // exports, so manifest validation passes.
+        let greedy_wat = "(component \
+            (core module $m \
+                (memory 1) \
+                (func $grow \
+                    (drop (memory.grow (i32.const 4000))) \
+                ) \
+                (start $grow) \
+            ) \
+            (core instance (instantiate $m)) \
+        )";
+
+        let dir = tempfile::tempdir().expect("tempdir should create");
+        let bundle = installed_bundle_with_wat(dir.path(), greedy_wat);
+        let (ctx, _tmp) = test_ctx("acme").await;
+
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let error = runtime
+            .instantiate(&bundle, HostPolicy::deny_all(), ctx)
+            .await
+            .expect_err("a component growing past its memory budget must not instantiate");
+        let PluginRuntimeError::InstantiationFailed(message) = &error else {
+            panic!("expected InstantiationFailed, got {error:?}");
+        };
+        assert!(
+            message.contains(MEMORY_LIMIT_MESSAGE),
+            "the failure must name the plugin memory budget, got: {message}"
+        );
+    }
+
     fn component_with_export(name: &str) -> String {
         format!(
             r#"(component
