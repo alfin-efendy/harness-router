@@ -48,6 +48,7 @@ npm/platform/*/ryuzi
 npm/platform/*/ryuzi.exe
 
 /target
+/target-plugins
 crates/core/tests/fixtures/**/target/
 crates/core/tests/fixtures/**/Cargo.lock
 crates/core/tests/fixtures/**/wit/deps/
