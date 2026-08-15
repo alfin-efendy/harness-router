@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { attentionCount, notifyIntentForEvent } from "./notify";
+import { attentionCount, notifyIntentForEvent, jobNotifyIntentForEvent, isSchedulerSession } from "./notify";
 import type { Session, CoreEvent } from "../bindings";
 import { LOCAL_RUNNER, sessKey, type UiSession } from "./session-key";
 
@@ -205,4 +205,78 @@ test("cancelAllSettles cancels every pending settle (focus-gain path)", () => {
   n.cancelAllSettles();
   f.runTimers();
   expect(f.sent.length).toBe(0);
+});
+
+test("jobRunChanged with notify=false raises nothing", () => {
+  expect(
+    jobNotifyIntentForEvent(
+      ev({ kind: "jobRunChanged", job_id: "j", run_id: "r", status: "failed", job_name: "Nightly", notify: false, detail: "boom" }),
+    ),
+  ).toBeNull();
+});
+
+test("jobRunChanged failure → error intent naming the job and the error", () => {
+  expect(
+    jobNotifyIntentForEvent(
+      ev({ kind: "jobRunChanged", job_id: "j", run_id: "r", status: "failed", job_name: "Nightly", notify: true, detail: "boom" }),
+    ),
+  ).toEqual({ title: "Nightly", body: "Run failed — boom", level: "error" });
+});
+
+test("jobRunChanged failure with no detail still names the job", () => {
+  expect(
+    jobNotifyIntentForEvent(
+      ev({ kind: "jobRunChanged", job_id: "j", run_id: "r", status: "failed", job_name: "", notify: true, detail: null }),
+    ),
+  ).toEqual({ title: "Scheduled job", body: "Run failed — no error reported", level: "error" });
+});
+
+test("jobRunChanged success → success intent with the diff summary", () => {
+  expect(
+    jobNotifyIntentForEvent(
+      ev({ kind: "jobRunChanged", job_id: "j", run_id: "r", status: "success", job_name: "Nightly", notify: true, detail: "+3 −1" }),
+    ),
+  ).toEqual({ title: "Nightly", body: "Run finished — +3 −1", level: "success" });
+});
+
+test("a non-terminal jobRunChanged and unrelated events raise nothing", () => {
+  expect(
+    jobNotifyIntentForEvent(
+      ev({ kind: "jobRunChanged", job_id: "j", run_id: "r", status: "running", job_name: "Nightly", notify: true, detail: null }),
+    ),
+  ).toBeNull();
+  expect(jobNotifyIntentForEvent(ev({ kind: "result", session_pk: "a" }))).toBeNull();
+});
+
+// An older remote daemon omits the `#[serde(default)]` fields entirely, so
+// they arrive `undefined`. A missing `notify` must read as "do not notify",
+// and a missing `job_name` must not throw.
+test("a jobRunChanged from an older daemon (fields absent) raises nothing", () => {
+  expect(jobNotifyIntentForEvent(ev({ kind: "jobRunChanged", job_id: "j", run_id: "r", status: "failed" }))).toBeNull();
+  expect(jobNotifyIntentForEvent(ev({ kind: "jobRunChanged", job_id: "j", run_id: "r", status: "failed", notify: true }))).toEqual({
+    title: "Scheduled job",
+    body: "Run failed — no error reported",
+    level: "error",
+  });
+});
+
+test("isSchedulerSession only matches scheduler-started sessions", () => {
+  expect(isSchedulerSession(undefined)).toBe(false);
+  expect(isSchedulerSession({ ...sess("a", 0), startedBy: null })).toBe(false);
+  expect(isSchedulerSession({ ...sess("a", 0), startedBy: "user" })).toBe(false);
+  expect(isSchedulerSession({ ...sess("a", 0), startedBy: "scheduler" })).toBe(true);
+});
+
+test("notifyNow sends immediately, and not at all when disabled", async () => {
+  const f = fakeDeps();
+  const n = createNotifier(f.deps);
+  n.notifyNow({ title: "Nightly", body: "Run failed — boom" });
+  await Promise.resolve();
+  expect(f.sent).toEqual([{ title: "Nightly", body: "Run failed — boom" }]);
+  expect(f.timers.length).toBe(0);
+
+  const off = fakeDeps({ isEnabled: () => false });
+  createNotifier(off.deps).notifyNow({ title: "Nightly", body: "x" });
+  await Promise.resolve();
+  expect(off.sent.length).toBe(0);
 });

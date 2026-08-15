@@ -488,6 +488,33 @@ pub(crate) fn run_note_for(final_text: Option<&str>) -> (bool, Option<String>) {
     }
 }
 
+/// Whether a finished run should raise a user-facing notification.
+///
+/// Composes the job's own switches with the run's `[SILENT]` opt-out:
+/// - `success` needs `notify_success` AND a reply that did not open with
+///   `[SILENT]` (`not_silenced` is the first element of [`run_note_for`]).
+/// - `failed` is gated on `notify_fail` alone — the `[SILENT]` convention can
+///   never apply, because a failed run has no final assistant text to read
+///   (`final_text` is `None` on that path), so `run_note_for` always reports
+///   `true` there and silencing a failure would be a lie.
+/// - Anything non-terminal (`running`) never notifies.
+///
+/// This is only about the USER-FACING notification. The gateway activity log
+/// (`crate::gateways::add_event`) is deliberately NOT gated on it — a failure
+/// must stay in the diagnostic record whatever the user's preference.
+pub(crate) fn should_notify_terminal(
+    status: &str,
+    notify_success: bool,
+    notify_fail: bool,
+    not_silenced: bool,
+) -> bool {
+    match status {
+        "success" => notify_success && not_silenced,
+        "failed" => notify_fail,
+        _ => false,
+    }
+}
+
 /// The final assistant message of a session: the trailing run of assistant
 /// text rows (they are persisted delta-shaped), concatenated in order.
 pub(crate) async fn final_assistant_text(store: &Store, session_pk: &str) -> Option<String> {
@@ -717,6 +744,12 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
                 job_id: job.id.clone(),
                 run_id: run_id.clone(),
                 status: "failed".into(),
+                job_name: job.name.clone(),
+                // The session never started, so there is no reply and no
+                // `[SILENT]` decision to compose — this is purely the job's
+                // own failure switch.
+                notify: job.notify_fail,
+                detail: Some(e.to_string()),
             });
             return Ok(run_id);
         }
@@ -726,6 +759,8 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
     let job_id = job.id.clone();
     let job_name = job.name.clone();
     let gateway = job.gateway.clone();
+    let notify_success = job.notify_success;
+    let notify_fail = job.notify_fail;
     let cp2 = Arc::clone(cp);
     let run_id2 = run_id.clone();
     tokio::spawn(async move {
@@ -816,6 +851,12 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
                 }
             }
         }
+        let notify_user = should_notify_terminal(status, notify_success, notify_fail, notify);
+        let detail = match &error {
+            Some(e) => Some(e.clone()),
+            None if status == "success" => Some(format!("+{add} −{del}")),
+            None => None,
+        };
         if status != "success" || notify {
             let level = if status == "success" {
                 "success"
@@ -841,6 +882,9 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
             job_id,
             run_id: run_id2,
             status: status.into(),
+            job_name,
+            notify: notify_user,
+            detail,
         });
     });
 
@@ -1065,6 +1109,21 @@ mod tests {
         );
         assert_eq!(run_note_for(Some("did things")), (true, None));
         assert_eq!(run_note_for(None), (true, None));
+    }
+
+    #[test]
+    fn terminal_notification_gate_composes_job_switches_with_silent() {
+        // success needs the switch AND a non-`[SILENT]` reply
+        assert!(should_notify_terminal("success", true, false, true));
+        assert!(!should_notify_terminal("success", true, false, false));
+        assert!(!should_notify_terminal("success", false, true, true));
+        // failure is gated on `notify_fail` alone — the `[SILENT]` convention
+        // never reaches it (a failed run has no final assistant text)
+        assert!(should_notify_terminal("failed", false, true, true));
+        assert!(should_notify_terminal("failed", false, true, false));
+        assert!(!should_notify_terminal("failed", false, false, true));
+        // a non-terminal status never notifies
+        assert!(!should_notify_terminal("running", true, true, true));
     }
 
     #[tokio::test]

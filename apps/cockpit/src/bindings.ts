@@ -2580,7 +2580,7 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 /**
  * A scheduled job run started or finished (status: running|success|failed).
  */
-{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string } |
+{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string; job_name?: string; notify?: boolean; detail?: string | null } |
 /**
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
