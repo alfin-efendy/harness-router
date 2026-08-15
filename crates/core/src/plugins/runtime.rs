@@ -155,6 +155,108 @@ impl Default for ResourceLimits {
     }
 }
 
+/// The stable, host-authored prefix of the error raised when a guest asks to
+/// grow linear memory past its [`ResourceLimits::max_memory_bytes`] budget.
+/// Tests assert on this substring, so keep it in sync with
+/// [`PluginResourceLimiter::memory_growing`].
+pub(crate) const MEMORY_LIMIT_MESSAGE: &str = "plugin memory limit exceeded";
+
+/// The stable, host-authored prefix of the error raised when a guest asks to
+/// grow a table past its [`ResourceLimits::max_table_elements`] budget.
+pub(crate) const TABLE_LIMIT_MESSAGE: &str = "plugin table limit exceeded";
+
+/// Applies a component's declared [`ResourceLimits`] to its live wasmtime
+/// `Store`.
+///
+/// Fuel bounds INSTRUCTIONS and the epoch deadline bounds WALL CLOCK; neither
+/// bounds ALLOCATION. A single `memory.grow` for thousands of pages costs
+/// almost no fuel and no measurable time, so without this limiter a guest can
+/// walk its linear memory up to wasmtime's default (effectively unbounded)
+/// ceiling and OOM-kill the whole daemon — taking every running session with
+/// it. This closes that hole for the two allocation channels wasmtime exposes
+/// to a `ResourceLimiter`: linear memory and tables.
+///
+/// The memory budget is enforced in AGGREGATE across every linear memory in the
+/// store, not per memory: `memory_growing` reports each memory's own `current`
+/// and `desired` size in bytes, so accumulating `desired - current` yields the
+/// total this store has been granted (wasm memories never shrink). A component
+/// therefore cannot evade the cap by declaring many small memories.
+///
+/// Refusals are raised as `Err`, not `Ok(false)`: `Ok(false)` makes
+/// `memory.grow` quietly return `-1` and lets a guest blunder on in an
+/// undefined state, while `Err` traps the call with a legible, host-authored
+/// message that survives into [`PluginRuntimeError::InstantiationFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PluginResourceLimiter {
+    max_memory_bytes: usize,
+    max_table_elements: usize,
+    /// Total bytes of linear memory this store has already been granted.
+    granted_memory_bytes: usize,
+}
+
+impl PluginResourceLimiter {
+    /// Build a limiter from a component's declared budget. A
+    /// `max_memory_bytes` too large for `usize` (only possible on a 32-bit
+    /// host) saturates to `usize::MAX` rather than wrapping to a tiny cap.
+    pub(crate) fn new(limits: &ResourceLimits) -> Self {
+        Self {
+            max_memory_bytes: usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX),
+            max_table_elements: limits.max_table_elements,
+            granted_memory_bytes: 0,
+        }
+    }
+}
+
+impl wasmtime::ResourceLimiter for PluginResourceLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let delta = desired.saturating_sub(current);
+        let projected = self.granted_memory_bytes.saturating_add(delta);
+        if projected > self.max_memory_bytes {
+            wasmtime::bail!(
+                "{MEMORY_LIMIT_MESSAGE}: growing a linear memory to {desired} bytes would put \
+                 this plugin at {projected} bytes, over its budget of {} bytes",
+                self.max_memory_bytes
+            );
+        }
+        // The module's own declared maximum still applies; refusing it is a
+        // plain `Ok(false)` because that is the guest's own contract, not a
+        // host policy violation.
+        let allow = match maximum {
+            Some(max) if desired > max => false,
+            _ => true,
+        };
+        if allow {
+            self.granted_memory_bytes = projected;
+        }
+        Ok(allow)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > self.max_table_elements {
+            wasmtime::bail!(
+                "{TABLE_LIMIT_MESSAGE}: growing a table to {desired} elements is over its \
+                 budget of {} elements",
+                self.max_table_elements
+            );
+        }
+        let allow = match maximum {
+            Some(max) if desired > max => false,
+            _ => true,
+        };
+        Ok(allow)
+    }
+}
+
 /// Capabilities a particular component activation may use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPolicy {
@@ -1944,6 +2046,72 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 max_concurrency: 4,
             }
+        );
+    }
+
+    /// The declared memory budget is a real ceiling, and blowing it produces a
+    /// host-authored error rather than a silent `-1` from `memory.grow`.
+    #[test]
+    fn resource_limiter_rejects_growth_past_the_memory_budget() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limiter = PluginResourceLimiter::new(&ResourceLimits::default());
+        assert!(
+            limiter
+                .memory_growing(0, 1024 * 1024, None)
+                .expect("1 MiB is inside the 64 MiB budget"),
+            "a small memory must be allowed"
+        );
+        let error = limiter
+            .memory_growing(1024 * 1024, 128 * 1024 * 1024, None)
+            .expect_err("growing to 128 MiB must exceed the 64 MiB budget");
+        assert!(
+            error.to_string().contains(MEMORY_LIMIT_MESSAGE),
+            "the refusal must carry the host-authored message, got: {error}"
+        );
+    }
+
+    /// The budget is aggregate: a component cannot evade it by spreading the
+    /// same total allocation over several linear memories.
+    #[test]
+    fn resource_limiter_aggregates_growth_across_memories() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limiter = PluginResourceLimiter::new(&ResourceLimits::default());
+        assert!(
+            limiter
+                .memory_growing(0, 40 * 1024 * 1024, None)
+                .expect("the first 40 MiB fits inside the 64 MiB budget"),
+            "the first memory must be allowed"
+        );
+        let error = limiter
+            .memory_growing(0, 40 * 1024 * 1024, None)
+            .expect_err("a second 40 MiB memory must push the total over 64 MiB");
+        assert!(
+            error.to_string().contains(MEMORY_LIMIT_MESSAGE),
+            "the refusal must carry the host-authored message, got: {error}"
+        );
+    }
+
+    /// Tables are the second allocation channel a `ResourceLimiter` sees, and
+    /// they are capped too.
+    #[test]
+    fn resource_limiter_rejects_growth_past_the_table_budget() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limiter = PluginResourceLimiter::new(&ResourceLimits::default());
+        assert!(
+            limiter
+                .table_growing(0, 1_000, None)
+                .expect("1000 elements is inside the 100_000 budget"),
+            "a small table must be allowed"
+        );
+        let error = limiter
+            .table_growing(1_000, 1_000_000, None)
+            .expect_err("1_000_000 elements must exceed the 100_000 budget");
+        assert!(
+            error.to_string().contains(TABLE_LIMIT_MESSAGE),
+            "the refusal must carry the host-authored message, got: {error}"
         );
     }
 
