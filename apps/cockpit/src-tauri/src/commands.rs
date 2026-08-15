@@ -2,7 +2,7 @@ use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use ryuzi_core::api::fsview_api::{content_type_for_path, MediaFile, MAX_MEDIA_READ_BYTES};
 use ryuzi_core::branches::BranchList;
-use ryuzi_core::domain::{ApprovalResponse, ToolPolicyRow};
+use ryuzi_core::domain::{ApprovalResponse, PendingApprovalRow, ToolPolicyRow};
 use ryuzi_core::llm_router::model_effort::{ModelPreferenceKey, ProjectRuntimeInfo};
 use ryuzi_core::{Message, PermMode, Project, Session};
 use std::path::Path;
@@ -493,6 +493,21 @@ pub fn resolve_approval(
     tokio::task::block_in_place(|| {
         tauri::async_runtime::block_on(client.resolve_approval(&run_id, &request_id, response))
     })
+}
+
+/// Every approval still parked on this runner. Cockpit calls it on connect
+/// and on every refresh so a reloaded webview re-lists what is waiting on
+/// the user instead of stranding the turn.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_pending_approvals(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<PendingApprovalRow>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("list_pending_approvals", serde_json::json!({}))
+        .await
 }
 
 #[tauri::command]

@@ -48,6 +48,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::list_tool_policies,
             commands::delete_tool_policy,
             commands::resolve_approval,
+            commands::list_pending_approvals,
             commands::stage_attachment,
             commands::read_local_media,
             commands::fetch_attachment,

@@ -3244,6 +3244,7 @@ async fn execute_tool_call(
             requesting_agent_name: agent.name.clone(),
             perm_mode: deps.perm_mode.clone(),
             project_id: deps.project_id.clone(),
+            store: deps.store.clone(),
         })),
         app: deps.app_control.clone(),
         write_origin: deps.write_origin,

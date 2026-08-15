@@ -64,6 +64,20 @@ CREATE TABLE native_tool_session_versions (
                     created_at INTEGER NOT NULL
                  );
 CREATE TABLE pairing_codes (code_hash TEXT PRIMARY KEY NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE pending_approvals (
+  run_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  session_pk TEXT NOT NULL,
+  requesting_agent_id TEXT NOT NULL,
+  requesting_agent_name TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  approval_kind TEXT NOT NULL,
+  input_json TEXT NOT NULL,
+  principal_json TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, request_id)
+);
 CREATE TABLE plugin_attach_status (plugin_id TEXT PRIMARY KEY NOT NULL,last_attach_at INTEGER NOT NULL,outcome TEXT NOT NULL,reason TEXT);
 CREATE TABLE plugin_catalog_cache (id TEXT PRIMARY KEY NOT NULL,manifest_toml TEXT NOT NULL,version TEXT NOT NULL,sequence INTEGER NOT NULL,blocked INTEGER NOT NULL DEFAULT 0,blocked_reason TEXT,fetched_at INTEGER NOT NULL);
 CREATE TABLE plugin_installs (plugin_id TEXT PRIMARY KEY NOT NULL,kind TEXT NOT NULL,source_spec TEXT NOT NULL,resolved_commit TEXT,fingerprint TEXT NOT NULL,installed_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,pin_reason TEXT,trust_tier TEXT NOT NULL,trust_ack_at INTEGER,trust_ack_summary TEXT);
@@ -126,6 +140,7 @@ CREATE INDEX idx_jobs_plugin ON jobs(plugin_id);
 CREATE INDEX idx_request_log_conn ON request_log(connection_id, ts);
 CREATE INDEX idx_request_log_ts ON request_log(ts);
 CREATE INDEX idx_session_prompt_queue_pending ON session_prompt_queue(session_pk, status, position);
+CREATE INDEX pending_approvals_session_idx ON pending_approvals(session_pk);
 CREATE INDEX sessions_primary_agent_idx ON sessions(primary_agent_id);
 CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN DELETE FROM messages_fts WHERE session_pk = old.session_pk AND seq = old.seq; END;
 CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages WHEN new.role IN ('user','assistant') AND new.block_type='text' AND json_extract(new.payload,'$.text') IS NOT NULL BEGIN INSERT INTO messages_fts(text, session_pk, seq) VALUES (json_extract(new.payload,'$.text'), new.session_pk, new.seq); END;

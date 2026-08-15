@@ -169,6 +169,34 @@ DROP INDEX IF EXISTS idx_messages_session;
 DROP INDEX IF EXISTS idx_provider_turns_session;
 ";
 
+/// v9 -> v10: parked tool/plan/question approvals, so a Cockpit reload can
+/// re-list what is waiting on the user instead of stranding the turn. Written
+/// by `crate::approval::persist_pending` when a call parks and deleted by
+/// `crate::approval::delete_pending` the moment that call site wakes (user
+/// answer, gateway answer, timeout, or cancel all complete the same `oneshot`).
+///
+/// Deliberately NOT foreign-keyed to `sessions`: rows are short-lived, are
+/// deleted by the parking call site, and the whole table is wiped by
+/// `daemon::build_daemon` on every boot (a `oneshot` sender cannot survive a
+/// process restart, so a row from a previous boot is unanswerable).
+const PENDING_APPROVALS_MIGRATION_SQL: &str = "
+CREATE TABLE pending_approvals (
+  run_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  session_pk TEXT NOT NULL,
+  requesting_agent_id TEXT NOT NULL,
+  requesting_agent_name TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  approval_kind TEXT NOT NULL,
+  input_json TEXT NOT NULL,
+  principal_json TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, request_id)
+);
+CREATE INDEX pending_approvals_session_idx ON pending_approvals(session_pk);
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -180,6 +208,7 @@ fn migrations() -> Migrations<'static> {
         M::up(MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL),
         M::up(GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL),
         M::up(DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL),
+        M::up(PENDING_APPROVALS_MIGRATION_SQL),
     ])
 }
 
@@ -847,9 +876,9 @@ impl Store {
         // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json,
         // 7 = + mcp_oauth_clients.token_endpoint, 8 = + gateways.fs_mode
         // permissive default, 9 = duplicate primary-key indexes on
-        // messages/provider_turns dropped.)
+        // messages/provider_turns dropped, 10 = + pending_approvals.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 9;
+        const LATEST_VERSION: i64 = 10;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -10782,8 +10811,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 9,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes migrations must be user_version 9"
+            user_version, 10,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes + pending-approvals migrations must be user_version 10"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(
@@ -10824,13 +10853,22 @@ mod tests {
                 "a fresh database must not carry the duplicate indexes: {leftovers:?}"
             );
 
-            // Rebuild a pre-v9 database: both indexes present, version pinned
-            // back to 8 so reopening has to run the new migration.
+            // Rebuild a pre-v9 database: both indexes present, everything a
+            // LATER migration created torn back down, and the version pinned
+            // back to 8 so reopening has to replay v9 onward.
+            //
+            // Tearing down the post-v8 objects is what makes the fixture
+            // faithful: a real v8 database has none of them, and `to_latest`
+            // replays EVERY migration above the pinned version. Rewinding the
+            // pragma alone would leave v10's `pending_approvals` in place and
+            // that migration would then fail with "table already exists".
+            // Any future migration must extend this teardown the same way.
             store
                 .with_conn(|c| {
                     c.execute_batch(
                         "CREATE INDEX idx_messages_session ON messages(session_pk, seq);\
-                         CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);",
+                         CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);\
+                         DROP TABLE IF EXISTS pending_approvals;",
                     )?;
                     c.pragma_update(None, "user_version", 8)
                 })
@@ -10853,7 +10891,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(duplicates, 0, "v8 -> v9 must drop both duplicate indexes");
-        assert_eq!(version, 9, "the upgrade must land on schema version 9");
+        assert_eq!(
+            version, 10,
+            "the upgrade must replay every migration above v8 and land on the latest version"
+        );
+        let has_pending_approvals: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                     AND name='pending_approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            has_pending_approvals, 1,
+            "the same replay must also re-apply v9 -> v10"
+        );
 
         // Coverage is unchanged: each table keeps exactly one index, the
         // primary key's automatic one over (session_pk, seq).
