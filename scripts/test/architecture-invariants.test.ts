@@ -64,9 +64,11 @@ const retired: Array<[string, RegExp]> = [
   ["pre-S1 cargo package name", /ryuzi-runner/],
   ["pre-S1 crate lib name", /ryuzi_runner/],
   ["pre-S1 crate path", /crates\/runner/],
+  ["retired in-process cockpit daemon mode", /--engine-daemon/],
+  ["retired cockpit daemon module", /engine_daemon/],
 ];
 
-test("no file references the pre-S1 runner crate", () => {
+test("no file references a pre-S1 architecture element", () => {
   const offenders: string[] = [];
   for (const rel of walk(root, [])) {
     const text = readFileSync(join(root, rel), "utf8");
@@ -75,4 +77,32 @@ test("no file references the pre-S1 runner crate", () => {
     }
   }
   expect(offenders).toEqual([]);
+});
+
+// Constants two crates must spell identically, with nothing at build time
+// linking them. A typo on either side fails silently and in the direction that
+// looks fine (the daemon just keeps its self-updater on under Cockpit — the
+// exact drift S1 exists to prevent), so pin the real call sites, not a bare
+// substring: prose mentioning the name in a comment must not satisfy the
+// guard.
+const pairedConstants: Array<[string, Array<[string, RegExp]>]> = [
+  [
+    "RYUZI_MANAGED_HOST: Cockpit sets it on the control-plane spawn, the control plane reads it to disable self-update",
+    [
+      ["apps/cockpit/src-tauri/src/engine.rs", /\.env\("RYUZI_MANAGED_HOST",\s*"1"\)/],
+      ["crates/control/src/daemon_cmd.rs", /env::var\("RYUZI_MANAGED_HOST"\)/],
+    ],
+  ],
+];
+
+test("both sides of a cross-crate string constant spell it the same way", () => {
+  const missing: string[] = [];
+  for (const [label, sides] of pairedConstants) {
+    for (const [rel, pattern] of sides) {
+      if (!pattern.test(readFileSync(join(root, rel), "utf8"))) {
+        missing.push(`${rel}: ${label}`);
+      }
+    }
+  }
+  expect(missing).toEqual([]);
 });

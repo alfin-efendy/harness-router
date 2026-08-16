@@ -245,7 +245,7 @@ struct PairRequest {
 /// This is deliberately NOT a field on [`ApiState`]: `ApiState` is
 /// constructed at 7+ call sites across `ryuzi-core` (this file's tests,
 /// `api/mod.rs`'s test support, `tests/control_api.rs`), `ryuzi-control`
-/// (`daemon_cmd.rs`), and `ryuzi-cockpit` (`engine.rs`, `engine_daemon.rs`).
+/// (`daemon_cmd.rs`), and `ryuzi-cockpit` (`engine.rs`).
 /// Adding a field there would mean touching every one of those for a
 /// concern that only the `/pair` route cares about. Instead, one
 /// `PairLimiter` is created per [`router`] call and captured by the

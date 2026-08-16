@@ -10,7 +10,6 @@ mod connections_cmd;
 mod delegation_cmd;
 mod endpoint_cmd;
 pub mod engine;
-pub mod engine_daemon;
 pub mod engine_manager;
 mod error;
 mod events;

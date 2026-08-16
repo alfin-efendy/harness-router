@@ -1,9 +1,10 @@
-//! Process-wide log wiring for the two daemon entry points.
+//! Process-wide log wiring for the daemon entry point.
 //!
 //! `ryuzi-core` emits ~174 `tracing` events, and `tracing` silently discards
 //! every one of them unless a subscriber is installed. [`init_tracing`] is the
 //! single place that installs one; it is called once per process from
-//! `ryuzi-control`'s `main` and from Cockpit's `--engine-daemon` entry point.
+//! `ryuzi-control`'s `main` — the only process that hosts a daemon, whether it
+//! was started by a user, by the updater's respawn, or by Cockpit.
 //!
 //! Output goes to **stderr**, not stdout: both daemon spawn paths redirect the
 //! child's stdout AND stderr into `<state dir>/daemon.log`, so stderr lands in

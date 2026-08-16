@@ -200,15 +200,24 @@ make cockpit # start Cockpit in dev mode (HMR)
 The engine (`ryuzi-core`) runs as a single background daemon process that
 every surface talks to — there is no per-surface embedded engine anymore.
 
-- **Single host.** The daemon (`ryuzi start` from the runner — a
+- **Single host.** The daemon (`ryuzi start` from the control plane — a
   user-facing alias for the hidden `ryuzi __daemon` entry point, also used as
-  the updater/canary respawn target — or Cockpit's hidden `--engine-daemon`
-  mode) is the one process that owns the scheduler, the orchestrator loops,
-  the gateways (Discord, etc.), and the `RouterServer` LLM-proxy endpoint.
+  the updater/canary respawn target) is the one process that owns the
+  scheduler, the orchestrator loops, the gateways (Discord, etc.), and the
+  `RouterServer` LLM-proxy endpoint.
 - **Thin clients.** Cockpit attaches to an already-running daemon if it finds
-  one, or auto-spawns `--engine-daemon` itself when none is running, then
-  talks to it exclusively over the control API — it never opens the SQLite
-  store or runs the scheduler/gateways in-process.
+  one, or spawns the bundled `ryuzi` control-plane binary when none is
+  running, then talks to it exclusively over the control API — it never opens
+  the SQLite store or runs the scheduler/gateways in-process.
+- **Managed-host mode (`RYUZI_MANAGED_HOST`).** Cockpit sets this to `1` on
+  the daemon it spawns, and a daemon that sees exactly `1` skips its own
+  self-updater — it logs `daemon: self-update disabled (managed host)` to
+  `daemon.log` and is otherwise identical. The desktop app ships the
+  control-plane binary inside its own bundle and updates as one unit, so a
+  daemon that also updated itself would drift away from the app that spawned
+  it. Any other value, including unset, keeps the updater on, so a
+  `ryuzi start` you run yourself is unaffected. Set it if you package `ryuzi`
+  inside some other artifact whose lifecycle you own.
 - **Control API.** Served on `127.0.0.1:${control_port:-4483}` (falls back to
   an ephemeral port if that one is taken). RPC calls and the SSE event stream
   require a bearer token read from `<state_dir>/control.token`, a file
