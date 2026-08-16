@@ -635,6 +635,31 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
+/// One parked approval, persisted so a surface that reconnects (a reloaded
+/// Cockpit webview) can re-list what is still waiting on the user. Mirrors the
+/// fields of `CoreEvent::ApprovalRequested`, plus `created_at`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingApprovalRow {
+    pub session_pk: String,
+    /// Durable run that owns this request; required to resolve it.
+    pub run_id: String,
+    pub request_id: String,
+    pub requesting_agent_id: String,
+    pub requesting_agent_name: String,
+    pub tool: String,
+    pub summary: String,
+    pub approval_kind: ApprovalKind,
+    /// Raw kind-specific payload: the tool's input JSON (Tool), the plan
+    /// markdown (Plan), or the questions spec (Question).
+    pub input: serde_json::Value,
+    /// Which plugin's MCP tool this approval is for; `None` for built-in tools
+    /// and Plan/Question prompts.
+    pub principal: Option<Principal>,
+    /// Epoch milliseconds when the call parked.
+    pub created_at: i64,
+}
+
 /// One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -870,6 +895,21 @@ pub enum CoreEvent {
         job_id: String,
         run_id: String,
         status: String,
+        /// The job's display name, so a notification can name the job instead
+        /// of the session it happened to run in.
+        #[serde(default)]
+        job_name: String,
+        /// Whether this terminal run should raise a user-facing notification —
+        /// the job's own `notify_success`/`notify_fail` switches composed with
+        /// the run's `[SILENT]` opt-out. Decided in
+        /// `crate::scheduler::should_notify_terminal`; always `false` for a
+        /// non-terminal status.
+        #[serde(default)]
+        notify: bool,
+        /// One-line outcome for the notification body: the error text for a
+        /// failed run, the `+adds −dels` diff summary for a successful one.
+        #[serde(default)]
+        detail: Option<String>,
     },
     /// Per-response context usage for a native session (drives the
     /// "% context left" indicator).

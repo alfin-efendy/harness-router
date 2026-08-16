@@ -137,6 +137,19 @@ async resolveApproval(runnerId: string | null, runId: string, requestId: string,
     return await TAURI_INVOKE("resolve_approval", { runnerId, runId, requestId, response });
 },
 /**
+ * Every approval still parked on this runner. Cockpit calls it on connect
+ * and on every refresh so a reloaded webview re-lists what is waiting on
+ * the user instead of stranding the turn.
+ */
+async listPendingApprovals(runnerId: string | null) : Promise<Result<PendingApprovalRow[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_pending_approvals", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Write pasted bytes into the attachments staging area and return the
  * absolute path — from there the file flows through the normal attachment
  * pipeline on send. Staging is wiped on app start (see lib.rs setup).
@@ -197,6 +210,20 @@ async listSessionArtifacts(runnerId: string | null, sessionPk: string) : Promise
 async fetchArtifact(runnerId: string | null, sessionPk: string, artifactId: string) : Promise<Result<ArtifactFileInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("fetch_artifact", { runnerId, sessionPk, artifactId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Run the engine's artifact-retention pass immediately, instead of waiting
+ * for the daemon's hourly timer. Sends no `retentionDays`, so the engine
+ * resolves the operator's configured `artifact_retention_days`. Returns the
+ * number of archived sessions purged.
+ */
+async runArtifactRetention(runnerId: string | null) : Promise<Result<number, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("run_artifact_retention", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -382,6 +409,46 @@ async updateAgent(runnerId: string | null, agentId: string, input: AgentMutation
 async duplicateAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentDetailInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("duplicate_agent", { runnerId, agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async exportAgent(agentId: string) : Promise<Result<AgentExportInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("export_agent", { agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async importAgent(data: string) : Promise<Result<AgentImportResultInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("import_agent", { data }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Prompts for a save location and writes an exported agent bundle there.
+ * Returns the chosen path, or `None` when the user cancelled.
+ */
+async saveAgentBundle(fileName: string, data: string) : Promise<Result<string | null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_agent_bundle", { fileName, data }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Prompts for an agent bundle file and returns its text. `None` when the
+ * user cancelled.
+ */
+async readAgentBundle() : Promise<Result<string | null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_agent_bundle") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -829,6 +896,43 @@ async completeMcpConnect(runnerId: string | null, id: string, code: string, veri
 async disconnectMcp(runnerId: string | null, id: string) : Promise<Result<AppInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("disconnect_mcp", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Every OAuth client id the user recorded by hand, for an authorization
+ * server that offers no dynamic client registration.
+ */
+async listManualMcpOauthClients(runnerId: string | null) : Promise<Result<ManualMcpOauthClient[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_manual_mcp_oauth_clients", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Record a client id for an authorization server's `issuer`. Deliberately
+ * takes no token endpoint: that value is a security binding the daemon may
+ * only learn from a real discovery run (see the daemon's
+ * `apps_api::require_registered_token_endpoint`).
+ */
+async setManualMcpOauthClient(runnerId: string | null, issuer: string, clientId: string) : Promise<Result<ManualMcpOauthClient[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_manual_mcp_oauth_client", { runnerId, issuer, clientId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget a client id the user recorded.
+ */
+async deleteManualMcpOauthClient(runnerId: string | null, issuer: string) : Promise<Result<ManualMcpOauthClient[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_manual_mcp_oauth_client", { runnerId, issuer }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1381,6 +1485,35 @@ async removeCustomProvider(runnerId: string | null, id: string) : Promise<Result
 async nativeAgents(runnerId: string | null, projectId: string) : Promise<Result<AgentInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("native_agents", { runnerId, projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The `.ryuzi/hooks` scripts present in a project's worktree and whether the
+ * user has trusted this exact set. Untrusted scripts are never executed.
+ */
+async worktreeHookStatus(runnerId: string | null, projectId: string) : Promise<Result<WorktreeHookStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("worktree_hook_status", { runnerId, projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Record the user's explicit acceptance of the hook scripts currently on
+ * disk in a project's worktree. Editing any of them revokes the acceptance.
+ *
+ * `digest` is the hook-set digest the caller DISPLAYED (`WorktreeHookStatus.
+ * digest`). The engine refuses to record anything if the scripts on disk no
+ * longer hash to it, so the acceptance can only ever bind to bytes the user
+ * actually reviewed.
+ */
+async trustWorktreeHooks(runnerId: string | null, projectId: string, digest: string) : Promise<Result<WorktreeHookTrustResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("trust_worktree_hooks", { runnerId, projectId, digest }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2082,6 +2215,11 @@ export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentConfigurationCatalogInfo = { skills: CatalogEntryInfo[]; nativeTools: CatalogEntryInfo[]; pluginTools: CatalogEntryInfo[]; apps: CatalogEntryInfo[] }
 export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: NativeToolDecisionInfo[]; pluginTools: string[]; apps: string[]; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
 /**
+ * What `export_agent` produced: the bundle JSON plus the suggested file
+ * name, so the shell can offer it in the save dialog.
+ */
+export type AgentExportInfo = { fileName: string; data: string; knowledgeFiles: number; projectMemoryFilesSkipped: number }
+/**
  * An immutable identity captured when an agent becomes the primary owner of a session.
  */
 export type AgentIdentitySnapshot = { id: string; name: string; avatarColor: string;
@@ -2092,6 +2230,12 @@ export type AgentIdentitySnapshot = { id: string; name: string; avatarColor: str
  * field existed still parses (as `None`) rather than failing to load.
  */
 avatarPet?: string | null }
+/**
+ * What `import_agent` landed: the new agent, plus every reference the
+ * bundle carried that does not exist on this machine. A non-empty
+ * `tolerated` means the agent is present but not executable until repaired.
+ */
+export type AgentImportResultInfo = { agentId: string; agentName: string; renamed: boolean; knowledgeFilesWritten: number; projectMemoryFilesSkipped: number; tolerated: AgentValidationInfo[] }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AgentLearningInfo = { concepts: KnowledgeConceptInfo[]; invalid: InvalidKnowledgeConceptInfo[]; journey: JourneyMilestoneInfo[]; skillUsage: AgentSkillUsageInfo[]; reviews: LearningReviewInfo[]; curator: CuratorStateInfo; curatorHistory: CuratorHistorySnapshotInfo[] }
 export type AgentMention = { agentId: string; labelSnapshot: string; startUtf16: number; endUtf16: number }
@@ -2551,7 +2695,7 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 /**
  * A scheduled job run started or finished (status: running|success|failed).
  */
-{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string } |
+{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string; job_name?: string; notify?: boolean; detail?: string | null } |
 /**
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
@@ -2683,12 +2827,26 @@ modelOverride?: string | null;
  * Task 12 addition: lets the scheduler screen distinguish plugin-owned
  * rows from user-created ones.
  */
-pluginId?: string | null }
+pluginId?: string | null;
+/**
+ * The chat this job reports its successful runs into — mirrors
+ * `crate::scheduler::JobRow.home_session_pk`. `None` (the default) means
+ * the job reports nowhere and its output only lives in the run history.
+ */
+homeSessionPk?: string | null }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean;
 /**
  * See `JobInfo::model_override`.
  */
-modelOverride?: string | null }
+modelOverride?: string | null;
+/**
+ * See `JobInfo::home_session_pk`. Validated by
+ * `api::scheduler_api::resolve_home_session`: it must name an existing
+ * CHAT session, so a job can never be pointed at a project or worker
+ * session. Optional on the wire, so `JobNewView` (which never offers the
+ * picker) keeps compiling.
+ */
+homeSessionPk?: string | null }
 export type JourneyMilestoneInfo = { conceptId: string; title: string; timestamp: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
@@ -2722,6 +2880,18 @@ export type KeychainStatus =
 export type KnowledgeConceptInfo = { id: string; relativePath: string; conceptType: string; title: string; description: string; body: string; scope: string | null; projectId: string | null; tags: string[]; timestamp: string }
 export type KnowledgeConceptMutationInfo = { title: string; description: string; body: string; scope: string; projectId: string | null; tags: string[] }
 export type LearningReviewInfo = { conceptId: string; title: string; description: string; timestamp: string }
+/**
+ * One authorization server for which the USER supplied an OAuth client id,
+ * because that server offers no RFC 7591 dynamic client registration.
+ *
+ * There is deliberately no token-endpoint field here, and there must never be
+ * one: the token endpoint is the binding
+ * `apps_api::require_registered_token_endpoint` checks before the daemon POSTs
+ * an authorization code, and it is only trustworthy while a real discovery run
+ * is the sole writer. `mcp_oauth::begin_mcp_connect` records it from the
+ * authorization server's own RFC 8414 metadata on the next connect.
+ */
+export type ManualMcpOauthClient = { issuer: string; clientId: string }
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 /**
  * `begin_mcp_connect` RPC result — the daemon has already discovered the
@@ -2796,6 +2966,30 @@ export type ModelStatusInfo = { model: string; status: string; message: string; 
 export type NativeToolDecisionInfo = { tool: string; decision: string }
 export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
+/**
+ * One parked approval, persisted so a surface that reconnects (a reloaded
+ * Cockpit webview) can re-list what is still waiting on the user. Mirrors the
+ * fields of `CoreEvent::ApprovalRequested`, plus `created_at`.
+ */
+export type PendingApprovalRow = { sessionPk: string;
+/**
+ * Durable run that owns this request; required to resolve it.
+ */
+runId: string; requestId: string; requestingAgentId: string; requestingAgentName: string; tool: string; summary: string; approvalKind: ApprovalKind;
+/**
+ * Raw kind-specific payload: the tool's input JSON (Tool), the plan
+ * markdown (Plan), or the questions spec (Question).
+ */
+input: JsonValue;
+/**
+ * Which plugin's MCP tool this approval is for; `None` for built-in tools
+ * and Plan/Question prompts.
+ */
+principal: Principal | null;
+/**
+ * Epoch milliseconds when the call parked.
+ */
+createdAt: number }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PermissionRuleInfo = { id: string; tool: string; decision: string; commandPrefix: string | null }
 /**
@@ -3356,6 +3550,40 @@ export type UpdateOutcomeDto = { kind: "updated" } | { kind: "alreadyCurrent" } 
 export type UpdateOutcomeEntry = { id: string; outcome: UpdateOutcomeDto }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
 export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }
+/**
+ * The worktree hook-script trust state for one project — what
+ * `.ryuzi/hooks/<event>/` scripts exist and whether the user has accepted
+ * this exact set of bytes. Mirrors
+ * `crate::harness::native::hooks::HookTrust`.
+ */
+export type WorktreeHookStatus = {
+/**
+ * `"<event>/<file>"` for every discovered script, sorted.
+ */
+scripts: string[];
+/**
+ * Content digest of the whole set; `None` when there are no scripts.
+ * This is the value the client must hand back to `trust_worktree_hooks`
+ * so the acceptance binds to the bytes that were actually reviewed.
+ */
+digest: string | null; trusted: boolean }
+/**
+ * The result of a `trust_worktree_hooks` attempt. Mirrors
+ * `crate::harness::native::hooks::TrustOutcome`; both variants carry the
+ * freshly re-read status, so a client can render the outcome without a second
+ * round trip.
+ */
+export type WorktreeHookTrustResult =
+/**
+ * The reviewed digest still matched disk; the acceptance was recorded.
+ */
+{ outcome: "recorded"; status: WorktreeHookStatus } |
+/**
+ * The scripts changed between being reviewed and being trusted, so
+ * **nothing was recorded**. The payload is the NEW set for the user to
+ * review afresh.
+ */
+{ outcome: "changed"; status: WorktreeHookStatus }
 export type WorktreeState = {
 /**
  * Uncommitted work (staged, unstaged, or untracked).

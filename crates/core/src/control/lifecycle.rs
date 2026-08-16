@@ -1541,10 +1541,12 @@ impl ControlPlane {
         result
     }
 
-    /// On boot: resume every session a dead process left in Running. Each
-    /// resume is isolated so one bad session can't block the rest.
+    /// On boot: close the automation-hook and scheduler job runs a dead
+    /// process left mid-flight, then resume every session it left in Running.
+    /// Each resume is isolated so one bad session can't block the rest.
     pub async fn reconcile(self: &Arc<Self>) -> anyhow::Result<()> {
         crate::automation::fail_incomplete_runs_on_restart(&self.store).await?;
+        crate::scheduler::fail_incomplete_runs_on_restart(&self.store).await?;
         for s in self
             .store
             .list_sessions_by_status(SessionStatus::Running)

@@ -17,6 +17,11 @@ const DEFAULT_CONTROL_PORT: u16 = 4483;
 const CONNECT_TIMEOUT_MS: u64 = 30_000;
 
 pub fn run() -> i32 {
+    // Mirrors ryuzi-runner's `main`: without this, every ryuzi-core
+    // `tracing::…!` event in this process is discarded. RYUZI_LOG overrides
+    // the default `info` level.
+    ryuzi_core::logging::init_tracing();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

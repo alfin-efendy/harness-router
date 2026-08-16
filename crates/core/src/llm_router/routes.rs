@@ -280,6 +280,61 @@ pub async fn save_provider_account_route(
     Ok(next)
 }
 
+/// Read the round-robin cursor at `key`, persist `(cursor + 1) % len`, and
+/// return the PRE-increment cursor (the index to start the rotation at).
+///
+/// The read and the write happen inside ONE `Store::with_conn` closure wrapped
+/// in an IMMEDIATE transaction. Splitting them across two awaited `Store`
+/// calls (as this code used to) releases the pooled connection in between, so
+/// two concurrent turns both read `k`, both write `k + 1`, and both route to
+/// the same account — which defeats the entire point of round-robin.
+async fn advance_round_robin_cursor(
+    store: &Store,
+    key: String,
+    len: usize,
+) -> anyhow::Result<usize> {
+    if len <= 1 {
+        return Ok(0);
+    }
+    store
+        .with_conn(move |conn| {
+            let transaction =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let raw: Option<String> = transaction
+                .query_row(
+                    "SELECT value FROM settings WHERE key=?1",
+                    [key.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let start = raw.and_then(|raw| raw.parse::<usize>().ok()).unwrap_or(0) % len;
+            transaction.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![key, ((start + 1) % len).to_string()],
+            )?;
+            transaction.commit()?;
+            Ok(start)
+        })
+        .await
+}
+
+/// Read the round-robin cursor at `key` WITHOUT advancing it. Used by the
+/// `peek_*` helpers, which exist so read-only callers (metadata, cost, tool-
+/// capability planning) can see the order the router would pick without
+/// consuming a slot in the rotation.
+async fn peek_round_robin_cursor(store: &Store, key: &str, len: usize) -> anyhow::Result<usize> {
+    if len <= 1 {
+        return Ok(0);
+    }
+    Ok(store
+        .get_setting(key)
+        .await?
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0)
+        % len)
+}
+
 pub async fn ordered_provider_connection_ids(
     store: &Store,
     provider: &str,
@@ -304,16 +359,7 @@ pub(crate) async fn ordered_provider_connection_ids_with_strategy(
         return Ok((ids.to_vec(), route.strategy));
     }
     let key = format!("{ACCOUNT_ROUND_ROBIN_KEY_PREFIX}{provider}.{scope}");
-    let start = store
-        .get_setting(&key)
-        .await?
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0)
-        % ids.len();
-    let next = (start + 1) % ids.len();
-    store
-        .set_setting(crate::domain::WriteOrigin::User, &key, &next.to_string())
-        .await?;
+    let start = advance_round_robin_cursor(store, key, ids.len()).await?;
 
     Ok((
         ids[start..]
@@ -336,12 +382,7 @@ pub async fn peek_provider_connection_ids(
         return Ok(ids.to_vec());
     }
     let key = format!("{ACCOUNT_ROUND_ROBIN_KEY_PREFIX}{provider}.{scope}");
-    let start = store
-        .get_setting(&key)
-        .await?
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0)
-        % ids.len();
+    let start = peek_round_robin_cursor(store, &key, ids.len()).await?;
     Ok(ids[start..]
         .iter()
         .chain(ids[..start].iter())
@@ -467,16 +508,7 @@ pub async fn ordered_targets(
         return Ok(route.targets.clone());
     }
     let key = format!("{ROUND_ROBIN_KEY_PREFIX}{}", route.id);
-    let start = store
-        .get_setting(&key)
-        .await?
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0)
-        % route.targets.len();
-    let next = (start + 1) % route.targets.len();
-    store
-        .set_setting(crate::domain::WriteOrigin::User, &key, &next.to_string())
-        .await?;
+    let start = advance_round_robin_cursor(store, key, route.targets.len()).await?;
 
     Ok(route.targets[start..]
         .iter()
@@ -493,12 +525,7 @@ pub async fn peek_ordered_targets(
         return Ok(route.targets.clone());
     }
     let key = format!("{ROUND_ROBIN_KEY_PREFIX}{}", route.id);
-    let start = store
-        .get_setting(&key)
-        .await?
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0)
-        % route.targets.len();
+    let start = peek_round_robin_cursor(store, &key, route.targets.len()).await?;
     Ok(route.targets[start..]
         .iter()
         .chain(route.targets[..start].iter())
@@ -524,19 +551,7 @@ pub(crate) async fn ordered_indexed_targets(
         return Ok(indexed);
     }
     let key = format!("{ROUND_ROBIN_KEY_PREFIX}{}", route.id);
-    let start = store
-        .get_setting(&key)
-        .await?
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0)
-        % indexed.len();
-    store
-        .set_setting(
-            crate::domain::WriteOrigin::User,
-            &key,
-            &((start + 1) % indexed.len()).to_string(),
-        )
-        .await?;
+    let start = advance_round_robin_cursor(store, key, indexed.len()).await?;
     Ok(indexed[start..]
         .iter()
         .chain(indexed[..start].iter())
@@ -1315,6 +1330,59 @@ mod tests {
 
         assert_eq!(first, vec!["c1".to_string(), "c2".to_string()]);
         assert_eq!(second, vec!["c2".to_string(), "c1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn round_robin_visits_every_account_before_repeating() {
+        let store = mem_store().await;
+        save_provider_account_route(&store, "openai", ModelRouteStrategy::RoundRobin)
+            .await
+            .unwrap();
+        let ids = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
+
+        let mut heads = Vec::new();
+        for _ in 0..4 {
+            let ordered = ordered_provider_connection_ids(&store, "openai", "gpt", &ids)
+                .await
+                .unwrap();
+            heads.push(ordered[0].clone());
+        }
+
+        // Three sequential routes must land on three DISTINCT accounts, then wrap.
+        assert_eq!(heads, vec!["c1", "c2", "c3", "c1"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_round_robin_advances_never_collide() {
+        let store = mem_store().await;
+        save_provider_account_route(&store, "openai", ModelRouteStrategy::RoundRobin)
+            .await
+            .unwrap();
+        let ids = vec![
+            "c1".to_string(),
+            "c2".to_string(),
+            "c3".to_string(),
+            "c4".to_string(),
+        ];
+
+        // This is deterministic rather than flaky: each advance is now a single
+        // `Store::with_conn` closure and the store's pool holds exactly one
+        // connection (`crates/core/src/store.rs`), so the four closures cannot
+        // interleave — each one reads and writes the cursor before the next can
+        // acquire the connection. Before this fix the read and the write were two
+        // separate pool acquisitions and the four heads collided.
+        let (a, b, c, d) = tokio::join!(
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids),
+        );
+
+        let heads = [a, b, c, d]
+            .into_iter()
+            .map(|ordered| ordered.unwrap()[0].clone())
+            .collect::<std::collections::HashSet<String>>();
+        assert_eq!(heads.len(), 4, "concurrent advances collided: {heads:?}");
     }
 
     #[tokio::test]

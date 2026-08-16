@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import {
   commands,
   type AgentDetailInfo,
+  type AgentImportResultInfo,
   type AgentModelInfo,
   type AgentMutationInfo,
   type AgentRegistryInfo,
@@ -50,6 +51,12 @@ type AgentsState = {
   create: (input: AgentMutationInfo) => Promise<AgentDetailInfo | null>;
   update: (agentId: string, input: AgentMutationInfo) => Promise<boolean>;
   duplicate: (agentId: string) => Promise<AgentDetailInfo | null>;
+  /** Exports one agent to a file the user picks. Resolves to the written
+   *  path, or null when the user cancelled or the export failed. */
+  exportAgent: (agentId: string) => Promise<string | null>;
+  /** Reads a bundle file the user picks and imports it. Resolves to the
+   *  import result, or null when the user cancelled or the import failed. */
+  importAgent: () => Promise<AgentImportResultInfo | null>;
   remove: (agentId: string) => Promise<boolean>;
   setDefault: (agentId: string) => Promise<boolean>;
   updateSubagentModel: (model: AgentModelInfo) => Promise<boolean>;
@@ -349,6 +356,57 @@ export const useAgents = create<AgentsState>((set, get) => {
           return result.data;
         } catch (error) {
           toast.error(`Duplicate agent failed: ${errorMessage(error)}`);
+          return null;
+        }
+      }),
+
+    // Export is a read, not a registry mutation — deliberately NOT wrapped in
+    // enqueueMutation, so it never blocks or is blocked by the save queue.
+    exportAgent: async (agentId) => {
+      try {
+        const exported = await commands.exportAgent(agentId);
+        if (exported.status === "error") {
+          toast.error(`Export agent failed: ${exported.error.message}`);
+          return null;
+        }
+        const saved = await commands.saveAgentBundle(exported.data.fileName, exported.data.data);
+        if (saved.status === "error") {
+          toast.error(`Export agent failed: ${saved.error.message}`);
+          return null;
+        }
+        // The user dismissed the save dialog — not a failure, so stay quiet.
+        if (saved.data === null) return null;
+        toast.success(`Exported ${exported.data.fileName}`);
+        return saved.data;
+      } catch (error) {
+        toast.error(`Export agent failed: ${errorMessage(error)}`);
+        return null;
+      }
+    },
+
+    importAgent: () =>
+      enqueueMutation(async () => {
+        fenceReads();
+        try {
+          const file = await commands.readAgentBundle();
+          if (file.status === "error") {
+            toast.error(`Import agent failed: ${file.error.message}`);
+            return null;
+          }
+          // Cancelled file picker — not a failure, so stay quiet.
+          if (file.data === null) return null;
+          const result = await commands.importAgent(file.data);
+          if (result.status === "error") {
+            toast.error(`Import agent failed: ${result.error.message}`);
+            return null;
+          }
+          fenceReads();
+          // The import result is a bespoke DTO, not an AgentDetailInfo, so
+          // upsertRoster does not apply — reload the roster instead.
+          await get().load();
+          return result.data;
+        } catch (error) {
+          toast.error(`Import agent failed: ${errorMessage(error)}`);
           return null;
         }
       }),

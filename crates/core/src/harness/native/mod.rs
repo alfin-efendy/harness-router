@@ -19,6 +19,7 @@ pub mod cost;
 pub mod delegation;
 pub mod file_reference;
 pub mod format;
+pub mod fs_access;
 pub mod hooks;
 pub mod iteration_budget;
 pub mod ledger;
@@ -332,6 +333,33 @@ pub(crate) async fn open_http_mcp(
     }
 }
 
+/// What a session's MCP attach produced: the tools it exposes, plus the remote
+/// HTTP connections whose server-side sessions must be terminated when the
+/// session ends.
+///
+/// The connections are kept as their CONCRETE type. The `Arc<dyn McpCaller>`
+/// the tools hold is enough to call a tool but cannot terminate a session, so
+/// erasing them here would throw away the only handle teardown has.
+struct ConnectedMcp {
+    tools: Vec<Arc<dyn tools::Tool>>,
+    remote: Vec<Arc<mcp_http::McpHttpConnection>>,
+}
+
+/// One connected MCP server, as the per-server connect task yields it: the
+/// server name, its tool definitions, the transport-erased caller its tools
+/// dispatch through, and — for a remote HTTP server only — the concrete
+/// connection whose server-side session teardown must later terminate.
+/// `None` in that last slot means stdio, which owns no HTTP session.
+///
+/// A named alias rather than the tuple inline: `clippy::type_complexity`
+/// rejects the four-slot form, and this is the one place its shape matters.
+type OpenedMcpServer = (
+    String,
+    Vec<mcp_client::McpToolDef>,
+    Arc<dyn mcp_client::McpCaller>,
+    Option<Arc<mcp_http::McpHttpConnection>>,
+);
+
 /// Connect the session's enabled MCP servers — stdio (`mcp_client`) and
 /// remote Streamable HTTP (`mcp_http`) alike — and build native tool
 /// wrappers for their tools. Servers connect CONCURRENTLY (`join_all` — each
@@ -355,13 +383,9 @@ async fn connect_mcp_tools(
     store: &Arc<crate::store::Store>,
     mcp_servers: &[crate::domain::McpServerSpec],
     principals: &std::collections::HashMap<String, crate::domain::Principal>,
-) -> Vec<Arc<dyn tools::Tool>> {
+) -> ConnectedMcp {
     let connections = futures::future::join_all(mcp_servers.iter().map(|spec| async move {
-        let opened: anyhow::Result<(
-            String,
-            Vec<mcp_client::McpToolDef>,
-            Arc<dyn mcp_client::McpCaller>,
-        )> = match &spec.transport {
+        let opened: anyhow::Result<OpenedMcpServer> = match &spec.transport {
             crate::domain::McpTransport::Stdio { .. } => {
                 mcp_client::McpConnection::connect_stdio(spec)
                     .await
@@ -371,6 +395,7 @@ async fn connect_mcp_tools(
                             conn.server_name.clone(),
                             conn.tools.clone(),
                             conn as Arc<dyn mcp_client::McpCaller>,
+                            None,
                         )
                     })
             }
@@ -382,7 +407,8 @@ async fn connect_mcp_tools(
                     (
                         conn.server_name.clone(),
                         conn.tools.clone(),
-                        conn as Arc<dyn mcp_client::McpCaller>,
+                        conn.clone() as Arc<dyn mcp_client::McpCaller>,
+                        Some(conn),
                     )
                 })
             }
@@ -397,7 +423,11 @@ async fn connect_mcp_tools(
     }))
     .await;
     let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
-    for (server_name, tool_defs, caller) in connections.into_iter().flatten() {
+    let mut remote: Vec<Arc<mcp_http::McpHttpConnection>> = Vec::new();
+    for (server_name, tool_defs, caller, http_conn) in connections.into_iter().flatten() {
+        if let Some(http_conn) = http_conn {
+            remote.push(http_conn);
+        }
         let principal = principals.get(&server_name).cloned();
         for t in &tool_defs {
             extra.push(Arc::new(tools::mcp::McpTool::new(
@@ -410,7 +440,10 @@ async fn connect_mcp_tools(
             )));
         }
     }
-    extra
+    ConnectedMcp {
+        tools: extra,
+        remote,
+    }
 }
 
 /// Wrap every enabled WASM component's already-discovered connector tools
@@ -444,7 +477,7 @@ async fn resolve_native_model(
     configured: Option<String>,
 ) -> Option<String> {
     if let Some(model) = configured.filter(|m| !m.trim().is_empty()) {
-        if crate::llm_router::client::route_model_for_anthropic_messages(store, &model)
+        if crate::llm_router::client::peek_model_for_anthropic_messages(store, &model)
             .await
             .ok()
             .flatten()
@@ -501,6 +534,7 @@ impl Harness for NativeHarness {
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates).
         let _ = hooks::fire_hook(
+            &ctx.store,
             &ctx.work_dir,
             hooks::HookEvent::SessionStart,
             &json!({
@@ -509,6 +543,7 @@ impl Harness for NativeHarness {
                 "model": model.clone(),
                 "work_dir": ctx.work_dir.display().to_string(),
             }),
+            None,
         )
         .await;
         crate::automation::dispatch_lifecycle_observation(
@@ -522,8 +557,9 @@ impl Harness for NativeHarness {
         );
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
-        let mut extra_tools =
-            connect_mcp_tools(&ctx.store, &ctx.mcp_servers, &ctx.mcp_principals).await;
+        let connected = connect_mcp_tools(&ctx.store, &ctx.mcp_servers, &ctx.mcp_principals).await;
+        let remote_mcp = connected.remote;
+        let mut extra_tools = connected.tools;
         // Task 6: fold in every enabled WASM component's connector tools
         // alongside the external MCP ones — both are `McpTool`s in the SAME
         // registry now, dispatched through the identical `deps.tools.get(name)`
@@ -581,6 +617,7 @@ impl Harness for NativeHarness {
             session_pk: ctx.session_pk.clone(),
             automation_events: ctx.automation_events.clone(),
             steer: steer.clone(),
+            remote_mcp,
             deps: Mutex::new(runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 primary_agent: ctx.primary_agent,
@@ -697,6 +734,10 @@ pub struct NativeSession {
     /// `deps.steer`, so a `steer()` call here is visible to whatever turn is
     /// currently running in `send_prompt`/`drive()`.
     steer: steer::SteerBuffer,
+    /// The session's remote (Streamable HTTP) MCP connections, kept so `end()`
+    /// can DELETE each server-side session instead of leaking it. Empty for a
+    /// session with no remote MCP server attached, which is the common case.
+    remote_mcp: Vec<Arc<mcp_http::McpHttpConnection>>,
 }
 
 #[async_trait]
@@ -733,9 +774,11 @@ impl HarnessSession for NativeSession {
         // interrupt (which cancels but does not `end()`).
         let deps = self.deps.lock().unwrap().clone();
         let _ = hooks::fire_hook(
+            &deps.store,
             &deps.work_dir,
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
+            None,
         )
         .await;
         crate::automation::dispatch_lifecycle_observation(
@@ -744,6 +787,12 @@ impl HarnessSession for NativeSession {
             self.session_pk.clone(),
             json!({ "reason": "ended" }),
         );
+        // Release every remote MCP session this harness session opened. Last,
+        // and after the in-flight turn has been cancelled above: a DELETE sent
+        // while a tool call is still in flight would 404 that call, and the
+        // connection would answer the 404 by re-initializing — allocating a
+        // brand-new server-side session that nothing would then terminate.
+        mcp_http::terminate_all(&self.remote_mcp).await;
         Ok(())
     }
 
@@ -1481,6 +1530,7 @@ pub(crate) mod tests {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        crate::harness::native::hooks::trust_current_hooks(&store, dir.path()).await;
         let factory = Arc::new(ScriptedFactory { turns: vec![] });
         let plugin = native_plugin_with_llm_factory(factory);
         let harness = plugin.harness.unwrap().create().unwrap();
@@ -1525,6 +1575,7 @@ pub(crate) mod tests {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        crate::harness::native::hooks::trust_current_hooks(&store, dir.path()).await;
         let factory = Arc::new(ScriptedFactory { turns: vec![] });
         let plugin = native_plugin_with_llm_factory(factory);
         let harness = plugin.harness.unwrap().create().unwrap();
@@ -2271,12 +2322,42 @@ pub(crate) mod tests {
         };
         let store = mcp_test_store().await;
 
-        let tools = connect_mcp_tools(&store, &[spec], &std::collections::HashMap::new()).await;
+        let tools = connect_mcp_tools(&store, &[spec], &std::collections::HashMap::new())
+            .await
+            .tools;
 
         let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "mcp__remote__ping"),
             "expected the remote server's tool in the session set, got {names:?}"
+        );
+    }
+
+    /// PROPERTY: a remote (HTTP) server's connection is handed back to the
+    /// caller, not just erased into `Arc<dyn McpCaller>` behind its tools.
+    ///
+    /// `NativeSession::end` terminates the server-side MCP session through
+    /// exactly these handles; a version of `connect_mcp_tools` that kept only
+    /// the tools would still pass every other test in this file while leaking
+    /// a session per connection.
+    #[tokio::test]
+    async fn connect_mcp_tools_hands_back_the_remote_connections_for_teardown() {
+        let (url, _seen, _server) = mcp_http::tests::spawn_json_server().await;
+        let spec = crate::domain::McpServerSpec {
+            name: "remote".to_string(),
+            transport: crate::domain::McpTransport::Http {
+                url,
+                headers: vec![],
+            },
+        };
+        let store = mcp_test_store().await;
+
+        let connected = connect_mcp_tools(&store, &[spec], &std::collections::HashMap::new()).await;
+
+        assert_eq!(
+            connected.remote.len(),
+            1,
+            "the one connected HTTP server must be returned as a terminable connection"
         );
     }
 
@@ -2314,7 +2395,9 @@ pub(crate) mod tests {
             },
         ];
         let store = mcp_test_store().await;
-        let tools = connect_mcp_tools(&store, &specs, &std::collections::HashMap::new()).await;
+        let tools = connect_mcp_tools(&store, &specs, &std::collections::HashMap::new())
+            .await
+            .tools;
         assert!(
             tools.is_empty(),
             "a server that can't be reached (bad HTTP endpoint or missing stdio binary) must be \

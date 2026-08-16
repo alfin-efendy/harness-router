@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AppInfo } from "@/bindings";
+import type { AppInfo, ManualMcpOauthClient } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // happy-dom lacks a couple of layout APIs Base UI's Menu popup touches when
@@ -139,6 +139,15 @@ const disconnectMcp = mock(async (_runnerId: string, id: string) => {
   appsFixture = appsFixture.map((a) => (a.id === id ? { ...a, oauthTokenStored: false, oauthReconnectRequired: false } : a));
   return { status: "ok" as const, data: appsFixture };
 });
+const listManualMcpOauthClients = mock(async (_runnerId: string) => ({ status: "ok" as const, data: [] as ManualMcpOauthClient[] }));
+const setManualMcpOauthClient = mock(async (_runnerId: string, _issuer: string, _clientId: string) => ({
+  status: "ok" as const,
+  data: [] as ManualMcpOauthClient[],
+}));
+const deleteManualMcpOauthClient = mock(async (_runnerId: string, _issuer: string) => ({
+  status: "ok" as const,
+  data: [] as ManualMcpOauthClient[],
+}));
 const openUrl = mock(async (_u: string) => {});
 // Counted, not merely stubbed: "the connect flow reports success exactly once"
 // is the observable that separates one live poll loop from two racing ones.
@@ -162,6 +171,9 @@ mock.module("@/bindings", () => ({
     beginMcpConnect,
     completeMcpConnect,
     disconnectMcp,
+    listManualMcpOauthClients,
+    setManualMcpOauthClient,
+    deleteManualMcpOauthClient,
   },
 }));
 mock.module("sonner", () => ({
@@ -184,16 +196,19 @@ beforeEach(() => {
   beginMcpConnect.mockClear();
   completeMcpConnect.mockClear();
   disconnectMcp.mockClear();
+  listManualMcpOauthClients.mockClear();
+  setManualMcpOauthClient.mockClear();
+  deleteManualMcpOauthClient.mockClear();
   openUrl.mockClear();
   toastSuccess.mockClear();
   appsFixture = [slackApp, brokenApp];
-  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null, manualOauthClients: [] });
   useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "slack" }, forward: [] } });
 });
 
 afterEach(() => {
   cleanup();
-  useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
+  useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null, manualOauthClients: [] });
   useNav.setState({ history: { back: [], current: { kind: "home" }, forward: [] } });
 });
 
@@ -290,6 +305,20 @@ test("a not-yet-connected remote server shows a Connect button and no OAuth pill
   expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
   expect(screen.queryByText("Reconnect required")).toBeNull();
+});
+
+test("the Client ID button opens the manual client id modal for a remote server", async () => {
+  appsFixture = [remoteApp];
+  useApps.setState({ apps: appsFixture, loaded: true, hydrating: false, probing: null });
+  useNav.setState({ history: { back: [{ kind: "plugins" }], current: { kind: "appDetail", id: "remote" }, forward: [] } });
+
+  render(<AppDetailView id="remote" />);
+  await screen.findByText("Remote MCP");
+
+  // The daemon's no-DCR failure tells the user to record a client id here, so
+  // the affordance has to exist on this exact card.
+  fireEvent.click(screen.getByRole("button", { name: "Client ID…" }));
+  expect(await screen.findByRole("dialog", { name: "Client ID" })).toBeTruthy();
 });
 
 test("clicking Connect starts the flow, opens the authorize URL, and shows a pending state (not idle/broken)", async () => {

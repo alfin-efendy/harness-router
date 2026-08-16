@@ -131,6 +131,111 @@ const MCP_SERVER_HEADERS_MIGRATION_SQL: &str =
 const MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL: &str =
     "ALTER TABLE mcp_oauth_clients ADD COLUMN token_endpoint TEXT;";
 
+/// v7 -> v8: default every EXISTING gateway row to the permissive `full`
+/// filesystem-access mode.
+///
+/// `gateways.fs_mode` shipped with a `'projects'` column default and every
+/// row-creation site in `api::gateways_api` hardcoded `"projects"` — but
+/// nothing in the engine ever READ the column, so the value was inert for its
+/// entire life. `harness::native::fs_access` now enforces it. Without this
+/// migration, switching enforcement on would retroactively block file edits
+/// and shell commands on every install that never touched the setting, for a
+/// choice the user never actually made. Rows are therefore moved to `full`
+/// (today's real behavior) and the user opts back in from the Gateways screen.
+///
+/// The column DEFAULT stays `'projects'`: SQLite cannot alter a default
+/// without rebuilding the table, and it is unreachable anyway — every INSERT
+/// supplies `fs_mode` explicitly (`gateways::upsert_row`).
+const GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL: &str =
+    "UPDATE gateways SET fs_mode='full' WHERE fs_mode='projects';";
+
+/// v8 -> v9: drop the two hand-written indexes that duplicated their own
+/// table's primary key. `messages` and `provider_turns` are both ordinary
+/// rowid tables declared `PRIMARY KEY (session_pk, seq)`, so SQLite already
+/// materialises an automatic index over that exact tuple in that exact order;
+/// `idx_messages_session` / `idx_provider_turns_session` added a second,
+/// identical B-tree. These are the two hottest write paths in the engine (one
+/// `messages` row per streamed block, one `provider_turns` row per model turn),
+/// so the duplication cost every insert a redundant index write and every
+/// database a redundant copy of the index on disk, for no read-plan benefit.
+///
+/// `IF EXISTS` because a database can reach v9 from either direction: a fresh
+/// install creates both indexes from `BASELINE_SQL` and then drops them here,
+/// while a database created by a future build that no longer has them must not
+/// fail. The indexes stay in `store_baseline.sql` for the same reason every
+/// other post-squash change does — that file is pinned pre-squash history.
+const DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL: &str = "
+DROP INDEX IF EXISTS idx_messages_session;
+DROP INDEX IF EXISTS idx_provider_turns_session;
+";
+
+/// v9 -> v10: parked tool/plan/question approvals, so a Cockpit reload can
+/// re-list what is waiting on the user instead of stranding the turn. Written
+/// by `crate::approval::persist_pending` when a call parks and deleted by
+/// `crate::approval::delete_pending` the moment that call site wakes (user
+/// answer, gateway answer, timeout, or cancel all complete the same `oneshot`).
+///
+/// Deliberately NOT foreign-keyed to `sessions`: rows are short-lived, are
+/// deleted by the parking call site, and the whole table is wiped by
+/// `daemon::build_daemon` on every boot (a `oneshot` sender cannot survive a
+/// process restart, so a row from a previous boot is unanswerable).
+const PENDING_APPROVALS_MIGRATION_SQL: &str = "
+CREATE TABLE pending_approvals (
+  run_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  session_pk TEXT NOT NULL,
+  requesting_agent_id TEXT NOT NULL,
+  requesting_agent_name TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  approval_kind TEXT NOT NULL,
+  input_json TEXT NOT NULL,
+  principal_json TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, request_id)
+);
+CREATE INDEX pending_approvals_session_idx ON pending_approvals(session_pk);
+";
+
+/// v10 -> v11: whether a `mcp_oauth_clients` row's `client_id` was supplied by
+/// the USER rather than obtained by RFC 7591 dynamic client registration.
+///
+/// Plenty of authorization servers — most enterprise and self-hosted ones —
+/// gate client registration behind an admin and expose no
+/// `registration_endpoint` at all. Before this column there was no way to
+/// connect to an MCP server behind one: `mcp_oauth::begin_mcp_connect` told the
+/// user a client id "must be supplied manually" and nothing in the product
+/// could record one.
+///
+/// The flag is provenance, not permission. A user-asserted row is written with
+/// `token_endpoint` NULL and never carries one, because that column is the
+/// binding `api::apps_api::require_registered_token_endpoint` checks before the
+/// daemon POSTs an authorization code, and it is only meaningful while a real
+/// RFC 8414 discovery run is the only thing that writes it. So a row the user
+/// wrote authorizes no exchange on its own; `begin_mcp_connect` fills the
+/// endpoint in from the authorization server's own metadata on the next
+/// connect, and leaves this flag alone so the client id's origin stays legible.
+///
+/// `DEFAULT 0` so every pre-existing row — all of them written by discovery —
+/// keeps reading as machine-registered without a data migration.
+const MCP_OAUTH_CLIENT_USER_ASSERTED_MIGRATION_SQL: &str =
+    "ALTER TABLE mcp_oauth_clients ADD COLUMN user_asserted INTEGER NOT NULL DEFAULT 0;";
+
+/// v11 -> v12: the chat a scheduled job reports into, or NULL for a job that
+/// reports nowhere (the default, and every pre-existing row).
+///
+/// The scheduler's run watcher has always known how to push a finished run's
+/// final text onto the background rail, but there was no place to record WHICH
+/// chat it belongs to — the read side resolved a `session_surfaces` row keyed
+/// by `(job.gateway, job.id)` that nothing ever wrote. That namespace belongs
+/// to real gateway conversations (`router.rs` routes inbound messages through
+/// it), and its key includes `gateway`, which the job editor can change out
+/// from under the binding. The binding belongs to the job, so it lives here.
+///
+/// Nullable and NULL on every existing row: a job reports nowhere until the
+/// user picks a chat in the Cockpit job editor, which is the only writer.
+const JOB_HOME_SESSION_MIGRATION_SQL: &str = "ALTER TABLE jobs ADD COLUMN home_session_pk TEXT;";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -140,6 +245,11 @@ fn migrations() -> Migrations<'static> {
         M::up(MCP_OAUTH_MIGRATION_SQL),
         M::up(MCP_SERVER_HEADERS_MIGRATION_SQL),
         M::up(MCP_OAUTH_CLIENT_TOKEN_ENDPOINT_MIGRATION_SQL),
+        M::up(GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL),
+        M::up(DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL),
+        M::up(PENDING_APPROVALS_MIGRATION_SQL),
+        M::up(MCP_OAUTH_CLIENT_USER_ASSERTED_MIGRATION_SQL),
+        M::up(JOB_HOME_SESSION_MIGRATION_SQL),
     ])
 }
 
@@ -228,21 +338,51 @@ pub struct ContextCheckpoint {
     pub payload: serde_json::Value,
 }
 
+/// Probe `workdir` for git-ness — the read-time source of truth for
+/// [`crate::domain::Project::is_git`], which is not a database column.
+///
+/// Deliberately NOT called from inside a `with_conn` closure. `Store` runs a
+/// single pooled connection (see `Store::open`), so filesystem work performed
+/// there serializes behind every other database read and write in the process.
+fn probe_is_git(workdir: &str) -> bool {
+    git2::Repository::open(workdir).is_ok()
+}
+
+/// Fill `is_git` on project rows that have already been read from the
+/// database, on a blocking-pool thread rather than the store connection.
+///
+/// One `spawn_blocking` for the whole batch: `list_projects` is refreshed
+/// after every finished turn, so this must never be one task per row.
+async fn fill_is_git(mut projects: Vec<Project>) -> anyhow::Result<Vec<Project>> {
+    if projects.is_empty() {
+        return Ok(projects);
+    }
+    Ok(tokio::task::spawn_blocking(move || {
+        for p in &mut projects {
+            p.is_git = probe_is_git(&p.workdir);
+        }
+        projects
+    })
+    .await?)
+}
+
+/// Map one `PROJECT_COLS` row. `is_git` is NOT a column and is deliberately
+/// left `false` here: every public reader fills it via [`fill_is_git`] AFTER
+/// the store connection has been released. Do not reintroduce a filesystem
+/// probe in this function — it runs on the store's single serialized
+/// connection thread and would block every other query behind it.
 fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
     let perm: String = r.get(6)?;
-    let workdir: String = r.get(2)?;
     Ok(Project {
         project_id: r.get(0)?,
         name: r.get(1)?,
-        // Read-time git-ness: cheap repo-open probe. Runs on the store's
-        // blocking connection thread, so sync git2 is fine here.
-        is_git: git2::Repository::open(&workdir).is_ok(),
-        workdir,
+        workdir: r.get(2)?,
         source: r.get(3)?,
         model: r.get(4)?,
         effort: r.get(5)?,
         perm_mode: PermMode::from_db(&perm),
         created_at: r.get(7)?,
+        is_git: false,
     })
 }
 
@@ -805,9 +945,12 @@ impl Store {
         // + plugin_oauth_profile_clients.client_secret_setting, 4 =
         // + automation_hooks/jobs/mcp_servers.plugin_id origin columns, 5 =
         // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json,
-        // 7 = + mcp_oauth_clients.token_endpoint.)
+        // 7 = + mcp_oauth_clients.token_endpoint, 8 = + gateways.fs_mode
+        // permissive default, 9 = duplicate primary-key indexes on
+        // messages/provider_turns dropped, 10 = + pending_approvals, 11 =
+        // + mcp_oauth_clients.user_asserted, 12 = + jobs.home_session_pk.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 7;
+        const LATEST_VERSION: i64 = 12;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -1010,28 +1153,35 @@ impl Store {
 
     pub async fn get_project(&self, id: &str) -> anyhow::Result<Option<Project>> {
         let id = id.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!("SELECT {PROJECT_COLS} FROM projects WHERE project_id=?1"),
-                params![id],
-                row_to_project,
-            )
-            .optional()
+        let row = self
+            .with_conn(move |c| {
+                c.query_row(
+                    &format!("SELECT {PROJECT_COLS} FROM projects WHERE project_id=?1"),
+                    params![id],
+                    row_to_project,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(match row {
+            Some(p) => fill_is_git(vec![p]).await?.pop(),
+            None => None,
         })
-        .await
     }
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
-        self.with_conn(|c| -> rusqlite::Result<Vec<Project>> {
-            let mut stmt = c.prepare(&format!(
-                "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at"
-            ))?;
-            let items = stmt
-                .query_map([], row_to_project)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(items)
-        })
-        .await
+        let items = self
+            .with_conn(|c| -> rusqlite::Result<Vec<Project>> {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at"
+                ))?;
+                let items = stmt
+                    .query_map([], row_to_project)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(items)
+            })
+            .await?;
+        fill_is_git(items).await
     }
 
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
@@ -3026,19 +3176,24 @@ impl Store {
     ) -> anyhow::Result<Option<Project>> {
         let gateway = gateway.to_string();
         let workspace_id = workspace_id.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!(
-                    "SELECT p.{PROJECT_COLS} FROM projects p \
-                     JOIN project_bindings b ON b.project_id = p.project_id \
-                     WHERE b.gateway = ?1 AND b.workspace_id = ?2"
-                ),
-                params![gateway, workspace_id],
-                row_to_project,
-            )
-            .optional()
+        let row = self
+            .with_conn(move |c| {
+                c.query_row(
+                    &format!(
+                        "SELECT p.{PROJECT_COLS} FROM projects p \
+                         JOIN project_bindings b ON b.project_id = p.project_id \
+                         WHERE b.gateway = ?1 AND b.workspace_id = ?2"
+                    ),
+                    params![gateway, workspace_id],
+                    row_to_project,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(match row {
+            Some(p) => fill_is_git(vec![p]).await?.pop(),
+            None => None,
         })
-        .await
     }
 
     /// Insert one request_log row and upsert its usage_daily rollup atomically.
@@ -3588,6 +3743,80 @@ impl Store {
             )?;
             let rows = stmt.query_map(params![token_endpoint], |r| r.get::<_, String>(0))?;
             rows.collect()
+        })
+        .await
+    }
+
+    /// Record a client id a USER supplied for `issuer` — the path for an
+    /// authorization server that offers no RFC 7591 dynamic registration, where
+    /// `mcp_oauth::begin_mcp_connect` would otherwise have nothing to register
+    /// with and no way to proceed.
+    ///
+    /// Deliberately writes NO `token_endpoint`, and clears any a previous
+    /// discovery run recorded. That column is a security binding, not a cache:
+    /// `api::apps_api::require_registered_token_endpoint` will only let the
+    /// daemon POST an authorization code to an endpoint recorded there, and the
+    /// invariant that makes the check worth anything is that ONLY a real RFC
+    /// 8414 discovery run writes it. A row written here therefore authorizes no
+    /// exchange at all until `begin_mcp_connect` runs, discovers the
+    /// authorization server for real, and upserts the endpoint from its
+    /// metadata — which it does on every connect, before any completion can
+    /// happen. Clearing a previously recorded endpoint matters for the same
+    /// reason: it was bound to the client id this call is replacing.
+    pub async fn upsert_user_asserted_mcp_oauth_client(
+        &self,
+        issuer: &str,
+        client_id: &str,
+    ) -> anyhow::Result<()> {
+        let issuer = issuer.to_string();
+        let client_id = client_id.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at, token_endpoint, user_asserted) \
+                 VALUES (?1, ?2, ?3, NULL, 1) \
+                 ON CONFLICT(issuer) DO UPDATE SET \
+                    client_id=excluded.client_id, token_endpoint=NULL, user_asserted=1",
+                params![issuer, client_id, created_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Every `(issuer, client_id)` pair a user supplied, for the Cockpit
+    /// surface that lists and removes them. Discovery-registered rows are
+    /// excluded: they are machine state a user has no business editing.
+    pub async fn list_user_asserted_mcp_oauth_clients(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT issuer, client_id FROM mcp_oauth_clients \
+                 WHERE user_asserted=1 ORDER BY issuer",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Forget a user-supplied client id. Scoped to `user_asserted=1` so this
+    /// can never delete a row dynamic registration owns — losing one of those
+    /// would silently orphan a client at the authorization server and force a
+    /// re-registration some servers rate-limit. Returns whether a row went.
+    pub async fn delete_user_asserted_mcp_oauth_client(
+        &self,
+        issuer: &str,
+    ) -> anyhow::Result<bool> {
+        let issuer = issuer.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM mcp_oauth_clients WHERE issuer=?1 AND user_asserted=1",
+                params![issuer],
+            )
+            .map(|rows| rows > 0)
         })
         .await
     }
@@ -5186,19 +5415,42 @@ impl Store {
         .await
     }
 
+    /// Remove an expired archived session and everything keyed to it.
+    ///
+    /// The `NOT EXISTS` guard keeps the session row alive until every artifact
+    /// it produced has already been tombstoned, so a caller that has not yet
+    /// run `mark_source_artifacts_deleted` gets `false` and no child row is
+    /// touched. Child rows are deleted in the same immediate transaction as
+    /// the session row: several session-keyed tables declare no foreign key
+    /// back to `sessions`, so without this they would be orphaned forever
+    /// (see `SESSION_CHILD_TABLES`).
+    ///
+    /// Returns `true` when the session row (and therefore its children) was
+    /// deleted.
     pub async fn delete_session_after_artifact_purge(
         &self,
         session_pk: &str,
     ) -> anyhow::Result<bool> {
         let session_pk = session_pk.to_string();
-        self.with_conn(move |c| {
-            c.execute(
+        self.with_conn(move |c| -> rusqlite::Result<bool> {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let deleted = tx.execute(
                 "DELETE FROM sessions WHERE session_pk=?1 AND NOT EXISTS (\
                    SELECT 1 FROM artifacts WHERE source_session_pk=?1 AND status <> 'deleted'\
                  )",
                 params![session_pk],
-            )
-            .map(|count| count == 1)
+            )?;
+            if deleted != 1 {
+                return Ok(false);
+            }
+            for &(table, column) in SESSION_CHILD_TABLES {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE {column}=?1"),
+                    params![session_pk],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
         })
         .await
     }
@@ -5226,6 +5478,35 @@ impl Store {
         .await
     }
 }
+
+/// Session-keyed tables that declare no `REFERENCES sessions(...)` clause, so
+/// SQLite cannot cascade them when a `sessions` row is removed. Each entry is
+/// `(table, session-key column)`. Tables that DO declare the cascade
+/// (`agent_runs`, `session_runtime_settings`, `native_tool_session_versions`,
+/// and `agent_run_messages` via `agent_runs`/`messages`) are deliberately
+/// absent — the database already handles them. `messages_fts` is absent too:
+/// the `messages_fts_ad` trigger clears the FTS5 shadow rows on every
+/// `messages` delete.
+///
+/// **Any new session-keyed table must be added here, or given an
+/// `ON DELETE CASCADE` foreign key.** Neither is automatic, and nothing fails
+/// loudly when both are missed — retention simply leaves the rows behind
+/// forever. `pending_approvals` was added later than this list and orphaned
+/// exactly that way until it was registered; `automation_hook_runs` still
+/// does, and drags `automation_hook_attempts` with it.
+const SESSION_CHILD_TABLES: &[(&str, &str)] = &[
+    ("messages", "session_pk"),
+    ("provider_turns", "session_pk"),
+    ("todos", "session_pk"),
+    ("session_context", "session_pk"),
+    ("context_checkpoints", "session_pk"),
+    ("session_surfaces", "session_pk"),
+    ("session_prompt_queue", "session_pk"),
+    ("session_route_state", "session_pk"),
+    ("session_automation_origins", "session_pk"),
+    ("background_events", "target_session_pk"),
+    ("pending_approvals", "session_pk"),
+];
 
 const ARTIFACT_COLS: &str = "id,source_session_pk,source_message_seq,source_run_id,creator,\
     creator_id,name,description,content_type,size_bytes,sha256,storage_key,status,created_at,\
@@ -5762,6 +6043,48 @@ mod tests {
             listed.iter().map(|p| p.is_git).collect::<Vec<_>>(),
             vec![false, true],
             "list_projects must compute the flag per row"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_project_by_workspace_fills_is_git() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // A workdir that really is a repo — every public project reader must
+        // report is_git=true for it, including the workspace-binding path.
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let mut p = sample_project();
+        p.workdir = repo_dir.path().to_string_lossy().into_owned();
+        store.insert_project(p).await.unwrap();
+        store.bind_project("acme-gw", "guild1", "p1").await.unwrap();
+
+        let resolved = store
+            .resolve_project_by_workspace("acme-gw", "guild1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.project_id, "p1");
+        assert!(
+            resolved.is_git,
+            "resolve_project_by_workspace must fill is_git like the other readers"
+        );
+
+        // The plain-folder direction, so a hardcoded `true` cannot pass.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let mut q = sample_project();
+        q.project_id = "p2".into();
+        q.workdir = plain_dir.path().to_string_lossy().into_owned();
+        store.insert_project(q).await.unwrap();
+        store.bind_project("acme-gw", "guild2", "p2").await.unwrap();
+        assert!(
+            !store
+                .resolve_project_by_workspace("acme-gw", "guild2")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_git
         );
     }
 
@@ -8683,6 +9006,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_asserted_client_row_records_no_token_endpoint() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_user_asserted_mcp_oauth_client("https://as.example", "manual-client")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("manual-client"),
+            "`begin_mcp_connect`'s reuse branch must find the row the user wrote"
+        );
+        // This is the property that keeps
+        // `api::apps_api::require_registered_token_endpoint` exactly as strong
+        // as it was: a row the user wrote carries no token endpoint, so it can
+        // authorize no token exchange at all.
+        assert!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://as.example/token")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a user-asserted row must authorize no token endpoint whatsoever"
+        );
+        assert_eq!(
+            store.list_user_asserted_mcp_oauth_clients().await.unwrap(),
+            vec![(
+                "https://as.example".to_string(),
+                "manual-client".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_upsert_over_a_user_asserted_row_records_the_endpoint_and_keeps_the_flag() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_user_asserted_mcp_oauth_client("https://as.example", "manual-client")
+            .await
+            .unwrap();
+        // Stands in for the unconditional write `begin_mcp_connect` performs
+        // on every connect, reused client id included.
+        store
+            .upsert_mcp_oauth_client(
+                "https://as.example",
+                "manual-client",
+                "https://as.example/token",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://as.example/token")
+                .await
+                .unwrap(),
+            vec!["manual-client".to_string()],
+            "only the DISCOVERED endpoint makes the row usable for a completion"
+        );
+        assert_eq!(
+            store.list_user_asserted_mcp_oauth_clients().await.unwrap(),
+            vec![(
+                "https://as.example".to_string(),
+                "manual-client".to_string()
+            )],
+            "the provenance flag must survive a discovery write, so the UI keeps \
+             showing the user what they entered"
+        );
+
+        // A row discovery owns must be untouchable through the user-facing
+        // delete: losing it would orphan a client at the authorization server.
+        store
+            .upsert_mcp_oauth_client(
+                "https://other.example",
+                "dcr-client",
+                "https://other.example/token",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .delete_user_asserted_mcp_oauth_client("https://other.example")
+                .await
+                .unwrap(),
+            "a discovery-registered row is not the user's to delete"
+        );
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://other.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dcr-client")
+        );
+
+        assert!(store
+            .delete_user_asserted_mcp_oauth_client("https://as.example")
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .delete_user_asserted_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap(),
+            "a second delete must report that nothing went"
+        );
+    }
+
+    #[tokio::test]
     async fn marking_reconnect_required_survives_a_read() {
         use_test_key_file();
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -10231,6 +10669,311 @@ mod tests {
             .is_some());
     }
 
+    /// Seed one row in every session-keyed child table for `pk`. Uses raw SQL
+    /// rather than the typed writers so the test stays pinned to the schema
+    /// this purge has to clean, not to ten unrelated APIs.
+    async fn seed_session_child_rows(store: &Store, pk: &'static str) {
+        store
+            .insert_message(NewMessage::block(
+                pk,
+                "user",
+                "text",
+                serde_json::json!({ "text": format!("{pk} transcript body") }),
+            ))
+            .await
+            .unwrap();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "INSERT INTO provider_turns(session_pk,seq,role,payload,created_at) \
+                     VALUES(?1,1,'user','{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO todos(session_pk,pos,content,status,created_at) \
+                     VALUES(?1,1,'ship it','pending',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_context(session_pk,payload,updated_at) \
+                     VALUES(?1,'{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO context_checkpoints(session_pk,boundary_seq,window_number,payload,created_at) \
+                     VALUES(?1,1,1,'{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_surfaces(gateway,conversation_id,session_pk) \
+                     VALUES('local',?1,?1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_prompt_queue(id,session_pk,position,payload,created_at) \
+                     VALUES(?1 || '-queued',?1,1,'{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_route_state(session_pk,requested_model,resolved_provider,\
+                     resolved_family,resolved_model,connection_id,updated_at) \
+                     VALUES(?1,'sol','openai','openai','gpt-5.6-sol','conn-1',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO session_automation_origins(session_pk,kind,hook_id,run_id,depth) \
+                     VALUES(?1,'webhook','hook-1','run-1',0)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO background_events(id,target_session_pk,kind,payload,created_at) \
+                     VALUES(?1 || '-event',?1,'note','{}',1)",
+                    params![pk],
+                )?;
+                c.execute(
+                    "INSERT INTO pending_approvals(run_id,request_id,session_pk,\
+                     requesting_agent_id,requesting_agent_name,tool,summary,approval_kind,\
+                     input_json,created_at) \
+                     VALUES(?1 || '-run','req-1',?1,'agent-1','Agent','bash','ls','tool','{}',1)",
+                    params![pk],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn count_rows(store: &Store, sql: String) -> i64 {
+        store
+            .with_conn(move |c| c.query_row(&sql, [], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn purging_a_session_deletes_every_session_keyed_child_row() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        let mut bystander = sample_session();
+        bystander.session_pk = "s2".into();
+        store.insert_session(bystander).await.unwrap();
+        seed_session_child_rows(&store, "s1").await;
+        seed_session_child_rows(&store, "s2").await;
+
+        // A live artifact blocks the purge, and nothing may be deleted.
+        store
+            .insert_artifact(&sample_artifact("art-1", "s1", ArtifactStatus::Available))
+            .await
+            .unwrap();
+        assert!(!store
+            .delete_session_after_artifact_purge("s1")
+            .await
+            .unwrap());
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE session_pk='s1'".into()
+            )
+            .await,
+            1,
+            "a blocked purge must not touch child rows"
+        );
+
+        store
+            .mark_source_artifacts_deleted("s1", 2_000)
+            .await
+            .unwrap();
+        assert!(store
+            .delete_session_after_artifact_purge("s1")
+            .await
+            .unwrap());
+        assert!(store.get_session("s1").await.unwrap().is_none());
+
+        for &(table, column) in SESSION_CHILD_TABLES {
+            let purged = count_rows(
+                &store,
+                format!("SELECT COUNT(*) FROM {table} WHERE {column}='s1'"),
+            )
+            .await;
+            assert_eq!(
+                purged, 0,
+                "{table} still holds rows for the purged session s1"
+            );
+            let kept = count_rows(
+                &store,
+                format!("SELECT COUNT(*) FROM {table} WHERE {column}='s2'"),
+            )
+            .await;
+            assert_eq!(kept, 1, "{table} lost rows for the untouched session s2");
+        }
+
+        // The messages_fts_ad trigger must have cleared the FTS5 shadow rows
+        // for s1 while leaving s2's indexed.
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 's1'".into()
+            )
+            .await,
+            0,
+            "the FTS shadow index still holds the purged session's transcript"
+        );
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 's2'".into()
+            )
+            .await,
+            1,
+            "the FTS shadow index lost an untouched session's transcript"
+        );
+
+        // The artifact tombstone and any cross-session references survive.
+        assert_eq!(
+            count_rows(
+                &store,
+                "SELECT COUNT(*) FROM artifacts WHERE id='art-1'".into()
+            )
+            .await,
+            1,
+            "artifact tombstones must outlive the purged session"
+        );
+    }
+
+    /// Every session-keyed table must be purged, cascaded, or knowingly kept.
+    ///
+    /// `purging_a_session_deletes_every_session_keyed_child_row` iterates
+    /// [`SESSION_CHILD_TABLES`], so it can only prove that the tables ON the
+    /// list are purged — a table missing from the list is invisible to it.
+    /// That blind spot has cost us twice: `pending_approvals` was added long
+    /// after the list and orphaned every row until it was registered, and
+    /// `automation_hook_runs` still orphans today. This test closes it by
+    /// walking the live schema instead of the list, so the next session-keyed
+    /// table fails here on the day it is added rather than silently growing
+    /// forever in the field.
+    #[tokio::test]
+    async fn every_session_keyed_table_is_purged_cascaded_or_knowingly_kept() {
+        // Tables that keep session-keyed rows on purpose. Each needs a reason,
+        // because "not in the list" is otherwise indistinguishable from a bug.
+        const KEPT_ON_PURPOSE: &[(&str, &str)] = &[
+            ("audit", "the audit trail must outlive what it describes"),
+            (
+                "job_runs",
+                "a job's run history is the job's, not the session's",
+            ),
+            (
+                "artifacts",
+                "owned by the artifact lifecycle; retention tombstones these \
+                 separately and delete_session_after_artifact_purge refuses to \
+                 run until they are gone",
+            ),
+            (
+                "artifact_references",
+                "keyed to artifacts, which outlive the session by design",
+            ),
+            (
+                "automation_hook_runs",
+                "KNOWN ORPHAN, pre-existing and NOT yet fixed. The naive fix is \
+                 wrong: automation_hook_attempts carries a foreign key to \
+                 automation_hook_runs(id) with NO ON DELETE CASCADE, so with \
+                 foreign_keys=ON a plain DELETE here raises a constraint failure \
+                 and aborts the whole retention transaction. Purging it needs \
+                 the attempts deleted first, and its session_pk is nullable.",
+            ),
+            (
+                "sessions",
+                "the parent — its session_pk is its own primary key",
+            ),
+            (
+                "jobs",
+                "`home_session_pk` is a REFERENCE, not ownership: a job outlives \
+                 the chat it reports into, so purging the session must never \
+                 delete the job. The pointer is left dangling and healed lazily \
+                 by scheduler::clear_home_session on the job's next run. A job \
+                 that is disabled or never fires again keeps a stale pk \
+                 indefinitely — harmless today (every read resolves it and \
+                 clears on miss) but the honest fix is for retention to NULL the \
+                 column rather than wait for a run that may never come.",
+            ),
+        ];
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let listed: std::collections::HashSet<&str> =
+            SESSION_CHILD_TABLES.iter().map(|&(t, _)| t).collect();
+        let excused: std::collections::HashSet<&str> =
+            KEPT_ON_PURPOSE.iter().map(|&(t, _)| t).collect();
+
+        let unhandled = store
+            .with_conn(move |c| -> rusqlite::Result<Vec<String>> {
+                let mut tables = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%'",
+                )?;
+                let names: Vec<String> = tables
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut unhandled = Vec::new();
+                for name in names {
+                    let mut cols = c.prepare(&format!("PRAGMA table_info({name})"))?;
+                    let has_session_key = cols
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                        .iter()
+                        .any(|col| col.ends_with("session_pk"));
+                    if !has_session_key
+                        || listed.contains(name.as_str())
+                        || excused.contains(name.as_str())
+                    {
+                        continue;
+                    }
+                    // A cascade reaching `sessions` does the job in the database.
+                    // Follow the chain, not just the first hop: agent_run_messages
+                    // is cleaned by cascading to agent_runs, which cascades to
+                    // sessions. Every edge on the path must be ON DELETE CASCADE.
+                    let mut frontier = vec![name.clone()];
+                    let mut visited = std::collections::HashSet::new();
+                    let mut cascades = false;
+                    while let Some(current) = frontier.pop() {
+                        if !visited.insert(current.clone()) {
+                            continue;
+                        }
+                        let mut fks = c.prepare(&format!("PRAGMA foreign_key_list({current})"))?;
+                        let parents = fks
+                            .query_map([], |r| {
+                                Ok((r.get::<_, String>(2)?, r.get::<_, String>(6)?))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        for (parent, on_delete) in parents {
+                            if on_delete != "CASCADE" {
+                                continue;
+                            }
+                            if parent == "sessions" {
+                                cascades = true;
+                                frontier.clear();
+                                break;
+                            }
+                            frontier.push(parent);
+                        }
+                    }
+                    if !cascades {
+                        unhandled.push(name);
+                    }
+                }
+                Ok(unhandled)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            unhandled.is_empty(),
+            "these tables have a session key but are neither in \
+             SESSION_CHILD_TABLES, nor cascaded from sessions, nor listed in \
+             KEPT_ON_PURPOSE — retention will orphan their rows forever: {unhandled:?}"
+        );
+    }
+
     #[tokio::test]
     async fn source_artifact_status_updates_only_exact_transitions() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -10507,12 +11250,14 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 7 database (v1 squashed baseline + v2
+    // produce a `user_version` 12 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
     // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
     // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json + v7
-    // mcp_oauth_clients.token_endpoint)
+    // mcp_oauth_clients.token_endpoint + v8 gateways.fs_mode permissive
+    // default + v9 duplicate-pk-index drop + v10 pending_approvals + v11
+    // mcp_oauth_clients.user_asserted + v12 jobs.home_session_pk)
     // whose schema + seeded rows exactly match the golden fixture.
     //
     // The fixture is also what proves a FRESH database and an UPGRADED one
@@ -10530,13 +11275,161 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 7,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint migrations must be user_version 7"
+            user_version, 12,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes + pending-approvals + mcp-oauth-client-user-asserted + job-home-session migrations must be user_version 12"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(
             dump, golden,
             "baseline schema/seed drifted from the pre-squash golden fixture"
+        );
+    }
+
+    // `messages` and `provider_turns` are rowid tables declared
+    // `PRIMARY KEY (session_pk, seq)`, so SQLite's automatic index already
+    // covers that tuple; the old `idx_*_session` indexes were an identical
+    // second B-tree taxing the two hottest insert paths. v8 -> v9 drops them.
+    // This pins BOTH directions: a fresh install (baseline creates them, the
+    // migration removes them) and an in-place upgrade from a v8 database.
+    #[tokio::test]
+    async fn duplicate_primary_key_indexes_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup-idx.db");
+
+        {
+            let store = Store::open(&path).await.unwrap();
+            let leftovers: Vec<String> = store
+                .with_conn(|c| {
+                    let mut stmt = c.prepare(
+                        "SELECT name FROM sqlite_master WHERE type='index' \
+                         AND name IN ('idx_messages_session','idx_provider_turns_session') \
+                         ORDER BY name",
+                    )?;
+                    let names = stmt
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(names)
+                })
+                .await
+                .unwrap();
+            assert!(
+                leftovers.is_empty(),
+                "a fresh database must not carry the duplicate indexes: {leftovers:?}"
+            );
+
+            // Rebuild a pre-v9 database: both indexes present, everything a
+            // LATER migration created torn back down, and the version pinned
+            // back to 8 so reopening has to replay v9 onward.
+            //
+            // Tearing down the post-v8 objects is what makes the fixture
+            // faithful: a real v8 database has none of them, and `to_latest`
+            // replays EVERY migration above the pinned version. Rewinding the
+            // pragma alone would leave v10's `pending_approvals` in place and
+            // that migration would then fail with "table already exists".
+            // Any future migration must extend this teardown the same way.
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        "CREATE INDEX idx_messages_session ON messages(session_pk, seq);\
+                         CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);\
+                         DROP TABLE IF EXISTS pending_approvals;\
+                         ALTER TABLE mcp_oauth_clients DROP COLUMN user_asserted;\
+                         ALTER TABLE jobs DROP COLUMN home_session_pk;",
+                    )?;
+                    c.pragma_update(None, "user_version", 8)
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(&path).await.unwrap();
+        let (duplicates, version) = store
+            .with_conn(|c| {
+                let duplicates: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                     AND name IN ('idx_messages_session','idx_provider_turns_session')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                Ok((duplicates, version))
+            })
+            .await
+            .unwrap();
+        assert_eq!(duplicates, 0, "v8 -> v9 must drop both duplicate indexes");
+        assert_eq!(
+            version, 12,
+            "the upgrade must replay every migration above v8 and land on the latest version"
+        );
+        let has_pending_approvals: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                     AND name='pending_approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            has_pending_approvals, 1,
+            "the same replay must also re-apply v9 -> v10"
+        );
+        let has_user_asserted: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mcp_oauth_clients') \
+                     WHERE name='user_asserted'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            has_user_asserted, 1,
+            "and v10 -> v11, which is what lets a user-supplied client id be recorded at all"
+        );
+        let has_home_session_pk: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('jobs') \
+                     WHERE name='home_session_pk'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            has_home_session_pk, 1,
+            "and v11 -> v12, which is what lets a scheduled job report into a chat at all"
+        );
+
+        // Coverage is unchanged: each table keeps exactly one index, the
+        // primary key's automatic one over (session_pk, seq).
+        let remaining: Vec<String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index' \
+                     AND tbl_name IN ('messages','provider_turns') ORDER BY name",
+                )?;
+                let names = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "expected one automatic index per table, got {remaining:?}"
+        );
+        assert!(
+            remaining.iter().all(|n| n.starts_with("sqlite_autoindex_")),
+            "only primary-key automatic indexes should remain: {remaining:?}"
         );
     }
 

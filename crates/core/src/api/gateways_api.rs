@@ -142,7 +142,10 @@ async fn ensure_local_row(cp: &ControlPlane) -> anyhow::Result<GatewayRow> {
         host: None,
         port: None,
         username: None,
-        fs_mode: "projects".into(),
+        // Permissive by default: `harness::native::fs_access` enforces this
+        // column now, so a machine the user never configured must keep the
+        // behavior they already have. Opting in happens on the Gateways screen.
+        fs_mode: "full".into(),
         paths: vec![],
         fingerprint: None,
         device_token: None,
@@ -250,7 +253,7 @@ async fn assemble(cp: &ControlPlane, probe: bool) -> anyhow::Result<Vec<GatewayI
                     host: None,
                     port: None,
                     username: None,
-                    fs_mode: "projects".into(),
+                    fs_mode: "full".into(),
                     paths: vec![],
                     fingerprint: None,
                     device_token: None,
@@ -429,7 +432,7 @@ async fn add_gateway(
             host: Some(host),
             port: Some(port),
             username: Some(username),
-            fs_mode: "projects".into(),
+            fs_mode: "full".into(),
             paths: vec![],
             fingerprint: None,
             device_token: None,
@@ -465,7 +468,7 @@ async fn save_runner(
             host: Some(host),
             port: Some(port),
             username: None,
-            fs_mode: "projects".into(),
+            fs_mode: "full".into(),
             paths: vec![],
             fingerprint: Some(fingerprint),
             device_token: Some(crate::llm_router::secrets::encrypt_field(&device_token)),

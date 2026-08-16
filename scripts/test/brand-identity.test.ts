@@ -15,6 +15,13 @@ const skippedDirs = new Set([
   "node_modules",
   "out",
   "target",
+  // Sibling cargo target dirs. `target-clippy` is the isolated CARGO_TARGET_DIR
+  // used so clippy and `cargo test` never share artifacts, and `target-plugins`
+  // is CI's plugin-test dir. Both sit inside the checkout and fill with
+  // fingerprint JSON, which this walker would otherwise scan — and race against
+  // while a build is still writing.
+  "target-clippy",
+  "target-plugins",
 ]);
 
 const skippedSubtrees = new Set(["docs/superpowers"]);

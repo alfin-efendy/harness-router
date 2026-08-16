@@ -213,6 +213,11 @@ pub struct JobInfo {
     /// rows from user-created ones.
     #[serde(default)]
     pub plugin_id: Option<String>,
+    /// The chat this job reports its successful runs into — mirrors
+    /// `crate::scheduler::JobRow.home_session_pk`. `None` (the default) means
+    /// the job reports nowhere and its output only lives in the run history.
+    #[serde(default)]
+    pub home_session_pk: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -231,6 +236,13 @@ pub struct JobInput {
     /// See `JobInfo::model_override`.
     #[serde(default)]
     pub model_override: Option<String>,
+    /// See `JobInfo::home_session_pk`. Validated by
+    /// `api::scheduler_api::resolve_home_session`: it must name an existing
+    /// CHAT session, so a job can never be pointed at a project or worker
+    /// session. Optional on the wire, so `JobNewView` (which never offers the
+    /// picker) keeps compiling.
+    #[serde(default)]
+    pub home_session_pk: Option<String>,
 }
 
 // --- automation_api (Hook persistence contract; RPC wiring follows in Task 5) ---
@@ -676,6 +688,22 @@ pub struct McpConnectStart {
     pub client_id: String,
 }
 
+/// One authorization server for which the USER supplied an OAuth client id,
+/// because that server offers no RFC 7591 dynamic client registration.
+///
+/// There is deliberately no token-endpoint field here, and there must never be
+/// one: the token endpoint is the binding
+/// `apps_api::require_registered_token_endpoint` checks before the daemon POSTs
+/// an authorization code, and it is only trustworthy while a real discovery run
+/// is the sole writer. `mcp_oauth::begin_mcp_connect` records it from the
+/// authorization server's own RFC 8414 metadata on the next connect.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualMcpOauthClient {
+    pub issuer: String,
+    pub client_id: String,
+}
+
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AddAppInput {
@@ -696,6 +724,37 @@ pub struct AddAppInput {
 }
 
 // --- native_api (moved verbatim from apps/cockpit/src-tauri/src/native_cmd.rs) ---
+
+/// The worktree hook-script trust state for one project — what
+/// `.ryuzi/hooks/<event>/` scripts exist and whether the user has accepted
+/// this exact set of bytes. Mirrors
+/// `crate::harness::native::hooks::HookTrust`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeHookStatus {
+    /// `"<event>/<file>"` for every discovered script, sorted.
+    pub scripts: Vec<String>,
+    /// Content digest of the whole set; `None` when there are no scripts.
+    /// This is the value the client must hand back to `trust_worktree_hooks`
+    /// so the acceptance binds to the bytes that were actually reviewed.
+    pub digest: Option<String>,
+    pub trusted: bool,
+}
+
+/// The result of a `trust_worktree_hooks` attempt. Mirrors
+/// `crate::harness::native::hooks::TrustOutcome`; both variants carry the
+/// freshly re-read status, so a client can render the outcome without a second
+/// round trip.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", tag = "outcome", content = "status")]
+pub enum WorktreeHookTrustResult {
+    /// The reviewed digest still matched disk; the acceptance was recorded.
+    Recorded(WorktreeHookStatus),
+    /// The scripts changed between being reviewed and being trusted, so
+    /// **nothing was recorded**. The payload is the NEW set for the user to
+    /// review afresh.
+    Changed(WorktreeHookStatus),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -1850,6 +1909,31 @@ pub struct PermissionRuleInfo {
 pub struct AgentValidationInfo {
     pub field: String,
     pub message: String,
+}
+
+/// What `import_agent` landed: the new agent, plus every reference the
+/// bundle carried that does not exist on this machine. A non-empty
+/// `tolerated` means the agent is present but not executable until repaired.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentImportResultInfo {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub renamed: bool,
+    pub knowledge_files_written: u32,
+    pub project_memory_files_skipped: u32,
+    pub tolerated: Vec<AgentValidationInfo>,
+}
+
+/// What `export_agent` produced: the bundle JSON plus the suggested file
+/// name, so the shell can offer it in the save dialog.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentExportInfo {
+    pub file_name: String,
+    pub data: String,
+    pub knowledge_files: u32,
+    pub project_memory_files_skipped: u32,
 }
 
 /// One startup-recovery note surfaced to the UI (for example a quarantined

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowUpRight, Check, CircleAlert, Clock, Copy, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
+import { ArrowUpRight, Check, CircleAlert, Clock, Copy, Folder, GitBranch, MessageSquare, Play, Server, Trash2 } from "lucide-react";
 import { commands } from "@/bindings";
 import {
   duplicateJobInput,
@@ -225,6 +225,7 @@ export function JobDetailView({ id }: { id: string }) {
   const gateways = useGateways((s) => s.gateways);
   const setFocused = useStore((s) => s.setFocused);
   const projects = useStore((s) => s.projects);
+  const sessions = useStore((s) => s.sessions);
   const plugins = usePlugins((s) => s.plugins);
   const nav = useNav();
   const [promptDraft, setPromptDraft] = useState<string | null>(null);
@@ -250,6 +251,18 @@ export function JobDetailView({ id }: { id: string }) {
   // this stays true even after the user fills in a project.
   const pluginOwned = j.pluginId != null;
   const needsTarget = jobNeedsTarget(j);
+  // A job may only report into a chat the user explicitly nominates — every
+  // report starts a real agent turn there. Local engine only (scheduler jobs
+  // always run on the local engine), chat sessions only (a project/worker
+  // session is not a place a user reads reports), and never an ended one: the
+  // background rail can only deliver into an idle session.
+  const homeChatOptions = [
+    { value: "", label: "Don’t report", description: "Results stay in the run history below." },
+    ...sessions
+      .filter((s) => s.runnerId === LOCAL_RUNNER && s.kind === "chat" && s.status !== "ended")
+      .map((s) => ({ value: s.sessionPk, label: s.title ?? "Untitled chat", description: s.sessionPk })),
+  ];
+  const homeChatValue = j.homeSessionPk ?? "";
   const duplicate = async () => {
     setDuplicating(true);
     const created = await createJob(duplicateJobInput(j));
@@ -402,6 +415,28 @@ export function JobDetailView({ id }: { id: string }) {
               disabled={pluginOwned}
               onToggle={() => patch({ notifyFail: !j.notifyFail })}
               label="Notify on failure"
+            />
+          </CardRow>
+          <CardRow>
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-medium">Report to chat</div>
+              <div className="mt-px text-[11.5px] text-muted-foreground">
+                Post each successful run into a chat. Every report starts a real turn there, so it spends tokens and the agent may use
+                tools. Runs that reply with [SILENT] report nothing.
+              </div>
+            </div>
+            <Combobox
+              aria-label="Report to chat"
+              options={homeChatOptions}
+              value={homeChatValue}
+              onValueChange={(pk) => patch({ homeSessionPk: pk === "" ? null : pk })}
+              placeholder="Don’t report"
+              trigger={
+                <Button variant="outline" size="sm">
+                  <MessageSquare aria-hidden size={12} strokeWidth={2} className="size-3" />
+                  {homeChatOptions.find((o) => o.value === homeChatValue)?.label ?? "Chat no longer exists"}
+                </Button>
+              }
             />
           </CardRow>
         </Card>

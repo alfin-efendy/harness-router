@@ -58,6 +58,67 @@ Installers are currently unsigned: on macOS run
 on Windows click through the SmartScreen prompt. Verify downloads against
 `cockpit-checksums.txt` on the release.
 
+### Docker (container image)
+
+Every release publishes a multi-arch image:
+
+```sh
+docker pull ghcr.io/alfin-efendy/ryuzi:latest
+```
+
+The daemon runs as the non-root user `ryuzi` (uid/gid `10001`). It executes
+tools and shell commands on your behalf, so it must not hold root inside the
+container — or on a bind-mounted workspace.
+
+Two directories hold everything that must survive a container restart, and both
+are declared volumes:
+
+| Path in the container | What lives there |
+| --- | --- |
+| `/home/ryuzi/.local/share/ryuzi` | SQLite database, control-API bearer token, TLS cert/key, daemon status file |
+| `/home/ryuzi/.config/ryuzi` | Agent YAML profiles and per-agent knowledge, installed plugin bundles |
+
+**The container is not reachable out of the box.** The default `ryuzi start`
+binds the control API to `127.0.0.1:4483`, which is loopback *inside the
+container's own network namespace* — publishing the port changes nothing. To
+drive the container from Cockpit you must widen the bind with the `listen_addr`
+setting.
+
+A non-loopback `listen_addr` is never served in plaintext: the daemon generates
+a self-signed certificate, persists it in the state dir (so the fingerprint is
+stable across restarts), and serves `https`. `ryuzi pair` prints the code and
+the fingerprint the remote Cockpit pins. If that certificate cannot be created
+or loaded, the daemon refuses to start rather than falling back to plaintext.
+
+```sh
+docker volume create ryuzi-state
+docker volume create ryuzi-config
+
+# One-time: seed the required settings into the persisted database.
+docker run --rm \
+  -v ryuzi-state:/home/ryuzi/.local/share/ryuzi \
+  -v ryuzi-config:/home/ryuzi/.config/ryuzi \
+  ghcr.io/alfin-efendy/ryuzi:latest config set listen_addr 0.0.0.0
+
+docker run --rm \
+  -v ryuzi-state:/home/ryuzi/.local/share/ryuzi \
+  -v ryuzi-config:/home/ryuzi/.config/ryuzi \
+  ghcr.io/alfin-efendy/ryuzi:latest config set workdir_root /workspace
+
+docker run -d --name ryuzi -p 4483:4483 \
+  -v ryuzi-state:/home/ryuzi/.local/share/ryuzi \
+  -v ryuzi-config:/home/ryuzi/.config/ryuzi \
+  -v /srv/projects:/workspace \
+  ghcr.io/alfin-efendy/ryuzi:latest
+```
+
+If you bind-mount host directories instead of named volumes, `chown 10001:10001`
+them on the host first — a root-owned bind mount is not writable by the
+non-root daemon.
+
+Auto-update is notify-only in a container: the image is the unit of upgrade, so
+pull a newer tag and recreate the container.
+
 ## Quick start
 
 Verify your environment:
@@ -123,6 +184,8 @@ Settings live in a local SQLite database at `~/.local/share/ryuzi/ryuzi.sqlite`.
 | `default_effort` | `medium` | Default reasoning effort for new projects. |
 | `default_perm_mode` | `default` | Default approval mode: `default`, `acceptEdits`, or `bypassPermissions`. `bypassPermissions` selected via Discord `/connect` is allowed only for admins (see `admin_role_ids`). |
 | `max_concurrent_runs` | `3` | Max simultaneous sessions. |
+| `control_port` | `4483` | Port the control API listens on. |
+| `listen_addr` | `127.0.0.1` | IP the control API binds to. `0.0.0.0` exposes it on all interfaces; any non-loopback address is served over HTTPS with a self-signed cert the client pins during `ryuzi pair`. |
 | `otel_endpoint` | *(blank)* | OpenTelemetry OTLP/HTTP endpoint (blank = console telemetry). |
 | `admin_role_ids` | *(blank)* | Comma-separated Discord role IDs allowed to administer. **Blank = everyone is admin.** When set, only these roles may select `bypassPermissions` on `/connect`. |
 | `approver_role_ids` | *(blank)* | Comma-separated role IDs allowed to approve tool use. **Blank = only the session starter may approve.** |
@@ -140,7 +203,7 @@ session runs as — under the cross-platform Ryuzi config directory
 ```text
 agents/index.yaml            # agent order + the default (primary) agent id
 agents/subagents.yaml        # shared model/effort config for memoryless subagents
-agents/<agent-id>.yaml       # one profile per main agent: model, permissions, tools, skills
+agents/<agent-id>/agent.yaml # one profile per main agent: model, permissions, tools, skills
 agents/<agent-id>/knowledge/ # that agent's own OKF memory, skill, review, and journey concepts
 ```
 
@@ -149,6 +212,17 @@ The YAML profiles and per-agent OKF (On-disk Knowledge Format) Markdown are
 SQLite (`~/.local/share/ryuzi/ryuzi.sqlite`) stays authoritative for
 everything else: projects, provider accounts/routes, sessions, transcripts,
 runs, queues, and provenance.
+
+**Export / import.** An agent's profile and its knowledge bundle can be
+written to a single `<name>.ryuzi-agent.json` file from the agent's `⋯` menu
+in Cockpit, and imported from the **Import agent** button on the Agents
+screen. The file contains the profile YAML and the agent's OKF Markdown and
+**never contains credentials, provider connections, or session history**;
+per-project memory is left out because project ids are machine-local. An
+imported agent always gets a fresh id, and any skill, plugin tool, app, or
+model it references that this machine does not have is imported as a
+validation issue — the agent appears in the list flagged **Invalid** with the
+missing references listed on its detail page, ready to repair.
 
 > **Agent data reset on first upgrade:** The first launch of this agent schema permanently removes the previous global agent settings, freeform memory files, Learning/curator state, and orchestration DAG data, then creates one main agent named **Ryuzi**. Projects, provider accounts/routes, and historical sessions/transcripts are preserved. Pre-upgrade sessions appear as read-only **Legacy agent** history and are not assigned to Ryuzi.
 

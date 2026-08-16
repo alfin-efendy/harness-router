@@ -42,3 +42,16 @@ pub async fn fetch_artifact(
         )
         .await
 }
+
+/// Run the engine's artifact-retention pass immediately, instead of waiting
+/// for the daemon's hourly timer. Sends no `retentionDays`, so the engine
+/// resolves the operator's configured `artifact_retention_days`. Returns the
+/// number of archived sessions purged.
+#[tauri::command]
+#[specta::specta]
+pub async fn run_artifact_retention(engine: Engine<'_>, runner_id: Option<String>) -> R<u32> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("run_artifact_retention", serde_json::json!({}))
+        .await
+}

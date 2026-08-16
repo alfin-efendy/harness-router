@@ -46,9 +46,9 @@
 //!   `project_id`/`branch`/`gateway` are preserved from the stored row
 //!   whenever non-empty; `cron`/`mode`/`natural_text`/`prompt`/
 //!   `model_override` always refresh from the manifest.
-//! - `notify_success`/`notify_fail`/`pre_check` are pure user preferences a
-//!   manifest never declares — always carried over from the stored row
-//!   (defaulted only when the row is brand new).
+//! - `notify_success`/`notify_fail`/`pre_check`/`home_session_pk` are pure
+//!   user preferences a manifest never declares — always carried over from the
+//!   stored row (defaulted only when the row is brand new).
 //!
 //! # Errors are per-row, never fatal
 //! An unknown trigger spelling (shouldn't happen — manifest `validate()`
@@ -308,37 +308,47 @@ async fn sync_one_job(
     };
 
     let existing = scheduler::get_job(store, &id).await?;
-    let (enabled, project_id, branch, gateway, notify_success, notify_fail, pre_check) =
-        match &existing {
-            Some(existing) => (
-                existing.enabled,
-                existing.project_id.clone(),
-                if existing.branch.trim().is_empty() {
-                    "main".to_string()
-                } else {
-                    existing.branch.clone()
-                },
-                if existing.gateway.trim().is_empty() {
-                    "local".to_string()
-                } else {
-                    existing.gateway.clone()
-                },
-                existing.notify_success,
-                existing.notify_fail,
-                existing.pre_check.clone(),
-            ),
-            // First sync: no target project a plugin could ever guess, so
-            // this installs disabled — see module doc.
-            None => (
-                false,
-                String::new(),
-                "main".to_string(),
-                "local".to_string(),
-                false,
-                false,
-                String::new(),
-            ),
-        };
+    let (
+        enabled,
+        project_id,
+        branch,
+        gateway,
+        notify_success,
+        notify_fail,
+        pre_check,
+        home_session_pk,
+    ) = match &existing {
+        Some(existing) => (
+            existing.enabled,
+            existing.project_id.clone(),
+            if existing.branch.trim().is_empty() {
+                "main".to_string()
+            } else {
+                existing.branch.clone()
+            },
+            if existing.gateway.trim().is_empty() {
+                "local".to_string()
+            } else {
+                existing.gateway.clone()
+            },
+            existing.notify_success,
+            existing.notify_fail,
+            existing.pre_check.clone(),
+            existing.home_session_pk.clone(),
+        ),
+        // First sync: no target project a plugin could ever guess, so
+        // this installs disabled — see module doc.
+        None => (
+            false,
+            String::new(),
+            "main".to_string(),
+            "local".to_string(),
+            false,
+            false,
+            String::new(),
+            None,
+        ),
+    };
 
     let job = JobRow {
         id,
@@ -356,6 +366,7 @@ async fn sync_one_job(
         pre_check,
         model_override: def.model_override.clone(),
         plugin_id: Some(plugin_id.to_string()),
+        home_session_pk,
     };
     scheduler::upsert_job(store, job).await?;
     Ok(true)
@@ -597,6 +608,40 @@ subtask = false
         );
     }
 
+    // Where a job reports is a pure user preference — no manifest declares it,
+    // and `sync_one_job` rebuilds the whole `JobRow` on every re-sync. If the
+    // rebuild dropped it, every plugin update would silently unbind the user's
+    // choice and the job would just quietly stop reporting weeks later.
+    #[tokio::test]
+    async fn a_plugin_update_does_not_unbind_the_chat_a_job_reports_into() {
+        let store = mem_store().await;
+        let plugin = plugin_with_hooks_and_jobs("gh");
+        sync_plugin_automations(&store, &plugin).await.unwrap();
+
+        // The user nominates a chat in the Cockpit job editor.
+        let mut job = scheduler::get_job(&store, "gh/nightly")
+            .await
+            .unwrap()
+            .expect("the manifest's job synced");
+        assert_eq!(job.home_session_pk, None, "a fresh sync reports nowhere");
+        job.home_session_pk = Some("chat-1".into());
+        scheduler::upsert_job(&store, job).await.unwrap();
+
+        // The plugin ships a new release and re-syncs.
+        sync_plugin_automations(&store, &plugin).await.unwrap();
+
+        assert_eq!(
+            scheduler::get_job(&store, "gh/nightly")
+                .await
+                .unwrap()
+                .unwrap()
+                .home_session_pk
+                .as_deref(),
+            Some("chat-1"),
+            "a plugin update must not silently unbind the user's chosen chat"
+        );
+    }
+
     // F3: a plugin update whose manifest drops a previously-declared hook
     // must prune that hook (and its run history) on re-sync, while leaving
     // hooks the manifest still declares — and another plugin's rows, and a
@@ -699,6 +744,7 @@ subtask = false
                 pre_check: String::new(),
                 model_override: None,
                 plugin_id: None,
+                home_session_pk: None,
             },
         )
         .await

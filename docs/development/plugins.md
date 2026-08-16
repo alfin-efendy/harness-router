@@ -390,6 +390,18 @@ token endpoint `https://auth.atlassian.com/oauth/token`. Several path-scoped
 issuers at one provider legitimately share a single endpoint while each holds
 its own client id, so the lookup returns every match and accepts on any.
 
+A row can also carry a client id the **user** supplied, for an authorization
+server that offers no RFC 7591 dynamic registration at all — common for
+enterprise and self-hosted deployments, where registration is an admin action.
+Such a row is flagged `user_asserted` and is written with **no**
+`token_endpoint`, which is what keeps the binding above exactly as strong as it
+was: a NULL endpoint matches nothing, so a user-supplied row authorizes no token
+exchange on its own. `mcp_oauth::begin_mcp_connect` reuses the client id
+verbatim instead of registering a new one, and records the `token_endpoint` from
+the authorization server's real RFC 8414 metadata on that same connect — before
+any completion can happen. No RPC, command or form anywhere accepts a token
+endpoint from a caller, and none may be added.
+
 This is a **deliberately separate store from `plugin_oauth_tokens`** — the
 table a declarative connector's own `[auth]` / `[[oauth]]` flow already
 uses — and the two are never allowed to leak into each other (pinned by a
@@ -664,6 +676,73 @@ file / `release.json` / release-ledger row. Provenance is stamped as
 `install.json` inside the version dir — `InstallProvenance::Catalog`,
 `LocalPath`, or `GitUrl(url)` — defaulting to `Catalog` when absent (every
 pre-Task-11 install path).
+
+---
+
+## Worktree hook scripts (`.ryuzi/hooks`)
+
+These are **not** the `[[hooks]]` manifest surface documented under
+"Automation sync" below. They are git-hook-style executables discovered in the
+*worktree being worked in*, at `.ryuzi/hooks/<event>/<script>`, where `<event>`
+is one of `session.start`, `tool.before`, `tool.after`, `session.end`. Each
+script receives that event's payload as JSON on stdin.
+
+`tool.before` is the only **gating** event: a non-zero exit denies the tool
+call and the script's stdout — capped at 2 000 bytes — becomes the reason
+shown to the model and the user. The other three events are observational and
+can never deny; a non-zero exit there is ignored and the remaining scripts
+still run.
+
+### Trust
+
+These scripts live in the repository, so anyone who can land a commit can
+propose code that runs on the user's machine. A worktree's hook scripts
+therefore **do not run at all** until the user explicitly accepts them in
+Cockpit → Project settings. Acceptance is recorded as the setting
+`worktree.hooks.trust.<digest> = "true"` — the same key-names-the-subject /
+value-is-`"true"` convention as `plugin.<id>.trusted` above.
+
+`<digest>` is a SHA-256 over the whole discovered hook set: each script's
+`"<event>/<file>"` relative name plus the SHA-256 of its bytes, in sorted
+order. Adding, removing or editing any script changes the digest, so the
+acceptance lapses automatically and must be granted again against the new
+bytes.
+
+The key is the content digest and **not** the worktree path, which carries an
+accepted trade-off: two worktrees holding byte-identical hook scripts share one
+acceptance. That is deliberate. A session frequently runs in a git worktree
+whose path differs from the project's `workdir`, and the Cockpit surface only
+knows the latter; content keying guarantees that the bytes the user reviewed
+are exactly the bytes that run, in either location.
+
+The acceptance is bound to the digest the user was **shown**, not to whatever
+is on disk when they click. `trust_worktree_hooks` takes the `digest` from the
+`WorktreeHookStatus` the client rendered, re-hashes the scripts, and records
+nothing unless the two still match — otherwise a `git pull`, a background sync
+or the agent's own file write landing while the modal was open would be trusted
+on the strength of a script list nobody read. A refusal comes back as the typed
+`{ outcome: "changed", status }` result carrying the NEW set, which Project
+settings renders in place of the old list with a prompt to review it again.
+
+### Untrusted behaviour
+
+An untrusted set is discovered and listed in Project settings, but never
+executed — and even a `tool.before` script **allows** the call. A hook that has
+never been permitted to run is not enforcing anything, so skipping it cannot
+weaken an enforcement the user actually had; denying every tool call in a
+freshly cloned repository would instead make the product unusable and train
+users to blanket-trust.
+
+### Bounds
+
+Each script is killed after 30 seconds. A gating hook that times out **denies**
+the call with a message naming the script — it is a hook the user did trust and
+is relying on, so failing open there would silently drop an enforced policy. An
+observational hook that times out is ignored. Turn cancellation likewise kills
+the child and allows, leaving the runner's own cancellation handling to own the
+call's outcome.
+
+Implementation: `crates/core/src/harness/native/hooks.rs`.
 
 ---
 

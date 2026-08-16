@@ -154,6 +154,11 @@ pub struct OauthServerMetadata {
     pub token_endpoint: String,
     #[serde(default)]
     pub registration_endpoint: Option<String>,
+    /// RFC 8414 §2 `scopes_supported`. Absent in most documents, so it
+    /// defaults to empty rather than being an error — an authorization server
+    /// is not required to advertise its scopes.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
 }
 
 /// The RFC 8414 discovery URL candidates for `resource`, most specific

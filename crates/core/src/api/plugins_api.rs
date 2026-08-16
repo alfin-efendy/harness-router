@@ -4207,6 +4207,7 @@ description = "does a thing"
             pre_check: String::new(),
             model_override: None,
             plugin_id: Some("acme".to_string()),
+            home_session_pk: None,
         };
         let info = plugin_job_info(natural_targetless.clone());
         assert_eq!(info.id, "acme/nightly");

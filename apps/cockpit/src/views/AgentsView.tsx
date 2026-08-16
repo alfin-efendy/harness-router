@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ChevronRight, Plus } from "lucide-react";
+import { AlertTriangle, ChevronRight, Plus, Upload } from "lucide-react";
 import { Badge, Button, SettingsCard, cn } from "@ryuzi/ui";
-import type { AgentModelInfo, AgentSummaryInfo } from "@/bindings";
+import type { AgentImportResultInfo, AgentModelInfo, AgentSummaryInfo } from "@/bindings";
 import { AgentAvatar } from "@/components/agents/AgentAvatar";
 import { AgentEditorModal } from "@/components/agents/AgentEditorModal";
+import { AgentImportModal } from "@/components/agents/AgentImportModal";
 import { statsRowFragment } from "@/lib/agent-stats";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
@@ -65,6 +66,7 @@ function AgentRow({ agent }: { agent: AgentSummaryInfo }) {
 
 export function AgentsView() {
   const [createOpen, setCreateOpen] = useState(false);
+  const [importResult, setImportResult] = useState<AgentImportResultInfo | null>(null);
   const registry = useAgents((s) => s.registry);
   const loading = useAgents((s) => s.loading);
   // The registry appends the built-in Fresh Agent row last — render in order,
@@ -81,6 +83,11 @@ export function AgentsView() {
     if (ids.length > 0) void useAgents.getState().loadStatsBatch(ids);
   }, [agents]);
 
+  const runImport = async () => {
+    const result = await useAgents.getState().importAgent();
+    if (result) setImportResult(result);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[860px]">
@@ -89,6 +96,9 @@ export function AgentsView() {
             <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Agents</h2>
             <p className="m-0 text-[13px] text-muted-foreground">Manage the agents available in this workspace.</p>
           </div>
+          <Button variant="outline" onClick={() => void runImport()} aria-label="Import agent" className="shrink-0">
+            <Upload aria-hidden size={14} strokeWidth={2} /> Import agent
+          </Button>
           <Button onClick={() => setCreateOpen(true)} aria-label="New agent" className="shrink-0">
             <Plus aria-hidden size={14} strokeWidth={2} /> New agent
           </Button>
@@ -101,6 +111,7 @@ export function AgentsView() {
         </div>
       </div>
       <AgentEditorModal open={createOpen} onClose={() => setCreateOpen(false)} />
+      <AgentImportModal result={importResult} onClose={() => setImportResult(null)} />
     </div>
   );
 }

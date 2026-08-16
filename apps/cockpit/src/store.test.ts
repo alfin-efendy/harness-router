@@ -1,11 +1,11 @@
 import { test, expect, mock, spyOn } from "bun:test";
-import { useStore, markFocusedSessionReadOnEvent } from "./store";
+import { useStore, markFocusedSessionReadOnEvent, mergePendingApprovals } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import { useDelegation } from "./store-delegation";
-import type { AgentSummaryInfo, TurnInput } from "./bindings";
+import type { AgentSummaryInfo, PendingApprovalRow, TurnInput } from "./bindings";
 import { LAST_PRIMARY_AGENT_KEY, choosePrimaryAgent } from "./store-nav";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
@@ -14,11 +14,15 @@ const k2 = sessKey(LOCAL_RUNNER, "s2");
 
 // refresh() (called fire-and-forget by start/startChat/send/stop/end/cloneProject, and by the
 // result/error event handlers, and awaited directly by send()) always fans out to
-// listGateways too. Mock it wherever listProjects/listSessions are given RESOLVING mocks
-// (never-resolving stubs never reach it, since refresh() awaits listProjects first) so the
-// unmocked Tauri IPC call doesn't reject the chain.
+// listGateways AND listPendingApprovals too. Mock BOTH wherever listProjects/listSessions
+// are given RESOLVING mocks (never-resolving stubs never reach them, since refresh() awaits
+// listProjects first) so the unmocked Tauri IPC call doesn't reject the chain.
 function mockGateways() {
   return spyOn(commands, "listGateways").mockResolvedValue({ status: "ok", data: [] });
+}
+
+function mockPendingApprovals(data: PendingApprovalRow[] = []) {
+  return spyOn(commands, "listPendingApprovals").mockResolvedValue({ status: "ok", data });
 }
 
 function reset() {
@@ -746,6 +750,126 @@ test("resolveApproval calls the run-scoped command and clears that request only"
   resolve.mockRestore();
 });
 
+// A parked approval lives only in engine memory plus a one-shot broadcast, so
+// before hydration a reloaded webview lost the card while the turn stayed
+// parked. refresh() now re-lists them from every runner.
+test("refresh hydrates pending approvals from the runner", async () => {
+  reset();
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGatewaysHydrate = mockGateways();
+  const listPendingHydrate = mockPendingApprovals([
+    {
+      sessionPk: "s1",
+      runId: "run-1",
+      requestId: "r1",
+      requestingAgentId: "agent-1",
+      requestingAgentName: "Agent One",
+      tool: "Bash",
+      summary: "Bash: rm",
+      approvalKind: "tool",
+      input: { command: "rm -rf ./x" },
+      principal: null,
+      createdAt: 1,
+    },
+  ]);
+
+  await useStore.getState().refresh();
+
+  const pending = useStore.getState().pendingApprovals;
+  expect(pending).toHaveLength(1);
+  expect(pending[0].runnerId).toBe(LOCAL_RUNNER);
+  expect(pending[0].runId).toBe("run-1");
+  expect(pending[0].requestId).toBe("r1");
+  expect(pending[0].kind).toBe("tool");
+
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+  listGatewaysHydrate.mockRestore();
+  listPendingHydrate.mockRestore();
+});
+
+// A runner too old to know `list_pending_approvals` rejects the call. That must
+// neither sink the whole refresh (the session list is what every view reads)
+// nor prune the cards that runner already has on screen.
+test("refresh survives a runner that cannot answer listPendingApprovals", async () => {
+  reset();
+  useStore.setState({
+    pendingApprovals: [
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "run-live",
+        requestId: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        kind: "tool",
+        input: {},
+        principal: null,
+      },
+    ],
+  });
+  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "ryuzi/s1" };
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
+  const listGatewaysRej = mockGateways();
+  const listPendingRej = spyOn(commands, "listPendingApprovals").mockRejectedValue(new Error("unknown method"));
+
+  await useStore.getState().refresh();
+
+  // Sessions still landed...
+  expect(useStore.getState().sessions[0].branch).toBe("ryuzi/s1");
+  // ...and the un-answerable runner's live card was NOT pruned.
+  expect(useStore.getState().pendingApprovals.map((a) => a.runId)).toEqual(["run-live"]);
+
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+  listGatewaysRej.mockRestore();
+  listPendingRej.mockRestore();
+});
+
+const liveApproval = (runnerId: string, runId: string, requestId: string) => ({
+  runnerId,
+  sessionPk: "s1",
+  runId,
+  requestId,
+  tool: "Bash",
+  summary: "Bash: rm",
+  kind: "tool" as const,
+  input: {},
+  principal: null,
+});
+
+test("mergePendingApprovals keeps a card that arrived mid-fetch", () => {
+  const live = [liveApproval(LOCAL_RUNNER, "run-new", "r1")];
+  const merged = mergePendingApprovals({ live, before: [], fetched: [], refreshedRunnerIds: [LOCAL_RUNNER] });
+  expect(merged).toHaveLength(1);
+  expect(merged[0].runId).toBe("run-new");
+});
+
+test("mergePendingApprovals drops a card the engine no longer has", () => {
+  const live = [liveApproval(LOCAL_RUNNER, "run-answered", "r1")];
+  const merged = mergePendingApprovals({
+    live,
+    before: [`${LOCAL_RUNNER}:run-answered:r1`],
+    fetched: [],
+    refreshedRunnerIds: [LOCAL_RUNNER],
+  });
+  expect(merged).toHaveLength(0);
+});
+
+test("mergePendingApprovals leaves other runners untouched", () => {
+  const live = [liveApproval("remote-1", "run-remote", "r1")];
+  const merged = mergePendingApprovals({
+    live,
+    before: ["remote-1:run-remote:r1"],
+    fetched: [],
+    refreshedRunnerIds: [LOCAL_RUNNER],
+  });
+  expect(merged).toHaveLength(1);
+  expect(merged[0].runnerId).toBe("remote-1");
+});
+
 test("pending approvals from different sessions both count", () => {
   useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSession: null });
   const s = useStore.getState();
@@ -825,6 +949,7 @@ test("result event triggers a refresh so the git/harness backfill (branch, workt
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
   const listGateways = mockGateways();
+  const listPending = mockPendingApprovals();
 
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" }, LOCAL_RUNNER);
   // refresh() is fire-and-forget; a setTimeout(0) tick drains the whole microtask
@@ -841,6 +966,7 @@ test("result event triggers a refresh so the git/harness backfill (branch, workt
   listProjects.mockRestore();
   listSessions.mockRestore();
   listGateways.mockRestore();
+  listPending.mockRestore();
 });
 
 test("sessionEnded event marks the session ended", () => {
@@ -886,6 +1012,7 @@ test("error event triggers a refresh so the DB-side demotion lands in the UI", a
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [demoted] });
   const listGateways = mockGateways();
+  const listPending = mockPendingApprovals();
 
   useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "boom" }, LOCAL_RUNNER);
   // refresh() is fire-and-forget; a setTimeout(0) tick drains the whole microtask queue
@@ -900,6 +1027,7 @@ test("error event triggers a refresh so the DB-side demotion lands in the UI", a
   listProjects.mockRestore();
   listSessions.mockRestore();
   listGateways.mockRestore();
+  listPending.mockRestore();
 });
 
 test("error event appends no transient row — the durable error row arrives via the message event", () => {
@@ -1192,6 +1320,7 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
+  const listPending = mockPendingApprovals();
 
   // cloneProject is a project-management action — always runs on the local engine.
   const ok = await useStore.getState().cloneProject("https://github.com/user/repo.git", "C:\\proj");
@@ -1204,6 +1333,7 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
   listProjects.mockRestore();
   listSessions.mockRestore();
   listGateways.mockRestore();
+  listPending.mockRestore();
 });
 
 test("a completed todowrite tool_call triggers a todo refetch for its session", () => {
@@ -1276,6 +1406,7 @@ test("send preserves /orchestrate text as an ordinary turn input", async () => {
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
+  const listPending = mockPendingApprovals();
   const turn: TurnInput = { text: "/orchestrate audit", context: null, attachments: [], git: null };
 
   await expect(useStore.getState().send(LOCAL_RUNNER, "s1", turn)).resolves.toBe(true);
@@ -1285,6 +1416,7 @@ test("send preserves /orchestrate text as an ordinary turn input", async () => {
   listProjects.mockRestore();
   listSessions.mockRestore();
   listGateways.mockRestore();
+  listPending.mockRestore();
 });
 
 test("send resolves true on success and false on backend error (drives composer draft restore)", async () => {
@@ -1293,6 +1425,7 @@ test("send resolves true on success and false on backend error (drives composer 
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
+  const listPending = mockPendingApprovals();
 
   await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(true);
 
@@ -1305,6 +1438,7 @@ test("send resolves true on success and false on backend error (drives composer 
   listProjects.mockRestore();
   listSessions.mockRestore();
   listGateways.mockRestore();
+  listPending.mockRestore();
 });
 
 test("send steers a RUNNING session instead of starting a new turn via continue", async () => {
@@ -1315,6 +1449,7 @@ test("send steers a RUNNING session instead of starting a new turn via continue"
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
+  const listPending = mockPendingApprovals();
 
   await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hold on", context: null, attachments: [], git: null })).resolves.toBe(
     true,
@@ -1327,6 +1462,7 @@ test("send steers a RUNNING session instead of starting a new turn via continue"
   listProjects.mockRestore();
   listSessions.mockRestore();
   listGateways.mockRestore();
+  listPending.mockRestore();
 });
 
 test("send falls back to continue for a session that is not running", async () => {
@@ -1337,6 +1473,7 @@ test("send falls back to continue for a session that is not running", async () =
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
+  const listPending = mockPendingApprovals();
 
   await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "go", context: null, attachments: [], git: null })).resolves.toBe(true);
   expect(cont).toHaveBeenCalled();
@@ -1347,6 +1484,7 @@ test("send falls back to continue for a session that is not running", async () =
   listProjects.mockRestore();
   listSessions.mockRestore();
   listGateways.mockRestore();
+  listPending.mockRestore();
 });
 
 test("setFocused marks the previously-focused session read up to its lastActive", () => {

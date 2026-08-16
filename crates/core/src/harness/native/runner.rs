@@ -54,7 +54,7 @@ const TEXT_FLUSH_BYTES: usize = 120;
 /// own `for_model` text is already model-facing (not raw secret material),
 /// but an external hook script is a different trust boundary than the LLM,
 /// so the observational payload still gets a hard size ceiling.
-const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
+pub(crate) const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
 const PERSISTED_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const TOOL_DISPLAY_SUMMARY_BYTES: usize = 240;
 
@@ -165,6 +165,12 @@ pub struct RunnerDeps {
     /// call reaches whichever turn is currently draining it. Survives across
     /// turns: `refresh_turn_model` clones the whole `RunnerDeps` per turn, but
     /// `SteerBuffer`'s clone shares the underlying `Arc<Mutex<Vec<_>>>`.
+    ///
+    /// Sub-agents are the exception: `deps_for_subagent` and
+    /// `RunnerMainAgentSpawner::execute_child` install a FRESH empty buffer, and
+    /// `drive` only drains when `DisplayMode::owns_steer()`. A child drive runs
+    /// against an ephemeral `ContextManager` and writes no message row, so a
+    /// child that consumed a steer would destroy a user instruction silently.
     pub steer: SteerBuffer,
     /// Shared async-delegation capacity gate (spec §6.2), from `SessionCtx`.
     pub background: Arc<super::background::BackgroundRegistry>,
@@ -1008,12 +1014,6 @@ enum DisplayMode {
     /// thinking, notices, and context usage stay internal (the report arrives
     /// via the parent's `task` tool output).
     ToolsOnly { label: String },
-    /// Fully silent drive: no text/thinking/notice/context-usage display, no
-    /// auto-continue, no compaction. Retained (with its `text()`/compaction
-    /// plumbing) for a headless drive with no transcript surface; it has no
-    /// constructor since the background review fork that used it was removed.
-    #[allow(dead_code)]
-    Silent,
 }
 
 impl DisplayMode {
@@ -1021,17 +1021,22 @@ impl DisplayMode {
     fn text(&self) -> bool {
         matches!(self, DisplayMode::Full)
     }
-    /// Whether the auto-continue re-grant applies. Parent turns and delegated
-    /// sub-agents (`ToolsOnly`) both continue past a spent budget window; a
-    /// fully-silent drive keeps the hard stop.
-    fn auto_continues(&self) -> bool {
-        matches!(self, DisplayMode::Full | DisplayMode::ToolsOnly { .. })
+    /// Whether this drive owns the session's mid-turn steer buffer. Only the
+    /// user-visible session turn (`Full`) may drain it: a steer is a message
+    /// from the user to THIS session, and a sub-agent drive (`ToolsOnly`) runs
+    /// against a `ContextManager::ephemeral` whose history is discarded, so a
+    /// child that drained it would destroy the instruction with no transcript
+    /// row and no way to recover it. Deliberately separate from `text()` even
+    /// though both are `Full`-only today: display policy and steer ownership
+    /// are different concerns and must be able to change independently.
+    fn owns_steer(&self) -> bool {
+        matches!(self, DisplayMode::Full)
     }
     /// Sub-agent attribution label for tool rows, if any.
     fn subagent(&self) -> Option<&str> {
         match self {
             DisplayMode::ToolsOnly { label } => Some(label),
-            DisplayMode::Full | DisplayMode::Silent => None,
+            DisplayMode::Full => None,
         }
     }
 }
@@ -1262,7 +1267,7 @@ async fn drive(
     // each auto-continue (`agent.max_provider_turns`). The parent budget itself
     // is seeded from the same setting in `run_turn`; this read defaults to the
     // same [`PARENT_MAX_ITERS`] ceiling and is consulted on both the top-level
-    // and delegated-sub-agent auto-continue paths (see `auto_continues()`).
+    // and delegated-sub-agent auto-continue paths (see `auto_budget` below).
     // Intentional split: a sub-agent's INITIAL window is the
     // [`SUBAGENT_MAX_ITERS`] constant (set where its budget is constructed at
     // delegation), while every RE-GRANT here — parent or sub-agent — comes from
@@ -1272,20 +1277,17 @@ async fn drive(
     let max_turns =
         crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
             .await;
-    // Auto-continue applies to the parent and to delegated sub-agents
-    // (`DisplayMode::auto_continues()`); a fully-silent drive keeps the hard
-    // stop. Read without usize_setting's floor so "0" can disable it.
-    let auto_budget = if display.auto_continues() {
-        deps.store
-            .get_setting("agent.auto_continue_budget")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4)
-    } else {
-        0
-    };
+    // Auto-continue applies to every drive — the parent turn and delegated
+    // sub-agents alike. Read without usize_setting's floor so "0" can disable
+    // it.
+    let auto_budget = deps
+        .store
+        .get_setting("agent.auto_continue_budget")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
 
     // Composition of two loop-control features:
     //   * The consumable `IterationBudget` (Phase 2) is THE turn cap — the
@@ -1304,8 +1306,7 @@ async fn drive(
                 return Ok(final_text);
             }
             // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
-            // A fully-silent drive (`DisplayMode::Silent`) never compacts.
-            if !matches!(display, DisplayMode::Silent) && cm.status().needs_compaction {
+            if cm.status().needs_compaction {
                 let trigger = if provider_turn == 0 {
                     "pre_turn"
                 } else {
@@ -1560,7 +1561,6 @@ async fn drive(
                     emit_run_context_usage(deps, cm).await;
                     emit_run_cost(deps, cm).await;
                 }
-                DisplayMode::Silent => {}
             }
             if !turn.text.is_empty() {
                 final_text = turn.text.clone();
@@ -1623,10 +1623,12 @@ async fn drive(
                 // message and loop once more so the model actually responds to the
                 // steer, instead of losing it — or leaking it, stale, into a later
                 // unrelated turn's tool-result batch.
-                if let Some(block) = deps.steer.take_block() {
-                    cm.append_user_text(&block).await?;
-                    provider_turn += 1;
-                    continue;
+                if display.owns_steer() {
+                    if let Some(block) = deps.steer.take_block() {
+                        cm.append_user_text(&block).await?;
+                        provider_turn += 1;
+                        continue;
+                    }
                 }
                 return Ok(final_text); // end_turn
             }
@@ -1686,8 +1688,10 @@ async fn drive(
             // alongside — so the model sees it on the NEXT iteration's request,
             // wrapped in the verbatim marker the system prompt teaches it to
             // trust as a direct user instruction.
-            if let Some(block) = deps.steer.take_block() {
-                cm.append_user_text(&block).await?;
+            if display.owns_steer() {
+                if let Some(block) = deps.steer.take_block() {
+                    cm.append_user_text(&block).await?;
+                }
             }
 
             if cancel.is_cancelled() {
@@ -1697,8 +1701,8 @@ async fn drive(
         }
         // Budget window exhausted without an end_turn. Auto-continue (#100)
         // applies to the parent and to delegated sub-agents alike
-        // (`display.auto_continues()`; only a fully-silent drive has
-        // auto_budget == 0): re-grant a fresh budget window and loop back into
+        // (`auto_budget`, from `agent.auto_continue_budget`, is 0 only when an
+        // operator disables it): re-grant a fresh budget window and loop into
         // `while budget.try_consume()`. The visible notice below is gated on
         // `display.text()` separately, so sub-agents auto-continue silently —
         // no transcript-notice row, no fake user message appended for them to
@@ -1763,8 +1767,10 @@ async fn drive(
     // Fold it into `cm` so the terminal summary call (and, when no model is
     // configured, the ledger the next turn resumes from) sees it rather than
     // dropping it silently.
-    if let Some(block) = deps.steer.take_block() {
-        cm.append_user_text(&block).await?;
+    if display.owns_steer() {
+        if let Some(block) = deps.steer.take_block() {
+            cm.append_user_text(&block).await?;
+        }
     }
     // Budget exhausted with tool calls still pending: make one tool-less
     // call asking the model for a final summary instead of leaving the user
@@ -1963,7 +1969,9 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         memory: None,
         snapshots: deps.snapshots.clone(),
         snapshot_taker: deps.snapshot_taker.clone(),
-        steer: deps.steer.clone(),
+        // A fresh, EMPTY buffer: a steer belongs to the user's session turn,
+        // never to a memoryless `task` child whose history is ephemeral.
+        steer: SteerBuffer::new(),
         background: deps.background.clone(),
         app_control: None,
         activated_tools: None,
@@ -2155,6 +2163,9 @@ impl RunnerMainAgentSpawner {
             // A delegated target may advertise its configured app tool but
             // never receives the parent's app-control facade to execute it.
             child_deps.app_control = None;
+            // Same rule as `deps_for_subagent`: a delegated child never shares
+            // the parent session's steer buffer.
+            child_deps.steer = SteerBuffer::new();
             child_deps.perm_overrides = Arc::new(std::sync::Mutex::new(Default::default()));
             child_deps.perm_mode = Arc::new(std::sync::Mutex::new(primary_turn.perm_mode));
             child_deps.model = primary_turn.model;
@@ -2982,9 +2993,11 @@ async fn execute_tool_call(
     cancel: &CancellationToken,
 ) -> Value {
     let hook = super::hooks::fire_hook(
+        &deps.store,
         &deps.work_dir,
         super::hooks::HookEvent::ToolBefore,
         &json!({ "tool": tool_name, "input": input }),
+        Some(cancel),
     )
     .await;
     crate::automation::dispatch_lifecycle_observation(
@@ -3015,6 +3028,38 @@ async fn execute_tool_call(
                     ToolErrorCategory::Permission,
                     "hook_denied",
                     "Tool call was denied by a policy hook",
+                ),
+                legacy_text: message,
+            },
+        )
+        .await
+        .provider_result;
+    }
+
+    // Gateway filesystem-access scope (Gateways screen → "Filesystem access").
+    // Checked before the permission gate so a blocked call never prompts the
+    // user for something the machine's policy already refuses.
+    if let super::fs_access::FsVerdict::Deny(code, message) =
+        super::fs_access::decide_for_session(&deps.store, &deps.work_dir, tool_kind).await
+    {
+        return complete_tool_call(
+            deps,
+            tool_call_id,
+            ToolCompletionContext {
+                version,
+                planned,
+                tool_name,
+                tool_kind,
+                trace_id,
+                duration_ms: 0,
+                normalization,
+                preflight,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::new(
+                    ToolErrorCategory::Permission,
+                    code,
+                    "Tool call was denied by the gateway filesystem policy",
                 ),
                 legacy_text: message,
             },
@@ -3182,6 +3227,7 @@ async fn execute_tool_call(
             requesting_agent_name: agent.name.clone(),
             perm_mode: deps.perm_mode.clone(),
             project_id: deps.project_id.clone(),
+            store: deps.store.clone(),
         })),
         app: deps.app_control.clone(),
         write_origin: deps.write_origin,
@@ -3446,9 +3492,11 @@ async fn fire_tool_after_observation(
 ) {
     let after_payload = json!({ "tool": tool_name, "input": input, "result": hook_summary });
     let _ = super::hooks::fire_hook(
+        &deps.store,
         &deps.work_dir,
         super::hooks::HookEvent::ToolAfter,
         &after_payload,
+        None,
     )
     .await;
     crate::automation::dispatch_lifecycle_observation(
@@ -5757,16 +5805,6 @@ mod tests {
         assert_eq!(sub.subagent(), Some("explore"));
     }
 
-    #[test]
-    fn display_mode_auto_continues_covers_parent_and_subagent_not_silent() {
-        assert!(DisplayMode::Full.auto_continues());
-        assert!(DisplayMode::ToolsOnly {
-            label: "sub".into()
-        }
-        .auto_continues());
-        assert!(!DisplayMode::Silent.auto_continues());
-    }
-
     /// Narrow one native tool's decision on `deps.primary_agent`'s profile to
     /// `Ask` (deferring to `permission_rules` → session overrides → project
     /// policy → `perm_mode`'s prompt path). The bootstrapped default Ryuzi
@@ -6160,6 +6198,7 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         run_turn(
             &deps,
             TurnPrompt::text("go", "go"),
@@ -6252,6 +6291,7 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let sink = Arc::new(BlockingAutomationSink {
@@ -7940,6 +7980,83 @@ mod tests {
         assert!(rendered.contains("actually, stop"));
         // Drained exactly once — a later turn will not see it again.
         assert!(deps.steer.take_block().is_none());
+    }
+
+    /// Regression: a steer that lands while a `task` sub-agent is in flight
+    /// must be consumed by the PARENT drive, not by the child. A child runs
+    /// against a `ContextManager::ephemeral` and the steer path writes no
+    /// message row, so a child that drained the buffer would destroy the
+    /// user's instruction with no trace anywhere.
+    #[tokio::test]
+    async fn steer_during_a_subagent_lands_in_the_parent_not_the_child() {
+        use super::super::steer::{STEER_MARKER_CLOSE, STEER_MARKER_OPEN};
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Parent calls task -> child explore runs -> parent closes.
+        let parent = vec![
+            tool_use_start(0, "c1", "task"),
+            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"look\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let sub = vec![
+            text_delta("found"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let parent_end = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        // Only consumed if the CHILD wrongly drains the steer and takes an
+        // extra round, which shifts every later response by one. Scripted so
+        // the regression fails on the request-count assertion below instead of
+        // on a "no more scripted turns" error.
+        let spare = vec![
+            text_delta("extra"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![parent, sub, parent_end, spare]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+
+        // Queued before the turn starts: `take_block()` picks up whatever is
+        // buffered the instant a drive reaches a drain point, so this is
+        // equivalent to a `steer` RPC landing while the child is running.
+        deps.steer.push("stop and check the tests first".into());
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            3,
+            "expected parent tool round, child round, parent continuation — a 4th \
+             request means the sub-agent drained the steer and took an extra round"
+        );
+        // The child's request must not carry the steer in its MESSAGES. Never
+        // assert on a whole body here: the system prompt teaches the marker
+        // verbatim, so the marker is present in every request's `system`.
+        let child_messages = serde_json::to_string(&bodies[1]["messages"]).unwrap();
+        assert!(
+            !child_messages.contains("stop and check the tests first"),
+            "the sub-agent must never receive the parent's steer: {child_messages}"
+        );
+        // The parent's continuation carries it, wrapped in the verbatim marker.
+        let parent_messages = bodies[2]["messages"].as_array().unwrap();
+        let last = parent_messages.last().expect("at least one message");
+        assert_eq!(last["role"], "user");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(rendered.contains(STEER_MARKER_OPEN));
+        assert!(rendered.contains(STEER_MARKER_CLOSE));
+        assert!(rendered.contains("stop and check the tests first"));
     }
 
     #[tokio::test]
@@ -9984,7 +10101,7 @@ mod tests {
                     input_json: String::new(),
                     input_overflowed: false,
                 },
-                &DisplayMode::Silent,
+                &DisplayMode::Full,
                 &None,
                 &CancellationToken::new(),
             )
@@ -10017,7 +10134,7 @@ mod tests {
                 input_json: String::new(),
                 input_overflowed: false,
             },
-            &DisplayMode::Silent,
+            &DisplayMode::Full,
             &None,
             &CancellationToken::new(),
         )
@@ -10064,7 +10181,7 @@ mod tests {
                     deps,
                     &deps.agent,
                     validated,
-                    &DisplayMode::Silent,
+                    &DisplayMode::Full,
                     &None,
                     &CancellationToken::new(),
                     plan,
@@ -10072,7 +10189,7 @@ mod tests {
                 .await
             }
             V2BatchCall::Rejected(rejected) => {
-                complete_rejected_v2_call(deps, rejected, &DisplayMode::Silent, plan).await
+                complete_rejected_v2_call(deps, rejected, &DisplayMode::Full, plan).await
             }
         }
     }
@@ -10364,6 +10481,7 @@ mod tests {
 
         let llm = Arc::new(V2RecordingLlm::new(vec![]));
         let mut deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         enable_v2(&mut deps);
         deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
         let compiled = crate::harness::native::tool_plan::compile_candidate(
@@ -10492,7 +10610,7 @@ mod tests {
             &deps,
             &deps.agent,
             validated,
-            &DisplayMode::Silent,
+            &DisplayMode::Full,
             &None,
             &CancellationToken::new(),
             &plan,
@@ -11081,6 +11199,31 @@ mod tests {
         assert_eq!(child.work_dir, parent.work_dir);
         assert_eq!(child.project_id, parent.project_id);
         assert!(child.app_control.is_none());
+    }
+
+    /// The parent's steer buffer must not be shared with a `task` child: a
+    /// sub-agent drive that drained it would swallow a user instruction the
+    /// parent never sees (the child's history is ephemeral and unpersisted).
+    #[tokio::test]
+    async fn subagent_deps_get_a_fresh_steer_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(testutil::RecordingLlm::new(vec![]));
+        let parent = deps_at(dir.path(), llm).await;
+        parent.steer.push("parent-only steer".into());
+
+        let child = deps_for_subagent(&parent).await.unwrap();
+
+        assert!(
+            child.steer.take_block().is_none(),
+            "the child must start with an EMPTY, independent steer buffer"
+        );
+        assert!(
+            parent
+                .steer
+                .take_block()
+                .is_some_and(|block| block.contains("parent-only steer")),
+            "draining the child must not consume the parent's queued steer"
+        );
     }
 
     #[tokio::test]
@@ -11832,8 +11975,8 @@ mod tests {
     /// Asserts (a) the drive auto-continued rather than hard-stopping, and
     /// (b) NOTHING was emitted to the transcript for the auto-continue: no
     /// `notice` row and no assistant `text` row, because `display.text()` is
-    /// false for `ToolsOnly` (a pure enum test on `auto_continues()` can't
-    /// catch either property — only driving the loop end-to-end can).
+    /// false for `ToolsOnly` (a pure enum test can't catch either property —
+    /// only driving the loop end-to-end can).
     #[tokio::test]
     async fn subagent_tools_only_auto_continues_silently() {
         use testutil::RecordingLlm;
@@ -13426,6 +13569,7 @@ mod tests {
         ];
         let llm = Arc::new(V2RecordingLlm::new(vec![tool_turn]));
         let mut deps = deps_at(dir.path(), llm).await;
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         enable_v2(&mut deps);
         deps.agent.tools = crate::harness::native::agents::ToolFilter::All;
         deps.tools = Arc::new(ToolRegistry::with_extra(vec![

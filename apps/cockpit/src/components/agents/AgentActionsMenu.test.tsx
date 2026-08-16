@@ -92,7 +92,7 @@ beforeEach(async () => {
 
 afterEach(cleanup);
 
-test("menu contains exactly Start chat, Duplicate, and Delete", () => {
+test("menu contains exactly Start chat, Duplicate, Export…, and Delete", () => {
   render(<AgentActionsMenu agent={reviewerSummary()} />);
   // No standalone Start chat Button anywhere — it exists only inside the menu.
   expect(screen.queryByRole("button", { name: "Start chat" })).toBeNull();
@@ -102,7 +102,7 @@ test("menu contains exactly Start chat, Duplicate, and Delete", () => {
     within(panel)
       .getAllByRole("button")
       .map((item) => item.textContent),
-  ).toEqual(["Start chat", "Duplicate", "Delete"]);
+  ).toEqual(["Start chat", "Duplicate", "Export…", "Delete"]);
 });
 
 test("Start chat preselects the agent through navigation state", () => {

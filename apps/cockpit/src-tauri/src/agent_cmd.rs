@@ -12,10 +12,11 @@ use std::sync::Arc;
 use tauri::State;
 
 use ryuzi_core::api::types::{
-    AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
-    AgentMutationInfo, AgentRegistryInfo, AgentStatsInfo, AgentStatsLite, KnowledgeConceptInfo,
-    KnowledgeConceptMutationInfo,
+    AgentConfigurationCatalogInfo, AgentDetailInfo, AgentExportInfo, AgentImportResultInfo,
+    AgentLearningInfo, AgentModelInfo, AgentMutationInfo, AgentRegistryInfo, AgentStatsInfo,
+    AgentStatsLite, KnowledgeConceptInfo, KnowledgeConceptMutationInfo,
 };
+use tauri_plugin_dialog::DialogExt;
 
 // Re-exported by name for a complete, documented DTO surface; specta still
 // emits these via the command type graph either way.
@@ -37,6 +38,10 @@ type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 fn agent_id_params(agent_id: &str) -> serde_json::Value {
     serde_json::json!({ "agent_id": agent_id })
+}
+
+fn import_agent_params(data: &str) -> serde_json::Value {
+    serde_json::json!({ "data": data })
 }
 
 fn create_agent_params(input: &AgentMutationInfo) -> serde_json::Value {
@@ -167,6 +172,28 @@ pub async fn duplicate_agent(
     engine
         .client(runner_id.as_deref().unwrap_or("local"))?
         .rpc("duplicate_agent", agent_id_params(&agent_id))
+        .await
+}
+
+// Bundles carry the agent's knowledge tree, which lives in the LOCAL engine
+// (same reason the Learning commands below are local-only), so these never
+// take a `runner_id`.
+
+#[tauri::command]
+#[specta::specta]
+pub async fn export_agent(engine: Engine<'_>, agent_id: String) -> R<AgentExportInfo> {
+    engine
+        .client("local")?
+        .rpc("export_agent", agent_id_params(&agent_id))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn import_agent(engine: Engine<'_>, data: String) -> R<AgentImportResultInfo> {
+    engine
+        .client("local")?
+        .rpc("import_agent", import_agent_params(&data))
         .await
 }
 
@@ -394,6 +421,57 @@ pub async fn list_selectable_models(
         .await
 }
 
+/// Prompts for a save location and writes an exported agent bundle there.
+/// Returns the chosen path, or `None` when the user cancelled.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_agent_bundle(
+    app: tauri::AppHandle,
+    file_name: String,
+    data: String,
+) -> R<Option<String>> {
+    let picked = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(&file_name)
+            .add_filter("Ryuzi agent bundle", &["json"])
+            .blocking_save_file()
+    })
+    .await
+    .ok()
+    .flatten()
+    .map(|path| path.to_string());
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    std::fs::write(std::path::PathBuf::from(&path), data)
+        .map_err(|error| CmdError::from(anyhow::anyhow!("failed to write {path}: {error}")))?;
+    Ok(Some(path))
+}
+
+/// Prompts for an agent bundle file and returns its text. `None` when the
+/// user cancelled.
+#[tauri::command]
+#[specta::specta]
+pub async fn read_agent_bundle(app: tauri::AppHandle) -> R<Option<String>> {
+    let picked = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("Ryuzi agent bundle", &["json"])
+            .blocking_pick_file()
+    })
+    .await
+    .ok()
+    .flatten()
+    .map(|path| path.to_string());
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    let data = std::fs::read_to_string(std::path::PathBuf::from(&path))
+        .map_err(|error| CmdError::from(anyhow::anyhow!("failed to read {path}: {error}")))?;
+    Ok(Some(data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +527,14 @@ mod tests {
         assert_eq!(
             agent_id_params("reviewer"),
             serde_json::json!({"agent_id": "reviewer"})
+        );
+    }
+
+    #[test]
+    fn import_agent_payload_matches_core_rpc_contract() {
+        assert_eq!(
+            import_agent_params("{\"bundle_version\":1}"),
+            serde_json::json!({"data": "{\"bundle_version\":1}"})
         );
     }
 

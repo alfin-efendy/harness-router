@@ -221,37 +221,37 @@ export function GatewayDetailView({ id }: { id: string }) {
               </span>
             )}
           </div>
-          <div className="flex flex-col gap-2 px-[18px] py-3">
-            <div className="flex items-center gap-3">
-              <span className="flex-1 text-[12.5px] font-medium">Filesystem access</span>
-              <Segmented
-                options={GW_FS_MODES.map((m) => ({ id: m.id, label: m.label }))}
-                value={g.fsMode as GatewayFsMode}
-                onChange={(m) => void updateFs(g.id, m, g.paths)}
-              />
-            </div>
-            <div className="text-right text-[11.5px] text-muted-foreground">{fsDesc}</div>
-            {g.fsMode === "projects" && (
-              <div className="flex flex-wrap gap-1.5">
-                {g.paths.map((p) => (
-                  <Button
-                    key={p}
-                    variant="outline"
-                    size="xs"
-                    title="Remove folder"
-                    onClick={() =>
-                      void updateFs(
-                        g.id,
-                        g.fsMode,
-                        g.paths.filter((x) => x !== p),
-                      )
-                    }
-                    className="rounded-full font-mono"
-                  >
-                    {p}
-                  </Button>
-                ))}
-                {g.kind === "local" && (
+          {g.kind === "local" && (
+            <div className="flex flex-col gap-2 px-[18px] py-3">
+              <div className="flex items-center gap-3">
+                <span className="flex-1 text-[12.5px] font-medium">Filesystem access</span>
+                <Segmented
+                  options={GW_FS_MODES.map((m) => ({ id: m.id, label: m.label }))}
+                  value={g.fsMode as GatewayFsMode}
+                  onChange={(m) => void updateFs(g.id, m, g.paths)}
+                />
+              </div>
+              <div className="text-right text-[11.5px] text-muted-foreground">{fsDesc}</div>
+              {g.fsMode === "projects" && (
+                <div className="flex flex-wrap gap-1.5">
+                  {g.paths.map((p) => (
+                    <Button
+                      key={p}
+                      variant="outline"
+                      size="xs"
+                      title="Remove folder"
+                      onClick={() =>
+                        void updateFs(
+                          g.id,
+                          g.fsMode,
+                          g.paths.filter((x) => x !== p),
+                        )
+                      }
+                      className="rounded-full font-mono"
+                    >
+                      {p}
+                    </Button>
+                  ))}
                   <Button
                     variant="outline"
                     size="xs"
@@ -261,10 +261,20 @@ export function GatewayDetailView({ id }: { id: string }) {
                     <Plus aria-hidden size={10} strokeWidth={2} className="size-2.5" />
                     Add folder
                   </Button>
-                )}
-              </div>
-            )}
-          </div>
+                </div>
+              )}
+            </div>
+          )}
+          {/* `updateFs` always writes to the LOCAL engine's database (store-gateways.ts
+              passes "local" as the runner id), while a remote runner enforces its OWN
+              gateways row. Offering the control for a remote gateway would recreate
+              exactly the false guarantee this card used to imply. */}
+          {g.kind !== "local" && (
+            <div className="flex items-center gap-3 px-[18px] py-3">
+              <span className="flex-1 text-[12.5px] font-medium">Filesystem access</span>
+              <span className="shrink-0 text-[12.5px] text-muted-foreground">Configured on that machine</span>
+            </div>
+          )}
         </Card>
 
         <Card>

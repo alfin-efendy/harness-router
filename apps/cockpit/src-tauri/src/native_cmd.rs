@@ -9,7 +9,7 @@ use tauri::State;
 
 pub use ryuzi_core::api::types::{
     AgentInfo, CommandFileInfo, CommandFileInputDto, CommandFileMutationDto, QueuedMessageInfo,
-    SlashEntryInfo, TodoItem,
+    SlashEntryInfo, TodoItem, WorktreeHookStatus, WorktreeHookTrustResult,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -28,6 +28,48 @@ pub async fn native_agents(
         .rpc(
             "native_agents",
             serde_json::json!({ "project_id": project_id }),
+        )
+        .await
+}
+
+/// The `.ryuzi/hooks` scripts present in a project's worktree and whether the
+/// user has trusted this exact set. Untrusted scripts are never executed.
+#[tauri::command]
+#[specta::specta]
+pub async fn worktree_hook_status(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+) -> R<WorktreeHookStatus> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "worktree_hook_status",
+            serde_json::json!({ "project_id": project_id }),
+        )
+        .await
+}
+
+/// Record the user's explicit acceptance of the hook scripts currently on
+/// disk in a project's worktree. Editing any of them revokes the acceptance.
+///
+/// `digest` is the hook-set digest the caller DISPLAYED (`WorktreeHookStatus.
+/// digest`). The engine refuses to record anything if the scripts on disk no
+/// longer hash to it, so the acceptance can only ever bind to bytes the user
+/// actually reviewed.
+#[tauri::command]
+#[specta::specta]
+pub async fn trust_worktree_hooks(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    digest: String,
+) -> R<WorktreeHookTrustResult> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "trust_worktree_hooks",
+            serde_json::json!({ "project_id": project_id, "digest": digest }),
         )
         .await
 }

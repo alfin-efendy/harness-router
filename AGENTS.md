@@ -181,10 +181,14 @@ Choose the smallest meaningful verification set for the files you touched:
 CI (`.github/workflows/ci.yml`) uses Bun 1.3.14 with
 `bun install --frozen-lockfile`, then: `bunx biome ci .` + `shellcheck
 install.sh`; `bun run typecheck` + `bun test`; `cargo fmt --check`,
-`cargo clippy -p ryuzi-core -p ryuzi-runner --all-targets -- -D warnings`,
-`cargo test -p ryuzi-core -p ryuzi-runner`, and a build + `--version`/`--help`
-smoke of the `ryuzi` binary; Playwright e2e for Cockpit; and an osv-scanner
-pass over both lockfiles.
+`cargo clippy -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk --all-targets
+-- -D warnings`, `cargo test -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk`,
+`cargo test --manifest-path` over every `plugins/*/Cargo.toml`, and a build +
+`--version`/`--help` smoke of the `ryuzi` binary; a separate `cockpit-rust` job
+running `cargo clippy -p ryuzi-cockpit --all-targets -- -D warnings` and
+`cargo test -p ryuzi-cockpit` on Linux (Tauri webkit system deps installed
+first); Playwright e2e for Cockpit; and an osv-scanner pass over both
+lockfiles.
 
 ## 6. Good and Bad Examples
 

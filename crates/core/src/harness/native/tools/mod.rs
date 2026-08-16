@@ -277,6 +277,9 @@ pub struct Interaction {
     /// The session's live permission mode (shared with `RunnerDeps`).
     pub perm_mode: Arc<std::sync::Mutex<crate::domain::PermMode>>,
     pub project_id: Option<String>,
+    /// Needed to persist a parked approval so a reconnecting surface can
+    /// re-list it (see `crate::approval::persist_pending`).
+    pub store: Arc<Store>,
 }
 
 impl Interaction {
@@ -295,6 +298,32 @@ impl Interaction {
     ) -> Option<crate::domain::ApprovalResponse> {
         let key = ApprovalKey::new(&self.run_id, request_id);
         let rx = self.approvals.register_for_session(session_pk, key.clone());
+        // Durability: the reply channel above is process-local, so a reloaded
+        // Cockpit would otherwise lose this prompt while the call stays
+        // parked. The delete below runs on EVERY exit path. Best-effort — a
+        // failed write must never change the outcome of the prompt.
+        if let Err(error) = crate::approval::persist_pending(
+            &self.store,
+            crate::domain::PendingApprovalRow {
+                session_pk: session_pk.to_string(),
+                run_id: self.run_id.clone(),
+                request_id: request_id.to_string(),
+                requesting_agent_id: self.requesting_agent_id.clone(),
+                requesting_agent_name: self.requesting_agent_name.clone(),
+                tool: tool.to_string(),
+                summary: summary.to_string(),
+                approval_kind,
+                // `input` is moved into the event send below; the row keeps
+                // its own copy.
+                input: input.clone(),
+                principal: None,
+                created_at: crate::paths::now_ms(),
+            },
+        )
+        .await
+        {
+            tracing::warn!("approvals: failed to persist a parked interaction: {error}");
+        }
         let _ = self
             .events
             .send(crate::domain::CoreEvent::ApprovalRequested {
@@ -312,14 +341,22 @@ impl Interaction {
                 // for `mcp__<server>__<tool>` calls via `permission::evaluate`.
                 principal: None,
             });
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 self.approvals.resolve_bool(&key, false);
                 None
             }
             res = rx => res.ok(),
+        };
+        // Answered or cancelled — both complete the oneshot above, so this one
+        // delete covers every exit path.
+        if let Err(error) =
+            crate::approval::delete_pending(&self.store, &self.run_id, request_id).await
+        {
+            tracing::warn!("approvals: failed to clear a resolved parked interaction: {error}");
         }
+        outcome
     }
 }
 
@@ -1202,6 +1239,7 @@ pub(crate) mod testutil {
             requesting_agent_name: "Test Agent".into(),
             perm_mode: perm.clone(),
             project_id: None,
+            store: ctx.store.clone(),
         }));
         (ctx, hub, rx, perm)
     }

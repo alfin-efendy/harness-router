@@ -27,13 +27,13 @@ CREATE TABLE endpoint_keys (id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',ke
 CREATE TABLE gateway_events (id INTEGER PRIMARY KEY AUTOINCREMENT,gateway_id TEXT NOT NULL,at INTEGER NOT NULL,level TEXT NOT NULL DEFAULT 'info',text TEXT NOT NULL);
 CREATE TABLE gateways (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,host TEXT,port INTEGER,username TEXT,fs_mode TEXT NOT NULL DEFAULT 'projects',paths TEXT NOT NULL DEFAULT '[]',created_at INTEGER, fingerprint TEXT, device_token TEXT);
 CREATE TABLE job_runs (id TEXT PRIMARY KEY,job_id TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'running',started_at INTEGER NOT NULL,finished_at INTEGER,session_pk TEXT,error TEXT,add_lines INTEGER,del_lines INTEGER,note TEXT,log TEXT);
-CREATE TABLE jobs (id TEXT PRIMARY KEY,name TEXT NOT NULL,cron TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'cron',natural_text TEXT NOT NULL DEFAULT '',project_id TEXT NOT NULL,branch TEXT NOT NULL DEFAULT 'main',gateway TEXT NOT NULL DEFAULT 'local',enabled INTEGER NOT NULL DEFAULT 1,prompt TEXT NOT NULL,notify_success INTEGER NOT NULL DEFAULT 0,notify_fail INTEGER NOT NULL DEFAULT 1,created_at INTEGER, pre_check TEXT NOT NULL DEFAULT '', model_override TEXT, plugin_id TEXT);
+CREATE TABLE jobs (id TEXT PRIMARY KEY,name TEXT NOT NULL,cron TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'cron',natural_text TEXT NOT NULL DEFAULT '',project_id TEXT NOT NULL,branch TEXT NOT NULL DEFAULT 'main',gateway TEXT NOT NULL DEFAULT 'local',enabled INTEGER NOT NULL DEFAULT 1,prompt TEXT NOT NULL,notify_success INTEGER NOT NULL DEFAULT 0,notify_fail INTEGER NOT NULL DEFAULT 1,created_at INTEGER, pre_check TEXT NOT NULL DEFAULT '', model_override TEXT, plugin_id TEXT, home_session_pk TEXT);
 CREATE TABLE mcp_agent_access (server_id TEXT NOT NULL,agent_id TEXT NOT NULL,allowed INTEGER NOT NULL DEFAULT 1,PRIMARY KEY (server_id, agent_id));
 CREATE TABLE mcp_oauth_clients (
   issuer     TEXT PRIMARY KEY,
   client_id  TEXT NOT NULL,
   created_at INTEGER NOT NULL
-, token_endpoint TEXT);
+, token_endpoint TEXT, user_asserted INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE mcp_oauth_tokens (
   server_name TEXT PRIMARY KEY,
   token_json  TEXT NOT NULL,
@@ -64,6 +64,20 @@ CREATE TABLE native_tool_session_versions (
                     created_at INTEGER NOT NULL
                  );
 CREATE TABLE pairing_codes (code_hash TEXT PRIMARY KEY NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE pending_approvals (
+  run_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  session_pk TEXT NOT NULL,
+  requesting_agent_id TEXT NOT NULL,
+  requesting_agent_name TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  approval_kind TEXT NOT NULL,
+  input_json TEXT NOT NULL,
+  principal_json TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, request_id)
+);
 CREATE TABLE plugin_attach_status (plugin_id TEXT PRIMARY KEY NOT NULL,last_attach_at INTEGER NOT NULL,outcome TEXT NOT NULL,reason TEXT);
 CREATE TABLE plugin_catalog_cache (id TEXT PRIMARY KEY NOT NULL,manifest_toml TEXT NOT NULL,version TEXT NOT NULL,sequence INTEGER NOT NULL,blocked INTEGER NOT NULL DEFAULT 0,blocked_reason TEXT,fetched_at INTEGER NOT NULL);
 CREATE TABLE plugin_installs (plugin_id TEXT PRIMARY KEY NOT NULL,kind TEXT NOT NULL,source_spec TEXT NOT NULL,resolved_commit TEXT,fingerprint TEXT NOT NULL,installed_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,pin_reason TEXT,trust_tier TEXT NOT NULL,trust_ack_at INTEGER,trust_ack_summary TEXT);
@@ -123,11 +137,10 @@ CREATE INDEX idx_context_checkpoints_session ON context_checkpoints(session_pk, 
 CREATE INDEX idx_gateway_events ON gateway_events(gateway_id, at);
 CREATE INDEX idx_job_runs_job ON job_runs(job_id, started_at);
 CREATE INDEX idx_jobs_plugin ON jobs(plugin_id);
-CREATE INDEX idx_messages_session ON messages(session_pk, seq);
-CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);
 CREATE INDEX idx_request_log_conn ON request_log(connection_id, ts);
 CREATE INDEX idx_request_log_ts ON request_log(ts);
 CREATE INDEX idx_session_prompt_queue_pending ON session_prompt_queue(session_pk, status, position);
+CREATE INDEX pending_approvals_session_idx ON pending_approvals(session_pk);
 CREATE INDEX sessions_primary_agent_idx ON sessions(primary_agent_id);
 CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN DELETE FROM messages_fts WHERE session_pk = old.session_pk AND seq = old.seq; END;
 CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages WHEN new.role IN ('user','assistant') AND new.block_type='text' AND json_extract(new.payload,'$.text') IS NOT NULL BEGIN INSERT INTO messages_fts(text, session_pk, seq) VALUES (json_extract(new.payload,'$.text'), new.session_pk, new.seq); END;

@@ -30,6 +30,12 @@ use crate::store::Store;
 /// forever, and `begin_mcp_connect` would wedge an RPC handler the same way.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The deadline for a session-teardown `DELETE`. Deliberately far tighter than
+/// [`DEFAULT_REQUEST_TIMEOUT`]: nothing reads its answer, and the callers are a
+/// button a human is watching (the Apps probe) and session teardown — neither
+/// may be delayed by a server that accepts the DELETE and never replies.
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The deadline [`hardened_http_client`] and [`McpHttpConnection::post_once`]
 /// apply. A test may shorten it through [`override_request_timeout`] so a
 /// hanging-body fixture doesn't have to be waited out in real time.
@@ -168,7 +174,7 @@ impl Drop for HttpsEnforcedGuard {
     }
 }
 
-fn plaintext_allowed() -> bool {
+pub(crate) fn plaintext_allowed() -> bool {
     #[cfg(test)]
     {
         PLAINTEXT_ALLOWED.with(std::cell::Cell::get)
@@ -617,9 +623,10 @@ impl McpHttpConnection {
             .ok_or_else(|| anyhow::anyhow!("401 carried no WWW-Authenticate header"))?;
         let metadata_url = crate::plugins::oauth::parse_www_authenticate_resource(&header)
             .ok_or_else(|| anyhow::anyhow!("WWW-Authenticate names no resource metadata"))?;
-        let issuers = mcp_oauth::protected_resource_metadata(&self.http, &metadata_url).await?;
+        let prm =
+            mcp_oauth::protected_resource_metadata(&self.http, &self.url, &metadata_url).await?;
         let (issuer, metadata) =
-            mcp_oauth::select_authorization_server(&self.http, &issuers).await?;
+            mcp_oauth::select_authorization_server(&self.http, &prm.authorization_servers).await?;
         let client_id = store
             .get_mcp_oauth_client(&issuer)
             .await?
@@ -683,6 +690,58 @@ impl McpHttpConnection {
         let mut headers = self.headers.lock().await;
         headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
         headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+    }
+
+    /// Tell the server this client is done with the session.
+    ///
+    /// MCP `2025-06-18` (Basic → Transports → Session Management): a client
+    /// that no longer needs a session SHOULD send an HTTP `DELETE` to the MCP
+    /// endpoint carrying its `Mcp-Session-Id`, and a server MAY answer `405
+    /// Method Not Allowed` if it does not support client-initiated
+    /// termination. Without this, every connection leaves a session allocated
+    /// on the remote server until that server's own idle timeout expires.
+    ///
+    /// Best effort by construction, and deliberately so: nothing the caller
+    /// does depends on the answer, a `405` is a legal reply, and a teardown
+    /// that can fail a session end (or a Probe click) would be worse than the
+    /// leak it is fixing. The status is therefore never inspected.
+    ///
+    /// Idempotent: the session id is `take`n, so a second call sends nothing,
+    /// and any request issued after this one starts a fresh handshake instead
+    /// of presenting an id the server has already been told to forget.
+    pub(crate) async fn terminate(&self) {
+        // Two statements, not one `let … else`: the lock guard must be
+        // released before anything below awaits the network.
+        let session = self.session_id.lock().await.take();
+        let Some(session) = session else {
+            // The server never issued a session id — there is nothing to
+            // terminate, and a DELETE would be a request about nothing.
+            return;
+        };
+        let headers_snapshot = self.headers.lock().await.clone();
+        let mut request = self
+            .http
+            .delete(&self.url)
+            .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+            .header("Mcp-Session-Id", &session);
+        // The credential goes with it: an auth-gated server answers an
+        // unauthenticated DELETE with 401 and keeps the session, which would
+        // leave the leak exactly where it was.
+        for (key, value) in &headers_snapshot {
+            request = request.header(key, value);
+        }
+        let _ = tokio::time::timeout(TERMINATE_TIMEOUT, request.send()).await;
+    }
+}
+
+/// Terminate every remote MCP session a harness session opened.
+///
+/// Sequential rather than concurrent: a session attaches a handful of remote
+/// servers at most, each call is already bounded by [`TERMINATE_TIMEOUT`], and
+/// a teardown that fans out is harder to bound than one that does not.
+pub(crate) async fn terminate_all(connections: &[Arc<McpHttpConnection>]) {
+    for conn in connections {
+        conn.terminate().await;
     }
 }
 
@@ -811,6 +870,10 @@ pub(crate) mod tests {
         /// request, in order.
         session_id: Option<String>,
         body: Value,
+        /// `"POST"` for a JSON-RPC message, `"DELETE"` for a session
+        /// termination. Without it a test cannot tell the two apart, since
+        /// both land in the same sink.
+        http_method: &'static str,
     }
 
     pub(crate) type Seen = std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>;
@@ -869,6 +932,7 @@ pub(crate) mod tests {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
             body: msg.clone(),
+            http_method: "POST",
         });
         let id = msg["id"].clone();
         let result = match msg["method"].as_str().unwrap_or_default() {
@@ -924,13 +988,41 @@ pub(crate) mod tests {
         }
     }
 
+    /// The session-termination half of the fixture. Records the DELETE into
+    /// the SAME sink the POSTs go to, so one assertion can see the whole
+    /// conversation in order, then answers `204 No Content` the way a real
+    /// server that honours termination does.
+    async fn handle_delete(State(state): State<ServerState>, headers: HeaderMap) -> StatusCode {
+        state.sink.lock().unwrap().push(SeenRequest {
+            protocol_version: headers
+                .get("mcp-protocol-version")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            accept: None,
+            authorization: headers
+                .get_all("authorization")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect(),
+            session_id: headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            body: Value::Null,
+            http_method: "DELETE",
+        });
+        StatusCode::NO_CONTENT
+    }
+
     async fn spawn_server(mode: ResponseMode) -> (String, Seen, tokio::task::JoinHandle<()>) {
         let sink: Seen = Default::default();
         let state = ServerState {
             sink: sink.clone(),
             mode,
         };
-        let app = Router::new().route("/", post(handle)).with_state(state);
+        let app = Router::new()
+            .route("/", post(handle).delete(handle_delete))
+            .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle_task = tokio::spawn(async move {
@@ -1421,8 +1513,12 @@ pub(crate) mod tests {
         }
 
         async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
+            // The bound port is unknown when this router is built, and the
+            // client now VERIFIES the `resource` claim against the configured
+            // server URL — so it has to be the real URL by the time it is served.
+            let mcp_url = state.mcp_url.lock().unwrap().clone();
             axum::Json(json!({
-                "resource": "placeholder",
+                "resource": mcp_url,
                 "authorization_servers": [state.as_url],
             }))
         }
@@ -1969,6 +2065,7 @@ pub(crate) mod tests {
                 authorization: vec![],
                 session_id: presented.clone(),
                 body: msg.clone(),
+                http_method: "POST",
             });
             let id = msg["id"].clone();
             let method = msg["method"].as_str().unwrap_or_default().to_string();
@@ -2150,6 +2247,131 @@ pub(crate) mod tests {
             1,
             "exactly one request must have been made — a 404 with no session id in play must not \
              provoke a re-handshake, and certainly not a loop of them"
+        );
+    }
+
+    /// Every DELETE the fixture saw, in order, as the `Mcp-Session-Id` it
+    /// carried.
+    fn deletes(seen: &Seen) -> Vec<Option<String>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.http_method == "DELETE")
+            .map(|r| r.session_id.clone())
+            .collect()
+    }
+
+    /// PROPERTY: a connection that holds a session id sends exactly one HTTP
+    /// DELETE carrying that id — and its credential — when it is terminated.
+    ///
+    /// MCP `2025-06-18` says a client that no longer needs a session SHOULD
+    /// delete it. Without this, every agent session and every Probe click
+    /// leaves a session allocated on the remote server until that server's own
+    /// idle timeout expires.
+    #[tokio::test]
+    async fn terminate_sends_a_delete_carrying_the_session_id_and_the_credential() {
+        let (url, seen, _server) = spawn_sse_server().await;
+        let conn = connect_http(&spec(&url), Some("secret-token"))
+            .await
+            .expect("connect over SSE must succeed");
+
+        conn.terminate().await;
+
+        let requests = seen.lock().unwrap().clone();
+        let deleted: Vec<&SeenRequest> = requests
+            .iter()
+            .filter(|r| r.http_method == "DELETE")
+            .collect();
+        assert_eq!(
+            deleted.len(),
+            1,
+            "exactly one DELETE must reach the server: {requests:?}"
+        );
+        assert_eq!(
+            deleted[0].session_id.as_deref(),
+            Some("sess-123"),
+            "the DELETE must name the session the server issued at initialize — a DELETE with no \
+             Mcp-Session-Id tells the server nothing about WHICH session to end"
+        );
+        assert_eq!(
+            deleted[0].authorization,
+            vec!["Bearer secret-token".to_string()],
+            "the DELETE must carry the same credential every other request carries: an auth-gated \
+             server answers an unauthenticated DELETE with 401 and keeps the session, leaving the \
+             leak exactly where it was"
+        );
+        assert_eq!(
+            deleted[0].protocol_version.as_deref(),
+            Some(MCP_PROTOCOL_VERSION),
+            "the DELETE is a protocol request like any other and must declare the revision this \
+             client speaks"
+        );
+    }
+
+    /// PROPERTY: terminating is safe to call when there is nothing to
+    /// terminate, and never deletes the same session twice.
+    ///
+    /// Both halves matter. A DELETE with no session id is a request about
+    /// nothing (the JSON fixture never issues an id), and a second DELETE
+    /// re-presents an id the server has already been told to forget — which a
+    /// strict server answers 404, and which would make every teardown path
+    /// that runs twice look like a protocol error.
+    #[tokio::test]
+    async fn terminate_sends_nothing_without_a_session_and_never_deletes_twice() {
+        let (json_url, json_seen, _json_server) = spawn_json_server().await;
+        let no_session = connect_http(&spec(&json_url), None)
+            .await
+            .expect("connect over plain JSON must succeed");
+
+        no_session.terminate().await;
+
+        assert!(
+            deletes(&json_seen).is_empty(),
+            "this server never issued a session id, so there is nothing to delete: {:?}",
+            deletes(&json_seen)
+        );
+
+        let (sse_url, sse_seen, _sse_server) = spawn_sse_server().await;
+        let conn = connect_http(&spec(&sse_url), None)
+            .await
+            .expect("connect over SSE must succeed");
+
+        conn.terminate().await;
+        conn.terminate().await;
+
+        assert_eq!(
+            deletes(&sse_seen),
+            vec![Some("sess-123".to_string())],
+            "the session id must be taken by the first terminate, so the second sends nothing: {:?}",
+            deletes(&sse_seen)
+        );
+    }
+
+    /// PROPERTY: `terminate_all` terminates EVERY connection it is handed, not
+    /// just the first — this is the exact shape `NativeSession::end` calls,
+    /// and a session commonly attaches more than one remote server.
+    #[tokio::test]
+    async fn terminate_all_terminates_every_remote_session() {
+        let (url_a, seen_a, _server_a) = spawn_sse_server().await;
+        let (url_b, seen_b, _server_b) = spawn_sse_server().await;
+        let conns = vec![
+            Arc::new(connect_http(&spec(&url_a), None).await.unwrap()),
+            Arc::new(connect_http(&spec(&url_b), None).await.unwrap()),
+        ];
+
+        terminate_all(&conns).await;
+
+        assert_eq!(
+            deletes(&seen_a),
+            vec![Some("sess-123".to_string())],
+            "the first server's session must have been terminated: {:?}",
+            deletes(&seen_a)
+        );
+        assert_eq!(
+            deletes(&seen_b),
+            vec![Some("sess-123".to_string())],
+            "a loop that stops after the first connection leaks every session but one: {:?}",
+            deletes(&seen_b)
         );
     }
 }

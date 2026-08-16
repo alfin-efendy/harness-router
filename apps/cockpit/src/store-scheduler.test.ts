@@ -25,6 +25,7 @@ function makeJob(overrides: Partial<JobInfo> = {}): JobInfo {
     notifyFail: false,
     nextRunMs: null,
     history: [],
+    homeSessionPk: null,
     ...overrides,
   };
 }
@@ -50,7 +51,12 @@ test("duplicateJobInput copies every editable field, suffixes the name, and drop
     prompt: "Triage new issues and open a summary PR.",
     notifySuccess: true,
     notifyFail: false,
+    homeSessionPk: null,
   });
   expect("id" in input).toBe(false);
   expect("pluginId" in input).toBe(false);
+});
+
+test("duplicateJobInput carries the report-to-chat binding to the copy", () => {
+  expect(duplicateJobInput(makeJob({ homeSessionPk: "chat-1" })).homeSessionPk).toBe("chat-1");
 });

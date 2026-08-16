@@ -589,6 +589,9 @@ pub(crate) fn spawn_detached(
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // The only safe moment to rotate: once the child is spawned, this file IS
+    // its inherited stdout/stderr fd and cannot be swapped from outside.
+    ryuzi_core::logging::rotate_if_large(log_path, ryuzi_core::logging::MAX_DAEMON_LOG_BYTES);
     let stdout = File::options().append(true).create(true).open(log_path)?;
     let stderr = File::options().append(true).create(true).open(log_path)?;
     let mut command = Command::new(&cmd[0]);

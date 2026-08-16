@@ -11,6 +11,33 @@ use serde_json::Value;
 
 use crate::plugins::oauth::{discover_oauth_server_metadata, OauthServerMetadata};
 
+/// The ceiling on ANY discovery or token response body this module reads.
+///
+/// The reads below are awaited inside an RPC handler and inside session start,
+/// under a 120-second deadline, from URLs a remote server names — so an
+/// unbounded read is a remote memory-exhaustion lever independent of the
+/// timeout. RFC 8414/9728 documents and token responses are a few kilobytes;
+/// 256 KiB is orders of magnitude of headroom.
+const MAX_METADATA_BODY_BYTES: usize = 256 * 1024;
+
+/// Read a JSON response body, aborting as soon as it exceeds
+/// [`MAX_METADATA_BODY_BYTES`]. Streamed rather than buffered-then-measured:
+/// measuring after the fact would already have allocated whatever arrived.
+async fn read_json_capped(response: reqwest::Response, what: &str) -> anyhow::Result<Value> {
+    use futures::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len() + chunk.len() > MAX_METADATA_BODY_BYTES {
+            anyhow::bail!("{what} exceeded the {MAX_METADATA_BODY_BYTES}-byte limit");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| anyhow::anyhow!("{what} is not valid JSON: {e}"))
+}
+
 /// The canonical URI of an MCP server, as RFC 8707 §2 defines it and the MCP
 /// specification requires: lowercase scheme and host, no fragment, and no
 /// trailing slash unless the slash is semantically significant.
@@ -36,8 +63,117 @@ pub fn canonical_resource_uri(url: &str) -> anyhow::Result<String> {
     Ok(canonical)
 }
 
-/// The `authorization_servers` list of a PRM document, in document order.
-pub fn authorization_servers_from_prm(doc: &Value) -> anyhow::Result<Vec<String>> {
+/// Validate the `resource_metadata` URL a remote MCP server named in its 401
+/// BEFORE any request is made to it.
+///
+/// The URL arrives in a `WWW-Authenticate` header written by the remote server,
+/// so it is attacker-controlled input in the case that matters: a compromised
+/// MCP server naming a plaintext URL, or an internal host only this machine can
+/// reach, would otherwise steer the whole discovery chain and turn the daemon
+/// into a probe inside the user's network. Three rules, all from RFC 9728 §3:
+///
+/// 1. `https://` — subject to the same test-build carve-out
+///    [`super::mcp_http::plaintext_allowed`] applies to the transport itself,
+///    because every MCP fixture in this crate can only bind plaintext loopback.
+/// 2. Same origin (scheme, host AND port) as the configured MCP server URL. A
+///    server may only describe its own protected-resource metadata.
+/// 3. The path carries the `/.well-known/oauth-protected-resource` segment,
+///    which RFC 9728 mandates — matched with `contains` so both the
+///    path-inserted form (`/.well-known/oauth-protected-resource/mcp`) and the
+///    path-suffixed form (`/mcp/.well-known/oauth-protected-resource`) pass.
+pub fn validate_metadata_url(server_url: &str, metadata_url: &str) -> anyhow::Result<()> {
+    let server = url::Url::parse(server_url)
+        .map_err(|e| anyhow::anyhow!("invalid MCP server URL {server_url}: {e}"))?;
+    let metadata = url::Url::parse(metadata_url).map_err(|e| {
+        anyhow::anyhow!("the MCP server named an unparseable metadata URL {metadata_url}: {e}")
+    })?;
+    if metadata.scheme() != "https" && !super::mcp_http::plaintext_allowed() {
+        anyhow::bail!(
+            "the MCP server named a non-https protected-resource metadata URL ({metadata_url}) — \
+             refusing to fetch it"
+        );
+    }
+    // The `Origin` VALUES, not their serializations: a non-`http(s)` scheme
+    // produces an opaque origin, which is never equal to any other origin —
+    // whereas every opaque origin serializes to the same string `"null"`, so
+    // comparing strings would be a bypass.
+    if metadata.origin() != server.origin() {
+        anyhow::bail!(
+            "the MCP server named a protected-resource metadata URL on a DIFFERENT origin \
+             ({}, expected {}) — refusing to fetch it",
+            metadata.origin().ascii_serialization(),
+            server.origin().ascii_serialization()
+        );
+    }
+    if !metadata
+        .path()
+        .contains("/.well-known/oauth-protected-resource")
+    {
+        anyhow::bail!(
+            "the MCP server named a metadata URL that is not an RFC 9728 well-known path \
+             ({metadata_url}) — refusing to fetch it"
+        );
+    }
+    Ok(())
+}
+
+/// Validate an `authorization_servers` entry before RFC 8414 discovery fetches
+/// it. The entry comes from a document the remote MCP server controls, so the
+/// same SSRF reasoning as [`validate_metadata_url`] applies — but an
+/// authorization server is legitimately a DIFFERENT origin from the MCP server
+/// (a real deployment never colocates them), so origin cannot be the rule here.
+/// What RFC 8414 §2 does require of an issuer identifier is: an `https` URL with
+/// a host, and no query or fragment component.
+pub fn validate_issuer_url(issuer: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(issuer)
+        .map_err(|e| anyhow::anyhow!("unparseable authorization server URL {issuer}: {e}"))?;
+    if parsed.scheme() != "https" && !super::mcp_http::plaintext_allowed() {
+        anyhow::bail!("authorization server {issuer} is not https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("authorization server {issuer} has no host");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!(
+            "authorization server {issuer} has a query or fragment — RFC 8414 issuer identifiers \
+             have neither"
+        );
+    }
+    Ok(())
+}
+
+/// Parse a PRM document and verify it actually describes `server_url`, then
+/// return its `authorization_servers` in document order.
+///
+/// The `resource` claim is not decoration: RFC 9728 §3.3 requires the client to
+/// check it, and it is the only thing in the document tying it to the server
+/// being connected. Without the check, a server could serve (or proxy) a
+/// document describing some OTHER resource entirely and route the user's
+/// authorization at it. Both sides go through [`canonical_resource_uri`] first
+/// so a trailing slash or an upper-case host is not a spurious mismatch.
+pub fn protected_resource_from_prm(doc: &Value, server_url: &str) -> anyhow::Result<Vec<String>> {
+    let claimed = doc
+        .get("resource")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the MCP server's protected-resource metadata carries no `resource` claim, so \
+                 nothing ties it to this server"
+            )
+        })?;
+    let claimed_canonical = canonical_resource_uri(claimed).map_err(|e| {
+        anyhow::anyhow!(
+            "the protected-resource metadata's `resource` claim is not a valid URI: {e}"
+        )
+    })?;
+    let expected = canonical_resource_uri(server_url)?;
+    if claimed_canonical != expected {
+        anyhow::bail!(
+            "the protected-resource metadata describes {claimed_canonical}, not {expected} — \
+             refusing to authorize against it"
+        );
+    }
     let servers: Vec<String> = doc
         .get("authorization_servers")
         .and_then(Value::as_array)
@@ -53,6 +189,32 @@ pub fn authorization_servers_from_prm(doc: &Value) -> anyhow::Result<Vec<String>
     Ok(servers)
 }
 
+/// The `scopes_supported` list of a PRM document (RFC 9728 §2), or empty when
+/// the document names none. Unlike `authorization_servers`, this is optional:
+/// a protected resource that advertises no scopes is legal, and the caller
+/// falls back to the authorization server's own list.
+pub fn scopes_supported_from_prm(doc: &Value) -> Vec<String> {
+    doc.get("scopes_supported")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The two fields this client reads out of an RFC 9728 protected-resource
+/// metadata document.
+#[derive(Debug, Clone)]
+pub struct ProtectedResourceMetadata {
+    /// Non-empty by construction — [`protected_resource_from_prm`] errors when
+    /// the document names none.
+    pub authorization_servers: Vec<String>,
+    /// Possibly empty; see [`scopes_supported_from_prm`].
+    pub scopes_supported: Vec<String>,
+}
+
 /// Fetch and parse the RFC 9728 document at `metadata_url`.
 ///
 /// The explicit per-request `timeout` is not redundant with the client's own:
@@ -62,10 +224,19 @@ pub fn authorization_servers_from_prm(doc: &Value) -> anyhow::Result<Vec<String>
 /// `mcp_http`'s refresh-on-401 path (inside `start_harness_session`), both of
 /// which wedge outright if it never returns. Same reasoning at every other
 /// request in this module.
+///
+/// `metadata_url` is validated against `server_url` — the URL the user actually
+/// configured — BEFORE the request is made, so a metadata URL a remote server
+/// named on some other origin is never fetched at all. See
+/// [`validate_metadata_url`].
 pub async fn protected_resource_metadata(
     http: &reqwest::Client,
+    server_url: &str,
     metadata_url: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<ProtectedResourceMetadata> {
+    // BEFORE the request, not after: the point is that this URL is never
+    // fetched at all unless it belongs to the server being connected.
+    validate_metadata_url(server_url, metadata_url)?;
     let response = http
         .get(metadata_url)
         .timeout(super::mcp_http::request_timeout())
@@ -77,7 +248,11 @@ pub async fn protected_resource_metadata(
             response.status()
         );
     }
-    authorization_servers_from_prm(&response.json::<Value>().await?)
+    let doc = read_json_capped(response, "protected-resource metadata").await?;
+    Ok(ProtectedResourceMetadata {
+        authorization_servers: protected_resource_from_prm(&doc, server_url)?,
+        scopes_supported: scopes_supported_from_prm(&doc),
+    })
 }
 
 /// Take the candidates IN DOCUMENT ORDER and use the first whose RFC 8414
@@ -89,6 +264,16 @@ pub async fn select_authorization_server(
 ) -> anyhow::Result<(String, OauthServerMetadata)> {
     let mut tried = Vec::new();
     for issuer in issuers {
+        // The list comes from a document the remote MCP server controls, so an
+        // entry is validated before it is fetched — same reasoning as
+        // `validate_metadata_url`, minus the origin rule, which cannot apply
+        // here (a real authorization server is a different origin by design).
+        // A rejected entry is RECORDED and SKIPPED, not raised: the documented
+        // document-order fallback must survive one hostile or broken entry.
+        if let Err(e) = validate_issuer_url(issuer) {
+            tried.push(format!("{issuer}: {e}"));
+            continue;
+        }
         match discover_oauth_server_metadata(http, issuer).await {
             Ok(metadata) => return Ok((issuer.clone(), metadata)),
             Err(e) => tried.push(format!("{issuer}: {e}")),
@@ -123,6 +308,24 @@ pub struct McpAuthorizeStart {
     /// The client id registered (or reused) for that same authorization
     /// server. Thread this to [`complete_mcp_connect`] verbatim.
     pub client_id: String,
+}
+
+/// The scopes to request on the authorize call.
+///
+/// An authorization server with no default scope mints a token with NO
+/// permissions when the request names none — consent succeeds, a token comes
+/// back, and every later MCP call 403s with `insufficient_scope`, which is
+/// invisible at connect time. So ask for what the deployment advertises: the
+/// protected resource's own `scopes_supported` first, since RFC 9728 has it
+/// describe THIS resource specifically, and the authorization server's
+/// broader RFC 8414 list only as a fallback. Both empty means send no `scope`
+/// parameter at all and let the server apply its default — the only remaining
+/// option, and the pre-existing behavior.
+pub fn requested_scopes(prm_scopes: &[String], as_scopes: &[String]) -> Vec<String> {
+    if prm_scopes.is_empty() {
+        return as_scopes.to_vec();
+    }
+    prm_scopes.to_vec()
 }
 
 /// Build the authorization URL. `resource` MUST be the canonical MCP server
@@ -274,8 +477,8 @@ pub async fn begin_mcp_connect(
         )
         })?;
 
-    let issuers = protected_resource_metadata(http, &metadata_url).await?;
-    let (issuer, metadata) = select_authorization_server(http, &issuers).await?;
+    let prm = protected_resource_metadata(http, url, &metadata_url).await?;
+    let (issuer, metadata) = select_authorization_server(http, &prm.authorization_servers).await?;
 
     let redirect_uri = mcp_redirect_uri(&server.name);
     // A client id already registered for this issuer (by this server or any
@@ -287,7 +490,8 @@ pub async fn begin_mcp_connect(
         None => {
             let registration = metadata.registration_endpoint.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "{issuer} supports no dynamic client registration — a client id for it must be supplied manually before {} can connect",
+                    "{issuer} supports no dynamic client registration — record a client id for \
+                     that issuer on {}'s page (Connection → Client ID) and connect again",
                     server.name
                 )
             })?;
@@ -305,12 +509,13 @@ pub async fn begin_mcp_connect(
     store
         .upsert_mcp_oauth_client(&issuer, &client_id, &metadata.token_endpoint)
         .await?;
+    let scopes = requested_scopes(&prm.scopes_supported, &metadata.scopes_supported);
     build_authorize_url(
         &metadata,
         &client_id,
         &redirect_uri,
         &canonical_resource_uri(url)?,
-        &[],
+        &scopes,
     )
 }
 
@@ -361,7 +566,7 @@ pub async fn complete_mcp_connect(
             response.status()
         );
     }
-    let body: serde_json::Value = response.json().await?;
+    let body = read_json_capped(response, "the token response").await?;
     let token = crate::store::McpOauthToken {
         access_token: body["access_token"]
             .as_str()
@@ -422,13 +627,96 @@ mod tests {
     }
 
     #[test]
+    fn a_metadata_url_on_another_origin_is_refused() {
+        // PROPERTY: the URL comes out of a header the REMOTE server wrote. A
+        // cross-origin value is the whole attack — it is how a compromised MCP
+        // server points discovery at a host of its choosing.
+        assert!(
+            validate_metadata_url(
+                "https://mcp.example.com/mcp",
+                "https://elsewhere.example/.well-known/oauth-protected-resource"
+            )
+            .is_err(),
+            "a metadata URL on a different HOST must be refused before it is fetched"
+        );
+        assert!(
+            validate_metadata_url(
+                "https://mcp.example.com/mcp",
+                "https://mcp.example.com:8443/.well-known/oauth-protected-resource"
+            )
+            .is_err(),
+            "a different PORT is a different origin too — same-host is not the rule"
+        );
+    }
+
+    #[test]
+    fn a_same_origin_well_known_metadata_url_is_accepted_in_both_rfc9728_forms() {
+        validate_metadata_url(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+        )
+        .expect("the RFC 9728 path-inserted form must be accepted");
+        validate_metadata_url(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com/mcp/.well-known/oauth-protected-resource",
+        )
+        .expect("the path-suffixed form must be accepted too");
+        assert!(
+            validate_metadata_url(
+                "https://mcp.example.com/mcp",
+                "https://mcp.example.com/anything-else"
+            )
+            .is_err(),
+            "a same-origin URL that is not an RFC 9728 well-known path must still be refused"
+        );
+    }
+
+    #[test]
+    fn a_plaintext_metadata_url_is_refused_under_the_production_rule() {
+        // The carve-out defaults to permissive in test builds because every MCP
+        // fixture here binds plaintext loopback; this guard turns the PRODUCTION
+        // rule on so it can actually be proven.
+        let _https = crate::harness::native::mcp_http::enforce_https_in_this_test();
+        assert!(
+            validate_metadata_url(
+                "http://mcp.example.com/mcp",
+                "http://mcp.example.com/.well-known/oauth-protected-resource"
+            )
+            .is_err(),
+            "same-origin is not enough — a plaintext discovery fetch must be refused outright"
+        );
+    }
+
+    #[test]
+    fn an_issuer_url_must_be_an_rfc8414_issuer_identifier() {
+        let _https = crate::harness::native::mcp_http::enforce_https_in_this_test();
+        validate_issuer_url("https://as.example/tenant-1").expect("a plain https issuer is valid");
+        assert!(
+            validate_issuer_url("http://as.example").is_err(),
+            "a plaintext issuer must be refused"
+        );
+        assert!(
+            validate_issuer_url("https://as.example?tenant=1").is_err(),
+            "RFC 8414 issuer identifiers carry no query component"
+        );
+        assert!(
+            validate_issuer_url("https://as.example#frag").is_err(),
+            "RFC 8414 issuer identifiers carry no fragment component"
+        );
+        assert!(
+            validate_issuer_url("not-a-url").is_err(),
+            "an unparseable issuer must be an error, not silently attempted"
+        );
+    }
+
+    #[test]
     fn prm_authorization_servers_are_returned_in_document_order() {
         let doc = serde_json::json!({
             "resource": "https://mcp.example.com",
             "authorization_servers": ["https://as-one.example", "https://as-two.example"]
         });
         assert_eq!(
-            authorization_servers_from_prm(&doc).unwrap(),
+            protected_resource_from_prm(&doc, "https://mcp.example.com").unwrap(),
             vec![
                 "https://as-one.example".to_string(),
                 "https://as-two.example".to_string()
@@ -445,14 +733,97 @@ mod tests {
         // not handed a silent no-op.
         let empty = serde_json::json!({ "resource": "https://mcp.example.com", "authorization_servers": [] });
         assert!(
-            authorization_servers_from_prm(&empty).is_err(),
+            protected_resource_from_prm(&empty, "https://mcp.example.com").is_err(),
             "an empty authorization_servers array names no AS to authorize against — this must be an \
              actionable error, not Ok(vec![]) that a caller could mistake for 'no auth needed'"
         );
         assert!(
-            authorization_servers_from_prm(&serde_json::json!({})).is_err(),
-            "a PRM document missing the field entirely must fail the same way as an empty array, \
-             not be treated as a different (silently-ignored) case"
+            protected_resource_from_prm(&serde_json::json!({}), "https://mcp.example.com").is_err(),
+            "a PRM document missing every field must fail — here on the absent `resource` claim, \
+             before the authorization_servers check is even reached"
+        );
+    }
+
+    #[test]
+    fn prm_scopes_are_parsed_and_a_document_without_them_yields_an_empty_list() {
+        let with_scopes = json!({
+            "resource": "https://mcp.example.com",
+            "authorization_servers": ["https://as.example"],
+            "scopes_supported": ["mcp:read", "mcp:write"]
+        });
+        assert_eq!(
+            scopes_supported_from_prm(&with_scopes),
+            vec!["mcp:read".to_string(), "mcp:write".to_string()],
+            "the resource's advertised scopes must be read in document order — they are what the \
+             authorize request asks for"
+        );
+        assert!(
+            scopes_supported_from_prm(&json!({
+                "resource": "https://mcp.example.com",
+                "authorization_servers": ["https://as.example"]
+            }))
+            .is_empty(),
+            "a PRM document with no scopes_supported must yield an empty list, NOT an error — a \
+             resource that advertises no scopes is legal and must fall back to the AS's list"
+        );
+    }
+
+    #[test]
+    fn the_resources_scopes_win_over_the_authorization_servers_and_neither_means_none() {
+        let prm = vec!["mcp:read".to_string()];
+        let as_scopes = vec!["everything".to_string(), "openid".to_string()];
+        assert_eq!(
+            requested_scopes(&prm, &as_scopes),
+            prm,
+            "RFC 9728's scopes_supported describes THIS resource, so it must win over the \
+             authorization server's broader catalogue — asking for `everything` here would \
+             request permissions the MCP server never needed"
+        );
+        assert_eq!(
+            requested_scopes(&[], &as_scopes),
+            as_scopes,
+            "when the resource advertises nothing, the AS's own list is the only signal left — \
+             falling through to no scope at all is what mints the unusable token this exists to \
+             prevent"
+        );
+        assert!(
+            requested_scopes(&[], &[]).is_empty(),
+            "neither document naming a scope must send NO scope parameter, so the server applies \
+             its default — inventing a scope value here would be guessing"
+        );
+    }
+
+    #[test]
+    fn a_prm_document_describing_a_different_resource_is_refused() {
+        // PROPERTY: the `resource` claim is the only thing in the document that
+        // ties it to the server being connected. A document describing some
+        // other resource must never be used to pick an authorization server for
+        // THIS one, however well-formed the rest of it is.
+        let doc = serde_json::json!({
+            "resource": "https://someone-else.example",
+            "authorization_servers": ["https://as-one.example"]
+        });
+        let err = protected_resource_from_prm(&doc, "https://mcp.example.com")
+            .expect_err("a mismatched `resource` claim must be refused, not ignored");
+        assert!(
+            err.to_string().contains("someone-else.example"),
+            "the error must name the resource the document actually claimed, so the failure is \
+             diagnosable: {err}"
+        );
+    }
+
+    #[test]
+    fn a_prm_resource_claim_matches_across_trailing_slash_and_case() {
+        // Canonicalization on both sides, or every deployment that writes its
+        // own URL slightly differently would be refused for no security reason.
+        let doc = serde_json::json!({
+            "resource": "HTTPS://MCP.Example.COM/mcp/",
+            "authorization_servers": ["https://as-one.example"]
+        });
+        assert!(
+            protected_resource_from_prm(&doc, "https://mcp.example.com/mcp").is_ok(),
+            "an upper-case host and a trailing slash are the SAME resource — both sides go \
+             through canonical_resource_uri first"
         );
     }
 
@@ -618,29 +989,50 @@ mod tests {
 
     /// Bind a loopback server for the protected-resource-metadata tests below.
     /// `status` is returned verbatim; `body`, when `Some`, is served as the
-    /// JSON response body for a successful status.
+    /// JSON response body for a successful status. A `"resource"` of
+    /// `"placeholder"` is substituted with the real bound URL at serve time —
+    /// the bound port is not known when the caller builds the document, and the
+    /// client now VERIFIES that claim.
+    ///
+    /// Returns the server's BASE URL: callers now need both it (as the
+    /// configured server URL) and the well-known path built from it.
     async fn spawn_prm_server(status: axum::http::StatusCode, body: Option<Value>) -> String {
         use axum::routing::get;
         use axum::Router;
 
+        let mcp_url_slot = Arc::new(Mutex::new(String::new()));
+        let slot_for_route = mcp_url_slot.clone();
         let app = Router::new().route(
             "/.well-known/oauth-protected-resource",
-            get(move || async move { (status, axum::Json(body.unwrap_or(Value::Null))) }),
+            get(move || {
+                let body = body.clone();
+                let slot = slot_for_route.clone();
+                async move {
+                    let mut body = body.unwrap_or(Value::Null);
+                    if body.get("resource").and_then(Value::as_str) == Some("placeholder") {
+                        body["resource"] = Value::String(slot.lock().unwrap().clone());
+                    }
+                    (status, axum::Json(body))
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        *mcp_url_slot.lock().unwrap() = base.clone();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://{addr}/.well-known/oauth-protected-resource")
+        base
     }
 
     #[tokio::test]
     async fn protected_resource_metadata_names_the_status_on_a_non_2xx_response() {
-        let url = spawn_prm_server(axum::http::StatusCode::NOT_FOUND, None).await;
+        let base = spawn_prm_server(axum::http::StatusCode::NOT_FOUND, None).await;
+        let metadata_url = format!("{base}/.well-known/oauth-protected-resource");
         let http = reqwest::Client::new();
 
-        let err = protected_resource_metadata(&http, &url)
+        let err = protected_resource_metadata(&http, &base, &metadata_url)
             .await
             .expect_err("a non-2xx status must be an error, not an empty/default result");
 
@@ -653,17 +1045,24 @@ mod tests {
 
     #[tokio::test]
     async fn protected_resource_metadata_rejects_a_2xx_body_with_no_authorization_servers() {
-        let url = spawn_prm_server(
+        // `"placeholder"`, not a hard-coded URL: the fixture substitutes the real
+        // bound URL, so the `resource` check passes and the empty
+        // `authorization_servers` list is what this test actually gets to prove.
+        let base = spawn_prm_server(
             axum::http::StatusCode::OK,
-            Some(serde_json::json!({ "resource": "https://mcp.example.com", "authorization_servers": [] })),
+            Some(serde_json::json!({ "resource": "placeholder", "authorization_servers": [] })),
         )
         .await;
+        let metadata_url = format!("{base}/.well-known/oauth-protected-resource");
         let http = reqwest::Client::new();
 
-        let err = protected_resource_metadata(&http, &url).await.expect_err(
-            "the MCP spec requires at least one authorization server; a 2xx body naming none must \
-             be an actionable error, not a silent empty Vec the caller could mistake for success",
-        );
+        let err = protected_resource_metadata(&http, &base, &metadata_url)
+            .await
+            .expect_err(
+                "the MCP spec requires at least one authorization server; a 2xx body naming none \
+                 must be an actionable error, not a silent empty Vec the caller could mistake for \
+                 success",
+            );
         assert!(
             err.to_string().contains("names no authorization server"),
             "got: {err}"
@@ -746,6 +1145,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_malformed_issuer_is_skipped_and_a_later_valid_one_still_wins() {
+        // PROPERTY: a bad entry is skipped, not fatal — document-order fallback
+        // is the documented behaviour and one hostile or broken entry must not
+        // be able to deny service to a legitimate later one.
+        let working =
+            spawn_as_metadata_server(Some(as_metadata_body("https://good-as.example"))).await;
+        let http = reqwest::Client::new();
+
+        let (issuer, _metadata) =
+            select_authorization_server(&http, &["not-a-url".to_string(), working.clone()])
+                .await
+                .expect("the second candidate is valid, so selection must still succeed");
+
+        assert_eq!(
+            issuer, working,
+            "the unparseable first entry must be skipped, not returned and not fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_metadata_body_is_refused_rather_than_buffered() {
+        // PROPERTY: the ceiling is on the BODY, independent of the timeout — a
+        // server that streams a valid, fast, enormous document must be cut off.
+        let base = spawn_prm_server(
+            axum::http::StatusCode::OK,
+            Some(serde_json::json!({
+                "resource": "placeholder",
+                "authorization_servers": ["https://as.example"],
+                "padding": "x".repeat(MAX_METADATA_BODY_BYTES + 1),
+            })),
+        )
+        .await;
+        let metadata_url = format!("{base}/.well-known/oauth-protected-resource");
+        let http = reqwest::Client::new();
+
+        let err = protected_resource_metadata(&http, &base, &metadata_url)
+            .await
+            .expect_err("a body past the ceiling must be an error, not a large allocation");
+        assert!(
+            err.to_string().contains("exceeded"),
+            "the failure must be the size ceiling, not an incidental parse error: {err}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Task 7: begin_mcp_connect / complete_mcp_connect
     // -----------------------------------------------------------------
@@ -814,7 +1258,15 @@ mod tests {
         }
 
         async fn handle_prm(State(state): State<McpState>) -> axum::Json<Value> {
-            axum::Json(state.prm_body.clone())
+            let mut body = state.prm_body.clone();
+            // The bound address is unknown when the caller builds the document,
+            // hence the sentinel — and the client now VERIFIES this claim, so it
+            // has to be the real URL by the time it is served.
+            if body.get("resource").and_then(Value::as_str) == Some("placeholder") {
+                let mcp_url = state.mcp_url.lock().unwrap().clone();
+                body["resource"] = Value::String(mcp_url);
+            }
+            axum::Json(body)
         }
 
         // The WWW-Authenticate value needs the server's own address, which
@@ -839,6 +1291,52 @@ mod tests {
         mcp_url
     }
 
+    /// An authorization server that serves RFC 8414 metadata with **no**
+    /// `registration_endpoint` — the enterprise/self-hosted shape this codebase
+    /// could not connect to before a user could supply a client id by hand.
+    ///
+    /// Its metadata names its OWN bound URL as `issuer`, the way
+    /// `spawn_oauth_fixture`'s `handle_as_metadata` does, rather than a fixed
+    /// fake string: a self-consistent document survives any future check that
+    /// the `issuer` field matches the URL the document was fetched from.
+    async fn spawn_as_without_registration() -> String {
+        use axum::extract::State;
+        use axum::routing::get;
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct AsState {
+            as_url: Arc<Mutex<String>>,
+        }
+
+        async fn handle_metadata(State(state): State<AsState>) -> axum::Json<Value> {
+            let as_url = state.as_url.lock().unwrap().clone();
+            axum::Json(json!({
+                "issuer": as_url,
+                "authorization_endpoint": format!("{as_url}/authorize"),
+                "token_endpoint": format!("{as_url}/token"),
+            }))
+        }
+
+        let slot = Arc::new(Mutex::new(String::new()));
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(handle_metadata),
+            )
+            .with_state(AsState {
+                as_url: slot.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let as_url = format!("http://{addr}");
+        *slot.lock().unwrap() = as_url.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        as_url
+    }
+
     /// A full, self-contained OAuth round: the remote MCP server that 401s
     /// and points at its own protected-resource metadata, and a SEPARATE
     /// authorization server serving RFC 8414 metadata, RFC 7591
@@ -860,7 +1358,16 @@ mod tests {
         registration_hits: Arc<Mutex<usize>>,
     }
 
+    /// The default fixture: neither the protected resource nor the
+    /// authorization server advertises any scope.
     async fn spawn_oauth_fixture() -> OauthFixture {
+        spawn_oauth_fixture_with_scopes(&[], &[]).await
+    }
+
+    async fn spawn_oauth_fixture_with_scopes(
+        prm_scopes: &[&str],
+        as_scopes: &[&str],
+    ) -> OauthFixture {
         use axum::extract::{Json, State};
         use axum::routing::{get, post};
         use axum::Router;
@@ -870,16 +1377,24 @@ mod tests {
             as_url: String,
             registration_hits: Arc<Mutex<usize>>,
             token_request_bodies: Arc<Mutex<Vec<String>>>,
+            scopes_supported: Vec<String>,
         }
 
         async fn handle_as_metadata(State(state): State<AsState>) -> axum::Json<Value> {
             let as_url = &state.as_url;
-            axum::Json(json!({
+            let mut doc = json!({
                 "issuer": as_url,
                 "authorization_endpoint": format!("{as_url}/authorize"),
                 "token_endpoint": format!("{as_url}/token"),
                 "registration_endpoint": format!("{as_url}/register"),
-            }))
+            });
+            // Only emitted when there is something to emit: an ABSENT field and
+            // an empty array must both be exercisable, and absent is the
+            // realistic shape.
+            if !state.scopes_supported.is_empty() {
+                doc["scopes_supported"] = json!(state.scopes_supported);
+            }
+            axum::Json(doc)
         }
 
         async fn handle_register(
@@ -914,6 +1429,7 @@ mod tests {
             as_url: as_url.clone(),
             registration_hits: registration_hits.clone(),
             token_request_bodies: token_request_bodies.clone(),
+            scopes_supported: as_scopes.iter().map(|s| s.to_string()).collect(),
         };
         let as_app = Router::new()
             .route(
@@ -927,11 +1443,14 @@ mod tests {
             axum::serve(as_listener, as_app).await.unwrap();
         });
 
-        let mcp_url = spawn_mcp_401_with_prm(json!({
+        let mut prm = json!({
             "resource": "placeholder",
             "authorization_servers": [as_url.clone()],
-        }))
-        .await;
+        });
+        if !prm_scopes.is_empty() {
+            prm["scopes_supported"] = json!(prm_scopes);
+        }
+        let mcp_url = spawn_mcp_401_with_prm(prm).await;
 
         OauthFixture {
             mcp_url,
@@ -1062,6 +1581,128 @@ mod tests {
         );
     }
 
+    /// The `scope` parameter on an authorize URL, if any. `query_pairs`
+    /// percent-decodes, so a space-joined scope list comes back with real
+    /// spaces.
+    fn scope_param(authorize_url: &str) -> Option<String> {
+        url::Url::parse(authorize_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_resources_advertised_scopes_land_on_the_authorize_url() {
+        // PROPERTY: what the PRM advertises is what gets requested. Without
+        // this, an authorization server with no default scope mints a token
+        // with no permissions — consent succeeds, the card goes green, and
+        // every tool call afterwards 403s.
+        let fixture =
+            spawn_oauth_fixture_with_scopes(&["mcp:read", "mcp:write"], &["everything"]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+
+        assert_eq!(
+            scope_param(&start.url).as_deref(),
+            Some("mcp:read mcp:write"),
+            "the PRM's scopes must be requested, space-joined per RFC 6749 §3.3, and must beat \
+             the AS's broader `everything`: {}",
+            start.url
+        );
+    }
+
+    #[tokio::test]
+    async fn the_authorization_servers_scopes_are_requested_when_the_resource_names_none() {
+        // PROPERTY: the fallback leg. A PRM with no scopes_supported is
+        // common; the AS's own RFC 8414 list is then the only signal, and
+        // dropping through to no scope at all is the bug.
+        let fixture = spawn_oauth_fixture_with_scopes(&[], &["jira:read", "confluence:read"]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+
+        assert_eq!(
+            scope_param(&start.url).as_deref(),
+            Some("jira:read confluence:read"),
+            "with no resource-level scopes the AS's scopes_supported must be requested: {}",
+            start.url
+        );
+    }
+
+    #[tokio::test]
+    async fn no_scope_parameter_is_sent_when_neither_document_advertises_one() {
+        // PROPERTY: when there is nothing to ask for, ask for nothing and let
+        // the server apply its default — an empty `scope=` or an invented
+        // value would be rejected by servers that validate the parameter.
+        let fixture = spawn_oauth_fixture_with_scopes(&[], &[]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+
+        assert_eq!(
+            scope_param(&start.url),
+            None,
+            "no advertised scope anywhere means the parameter must be absent entirely, not \
+             present and empty: {}",
+            start.url
+        );
+    }
+
+    #[tokio::test]
+    async fn the_granted_scope_from_the_token_response_is_persisted_not_the_requested_one() {
+        // PROPERTY: an authorization server may downgrade what it grants
+        // (RFC 6749 §5.1 allows the response `scope` to differ from the
+        // request). The stored token must record what was GRANTED. The
+        // fixture's token endpoint answers `"scope": "read write"` while the
+        // request asks for `mcp:read`, so a regression that echoed the
+        // requested scopes back into the row would fail here.
+        let fixture = spawn_oauth_fixture_with_scopes(&["mcp:read"], &[]).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+
+        let start = begin_mcp_connect(&store, &http, &mcp_spec(&fixture.mcp_url))
+            .await
+            .expect("discovery must succeed");
+        complete_mcp_connect(
+            &store,
+            &http,
+            "rovo",
+            &fixture.mcp_url,
+            &start.issuer_token_endpoint,
+            &start.client_id,
+            "the-code",
+            &start.verifier,
+        )
+        .await
+        .expect("the token exchange must succeed");
+
+        let stored = store
+            .get_mcp_oauth_token("rovo")
+            .await
+            .unwrap()
+            .expect("a token must be stored after a successful exchange");
+        assert_eq!(
+            stored.scopes,
+            vec!["read".to_string(), "write".to_string()],
+            "the row must carry the scopes the AS actually granted, not the ones we asked for"
+        );
+    }
+
     #[tokio::test]
     async fn a_401_without_www_authenticate_is_an_actionable_error_not_a_silent_noop() {
         // PROPERTY: a 401 that names no WWW-Authenticate header must fail
@@ -1096,7 +1737,7 @@ mod tests {
         // PROPERTY: the same guarantee as
         // `a_prm_document_without_authorization_servers_is_an_error` above,
         // but exercised through begin_mcp_connect end to end rather than
-        // calling authorization_servers_from_prm directly — this is what
+        // calling protected_resource_from_prm directly — this is what
         // actually catches a regression in how the two are wired together,
         // not just in the parsing function itself.
         let url = spawn_mcp_401_with_prm(json!({
@@ -1116,6 +1757,147 @@ mod tests {
         assert!(
             err.to_string().contains("no authorization server"),
             "got: {err}"
+        );
+    }
+
+    /// PROPERTY: an authorization server with no `registration_endpoint` is
+    /// connectable once — and only once — the user has recorded a client id for
+    /// its issuer. Before that the failure must name the issuer, because that
+    /// string is the exact key the user has to record the client id under.
+    #[tokio::test]
+    async fn a_user_recorded_client_id_replaces_dynamic_registration() {
+        let as_url = spawn_as_without_registration().await;
+        let mcp_url = spawn_mcp_401_with_prm(json!({
+            "resource": "placeholder",
+            "authorization_servers": [as_url.clone()],
+        }))
+        .await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+        let spec = mcp_spec(&mcp_url);
+
+        let err = begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect_err("no registration endpoint and no stored client id means no connect");
+        let message = err.to_string();
+        assert!(
+            message.contains("supports no dynamic client registration"),
+            "the failure must say why, not fail generically: {message}"
+        );
+        assert!(
+            message.contains(&as_url),
+            "the failure must name the ISSUER, because that is the key the user has to record \
+             the client id under: {message}"
+        );
+
+        store
+            .upsert_user_asserted_mcp_oauth_client(&as_url, "manual-client")
+            .await
+            .unwrap();
+
+        let start = begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect("a recorded client id must make the same server connectable");
+        assert_eq!(
+            start.client_id, "manual-client",
+            "the flow must use the client id the user recorded, not invent one"
+        );
+        assert_eq!(
+            start.issuer_token_endpoint,
+            format!("{as_url}/token"),
+            "the token endpoint must come from the authorization server's own metadata"
+        );
+
+        // PROPERTY: the endpoint the completion gate will accept was written by
+        // THIS discovery run, not by the user — the user-asserted row carried
+        // none, so nothing could have been authorized before this point.
+        let ids = store
+            .mcp_oauth_client_ids_for_token_endpoint(&format!("{as_url}/token"))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["manual-client".to_string()]);
+    }
+
+    /// Bind an MCP server that 401s with a `WWW-Authenticate` header pointing at
+    /// a DIFFERENT origin's protected-resource metadata, plus that other origin
+    /// as a separate server which records whether it was ever hit.
+    ///
+    /// Two servers, and a hit counter rather than only an error assertion: the
+    /// guarantee under test is that the daemon never MAKES the request, not
+    /// merely that it reports a failure afterwards.
+    async fn spawn_mcp_401_pointing_at_another_origin() -> (String, Arc<Mutex<usize>>) {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        let other_hits = Arc::new(Mutex::new(0usize));
+        let hits_for_route = other_hits.clone();
+        let other_app = Router::new().route(
+            "/.well-known/oauth-protected-resource",
+            get(move || {
+                let hits = hits_for_route.clone();
+                async move {
+                    *hits.lock().unwrap() += 1;
+                    axum::Json(json!({
+                        "resource": "https://whatever.example",
+                        "authorization_servers": ["https://as.example"],
+                    }))
+                }
+            }),
+        );
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(other_listener, other_app).await.unwrap();
+        });
+        let other_url = format!("http://{other_addr}");
+
+        async fn handle_probe(State(other_url): State<String>) -> axum::response::Response {
+            let www_auth = format!(
+                "Bearer resource_metadata=\"{other_url}/.well-known/oauth-protected-resource\""
+            );
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::UNAUTHORIZED)
+                .header(axum::http::header::WWW_AUTHENTICATE, www_auth)
+                .body(axum::body::Body::empty())
+                .unwrap()
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route("/", post(handle_probe))
+            .with_state(other_url);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), other_hits)
+    }
+
+    #[tokio::test]
+    async fn a_metadata_url_on_another_origin_is_never_even_requested() {
+        let (mcp_url, other_hits) = spawn_mcp_401_pointing_at_another_origin().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+        let spec = mcp_spec(&mcp_url);
+
+        let err = begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect_err("a cross-origin metadata URL must fail the connect");
+
+        assert!(
+            err.to_string().contains("DIFFERENT origin"),
+            "the refusal must be the origin check, not some incidental downstream failure: {err}"
+        );
+        assert_eq!(
+            *other_hits.lock().unwrap(),
+            0,
+            "the named URL must never be REQUESTED — an error raised only after the fetch would \
+             still have made the daemon probe a host of the remote server's choosing"
         );
     }
 
@@ -1197,12 +1979,18 @@ mod tests {
         let _timeout = crate::harness::native::mcp_http::override_request_timeout(
             std::time::Duration::from_millis(300),
         );
-        let url = crate::harness::native::mcp_http::tests::spawn_hanging_body_server().await;
+        // That fixture answers ANY request path, and returns its BASE URL — so
+        // it doubles as the configured server URL here, with the RFC 9728
+        // well-known path appended for the metadata URL. Passing the base as
+        // the metadata URL would now be refused by the well-known-path rule
+        // BEFORE the fetch, and this test would pass on the wrong error.
+        let base = crate::harness::native::mcp_http::tests::spawn_hanging_body_server().await;
+        let metadata_url = format!("{base}/.well-known/oauth-protected-resource");
         let http = reqwest::Client::new();
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            protected_resource_metadata(&http, &url),
+            protected_resource_metadata(&http, &base, &metadata_url),
         )
         .await
         .expect(

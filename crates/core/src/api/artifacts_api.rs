@@ -48,10 +48,14 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "run_artifact_retention" => {
             let a: RunRetentionP = params(p)?;
+            let retention_days = match a.retention_days {
+                Some(days) => days,
+                None => crate::artifacts::configured_retention_days(state.cp.store()).await,
+            };
             ok(run_artifact_retention(
                 state,
                 a.now_ms.unwrap_or_else(crate::paths::now_ms),
-                a.retention_days.unwrap_or(30),
+                retention_days,
             )
             .await?)
         }
@@ -232,5 +236,89 @@ mod tests {
         assert_eq!(ref_list[0].reference_id.as_deref(), Some("ref-1"));
         assert_eq!(ref_list[0].shared_from_session_pk.as_deref(), Some("s1"));
         assert_eq!(ref_list[0].parent_reference_id, None);
+    }
+
+    fn archived_session(id: &str) -> crate::domain::Session {
+        crate::domain::Session {
+            session_pk: id.into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status: crate::domain::SessionStatus::Idle,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(1),
+            last_active: Some(1),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: crate::domain::SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+            archived_at: None,
+        }
+    }
+
+    /// The on-demand retention RPC must use the operator's configured
+    /// `artifact_retention_days`, not a hardcoded 30 — with the old default a
+    /// session archived "now" would never be purged and this would return 0.
+    #[tokio::test]
+    async fn run_artifact_retention_defaults_to_the_configured_window() {
+        let s = state().await;
+        s.cp.store()
+            .insert_session(archived_session("s-retain"))
+            .await
+            .unwrap();
+        assert!(s
+            .cp
+            .store()
+            .archive_session("s-retain", 1_000)
+            .await
+            .unwrap());
+        s.cp.store()
+            .set_setting_raw(crate::artifacts::RETENTION_DAYS_SETTING, "0")
+            .await
+            .unwrap();
+
+        let out = dispatch(&s, "run_artifact_retention", json!({"nowMs": 1_000}))
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_value::<usize>(out).unwrap(), 1);
+        assert!(s
+            .cp
+            .store()
+            .get_session("s-retain")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// An explicit `retentionDays` still overrides the configured window.
+    #[tokio::test]
+    async fn run_artifact_retention_honors_an_explicit_retention_days() {
+        let s = state().await;
+        s.cp.store()
+            .insert_session(archived_session("s-keep"))
+            .await
+            .unwrap();
+        assert!(s.cp.store().archive_session("s-keep", 1_000).await.unwrap());
+        s.cp.store()
+            .set_setting_raw(crate::artifacts::RETENTION_DAYS_SETTING, "0")
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            &s,
+            "run_artifact_retention",
+            json!({"nowMs": 1_000, "retentionDays": 30}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(serde_json::from_value::<usize>(out).unwrap(), 0);
+        assert!(s.cp.store().get_session("s-keep").await.unwrap().is_some());
     }
 }

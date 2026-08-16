@@ -20,7 +20,7 @@ echo "## CI report"
 echo
 echo "| Job | Result |"
 echo "| --- | --- |"
-for job in lint ts rust e2e-cockpit osv; do
+for job in lint ts rust cockpit-rust e2e-cockpit osv; do
   result=$(jq -r --arg j "$job" '.[$j].result // "skipped"' <<<"$NEEDS_JSON")
   echo "| \`$job\` | $(emoji "$result") $result |"
 done
