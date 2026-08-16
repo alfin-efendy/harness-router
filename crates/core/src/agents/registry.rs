@@ -487,11 +487,53 @@ impl AgentRegistry {
             .expect("committed duplicate"))
     }
 
+    /// Strips standing *grants* from a profile arriving from outside this
+    /// machine, leaving restrictions intact.
+    ///
+    /// A `.ryuzi-agent.json` bundle is an ordinary file the user obtained from
+    /// somewhere — a colleague, a download, a repository. Committing its
+    /// `permissions` verbatim let it install an agent with, say,
+    /// `native: { bash: allow }`, and `permission.rs` returns
+    /// `PermDecision::Allow` for that before the approval prompt is ever
+    /// reached. The result was silent shell execution on the next turn, while
+    /// the import modal said "Ready to use."
+    ///
+    /// The asymmetry is deliberate and is the whole point:
+    ///
+    /// - `Allow` / [`PermissionDecision::Allow`] is the only direction that
+    ///   *grants* power, so it is the only one that must not cross a trust
+    ///   boundary unattended. Both become `Ask`, which is already what an
+    ///   absent entry means, so the imported agent behaves exactly like a
+    ///   freshly created one: it works, it just asks first.
+    /// - `Off` and [`PermissionDecision::Deny`] only ever *reduce* what the
+    ///   agent may do. Honouring them cannot escalate anything, and dropping
+    ///   them would silently hand the agent more reach than its author
+    ///   intended — the opposite of the bug.
+    ///
+    /// The user can re-grant anything they want in the agent's Permissions
+    /// tab. That click is the consent this import path was missing.
+    fn drop_imported_grants(permissions: &mut AgentPermissions) {
+        for decision in permissions.native.values_mut() {
+            if matches!(decision, NativeToolDecision::Allow) {
+                *decision = NativeToolDecision::Ask;
+            }
+        }
+        for rule in &mut permissions.rules {
+            if matches!(rule.decision, PermissionDecision::Allow) {
+                rule.decision = PermissionDecision::Ask;
+            }
+        }
+    }
+
     /// Commits an imported profile under a freshly generated id. Structural
     /// defects reject the import; reference/environment issues (unknown
     /// model, skill, plugin tool, or app) are tolerated so the agent lands
     /// visible and flagged for repair, exactly like a profile whose
     /// references went stale on disk.
+    ///
+    /// Standing permissions in the bundle are downgraded before commit — see
+    /// [`drop_imported_grants`]. A bundle is a file from somewhere else; it
+    /// does not get to hand itself privileges.
     pub async fn import(
         &self,
         profile: AgentProfile,
@@ -507,6 +549,7 @@ impl AgentRegistry {
         let mut profile = profile;
         profile.id = id.clone();
         profile.schema_version = AGENT_SCHEMA_VERSION;
+        Self::drop_imported_grants(&mut profile.permissions);
         let name_is_taken = state.agents.values().any(|agent| {
             agent
                 .profile
@@ -1521,6 +1564,98 @@ mod tests {
 
     fn imported_profile(name: &str, model: &str) -> AgentProfile {
         parse_agent_profile(&profile_yaml("agent-from-bundle", name, model, None)).unwrap()
+    }
+
+    /// A bundle cannot grant itself standing permission.
+    ///
+    /// Committing `permissions` verbatim meant a downloaded bundle could ship
+    /// `native: { bash: allow }`, and `permission.rs` returns
+    /// `PermDecision::Allow` for that before the approval prompt — silent
+    /// shell execution on the next turn, under a modal reading "Ready to use."
+    #[tokio::test]
+    async fn import_downgrades_granted_permissions_but_keeps_restrictions() {
+        let (fixture, registry) = import_fixture().await;
+        let mut profile = imported_profile("Imported", "anthropic/claude-opus-4-8");
+        profile
+            .permissions
+            .native
+            .insert("bash".into(), NativeToolDecision::Allow);
+        profile
+            .permissions
+            .native
+            .insert("write".into(), NativeToolDecision::Off);
+        profile.permissions.rules = vec![
+            PermissionRule {
+                id: "r-grant".into(),
+                tool: "bash".into(),
+                decision: PermissionDecision::Allow,
+                command_prefix: Some("rm ".into()),
+            },
+            PermissionRule {
+                id: "r-restrict".into(),
+                tool: "bash".into(),
+                decision: PermissionDecision::Deny,
+                command_prefix: Some("curl ".into()),
+            },
+        ];
+
+        let outcome = registry.import(profile).await.unwrap();
+        let committed = &outcome.snapshot.profile.permissions;
+
+        assert_eq!(
+            committed.native.get("bash"),
+            Some(&NativeToolDecision::Ask),
+            "an imported `allow` must become `ask` — the grant is what needs consent"
+        );
+        assert_eq!(
+            committed.native.get("write"),
+            Some(&NativeToolDecision::Off),
+            "`off` only restricts, so dropping it would GRANT reach the author withheld"
+        );
+        assert_eq!(
+            committed
+                .rules
+                .iter()
+                .find(|r| r.id == "r-grant")
+                .map(|r| r.decision),
+            Some(PermissionDecision::Ask),
+            "a rule granting allow must be downgraded like a native allow"
+        );
+        assert_eq!(
+            committed
+                .rules
+                .iter()
+                .find(|r| r.id == "r-restrict")
+                .map(|r| r.decision),
+            Some(PermissionDecision::Deny),
+            "a deny rule must survive — it can only ever reduce what runs"
+        );
+
+        // The snapshot is what the caller sees; the permission gate reads what
+        // was written. Reload from disk so a scrub that only touched the
+        // returned copy cannot pass this test.
+        let reloaded = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap()
+            .snapshot()
+            .await;
+        let persisted = &reloaded
+            .agents
+            .iter()
+            .find(|a| a.profile.name == "Imported")
+            .expect("imported agent missing after reload")
+            .profile
+            .permissions;
+        assert_eq!(
+            persisted.native.get("bash"),
+            Some(&NativeToolDecision::Ask),
+            "the downgrade must be on disk, not just in the returned snapshot"
+        );
+        assert_eq!(
+            persisted.native.get("write"),
+            Some(&NativeToolDecision::Off),
+            "the restriction must survive the round trip too"
+        );
     }
 
     #[tokio::test]
