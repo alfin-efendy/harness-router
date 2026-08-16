@@ -5487,6 +5487,13 @@ impl Store {
 /// absent — the database already handles them. `messages_fts` is absent too:
 /// the `messages_fts_ad` trigger clears the FTS5 shadow rows on every
 /// `messages` delete.
+///
+/// **Any new session-keyed table must be added here, or given an
+/// `ON DELETE CASCADE` foreign key.** Neither is automatic, and nothing fails
+/// loudly when both are missed — retention simply leaves the rows behind
+/// forever. `pending_approvals` was added later than this list and orphaned
+/// exactly that way until it was registered; `automation_hook_runs` still
+/// does, and drags `automation_hook_attempts` with it.
 const SESSION_CHILD_TABLES: &[(&str, &str)] = &[
     ("messages", "session_pk"),
     ("provider_turns", "session_pk"),
@@ -5498,6 +5505,7 @@ const SESSION_CHILD_TABLES: &[(&str, &str)] = &[
     ("session_route_state", "session_pk"),
     ("session_automation_origins", "session_pk"),
     ("background_events", "target_session_pk"),
+    ("pending_approvals", "session_pk"),
 ];
 
 const ARTIFACT_COLS: &str = "id,source_session_pk,source_message_seq,source_run_id,creator,\
@@ -10722,6 +10730,13 @@ mod tests {
                      VALUES(?1 || '-event',?1,'note','{}',1)",
                     params![pk],
                 )?;
+                c.execute(
+                    "INSERT INTO pending_approvals(run_id,request_id,session_pk,\
+                     requesting_agent_id,requesting_agent_name,tool,summary,approval_kind,\
+                     input_json,created_at) \
+                     VALUES(?1 || '-run','req-1',?1,'agent-1','Agent','bash','ls','tool','{}',1)",
+                    params![pk],
+                )?;
                 Ok(())
             })
             .await
@@ -10823,6 +10838,139 @@ mod tests {
             .await,
             1,
             "artifact tombstones must outlive the purged session"
+        );
+    }
+
+    /// Every session-keyed table must be purged, cascaded, or knowingly kept.
+    ///
+    /// `purging_a_session_deletes_every_session_keyed_child_row` iterates
+    /// [`SESSION_CHILD_TABLES`], so it can only prove that the tables ON the
+    /// list are purged — a table missing from the list is invisible to it.
+    /// That blind spot has cost us twice: `pending_approvals` was added long
+    /// after the list and orphaned every row until it was registered, and
+    /// `automation_hook_runs` still orphans today. This test closes it by
+    /// walking the live schema instead of the list, so the next session-keyed
+    /// table fails here on the day it is added rather than silently growing
+    /// forever in the field.
+    #[tokio::test]
+    async fn every_session_keyed_table_is_purged_cascaded_or_knowingly_kept() {
+        // Tables that keep session-keyed rows on purpose. Each needs a reason,
+        // because "not in the list" is otherwise indistinguishable from a bug.
+        const KEPT_ON_PURPOSE: &[(&str, &str)] = &[
+            ("audit", "the audit trail must outlive what it describes"),
+            (
+                "job_runs",
+                "a job's run history is the job's, not the session's",
+            ),
+            (
+                "artifacts",
+                "owned by the artifact lifecycle; retention tombstones these \
+                 separately and delete_session_after_artifact_purge refuses to \
+                 run until they are gone",
+            ),
+            (
+                "artifact_references",
+                "keyed to artifacts, which outlive the session by design",
+            ),
+            (
+                "automation_hook_runs",
+                "KNOWN ORPHAN, pre-existing and NOT yet fixed. The naive fix is \
+                 wrong: automation_hook_attempts carries a foreign key to \
+                 automation_hook_runs(id) with NO ON DELETE CASCADE, so with \
+                 foreign_keys=ON a plain DELETE here raises a constraint failure \
+                 and aborts the whole retention transaction. Purging it needs \
+                 the attempts deleted first, and its session_pk is nullable.",
+            ),
+            (
+                "sessions",
+                "the parent — its session_pk is its own primary key",
+            ),
+            (
+                "jobs",
+                "`home_session_pk` is a REFERENCE, not ownership: a job outlives \
+                 the chat it reports into, so purging the session must never \
+                 delete the job. The pointer is left dangling and healed lazily \
+                 by scheduler::clear_home_session on the job's next run. A job \
+                 that is disabled or never fires again keeps a stale pk \
+                 indefinitely — harmless today (every read resolves it and \
+                 clears on miss) but the honest fix is for retention to NULL the \
+                 column rather than wait for a run that may never come.",
+            ),
+        ];
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let listed: std::collections::HashSet<&str> =
+            SESSION_CHILD_TABLES.iter().map(|&(t, _)| t).collect();
+        let excused: std::collections::HashSet<&str> =
+            KEPT_ON_PURPOSE.iter().map(|&(t, _)| t).collect();
+
+        let unhandled = store
+            .with_conn(move |c| -> rusqlite::Result<Vec<String>> {
+                let mut tables = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%'",
+                )?;
+                let names: Vec<String> = tables
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut unhandled = Vec::new();
+                for name in names {
+                    let mut cols = c.prepare(&format!("PRAGMA table_info({name})"))?;
+                    let has_session_key = cols
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                        .iter()
+                        .any(|col| col.ends_with("session_pk"));
+                    if !has_session_key
+                        || listed.contains(name.as_str())
+                        || excused.contains(name.as_str())
+                    {
+                        continue;
+                    }
+                    // A cascade reaching `sessions` does the job in the database.
+                    // Follow the chain, not just the first hop: agent_run_messages
+                    // is cleaned by cascading to agent_runs, which cascades to
+                    // sessions. Every edge on the path must be ON DELETE CASCADE.
+                    let mut frontier = vec![name.clone()];
+                    let mut visited = std::collections::HashSet::new();
+                    let mut cascades = false;
+                    while let Some(current) = frontier.pop() {
+                        if !visited.insert(current.clone()) {
+                            continue;
+                        }
+                        let mut fks = c.prepare(&format!("PRAGMA foreign_key_list({current})"))?;
+                        let parents = fks
+                            .query_map([], |r| {
+                                Ok((r.get::<_, String>(2)?, r.get::<_, String>(6)?))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        for (parent, on_delete) in parents {
+                            if on_delete != "CASCADE" {
+                                continue;
+                            }
+                            if parent == "sessions" {
+                                cascades = true;
+                                frontier.clear();
+                                break;
+                            }
+                            frontier.push(parent);
+                        }
+                    }
+                    if !cascades {
+                        unhandled.push(name);
+                    }
+                }
+                Ok(unhandled)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            unhandled.is_empty(),
+            "these tables have a session key but are neither in \
+             SESSION_CHILD_TABLES, nor cascaded from sessions, nor listed in \
+             KEPT_ON_PURPOSE — retention will orphan their rows forever: {unhandled:?}"
         );
     }
 
