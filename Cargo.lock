@@ -4978,6 +4978,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryuzi-control"
+version = "0.9.1"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "async-trait",
+ "dirs 5.0.1",
+ "predicates",
+ "ryuzi-core",
+ "serial_test",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ryuzi-core"
 version = "0.6.0"
 dependencies = [
@@ -5053,21 +5068,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "toml 0.8.23",
-]
-
-[[package]]
-name = "ryuzi-runner"
-version = "0.9.1"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "async-trait",
- "dirs 5.0.1",
- "predicates",
- "ryuzi-core",
- "serial_test",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

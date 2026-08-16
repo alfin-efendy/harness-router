@@ -168,7 +168,7 @@ pub type ResolvedBind = (
     Option<String>,
 );
 
-/// The pure listen-address decision behind `ryuzi-runner`'s
+/// The pure listen-address decision behind `ryuzi-control`'s
 /// `daemon_cmd::start_control_api` (P2-7): given the raw `listen_addr`
 /// setting value and the control directory, resolve the bind IP, an
 /// optional TLS server config, the URL scheme, and the cert fingerprint (if

@@ -109,10 +109,10 @@ jobs:
           git config --global user.name "ryuzi CI"
       - run: cargo fmt --check
         if: matrix.os == 'ubuntu-latest'
-      - run: cargo clippy -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk --all-targets -- -D warnings
+      - run: cargo clippy -p ryuzi-core -p ryuzi-control -p ryuzi-plugin-sdk --all-targets -- -D warnings
         if: matrix.os == 'ubuntu-latest'
       - name: cargo test
-        run: cargo test -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk
+        run: cargo test -p ryuzi-core -p ryuzi-control -p ryuzi-plugin-sdk
         timeout-minutes: 20
       # Every first-party plugin crate is its own standalone workspace, NOT a
       # member of the root workspace, so the `-p ryuzi-core ...` run above never
@@ -133,9 +133,9 @@ jobs:
             cargo test --manifest-path "$manifest"
             echo "::endgroup::"
           done
-      - name: Build + smoke the runner binary (absorbs the old build-smoke job)
+      - name: Build + smoke the control-plane binary (absorbs the old build-smoke job)
         run: |
-          cargo build -p ryuzi-runner
+          cargo build -p ryuzi-control
           ./target/debug/ryuzi --version
           ./target/debug/ryuzi --help
 

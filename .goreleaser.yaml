@@ -22,7 +22,7 @@ builds:
       - aarch64-unknown-linux-gnu
     flags:
       - --release
-      - -p=ryuzi-runner
+      - -p=ryuzi-control
 
   - id: ryuzi-darwin
     builder: rust
@@ -37,7 +37,7 @@ builds:
       - aarch64-apple-darwin
     flags:
       - --release
-      - -p=ryuzi-runner
+      - -p=ryuzi-control
 
   - id: ryuzi-musl
     builder: rust
@@ -51,7 +51,7 @@ builds:
       - aarch64-unknown-linux-musl
     flags:
       - --release
-      - -p=ryuzi-runner
+      - -p=ryuzi-control
 
 archives:
   # Names are the target triple minus `-unknown` ("platform tag") and MUST

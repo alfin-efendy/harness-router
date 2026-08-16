@@ -8,7 +8,7 @@ fn main() -> ExitCode {
     // stderr, which the daemon spawn path redirects into daemon.log.
     ryuzi_core::logging::init_tracing();
 
-    let mut deps = ryuzi_runner::dispatch::Deps {
+    let mut deps = ryuzi_control::dispatch::Deps {
         db_path: ryuzi_core::paths::db_path(),
         out: Box::new(|s| println!("{s}")),
         err: Box::new(|s| eprintln!("{s}")),
@@ -19,9 +19,9 @@ fn main() -> ExitCode {
             let _ = std::io::stdin().read_line(&mut line);
             line
         }),
-        detect_git: ryuzi_runner::detect::detect_git,
+        detect_git: ryuzi_control::detect::detect_git,
     };
-    ExitCode::from(ryuzi_runner::dispatch::run_cli(
+    ExitCode::from(ryuzi_control::dispatch::run_cli(
         std::env::args().skip(1).collect(),
         &mut deps,
     ))

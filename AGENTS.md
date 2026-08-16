@@ -5,9 +5,9 @@ nearest nested `AGENTS.md` if one is added later, but keep these root rules in
 force unless a more specific file overrides them.
 
 The product is the Cockpit desktop app (a Tauri UI over the Rust engine in
-`crates/core`) plus the headless runner daemon (`ryuzi`, built from
-`crates/runner`). There is no interactive CLI product — the old TUI/CLI was
-removed when the runner shipped. No TypeScript CLI, protocol package, or TS
+`crates/core`) plus the headless control-plane daemon (`ryuzi`, built from
+`crates/control`). There is no interactive CLI product — the old TUI/CLI was
+removed when the daemon shipped. No TypeScript CLI, protocol package, or TS
 core exist either.
 
 ## 1. Commands First
@@ -20,18 +20,18 @@ changes directory.
 | Install all dev deps | `bun install` |
 | First-time setup | `make setup` |
 | Toolchain check | `make doctor` |
-| Run the ryuzi runner from source | `cargo run -p ryuzi-runner -- <args>` or `make runner ARGS="<args>"` |
+| Run the ryuzi control plane from source | `cargo run -p ryuzi-control -- <args>` or `make control ARGS="<args>"` |
 | Run Cockpit desktop app | `bun run cockpit:dev` or `make dev` |
 | Build Cockpit desktop app | `bun run cockpit:build` or `make build` |
 | Run JS/TS tests | `bun test` |
-| Run Rust tests | `cargo test -p ryuzi-core -p ryuzi-runner` (or `cargo test` for the whole workspace) |
+| Run Rust tests | `cargo test -p ryuzi-core -p ryuzi-control` (or `cargo test` for the whole workspace) |
 | Run all tests | `make test-all` |
 | Type-check TS workspaces | `bun run typecheck` |
 | Lint JS/TS | `bun run lint` |
-| Lint Rust | `cargo clippy -p ryuzi-core -p ryuzi-runner --all-targets -- -D warnings` |
+| Lint Rust | `cargo clippy -p ryuzi-core -p ryuzi-control --all-targets -- -D warnings` |
 | Format JS/TS and Rust | `bun run format && cargo fmt` or `make format` |
 | Pre-commit JS gate | `make check` |
-| Runner smoke test | `cargo build -p ryuzi-runner && ./target/debug/ryuzi --version && ./target/debug/ryuzi --help` |
+| Control-plane smoke test | `cargo build -p ryuzi-control && ./target/debug/ryuzi --version && ./target/debug/ryuzi --help` |
 
 Use Bun for JavaScript and TypeScript work:
 
@@ -45,7 +45,7 @@ Use Bun for JavaScript and TypeScript work:
 Rust work uses Cargo:
 
 - Use `cargo test`, `cargo fmt`, and `cargo clippy` when touching Rust crates.
-- Keep clippy clean: CI fails on any warning in `ryuzi-core` and `ryuzi-runner`.
+- Keep clippy clean: CI fails on any warning in `ryuzi-core` and `ryuzi-control`.
 - Do not replace existing Rust workspace conventions with JS tooling.
 
 ## 2. Reality Check Before Editing
@@ -70,7 +70,7 @@ desktop UI and shared web UI).
 | Path | Role | Primary tooling |
 | --- | --- | --- |
 | `crates/core` | `ryuzi-core` — engine: control plane, store (SQLite), gateways (Discord), harness, LLM router, scheduler, settings, telemetry, update, worktrees, plugin host (`src/plugins/`) + embedded integration catalog (`plugins/catalog/*.toml`) | Cargo |
-| `crates/runner` | `ryuzi-runner` — the ryuzi headless runner daemon (binary: ryuzi) | Cargo |
+| `crates/control` | `ryuzi-control` — the headless control-plane daemon (binary: ryuzi) | Cargo |
 | `crates/plugin-sdk` | `ryuzi-plugin-sdk` — declarative plugin contract: manifest types, category vocabulary, validation, placeholder substitution (no `ryuzi-core` dependency) | Cargo |
 | `apps/cockpit` | Tauri desktop app frontend | Bun, Vite, React, Tailwind v4 |
 | `apps/cockpit/src-tauri` | `ryuzi-cockpit` — Tauri shell and desktop commands, depends on `ryuzi-core` | Cargo, Tauri 2 |
@@ -84,7 +84,7 @@ desktop UI and shared web UI).
 
 Keep dependencies flowing inward:
 
-- `crates/runner` and `apps/cockpit/src-tauri` depend on `crates/core`; the
+- `crates/control` and `apps/cockpit/src-tauri` depend on `crates/core`; the
   engine never depends on its consumers.
 - `apps/cockpit` imports `packages/ui`; `packages/ui` must not depend on
   app-specific state.
@@ -93,16 +93,16 @@ Keep dependencies flowing inward:
 
 ## 4. Area Rules
 
-### Runner (Rust)
+### Control plane (Rust)
 
-- Source lives in `crates/runner`; the binary is named `ryuzi`
-  (`crates/runner/src/main.rs`, library in `src/lib.rs`). There is no TUI —
+- Source lives in `crates/control`; the binary is named `ryuzi`
+  (`crates/control/src/main.rs`, library in `src/lib.rs`). There is no TUI —
   the command surface is `setup`, `start`, `status`, `service`, `doctor`,
   `config`, plus `--version`/`--help` and the hidden `__daemon`.
-- Run it with `cargo run -p ryuzi-runner -- <args>`.
+- Run it with `cargo run -p ryuzi-control -- <args>`.
 - Tests are inline `#[cfg(test)]` modules plus integration tests in
-  `crates/runner/tests` (assert_cmd; no insta snapshots).
-- The runner's brand identity is text-only: glyph `r`, name `ryuzi`
+  `crates/control/tests` (assert_cmd; no insta snapshots).
+- The control plane's brand identity is text-only: glyph `r`, name `ryuzi`
   (see `assets/brand/README.md`).
 - Do not change npm launcher behavior in `npm/ryuzi` or `npm/platform/*`
   without checking packaging and release workflows.
@@ -153,7 +153,7 @@ Keep dependencies flowing inward:
 
 ### Rust Workspace
 
-- Cargo workspace members are `crates/core`, `crates/runner`,
+- Cargo workspace members are `crates/core`, `crates/control`,
   `crates/plugin-sdk`, and `apps/cockpit/src-tauri` (declared in root
   `Cargo.toml`).
 - Shared dependencies and lint levels live in `[workspace.dependencies]` and
@@ -171,18 +171,18 @@ Choose the smallest meaningful verification set for the files you touched:
 | --- | --- |
 | Pure docs | Review rendered Markdown mentally; no test required |
 | Engine (`crates/core`) | `cargo test -p ryuzi-core` and `cargo fmt` |
-| Runner (`crates/runner`) | `cargo test -p ryuzi-runner` plus `cargo run -p ryuzi-runner -- --help` when relevant |
+| Control plane (`crates/control`) | `cargo test -p ryuzi-control` plus `cargo run -p ryuzi-control -- --help` when relevant |
 | Tauri commands (`src-tauri`) | `cargo test -p ryuzi-cockpit` |
 | Cockpit React UI | Targeted `bun test apps/cockpit/src/...` plus `bun run --cwd apps/cockpit build` for broad UI changes |
 | Shared UI (`packages/ui`) | `bun test packages/ui` and `bun run typecheck` |
 | Cross-stack Tauri change | `bun run cockpit:build` or explain why it was not run |
-| Release or npm packaging | Check `.github/workflows/*`, `scripts/npm/*`, `npm/*`, and run the runner smoke test |
+| Release or npm packaging | Check `.github/workflows/*`, `scripts/npm/*`, `npm/*`, and run the control-plane smoke test |
 
 CI (`.github/workflows/ci.yml`) uses Bun 1.3.14 with
 `bun install --frozen-lockfile`, then: `bunx biome ci .` + `shellcheck
 install.sh`; `bun run typecheck` + `bun test`; `cargo fmt --check`,
-`cargo clippy -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk --all-targets
--- -D warnings`, `cargo test -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk`,
+`cargo clippy -p ryuzi-core -p ryuzi-control -p ryuzi-plugin-sdk --all-targets
+-- -D warnings`, `cargo test -p ryuzi-core -p ryuzi-control -p ryuzi-plugin-sdk`,
 `cargo test --manifest-path` over every `plugins/*/Cargo.toml`, and a build +
 `--version`/`--help` smoke of the `ryuzi` binary; a separate `cockpit-rust` job
 running `cargo clippy -p ryuzi-cockpit --all-targets -- -D warnings` and
@@ -198,7 +198,7 @@ Good:
 
 ```sh
 cargo test -p ryuzi-core
-cargo run -p ryuzi-runner -- --help
+cargo run -p ryuzi-control -- --help
 bun test apps/cockpit/src/store.test.ts
 bun run typecheck
 ```
@@ -209,7 +209,7 @@ Bad:
 npm test
 npx biome ci .
 node scripts/anything.js
-bun run ryuzi   # no such script — the runner is the Rust binary, not a Bun app
+bun run ryuzi   # no such script — the control plane is the Rust binary, not a Bun app
 ```
 
 ### Branch Claims

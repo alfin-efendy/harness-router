@@ -1,6 +1,6 @@
 //! Process-level test for the daemon entry points (hidden `__daemon` and the
 //! user-facing `start` alias, both dispatching to
-//! `crates/runner/src/daemon_cmd.rs`): spawns the real compiled `ryuzi`
+//! `crates/control/src/daemon_cmd.rs`): spawns the real compiled `ryuzi`
 //! binary, waits for it to reach `daemon.json` state `"running"`, then
 //! verifies a clean SIGTERM shutdown. Unix-only (SIGTERM/`libc::kill` via
 //! `ryuzi_core::daemon_status::send_sigterm`).
@@ -46,7 +46,7 @@ fn lifecycle(entry: &str) {
     // Redirect ryuzi_core::paths::state_dir() (and thus db_path()) into the
     // tempdir on both Linux (XDG_DATA_HOME) and macOS (HOME) — same
     // XDG_DATA_HOME/HOME redirection pattern used throughout this crate's
-    // integration tests (see e.g. crates/runner/tests/e2e_journey.rs).
+    // integration tests (see e.g. crates/control/tests/e2e_journey.rs).
     //
     // Those two are NOT sufficient on Windows: `dirs::data_dir()` /
     // `dirs::config_dir()` resolve `FOLDERID_RoamingAppData` through the

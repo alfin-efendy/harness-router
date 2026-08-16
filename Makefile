@@ -6,7 +6,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-# Extra args for runnable targets, e.g.  make cli ARGS="status"
+# Extra args for runnable targets, e.g.  make control ARGS="status"
 ARGS ?=
 
 ##@ Help
@@ -30,13 +30,12 @@ doctor: ## Check the required toolchain is present
 	@echo "tauri: $$(cd apps/cockpit && bun run tauri --version 2>/dev/null || echo 'run `make install`')"
 
 ##@ Development
-.PHONY: dev cockpit runner cli
+.PHONY: dev cockpit control
 dev: ## Run the Cockpit desktop app with HMR (tauri dev)
 	bun run cockpit:dev
 cockpit: dev ## Alias for `dev`
-runner: ## Run the ryuzi runner (Rust) — pass flags via ARGS, e.g. make runner ARGS="status"
-	cargo run -p ryuzi-runner -- $(ARGS)
-cli: runner ## Alias for `runner` (old name)
+control: ## Run the ryuzi control plane (Rust) — pass flags via ARGS, e.g. make control ARGS="status"
+	cargo run -p ryuzi-control -- $(ARGS)
 
 ##@ Build
 .PHONY: build build-web run-release bundles

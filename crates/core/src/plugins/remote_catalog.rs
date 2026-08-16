@@ -528,7 +528,7 @@ const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/alfin-efendy/ryuzi/relea
 /// both export the vX.Y.Z tag being released — see `.goreleaser.yaml` /
 /// `cockpit-release.yml`). `None` in dev and fork builds. The tag is STAMPED
 /// rather than derived from `CARGO_PKG_VERSION` because the release tag tracks
-/// `crates/runner`'s version — neither this crate's own version nor Cockpit's
+/// `crates/control`'s version — neither this crate's own version nor Cockpit's
 /// matches it.
 pub const BUILD_RELEASE_TAG: Option<&str> = option_env!("RYUZI_RELEASE_TAG");
 
