@@ -11250,14 +11250,14 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 11 database (v1 squashed baseline + v2
+    // produce a `user_version` 12 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
     // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
     // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json + v7
     // mcp_oauth_clients.token_endpoint + v8 gateways.fs_mode permissive
     // default + v9 duplicate-pk-index drop + v10 pending_approvals + v11
-    // mcp_oauth_clients.user_asserted)
+    // mcp_oauth_clients.user_asserted + v12 jobs.home_session_pk)
     // whose schema + seeded rows exactly match the golden fixture.
     //
     // The fixture is also what proves a FRESH database and an UPGRADED one
