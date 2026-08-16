@@ -106,7 +106,7 @@ fn config_survives_a_full_daemon_lifecycle() {
         .stdout(predicate::str::contains("high"));
 
     // 2. Seed settings so the daemon never touches the network (same seeding
-    //    as crates/runner/tests/daemon.rs). A fresh db already boots
+    //    as crates/control/tests/daemon.rs). A fresh db already boots
     //    zero-gateway — Task 4 retired the `enabled_gateways` CSV, so there
     //    is no longer a seed to clear.
     sandbox.export();

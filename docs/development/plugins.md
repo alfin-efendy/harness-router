@@ -37,8 +37,8 @@ two different crates:
   capability it actually provides, `PluginHost` tracks every installed
   plugin, and `Registries` (`harness`/`gateway`/`connector`/`plugins`) is the
   composition root the daemon builds at startup inside
-  `ryuzi_core::daemon::build_daemon` — used by both the runner (`ryuzi
-  start`) and Cockpit's `--engine-daemon` mode.
+  `ryuzi_core::daemon::build_daemon` — used by the control plane (`ryuzi
+  start`), which Cockpit spawns and attaches to.
 
 Manifests come from two places, merged in this order (first registration for
 a given `id` wins — see `PluginHost::add`/`Registries::add_plugin`):

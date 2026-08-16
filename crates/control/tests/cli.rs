@@ -3,7 +3,7 @@ use predicates::prelude::*;
 
 /// Builds a `ryuzi` command whose state and config trees are redirected into
 /// `tmp`. **Every** spawned `ryuzi` in this file must go through here, even
-/// the ones that only print `--version` or `--help`: `crates/runner/src/
+/// the ones that only print `--version` or `--help`: `crates/control/src/
 /// main.rs` resolves `ryuzi_core::paths::db_path()` for every invocation, and
 /// it is far too easy for a future subcommand to start touching it.
 ///

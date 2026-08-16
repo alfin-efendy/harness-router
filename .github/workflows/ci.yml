@@ -44,6 +44,16 @@ jobs:
               - "package.json"
               - "bun.lock"
               - ".github/**"
+              # Not TypeScript, but the inputs of scripts/test/release-config.test.ts,
+              # which pins every release-please `package-name` to the real Cargo
+              # `[package] name`. `bun test` runs only in the `ts` job, so without
+              # these a package rename (S6 renames ryuzi-control) would set rust=true
+              # and ts=false, skipping the one guard that catches the drift.
+              # release.yml, the third input, is already covered by `.github/**`.
+              - "release-please-config.json"
+              - ".release-please-manifest.json"
+              - "crates/**/Cargo.toml"
+              - "apps/**/Cargo.toml"
             rust:
               - "crates/**"
               - "apps/cockpit/src-tauri/**"
@@ -109,10 +119,10 @@ jobs:
           git config --global user.name "ryuzi CI"
       - run: cargo fmt --check
         if: matrix.os == 'ubuntu-latest'
-      - run: cargo clippy -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk --all-targets -- -D warnings
+      - run: cargo clippy -p ryuzi-core -p ryuzi-control -p ryuzi-plugin-sdk --all-targets -- -D warnings
         if: matrix.os == 'ubuntu-latest'
       - name: cargo test
-        run: cargo test -p ryuzi-core -p ryuzi-runner -p ryuzi-plugin-sdk
+        run: cargo test -p ryuzi-core -p ryuzi-control -p ryuzi-plugin-sdk
         timeout-minutes: 20
       # Every first-party plugin crate is its own standalone workspace, NOT a
       # member of the root workspace, so the `-p ryuzi-core ...` run above never
@@ -133,9 +143,9 @@ jobs:
             cargo test --manifest-path "$manifest"
             echo "::endgroup::"
           done
-      - name: Build + smoke the runner binary (absorbs the old build-smoke job)
+      - name: Build + smoke the control-plane binary (absorbs the old build-smoke job)
         run: |
-          cargo build -p ryuzi-runner
+          cargo build -p ryuzi-control
           ./target/debug/ryuzi --version
           ./target/debug/ryuzi --help
 
@@ -165,6 +175,14 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
+      - uses: ./.github/actions/setup-bun
+      # `tauri-build` resolves `bundle.externalBin` inside build.rs on every
+      # compile of this crate — the dev profile too, not just `tauri build` —
+      # and the staging slot is a gitignored build artifact, so a clean
+      # checkout cannot compile ryuzi-cockpit until the sidecar is in place.
+      # Debug profile: nothing in this job runs the binary, it only has to exist.
+      - name: Stage the control-plane sidecar
+        run: bun run cockpit:sidecar --debug
       - run: cargo clippy -p ryuzi-cockpit --all-targets -- -D warnings
       - name: cargo test
         run: cargo test -p ryuzi-cockpit

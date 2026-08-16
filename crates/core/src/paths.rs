@@ -25,7 +25,7 @@ fn env_dir_override(var: &str) -> Option<PathBuf> {
 /// `skills_install`.
 ///
 /// **Why this is a RUNTIME check and NOT `#[cfg(test)]`-gated — do not
-/// "tighten" it:** the tests that depend on it (`crates/runner/tests/cli.rs`,
+/// "tighten" it:** the tests that depend on it (`crates/control/tests/cli.rs`,
 /// `daemon.rs`, `e2e_journey.rs`) spawn the REAL compiled `ryuzi` binary as a
 /// subprocess via `assert_cmd`. That binary is built without `cfg(test)`, so
 /// a `cfg(test)` seam in this library is invisible to it — the override has
@@ -36,7 +36,7 @@ fn env_dir_override(var: &str) -> Option<PathBuf> {
 /// Those tests previously relied on `XDG_DATA_HOME`/`HOME` alone. `dirs::
 /// data_dir()` honors both on Linux/macOS but on **Windows** it calls the
 /// `FOLDERID_RoamingAppData` known-folder API, which ignores every
-/// environment variable — so `cargo test -p ryuzi-runner` on Windows opened
+/// environment variable — so `cargo test -p ryuzi-control` on Windows opened
 /// the developer's LIVE `%APPDATA%\ryuzi\ryuzi.sqlite` and ran schema
 /// migrations against it, leaving a database the installed release build
 /// refused to open. This project has now destroyed real user state twice by

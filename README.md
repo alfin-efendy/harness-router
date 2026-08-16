@@ -265,9 +265,9 @@ This is a Bun workspaces monorepo (Cockpit desktop app + shared UI) wrapping a C
 
 ```bash
 bun install                        # link workspaces (Cockpit, shared UI)
-cargo run -p ryuzi-runner -- ...   # run the ryuzi runner from source (or: make runner ARGS="...")
+cargo run -p ryuzi-control -- ...  # run the ryuzi control plane from source (or: make control ARGS="...")
 bun test                           # run Cockpit/UI/script package tests
-cargo test -p ryuzi-core -p ryuzi-runner   # run Rust tests
+cargo test -p ryuzi-core -p ryuzi-control  # run Rust tests
 bun run typecheck                  # tsc --noEmit across the Bun workspaces
 bun run lint                       # biome ci .
 bun run format                     # biome check --write . && cargo fmt
@@ -278,7 +278,7 @@ bun run format                     # biome check --write . && cargo fmt
 ```
 crates/
   core/              # ryuzi-core — engine: control plane, store, providers, agents, gateways, observability
-  runner/            # ryuzi-runner — the ryuzi headless runner daemon
+  control/           # ryuzi-control — the ryuzi headless control-plane daemon
 apps/
   cockpit/           # @ryuzi/cockpit — Tauri desktop app (thin UI over ryuzi-core)
   mission-control/   # @ryuzi/mission-control — web app (planned)

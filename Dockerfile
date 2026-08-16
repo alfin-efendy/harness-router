@@ -28,7 +28,7 @@ RUN mkdir -p /home/ryuzi/.local/share/ryuzi /home/ryuzi/.config/ryuzi \
 VOLUME ["/home/ryuzi/.local/share/ryuzi", "/home/ryuzi/.config/ryuzi"]
 
 # Control API port (`control_port`, default 4483 — see DEFAULT_CONTROL_PORT in
-# crates/runner/src/daemon_cmd.rs). Documentation only: it publishes nothing by
+# crates/control/src/daemon_cmd.rs). Documentation only: it publishes nothing by
 # itself, and the daemon stays on loopback until `listen_addr` is widened.
 EXPOSE 4483
 

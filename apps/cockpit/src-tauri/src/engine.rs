@@ -204,9 +204,9 @@ fn drain_lines(buf: &mut Vec<u8>) -> Vec<Value> {
 
 const SPAWN_TIMEOUT_MS: u64 = 30_000;
 
-/// Attach to a live daemon, or spawn one (`current_exe --engine-daemon`) and
-/// poll daemon.json until Running(port). A live pid whose control API is
-/// unreachable/401 is treated as outdated: SIGTERM, wait dead (5s), spawn fresh.
+/// Attach to a live daemon, or spawn the `ryuzi` control-plane binary
+/// (resolved by [`resolve_control_binary`]) and wait for it to become
+/// reachable.
 ///
 /// The returned `EngineClient` is captured ONCE by the caller (typically into
 /// managed Tauri state) and never refreshed mid-session, so recovering across
@@ -244,7 +244,7 @@ pub async fn connect_or_spawn() -> anyhow::Result<EngineClient> {
         }
     }
 
-    spawn_engine_daemon(&dir)?;
+    spawn_control_plane(&dir)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SPAWN_TIMEOUT_MS);
     while std::time::Instant::now() < deadline {
         if let Some(client) = try_attach(&dir).await {
@@ -266,7 +266,17 @@ async fn try_attach(dir: &std::path::Path) -> Option<EngineClient> {
     }
     let port = status.port?;
     let token = ryuzi_core::control_token::read_token(dir)?;
-    let client = EngineClient::new(format!("http://127.0.0.1:{port}"), token);
+    let base_url = local_base_url(status.scheme.as_deref(), status.host.as_deref(), port);
+    // A non-loopback bind serves TLS and nothing else (`serve` binds exactly
+    // one listener), and its cert is self-signed, so it can only be reached
+    // through the same fingerprint pin remote runners use — the daemon writes
+    // that fingerprint into `daemon.json` precisely so a client can.
+    let client = match (status.scheme.as_deref(), status.fingerprint) {
+        (Some("https"), Some(fingerprint)) => {
+            EngineClient::new_pinned(base_url, token, fingerprint)
+        }
+        _ => EngineClient::new(base_url, token),
+    };
     // Auth-verified liveness probe: /health is open, so probe an authed route.
     match client
         .rpc::<Option<String>>("get_setting", serde_json::json!({"key": "control_port"}))
@@ -275,6 +285,50 @@ async fn try_attach(dir: &std::path::Path) -> Option<EngineClient> {
         Ok(_) => Some(client),
         Err(_) => None,
     }
+}
+
+/// Base URL for the LOCAL daemon that `daemon.json` describes.
+///
+/// A daemon Cockpit spawned is always loopback: the spawn sets
+/// `RYUZI_MANAGED_HOST=1`, and `daemon_cmd::effective_listen_addr` in
+/// `crates/control` forces `127.0.0.1` under that flag regardless of the
+/// `listen_addr` setting — reproducing what the deleted in-process daemon
+/// did. So for the common path this returns `http://127.0.0.1:{port}` by
+/// construction, exactly as before.
+///
+/// This function still handles the other shapes `daemon.json` can carry,
+/// because Cockpit also attaches to a daemon **it did not spawn** — one
+/// already running from a standalone `ryuzi start`, which does honour
+/// `listen_addr`:
+///
+/// - a **wildcard** bind (`0.0.0.0` / `::`) is not itself dialable, but
+///   loopback is part of what it accepts and is the one route guaranteed to
+///   exist from this machine. Dialing loopback also keeps the *peer* address
+///   loopback, which `serve::authorize` requires before it will accept the
+///   control token.
+/// - a **specific** non-loopback bind (`listen_addr = 192.168.1.5`) is not
+///   attachable from here. The URL and the TLS pin are both right, but
+///   `serve::authorize` answers 401: the control token authenticates a
+///   loopback peer only, and a connection to the host's own LAN address does
+///   not have a loopback peer address. Reaching such a daemon needs a paired
+///   device token (`ryuzi pair`) — the remote-client path, not this one.
+///   `try_attach` returns `None`, and `connect_or_spawn` then spawns a
+///   managed daemon of its own, which loopback-binds and is reachable.
+/// - **absent** host (a pre-remote-runner status file, always loopback), an
+///   **IPv6 literal** (needs brackets inside a URL authority), and anything
+///   **unparsable** (falls back to loopback, mirroring `resolve_bind`'s own
+///   "a bad setting value must never widen the surface" rule).
+fn local_base_url(scheme: Option<&str>, host: Option<&str>, port: u16) -> String {
+    use std::net::IpAddr;
+    let scheme = scheme.unwrap_or("http");
+    let host = match host.and_then(|h| h.parse::<IpAddr>().ok()) {
+        Some(IpAddr::V6(ip)) if ip.is_unspecified() => "[::1]".to_string(),
+        Some(IpAddr::V6(ip)) => format!("[{ip}]"),
+        Some(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        Some(ip) => ip.to_string(),
+        None => "127.0.0.1".to_string(),
+    };
+    format!("{scheme}://{host}:{port}")
 }
 
 /// Open `<dir>/daemon.log` for append, creating the state dir if missing.
@@ -298,16 +352,100 @@ fn open_daemon_log(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-fn spawn_engine_daemon(dir: &std::path::Path) -> anyhow::Result<()> {
-    use std::process::{Command, Stdio};
+/// On-disk filename of the control-plane binary Cockpit spawns.
+///
+/// Three places must agree on this name and there is no build-time link
+/// between them: this resolver, `tauri.conf.json`'s
+/// `bundle.externalBin = ["binaries/ryuzi"]`, and
+/// `scripts/cockpit/stage-sidecar.ts`, which copies the built binary into that
+/// slot. Tauri strips the `-<target-triple>` suffix when it installs the
+/// sidecar, so the installed name is exactly this.
+pub(crate) const CONTROL_BIN: &str = if cfg!(windows) { "ryuzi.exe" } else { "ryuzi" };
+
+/// Locate the `ryuzi` control-plane binary. See
+/// [`resolve_control_binary_in`] for the search order.
+fn resolve_control_binary() -> anyhow::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
+    let exe_dir = exe
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let override_path = std::env::var_os("RYUZI_CONTROL_BIN").map(std::path::PathBuf::from);
+    resolve_control_binary_in(override_path, &exe_dir, lookup_on_path)
+}
+
+/// Search order, most specific first:
+///
+/// 1. `override_path` — the `RYUZI_CONTROL_BIN` environment variable. For
+///    tests, and for running Cockpit against a control plane built elsewhere.
+/// 2. A sibling of the running executable. This one branch covers both real
+///    layouts: Tauri installs an `externalBin` sidecar next to the app
+///    executable, and `cargo` puts `ryuzi` and `ryuzi-cockpit` in the same
+///    `target/<profile>/` directory, so `cargo tauri dev` works with no extra
+///    wiring.
+/// 3. `PATH`, for a separately installed control plane.
+fn resolve_control_binary_in(
+    override_path: Option<std::path::PathBuf>,
+    exe_dir: &std::path::Path,
+    path_lookup: impl FnOnce(&str) -> Option<std::path::PathBuf>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = override_path {
+        if path.is_file() {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "RYUZI_CONTROL_BIN points at {} but that is not a file",
+            path.display()
+        );
+    }
+    let sibling = exe_dir.join(CONTROL_BIN);
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    if let Some(found) = path_lookup(CONTROL_BIN) {
+        return Ok(found);
+    }
+    anyhow::bail!(
+        "control-plane binary `{CONTROL_BIN}` not found next to {} or on PATH. \
+         Build one with `cargo build -p ryuzi-control`, or point RYUZI_CONTROL_BIN at an existing binary.",
+        exe_dir.display()
+    )
+}
+
+/// First entry in `PATH` that holds a file called `name`.
+fn lookup_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn spawn_control_plane(dir: &std::path::Path) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let bin = resolve_control_binary()?;
     let log = open_daemon_log(dir)?;
     let log2 = log.try_clone()?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("--engine-daemon")
+    let mut cmd = Command::new(bin);
+    // `start` is the foreground daemon entry point; this process is detached
+    // below, so it keeps running after Cockpit exits — the same lifetime the
+    // in-process daemon mode Cockpit used to host had.
+    //
+    // RYUZI_MANAGED_HOST: Cockpit ships this binary inside its own bundle and
+    // updates it as one unit, so the daemon must not run its own self-updater.
+    // See `daemon_cmd::self_update_enabled` in crates/control.
+    cmd.arg("start")
+        .env("RYUZI_MANAGED_HOST", "1")
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log2);
+    // The control plane is a CONSOLE-subsystem binary and a release Cockpit is
+    // a GUI process (`windows_subsystem = "windows"` in main.rs), so Windows
+    // allocates a brand-new console window for the child unless the spawn asks
+    // it not to — redirecting stdout/stderr does NOT suppress it. That window
+    // would sit in the taskbar for the daemon's whole detached lifetime, and
+    // closing it would deliver a Ctrl-Close event that kills the engine. No-op
+    // off Windows. See `ryuzi_core::process_util`'s module doc.
+    ryuzi_core::process_util::no_window_std(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -783,6 +921,130 @@ mod tests {
             err.message.contains("pairing request failed"),
             "a wrong pin should fail the TLS handshake itself: {}",
             err.message
+        );
+    }
+
+    // ---------- local daemon base URL ----------
+
+    /// A status file written before `scheme`/`host` existed (or by a daemon
+    /// still connecting) must keep resolving to the historical loopback HTTP
+    /// endpoint.
+    #[test]
+    fn base_url_defaults_to_loopback_http_when_the_status_file_says_nothing() {
+        assert_eq!(
+            super::local_base_url(None, None, 4483),
+            "http://127.0.0.1:4483"
+        );
+    }
+
+    /// `listen_addr = 0.0.0.0` is a documented, user-settable value. The
+    /// daemon then binds every interface over TLS, and 0.0.0.0 is not an
+    /// address anything can dial — but loopback is part of what that bind
+    /// accepts, so Cockpit must still be able to reach its own engine.
+    #[test]
+    fn base_url_dials_loopback_for_a_wildcard_bind() {
+        assert_eq!(
+            super::local_base_url(Some("https"), Some("0.0.0.0"), 4483),
+            "https://127.0.0.1:4483"
+        );
+        assert_eq!(
+            super::local_base_url(Some("https"), Some("::"), 4483),
+            "https://[::1]:4483"
+        );
+    }
+
+    /// URL *construction* only — do not read this as "a specific non-loopback
+    /// bind works". It does not: `serve::authorize` answers 401 to a
+    /// non-loopback peer presenting the control token, so such a daemon is
+    /// still unattachable from Cockpit (see [`super::local_base_url`]'s doc).
+    /// What this pins is that the address is not silently rewritten to
+    /// loopback and that an IPv6 literal is bracketed.
+    #[test]
+    fn base_url_keeps_a_specific_bind_address_and_brackets_ipv6() {
+        assert_eq!(
+            super::local_base_url(Some("https"), Some("192.168.1.5"), 9000),
+            "https://192.168.1.5:9000"
+        );
+        assert_eq!(
+            super::local_base_url(Some("https"), Some("fd00::1"), 9000),
+            "https://[fd00::1]:9000"
+        );
+    }
+
+    #[test]
+    fn base_url_falls_back_to_loopback_when_the_host_is_not_an_ip() {
+        assert_eq!(
+            super::local_base_url(Some("http"), Some("not-an-ip"), 4483),
+            "http://127.0.0.1:4483"
+        );
+    }
+
+    // ---------- control-plane binary resolution ----------
+
+    #[test]
+    fn resolver_prefers_the_explicit_override_over_a_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let sibling = exe_dir.join(super::CONTROL_BIN);
+        std::fs::write(&sibling, b"sibling").unwrap();
+
+        let chosen = tmp.path().join("elsewhere-ryuzi");
+        std::fs::write(&chosen, b"override").unwrap();
+
+        let found =
+            super::resolve_control_binary_in(Some(chosen.clone()), &exe_dir, |_| None).unwrap();
+        assert_eq!(found, chosen);
+    }
+
+    #[test]
+    fn resolver_finds_the_binary_next_to_the_running_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().to_path_buf();
+        let sibling = exe_dir.join(super::CONTROL_BIN);
+        std::fs::write(&sibling, b"sidecar").unwrap();
+
+        let found = super::resolve_control_binary_in(None, &exe_dir, |_| None).unwrap();
+        assert_eq!(found, sibling);
+    }
+
+    #[test]
+    fn resolver_falls_back_to_path_when_there_is_no_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("empty");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let on_path = tmp.path().join("from-path");
+        std::fs::write(&on_path, b"installed").unwrap();
+
+        let expected = on_path.clone();
+        let found =
+            super::resolve_control_binary_in(None, &exe_dir, move |_| Some(expected)).unwrap();
+        assert_eq!(found, on_path);
+    }
+
+    /// Cockpit dies with an invisible window when the engine is unreachable
+    /// (see `open_daemon_log_creates_the_state_dir_when_it_does_not_exist_yet`
+    /// above), so this error is often the only thing a user will ever see
+    /// about it. It must name the binary and say how to get one.
+    #[test]
+    fn resolver_error_names_the_binary_and_how_to_build_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("empty");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        let err = super::resolve_control_binary_in(None, &exe_dir, |_| None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(super::CONTROL_BIN),
+            "message must name the binary: {msg}"
+        );
+        assert!(
+            msg.contains("cargo build -p ryuzi-control"),
+            "message must say how to build one: {msg}"
+        );
+        assert!(
+            msg.contains("RYUZI_CONTROL_BIN"),
+            "message must mention the override: {msg}"
         );
     }
 }

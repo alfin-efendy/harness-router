@@ -268,7 +268,7 @@ pub struct InstalledBundle {
 /// `daemon.rs` previously guarded its migration sweep with `cfg!(test)`
 /// alone, which is only `true` when THIS crate itself is compiled as the
 /// test target — it is `false` for an out-of-crate integration test (e.g.
-/// `crates/runner/tests/daemon.rs`, which spawns the real compiled `ryuzi`
+/// `crates/control/tests/daemon.rs`, which spawns the real compiled `ryuzi`
 /// binary) and for the shipped binary. Any such caller MUST set
 /// `RYUZI_PLUGINS_ROOT` (alongside `HOME`/`XDG_DATA_HOME`) before spawning —
 /// this project has already destroyed one real user's installed plugins by

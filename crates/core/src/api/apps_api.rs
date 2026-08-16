@@ -341,7 +341,7 @@ fn validate_manual_oauth_client(
 /// deciding whether an authorization code is trusted must not sit in a crate
 /// no test suite reaches: `cargo test -p ryuzi-cockpit` cannot start at all on
 /// Windows (tauri#13419, STATUS_ENTRYPOINT_NOT_FOUND) and CI runs
-/// `cargo test` for `ryuzi-core`/`ryuzi-runner`/`ryuzi-plugin-sdk` only.
+/// `cargo test` for `ryuzi-core`/`ryuzi-control`/`ryuzi-plugin-sdk` only.
 /// Defined here it is covered by this module's tests; Cockpit calls it.
 pub fn validate_mcp_oauth_callback(
     callback: &crate::oauth_loopback::CallbackResult,

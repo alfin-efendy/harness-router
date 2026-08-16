@@ -6,8 +6,9 @@
 //! point is `ryuzi start` (same code path, see `dispatch.rs`).
 //!
 //! Owns the daemon process lifecycle: timed connect, reentrancy-guarded
-//! shutdown on SIGTERM/SIGINT, the canary probe/promote flow, and the
-//! production `UpdateManager` / apply+canary host wiring.
+//! shutdown on SIGTERM/SIGINT/Ctrl-C or the `shutdown_engine` control-API RPC,
+//! the canary probe/promote flow, and the production `UpdateManager` /
+//! apply+canary host wiring.
 
 use anyhow::Context;
 use std::future::Future;
@@ -74,9 +75,8 @@ where
 /// any error is swallowed so the shutdown always completes), clear `dir`'s
 /// status file, then call `exit(0)`. Generic over `stop`/`exit` so it's
 /// unit-testable without a real `Daemon` or a real `std::process::exit`.
-// Non-test callers are the unix-only signal handlers; on Windows only the
-// unit tests reach this, so the lib build sees it as dead.
-#[cfg_attr(not(unix), allow(dead_code))]
+// Reached on every platform through `ShutdownCtx::spawn_on` — OS signals and
+// the `shutdown_engine` RPC funnel into it alike.
 pub(crate) async fn shutdown_once<S, E>(dir: &Path, stopping: &AtomicBool, stop: S, exit: E)
 where
     S: Future<Output = anyhow::Result<()>>,
@@ -140,12 +140,14 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<Contro
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_CONTROL_PORT);
-    let listen_addr = settings
+    let configured_addr = settings
         .get("listen_addr")
         .await
         .ok()
         .flatten()
         .unwrap_or_else(|| std::net::Ipv4Addr::LOCALHOST.to_string());
+    let managed = std::env::var("RYUZI_MANAGED_HOST").ok();
+    let listen_addr = effective_listen_addr(managed.as_deref(), configured_addr);
 
     let (addr, tls, scheme, fingerprint) = ryuzi_core::tls::resolve_bind(&listen_addr, dir)
         .context("failed to build TLS material for non-loopback bind")?;
@@ -264,13 +266,20 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     };
 
     let daemon = Arc::new(daemon);
-    let updater = build_updater(Arc::clone(&daemon), dir.clone());
-    updater.start();
+    let managed = std::env::var("RYUZI_MANAGED_HOST").ok();
+    let updater = if self_update_enabled(managed.as_deref()) {
+        let updater = build_updater(Arc::clone(&daemon), dir.clone());
+        updater.start();
+        Some(updater)
+    } else {
+        (deps.out)("daemon: self-update disabled (managed host)");
+        None
+    };
 
     // Install signal handlers before publishing Running. The status file is
     // the readiness contract; once clients observe it they may send SIGTERM
     // immediately and must still receive the graceful exit path.
-    install_signal_handlers(dir.clone(), Arc::clone(&daemon), Some(Arc::clone(&updater)));
+    install_signal_handlers(dir.clone(), Arc::clone(&daemon), updater);
 
     let _ = write_status(
         &dir,
@@ -296,8 +305,10 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     );
     catalog_mgr.start();
 
-    // Block forever: the process only exits via a signal handler calling
-    // `std::process::exit` from within `shutdown_once`.
+    // Block forever: the process only exits through one of the triggers
+    // `install_signal_handlers` wired above (an OS signal, or the
+    // `shutdown_engine` RPC) calling `std::process::exit` from within
+    // `shutdown_once`.
     std::future::pending::<()>().await;
     unreachable!("shutdown_once exits the process before this future can resolve")
 }
@@ -325,6 +336,51 @@ async fn build_and_start(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         return Err(e);
     }
     Ok(daemon)
+}
+
+/// `RYUZI_MANAGED_HOST=1` means a host process owns this daemon's lifecycle
+/// and ships it as part of its own artifact — today that is Cockpit, which
+/// spawns the binary as a bundled sidecar. Two behaviours key off it:
+/// [`self_update_enabled`] and [`effective_listen_addr`]. Both exist to
+/// reproduce what Cockpit's deleted in-process daemon did, so keep them
+/// reading the same flag rather than growing a second env var.
+///
+/// Anything other than exactly `"1"` (including unset) means unmanaged.
+fn is_managed_host(managed: Option<&str>) -> bool {
+    managed == Some("1")
+}
+
+/// Whether this daemon should run its own self-updater.
+///
+/// A managed host updates the whole bundle at once; a daemon that
+/// self-updated inside that arrangement would silently drift away from the
+/// app that shipped it. A standalone `ryuzi start` is unaffected.
+pub(crate) fn self_update_enabled(managed: Option<&str>) -> bool {
+    !is_managed_host(managed)
+}
+
+/// The address [`start_control_api`] binds, given the `listen_addr` setting.
+///
+/// A managed host reaches this daemon over loopback with the **control
+/// token**, and `serve::authorize` accepts that token from a loopback peer
+/// only (see `serve.rs`'s `require_token`). Honouring a non-loopback
+/// `listen_addr` under a managed host would bind an address whose own peer
+/// address is not loopback, so every attach would answer 401, Cockpit's
+/// 30-second connect poll would expire, and `setup()` would panic while the
+/// window is still `visible: false` — the app exits having shown nothing.
+///
+/// Cockpit's deleted in-process daemon hard-bound `Ipv4Addr::LOCALHOST` with
+/// `tls: None` and ignored this setting entirely. Reproducing that is the
+/// whole point: S1 replaced the host, not the behaviour.
+///
+/// A standalone `ryuzi start` honours `listen_addr` in full — that is how a
+/// client paired via `ryuzi pair` reaches it, with a device token that
+/// authenticates from any peer.
+pub(crate) fn effective_listen_addr(managed: Option<&str>, configured: String) -> String {
+    if is_managed_host(managed) {
+        return std::net::Ipv4Addr::LOCALHOST.to_string();
+    }
+    configured
 }
 
 /// Builds the production `UpdateManager`: real HTTP, real settings, and —
@@ -776,39 +832,37 @@ impl CanaryHost for ProdCanaryHost {
     }
 }
 
-/// Installs SIGTERM/SIGINT handlers that drive [`shutdown_once`]: stop the
-/// updater first (if any — so no update tick can race the teardown),
-/// then best-effort `daemon.stop()`, clear `dir`'s status file,
-/// `std::process::exit(0)`. Both signals share one reentrancy guard and one
-/// `Daemon`/`UpdateManager` handle so whichever fires first wins and the
-/// other is a no-op.
-///
-/// Unix-only: `tokio::signal::unix` does not exist on Windows, and an
-/// unconditional `use` used to break `cargo check --workspace` on Windows
-/// dev machines. The non-unix variant below drives the same teardown from
-/// `ctrl_c` instead.
-#[cfg(unix)]
-fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
-    use tokio::signal::unix::{signal, SignalKind};
+/// Everything a shutdown trigger needs to tear this daemon down. Cloned once
+/// per trigger; `stopping` is shared, so whichever trigger fires first is the
+/// only one that runs the teardown and the rest are no-ops.
+#[derive(Clone)]
+struct ShutdownCtx {
+    dir: PathBuf,
+    daemon: Arc<Daemon>,
+    updater: Option<Arc<UpdateManager>>,
+    stopping: Arc<AtomicBool>,
+}
 
-    let stopping = Arc::new(AtomicBool::new(false));
-
-    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+impl ShutdownCtx {
+    /// Spawn a task that awaits `trigger` and then drives [`shutdown_once`]:
+    /// stop the updater first (if any — so no update tick can race the
+    /// teardown), then best-effort `daemon.stop()`, clear `dir`'s status file,
+    /// `std::process::exit(0)`.
+    fn spawn_on<F>(&self, trigger: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
     {
-        let daemon = Arc::clone(&daemon);
-        let updater = updater.clone();
-        let stopping = Arc::clone(&stopping);
-        let dir = dir.clone();
+        let ctx = self.clone();
         tokio::spawn(async move {
-            sigterm.recv().await;
+            trigger.await;
             shutdown_once(
-                &dir,
-                &stopping,
+                &ctx.dir,
+                &ctx.stopping,
                 async {
-                    if let Some(u) = &updater {
+                    if let Some(u) = &ctx.updater {
                         u.stop();
                     }
-                    daemon.stop().await;
+                    ctx.daemon.stop().await;
                     Ok(())
                 },
                 |c| std::process::exit(c),
@@ -816,48 +870,85 @@ fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Ar
             .await;
         });
     }
+}
+
+/// Resolves once the `shutdown_engine` control-API RPC has asked this process
+/// to exit (see [`ryuzi_core::ControlPlane::request_shutdown`]).
+///
+/// Split out of [`install_signal_handlers`] so the seam between that RPC and
+/// the daemon's teardown is unit-testable without a real signal or a real
+/// `Daemon` — it is the only graceful stop a *detached* daemon has on Windows,
+/// where `daemon_status::send_sigterm` degrades to `TerminateProcess`.
+async fn shutdown_rpc_trigger(cp: Arc<ryuzi_core::ControlPlane>) {
+    cp.shutdown_requested().await;
+    println!("daemon: shutdown requested via control API");
+}
+
+/// Installs every shutdown trigger this daemon answers to. All of them share
+/// one [`ShutdownCtx`], hence one reentrancy guard and one
+/// `Daemon`/`UpdateManager` handle.
+///
+/// Two classes of trigger:
+///
+/// - OS signals — SIGTERM and SIGINT here, `ctrl_c` in the non-unix variant
+///   below.
+/// - The `shutdown_engine` control-API RPC, via [`shutdown_rpc_trigger`].
+///   This one is not a nicety: it is the only way a host process can cycle a
+///   *detached* daemon gracefully on Windows, which has no SIGTERM — there
+///   `daemon_status::send_sigterm` is `TerminateProcess`, a hard kill with no
+///   `daemon.stop()` (gateways left open, in-flight turns killed) and no
+///   `clear_status`. Cockpit's "Restart engine"
+///   (`engine_manager::restart_local`) sends the RPC first and only escalates
+///   to that kill after a 5s grace period.
+///
+/// The unix/non-unix split exists because `tokio::signal::unix` does not
+/// exist on Windows, and an unconditional `use` used to break
+/// `cargo check --workspace` on Windows dev machines.
+#[cfg(unix)]
+fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let cp = Arc::clone(&daemon.cp);
+    let ctx = ShutdownCtx {
+        dir,
+        daemon,
+        updater,
+        stopping: Arc::new(AtomicBool::new(false)),
+    };
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    ctx.spawn_on(async move {
+        sigterm.recv().await;
+    });
 
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::spawn(async move {
+    ctx.spawn_on(async move {
         sigint.recv().await;
-        shutdown_once(
-            &dir,
-            &stopping,
-            async {
-                if let Some(u) = &updater {
-                    u.stop();
-                }
-                daemon.stop().await;
-                Ok(())
-            },
-            |c| std::process::exit(c),
-        )
-        .await;
     });
+
+    ctx.spawn_on(shutdown_rpc_trigger(cp));
 }
 
 /// Non-unix (Windows): there is no SIGTERM; Ctrl-C / console-close both
 /// surface through `tokio::signal::ctrl_c`, driving the same
 /// [`shutdown_once`] teardown so a native Windows daemon still cleans up.
+/// The `shutdown_engine` RPC arm matters most here — see the unix variant's
+/// doc for why.
 #[cfg(not(unix))]
 fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
-    let stopping = Arc::new(AtomicBool::new(false));
-    tokio::spawn(async move {
+    let cp = Arc::clone(&daemon.cp);
+    let ctx = ShutdownCtx {
+        dir,
+        daemon,
+        updater,
+        stopping: Arc::new(AtomicBool::new(false)),
+    };
+
+    ctx.spawn_on(async {
         let _ = tokio::signal::ctrl_c().await;
-        shutdown_once(
-            &dir,
-            &stopping,
-            async {
-                if let Some(u) = &updater {
-                    u.stop();
-                }
-                daemon.stop().await;
-                Ok(())
-            },
-            |c| std::process::exit(c),
-        )
-        .await;
     });
+
+    ctx.spawn_on(shutdown_rpc_trigger(cp));
 }
 
 #[cfg(test)]
@@ -1000,6 +1091,107 @@ mod tests {
             *exit_calls.lock().unwrap(),
             vec![0],
             "a reentrant shutdown call must not call exit again"
+        );
+    }
+
+    // ---------- shutdown_rpc_trigger ----------
+
+    /// `shutdown_engine` (spec B3) is the only graceful stop a DETACHED daemon
+    /// has on Windows — `daemon_status::send_sigterm` is `TerminateProcess`
+    /// there, which skips `daemon.stop()` and `clear_status` entirely. Cockpit
+    /// spawns exactly such a detached daemon and its "Restart engine" button
+    /// sends this RPC first, so if this trigger ever stops resolving, restart
+    /// silently degrades to a hard kill.
+    #[tokio::test]
+    async fn shutdown_rpc_trigger_resolves_once_the_rpc_requests_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            ryuzi_core::Store::open(&tmp.path().join("ryuzi.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let persistence = ryuzi_core::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let cp =
+            ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new(), persistence).await;
+
+        let mut waiting = tokio::spawn(super::shutdown_rpc_trigger(Arc::clone(&cp)));
+
+        // Half the guard: a trigger that resolves on its own would tear the
+        // daemon down the instant it finished booting.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut waiting)
+                .await
+                .is_err(),
+            "the trigger must not fire before the RPC asks it to"
+        );
+
+        cp.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the trigger must resolve after request_shutdown")
+            .expect("the trigger task must not panic");
+    }
+
+    // ---------- self_update_enabled ----------
+
+    /// Cockpit spawns this daemon as a sidecar of an app bundle that updates
+    /// as one unit. If the daemon self-updated too, the bundle and the control
+    /// plane would drift apart. `RYUZI_MANAGED_HOST=1` is how the host says
+    /// "I own your lifecycle".
+    #[test]
+    fn managed_hosts_disable_self_update() {
+        assert!(!super::self_update_enabled(Some("1")));
+    }
+
+    #[test]
+    fn a_standalone_daemon_keeps_self_update() {
+        assert!(super::self_update_enabled(None));
+        assert!(super::self_update_enabled(Some("")));
+        assert!(super::self_update_enabled(Some("0")));
+    }
+
+    // ---------- effective_listen_addr ----------
+
+    /// Regression guard. Cockpit's deleted in-process daemon ignored
+    /// `listen_addr` and hard-bound loopback. The spawned `ryuzi start` that
+    /// replaced it honours the setting, so without this a user who had ever
+    /// set `listen_addr` to a LAN address got a daemon that answers 401 to
+    /// the control token, a connect poll that expires, and a Cockpit that
+    /// exits without ever showing a window.
+    #[test]
+    fn a_managed_host_forces_a_loopback_bind() {
+        assert_eq!(
+            super::effective_listen_addr(Some("1"), "192.168.1.5".to_string()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some("1"), "0.0.0.0".to_string()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some("1"), "::".to_string()),
+            "127.0.0.1"
+        );
+    }
+
+    /// The other direction matters just as much: a standalone daemon is how a
+    /// paired remote client reaches this machine, and that needs the
+    /// configured address to survive untouched.
+    #[test]
+    fn a_standalone_daemon_keeps_its_configured_bind() {
+        assert_eq!(
+            super::effective_listen_addr(None, "192.168.1.5".to_string()),
+            "192.168.1.5"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some("0"), "0.0.0.0".to_string()),
+            "0.0.0.0"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some(""), "127.0.0.1".to_string()),
+            "127.0.0.1"
         );
     }
 
