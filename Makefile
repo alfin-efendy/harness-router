@@ -30,12 +30,17 @@ doctor: ## Check the required toolchain is present
 	@echo "tauri: $$(cd apps/cockpit && bun run tauri --version 2>/dev/null || echo 'run `make install`')"
 
 ##@ Development
-.PHONY: dev cockpit control
+.PHONY: dev cockpit control sidecar
 dev: ## Run the Cockpit desktop app with HMR (tauri dev)
 	bun run cockpit:dev
 cockpit: dev ## Alias for `dev`
 control: ## Run the ryuzi control plane (Rust) — pass flags via ARGS, e.g. make control ARGS="status"
 	cargo run -p ryuzi-control -- $(ARGS)
+# tauri-build resolves bundle.externalBin inside build.rs on EVERY compile of
+# ryuzi-cockpit, and the slot is a gitignored build artifact — so nothing that
+# touches that crate compiles on a clean checkout until this has run once.
+sidecar: ## Stage the control-plane sidecar ryuzi-cockpit's build.rs requires (debug)
+	bun run cockpit:sidecar --debug
 
 ##@ Build
 .PHONY: build build-web run-release bundles
@@ -54,7 +59,7 @@ bundles: ## List the installer bundles produced by `make build`
 .PHONY: test test-rust test-all typecheck lint format fmt check
 test: ## Run JS/TS unit tests (bun test)
 	bun test
-test-rust: ## Run Rust tests (cargo test, whole workspace)
+test-rust: sidecar ## Run Rust tests (cargo test, whole workspace)
 	cargo test
 test-all: test test-rust ## Run every test (JS + Rust)
 typecheck: ## Type-check the workspace (tsc --noEmit)

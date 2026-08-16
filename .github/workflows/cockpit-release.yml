@@ -98,6 +98,21 @@ jobs:
               echo "__SIGNING_EOF__"
             } >> "$GITHUB_ENV"
           done
+      # Cockpit ships the control plane as a Tauri `externalBin` sidecar, and
+      # the staging slot (apps/cockpit/src-tauri/binaries/) is a gitignored
+      # build artifact — so a fresh checkout cannot compile ryuzi-cockpit at
+      # all until the binary is in place. Release profile: this copy is the one
+      # users get. Same `matrix.args` as the build below so the staged triples
+      # can never drift from the triples tauri asks for (`universal-apple-darwin`
+      # expands to both darwin arches plus the lipo'd fat binary).
+      - name: Stage the control-plane sidecar
+        env:
+          # The sidecar IS the daemon that fetches plugins at runtime, so it
+          # needs the same stamp the installer build below gets — otherwise a
+          # released Cockpit would ship a control plane that falls back to
+          # `latest` for unversioned fetches.
+          RYUZI_RELEASE_TAG: ${{ inputs.tag }}
+        run: bun run cockpit:sidecar ${{ matrix.args }}
       - name: Build installers
         env:
           # Stamped into crates/core's option_env!("RYUZI_RELEASE_TAG") so the

@@ -23,8 +23,9 @@ changes directory.
 | Run the ryuzi control plane from source | `cargo run -p ryuzi-control -- <args>` or `make control ARGS="<args>"` |
 | Run Cockpit desktop app | `bun run cockpit:dev` or `make dev` |
 | Build Cockpit desktop app | `bun run cockpit:build` or `make build` |
+| Stage the sidecar every `ryuzi-cockpit` compile needs | `bun run cockpit:sidecar --debug` or `make sidecar` |
 | Run JS/TS tests | `bun test` |
-| Run Rust tests | `cargo test -p ryuzi-core -p ryuzi-control` (or `cargo test` for the whole workspace) |
+| Run Rust tests | `cargo test -p ryuzi-core -p ryuzi-control` (whole-workspace `cargo test` also compiles `ryuzi-cockpit` — `make sidecar` first) |
 | Run all tests | `make test-all` |
 | Type-check TS workspaces | `bun run typecheck` |
 | Lint JS/TS | `bun run lint` |
@@ -128,6 +129,16 @@ Keep dependencies flowing inward:
 - Use `bun run cockpit:dev` for local desktop development.
 - Use `bun run --cwd apps/cockpit build` for frontend build checks when the
   desktop shell is not needed.
+- Cockpit ships the control plane as a Tauri `externalBin` sidecar, and
+  `tauri-build` resolves it inside `build.rs` on **every** compile of
+  `ryuzi-cockpit` — `cargo check`, `cargo clippy`, `cargo test`,
+  `cargo gen-bindings`, dev profile included, not just `tauri build`. The
+  staging slot `apps/cockpit/src-tauri/binaries/` is a gitignored build
+  artifact, so on a clean checkout all of those fail with
+  `resource path binaries/ryuzi-<triple> doesn't exist` until
+  `bun run cockpit:sidecar --debug` (or `make sidecar`) has run once.
+  `cockpit:dev`, `cockpit:build`, `make test-rust`, and CI stage it for you;
+  bare `cargo` invocations do not.
 - Keep generated bindings such as `apps/cockpit/src/bindings.ts` generated; do
   not hand-edit generated files unless explicitly required.
 
@@ -172,7 +183,7 @@ Choose the smallest meaningful verification set for the files you touched:
 | Pure docs | Review rendered Markdown mentally; no test required |
 | Engine (`crates/core`) | `cargo test -p ryuzi-core` and `cargo fmt` |
 | Control plane (`crates/control`) | `cargo test -p ryuzi-control` plus `cargo run -p ryuzi-control -- --help` when relevant |
-| Tauri commands (`src-tauri`) | `cargo test -p ryuzi-cockpit` |
+| Tauri commands (`src-tauri`) | `make sidecar` once, then `cargo test -p ryuzi-cockpit` |
 | Cockpit React UI | Targeted `bun test apps/cockpit/src/...` plus `bun run --cwd apps/cockpit build` for broad UI changes |
 | Shared UI (`packages/ui`) | `bun test packages/ui` and `bun run typecheck` |
 | Cross-stack Tauri change | `bun run cockpit:build` or explain why it was not run |
@@ -185,10 +196,16 @@ install.sh`; `bun run typecheck` + `bun test`; `cargo fmt --check`,
 -- -D warnings`, `cargo test -p ryuzi-core -p ryuzi-control -p ryuzi-plugin-sdk`,
 `cargo test --manifest-path` over every `plugins/*/Cargo.toml`, and a build +
 `--version`/`--help` smoke of the `ryuzi` binary; a separate `cockpit-rust` job
-running `cargo clippy -p ryuzi-cockpit --all-targets -- -D warnings` and
+that stages the sidecar (`bun run cockpit:sidecar --debug`) and then runs
+`cargo clippy -p ryuzi-cockpit --all-targets -- -D warnings` and
 `cargo test -p ryuzi-cockpit` on Linux (Tauri webkit system deps installed
 first); Playwright e2e for Cockpit; and an osv-scanner pass over both
 lockfiles.
+
+The `cockpit-release` workflow stages the sidecar the same way before
+`tauri build`, once per installer target — `matrix.args` is passed through to
+`cockpit:sidecar` so the staged triples cannot drift from the triples Tauri
+looks for.
 
 ## 6. Good and Bad Examples
 
