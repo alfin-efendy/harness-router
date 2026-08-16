@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.6.0...core-v0.7.0) (2026-08-16)
+
+
+### Features
+
+* **mcp:** connect remote MCP servers over HTTP with OAuth 2.1, and ship the Atlassian Rovo plugin ([#205](https://github.com/alfin-efendy/ryuzi/issues/205)) ([d9b1d85](https://github.com/alfin-efendy/ryuzi/commit/d9b1d85bb7532550b74eaed1129ad792618baaf7))
+
+
+### Bug Fixes
+
+* **mcp:** bind the OAuth token endpoint to the discovered authorization server ([#208](https://github.com/alfin-efendy/ryuzi/issues/208)) ([7889457](https://github.com/alfin-efendy/ryuzi/commit/78894578edd66e70ad131a4641fae5f6bea4d3a2))
+
 ## [0.6.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.5.0...core-v0.6.0) (2026-08-10)
 
 
