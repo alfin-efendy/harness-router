@@ -98,3 +98,7 @@ apps/cockpit/test-results/
 # a release artifact, not tracked; see docs/development/plugins.md#remote-catalog
 /catalog.json
 /catalog.json.sig
+
+# Tauri sidecar staging slot: a build artifact copied in by
+# scripts/cockpit/stage-sidecar.ts, never a source file.
+apps/cockpit/src-tauri/binaries/

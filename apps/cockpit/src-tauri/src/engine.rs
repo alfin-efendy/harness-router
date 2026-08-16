@@ -298,6 +298,76 @@ fn open_daemon_log(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// On-disk filename of the control-plane binary Cockpit spawns.
+///
+/// Three places must agree on this name and there is no build-time link
+/// between them: this resolver, `tauri.conf.json`'s
+/// `bundle.externalBin = ["binaries/ryuzi"]`, and
+/// `scripts/cockpit/stage-sidecar.ts`, which copies the built binary into that
+/// slot. Tauri strips the `-<target-triple>` suffix when it installs the
+/// sidecar, so the installed name is exactly this.
+pub(crate) const CONTROL_BIN: &str = if cfg!(windows) { "ryuzi.exe" } else { "ryuzi" };
+
+/// Locate the `ryuzi` control-plane binary. See
+/// [`resolve_control_binary_in`] for the search order.
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_control_binary() -> anyhow::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let exe_dir = exe
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let override_path = std::env::var_os("RYUZI_CONTROL_BIN").map(std::path::PathBuf::from);
+    resolve_control_binary_in(override_path, &exe_dir, lookup_on_path)
+}
+
+/// Search order, most specific first:
+///
+/// 1. `override_path` — the `RYUZI_CONTROL_BIN` environment variable. For
+///    tests, and for running Cockpit against a control plane built elsewhere.
+/// 2. A sibling of the running executable. This one branch covers both real
+///    layouts: Tauri installs an `externalBin` sidecar next to the app
+///    executable, and `cargo` puts `ryuzi` and `ryuzi-cockpit` in the same
+///    `target/<profile>/` directory, so `cargo tauri dev` works with no extra
+///    wiring.
+/// 3. `PATH`, for a separately installed control plane.
+fn resolve_control_binary_in(
+    override_path: Option<std::path::PathBuf>,
+    exe_dir: &std::path::Path,
+    path_lookup: impl FnOnce(&str) -> Option<std::path::PathBuf>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = override_path {
+        if path.is_file() {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "RYUZI_CONTROL_BIN points at {} but that is not a file",
+            path.display()
+        );
+    }
+    let sibling = exe_dir.join(CONTROL_BIN);
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    if let Some(found) = path_lookup(CONTROL_BIN) {
+        return Ok(found);
+    }
+    anyhow::bail!(
+        "control-plane binary `{CONTROL_BIN}` not found next to {} or on PATH. \
+         Build one with `cargo build -p ryuzi-control`, or point RYUZI_CONTROL_BIN at an existing binary.",
+        exe_dir.display()
+    )
+}
+
+/// First entry in `PATH` that holds a file called `name`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn lookup_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 fn spawn_engine_daemon(dir: &std::path::Path) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
@@ -783,6 +853,75 @@ mod tests {
             err.message.contains("pairing request failed"),
             "a wrong pin should fail the TLS handshake itself: {}",
             err.message
+        );
+    }
+
+    // ---------- control-plane binary resolution ----------
+
+    #[test]
+    fn resolver_prefers_the_explicit_override_over_a_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let sibling = exe_dir.join(super::CONTROL_BIN);
+        std::fs::write(&sibling, b"sibling").unwrap();
+
+        let chosen = tmp.path().join("elsewhere-ryuzi");
+        std::fs::write(&chosen, b"override").unwrap();
+
+        let found =
+            super::resolve_control_binary_in(Some(chosen.clone()), &exe_dir, |_| None).unwrap();
+        assert_eq!(found, chosen);
+    }
+
+    #[test]
+    fn resolver_finds_the_binary_next_to_the_running_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().to_path_buf();
+        let sibling = exe_dir.join(super::CONTROL_BIN);
+        std::fs::write(&sibling, b"sidecar").unwrap();
+
+        let found = super::resolve_control_binary_in(None, &exe_dir, |_| None).unwrap();
+        assert_eq!(found, sibling);
+    }
+
+    #[test]
+    fn resolver_falls_back_to_path_when_there_is_no_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("empty");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let on_path = tmp.path().join("from-path");
+        std::fs::write(&on_path, b"installed").unwrap();
+
+        let expected = on_path.clone();
+        let found =
+            super::resolve_control_binary_in(None, &exe_dir, move |_| Some(expected)).unwrap();
+        assert_eq!(found, on_path);
+    }
+
+    /// Cockpit dies with an invisible window when the engine is unreachable
+    /// (see `open_daemon_log_creates_the_state_dir_when_it_does_not_exist_yet`
+    /// above), so this error is often the only thing a user will ever see
+    /// about it. It must name the binary and say how to get one.
+    #[test]
+    fn resolver_error_names_the_binary_and_how_to_build_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("empty");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        let err = super::resolve_control_binary_in(None, &exe_dir, |_| None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(super::CONTROL_BIN),
+            "message must name the binary: {msg}"
+        );
+        assert!(
+            msg.contains("cargo build -p ryuzi-control"),
+            "message must say how to build one: {msg}"
+        );
+        assert!(
+            msg.contains("RYUZI_CONTROL_BIN"),
+            "message must mention the override: {msg}"
         );
     }
 }
