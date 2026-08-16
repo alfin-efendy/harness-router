@@ -2827,12 +2827,26 @@ modelOverride?: string | null;
  * Task 12 addition: lets the scheduler screen distinguish plugin-owned
  * rows from user-created ones.
  */
-pluginId?: string | null }
+pluginId?: string | null;
+/**
+ * The chat this job reports its successful runs into — mirrors
+ * `crate::scheduler::JobRow.home_session_pk`. `None` (the default) means
+ * the job reports nowhere and its output only lives in the run history.
+ */
+homeSessionPk?: string | null }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean;
 /**
  * See `JobInfo::model_override`.
  */
-modelOverride?: string | null }
+modelOverride?: string | null;
+/**
+ * See `JobInfo::home_session_pk`. Validated by
+ * `api::scheduler_api::resolve_home_session`: it must name an existing
+ * CHAT session, so a job can never be pointed at a project or worker
+ * session. Optional on the wire, so `JobNewView` (which never offers the
+ * picker) keeps compiling.
+ */
+homeSessionPk?: string | null }
 export type JourneyMilestoneInfo = { conceptId: string; title: string; timestamp: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**

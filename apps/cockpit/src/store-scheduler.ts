@@ -97,6 +97,7 @@ export function toInput(j: JobInfo): JobInput {
     prompt: j.prompt,
     notifySuccess: j.notifySuccess,
     notifyFail: j.notifyFail,
+    homeSessionPk: j.homeSessionPk ?? null,
   };
 }
 
