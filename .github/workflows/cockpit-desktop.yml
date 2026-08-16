@@ -52,6 +52,17 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      # `tauri-build` resolves `bundle.externalBin` inside build.rs on every
+      # compile of ryuzi-cockpit, and the staging slot is a gitignored build
+      # artifact, so a clean checkout cannot compile — let alone bundle —
+      # until the sidecar is in place. Release profile: these are the
+      # installers this workflow uploads. Same step ci.yml and
+      # cockpit-release.yml already carry; this workflow is the only
+      # pre-release rehearsal of `tauri build` on macOS and Windows, so it
+      # must not be the one left out.
+      - name: Stage the control-plane sidecar
+        run: bun run cockpit:sidecar
+
       - name: Build Cockpit (tauri build)
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:

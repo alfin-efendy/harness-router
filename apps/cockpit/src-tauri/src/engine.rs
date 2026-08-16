@@ -289,36 +289,35 @@ async fn try_attach(dir: &std::path::Path) -> Option<EngineClient> {
 
 /// Base URL for the LOCAL daemon that `daemon.json` describes.
 ///
-/// Forced by this change rather than an opportunistic improvement: the
-/// in-process daemon Cockpit used to spawn hard-bound `Ipv4Addr::LOCALHOST`
-/// with `tls: None` and wrote `scheme: "http"` into the status file, so
-/// `http://127.0.0.1:{port}` was correct by construction. The `ryuzi` binary
-/// replacing it honors the user-settable `listen_addr` instead, and
-/// `ryuzi_core::tls::resolve_bind` turns a non-loopback value into `https`
-/// plus TLS material while `serve` binds exactly one listener (TLS or plain,
-/// never both) — so keeping the hardcode would have turned `listen_addr` into
-/// a setting that breaks Cockpit, a user-visible regression this refactor is
-/// not allowed to introduce.
+/// A daemon Cockpit spawned is always loopback: the spawn sets
+/// `RYUZI_MANAGED_HOST=1`, and `daemon_cmd::effective_listen_addr` in
+/// `crates/control` forces `127.0.0.1` under that flag regardless of the
+/// `listen_addr` setting — reproducing what the deleted in-process daemon
+/// did. So for the common path this returns `http://127.0.0.1:{port}` by
+/// construction, exactly as before.
 ///
-/// What that buys, precisely:
+/// This function still handles the other shapes `daemon.json` can carry,
+/// because Cockpit also attaches to a daemon **it did not spawn** — one
+/// already running from a standalone `ryuzi start`, which does honour
+/// `listen_addr`:
 ///
-/// - a **wildcard** bind (`0.0.0.0` / `::`) becomes reachable. It is not
-///   itself a dialable address, but loopback is part of what it accepts and
-///   is the one route guaranteed to exist from the machine Cockpit runs on —
-///   and dialing loopback also keeps the *peer* address loopback, which
-///   `serve::authorize` requires before it will accept the control token.
-/// - a **specific** non-loopback bind (`listen_addr = 192.168.1.5`) stays
-///   unattachable. The URL and the TLS pin are then both right, but
-///   `serve::authorize` still answers 401: the control token authenticates a
-///   loopback peer only, and a connection from the host's own LAN address is
-///   not loopback. Reaching such a daemon needs a paired device token
-///   (`ryuzi pair`) — the remote-runner path, not this one. That case was
-///   equally broken before; it just failed at connect instead of at auth.
-///
-/// The remaining host cases: absent (a pre-remote-runner status file, always
-/// loopback), an IPv6 literal (needs brackets inside a URL authority), and
-/// anything unparsable (falls back to loopback, mirroring `resolve_bind`'s own
-/// "a bad setting value must never widen the surface" fallback).
+/// - a **wildcard** bind (`0.0.0.0` / `::`) is not itself dialable, but
+///   loopback is part of what it accepts and is the one route guaranteed to
+///   exist from this machine. Dialing loopback also keeps the *peer* address
+///   loopback, which `serve::authorize` requires before it will accept the
+///   control token.
+/// - a **specific** non-loopback bind (`listen_addr = 192.168.1.5`) is not
+///   attachable from here. The URL and the TLS pin are both right, but
+///   `serve::authorize` answers 401: the control token authenticates a
+///   loopback peer only, and a connection to the host's own LAN address does
+///   not have a loopback peer address. Reaching such a daemon needs a paired
+///   device token (`ryuzi pair`) — the remote-client path, not this one.
+///   `try_attach` returns `None`, and `connect_or_spawn` then spawns a
+///   managed daemon of its own, which loopback-binds and is reachable.
+/// - **absent** host (a pre-remote-runner status file, always loopback), an
+///   **IPv6 literal** (needs brackets inside a URL authority), and anything
+///   **unparsable** (falls back to loopback, mirroring `resolve_bind`'s own
+///   "a bad setting value must never widen the surface" rule).
 fn local_base_url(scheme: Option<&str>, host: Option<&str>, port: u16) -> String {
     use std::net::IpAddr;
     let scheme = scheme.unwrap_or("http");

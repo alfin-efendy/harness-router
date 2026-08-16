@@ -140,12 +140,14 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<Contro
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_CONTROL_PORT);
-    let listen_addr = settings
+    let configured_addr = settings
         .get("listen_addr")
         .await
         .ok()
         .flatten()
         .unwrap_or_else(|| std::net::Ipv4Addr::LOCALHOST.to_string());
+    let managed = std::env::var("RYUZI_MANAGED_HOST").ok();
+    let listen_addr = effective_listen_addr(managed.as_deref(), configured_addr);
 
     let (addr, tls, scheme, fingerprint) = ryuzi_core::tls::resolve_bind(&listen_addr, dir)
         .context("failed to build TLS material for non-loopback bind")?;
@@ -336,18 +338,49 @@ async fn build_and_start(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     Ok(daemon)
 }
 
-/// Whether this daemon should run its own self-updater.
-///
 /// `RYUZI_MANAGED_HOST=1` means a host process owns this daemon's lifecycle
 /// and ships it as part of its own artifact — today that is Cockpit, which
-/// spawns the binary as a bundled sidecar and updates the whole bundle at
-/// once. A daemon that self-updated in that arrangement would silently drift
-/// away from the app that shipped it.
+/// spawns the binary as a bundled sidecar. Two behaviours key off it:
+/// [`self_update_enabled`] and [`effective_listen_addr`]. Both exist to
+/// reproduce what Cockpit's deleted in-process daemon did, so keep them
+/// reading the same flag rather than growing a second env var.
 ///
-/// Anything other than exactly `"1"` (including unset) keeps the updater on,
-/// so a standalone `ryuzi start` is unaffected.
+/// Anything other than exactly `"1"` (including unset) means unmanaged.
+fn is_managed_host(managed: Option<&str>) -> bool {
+    managed == Some("1")
+}
+
+/// Whether this daemon should run its own self-updater.
+///
+/// A managed host updates the whole bundle at once; a daemon that
+/// self-updated inside that arrangement would silently drift away from the
+/// app that shipped it. A standalone `ryuzi start` is unaffected.
 pub(crate) fn self_update_enabled(managed: Option<&str>) -> bool {
-    managed != Some("1")
+    !is_managed_host(managed)
+}
+
+/// The address [`start_control_api`] binds, given the `listen_addr` setting.
+///
+/// A managed host reaches this daemon over loopback with the **control
+/// token**, and `serve::authorize` accepts that token from a loopback peer
+/// only (see `serve.rs`'s `require_token`). Honouring a non-loopback
+/// `listen_addr` under a managed host would bind an address whose own peer
+/// address is not loopback, so every attach would answer 401, Cockpit's
+/// 30-second connect poll would expire, and `setup()` would panic while the
+/// window is still `visible: false` — the app exits having shown nothing.
+///
+/// Cockpit's deleted in-process daemon hard-bound `Ipv4Addr::LOCALHOST` with
+/// `tls: None` and ignored this setting entirely. Reproducing that is the
+/// whole point: S1 replaced the host, not the behaviour.
+///
+/// A standalone `ryuzi start` honours `listen_addr` in full — that is how a
+/// client paired via `ryuzi pair` reaches it, with a device token that
+/// authenticates from any peer.
+pub(crate) fn effective_listen_addr(managed: Option<&str>, configured: String) -> String {
+    if is_managed_host(managed) {
+        return std::net::Ipv4Addr::LOCALHOST.to_string();
+    }
+    configured
 }
 
 /// Builds the production `UpdateManager`: real HTTP, real settings, and —
@@ -1117,6 +1150,49 @@ mod tests {
         assert!(super::self_update_enabled(None));
         assert!(super::self_update_enabled(Some("")));
         assert!(super::self_update_enabled(Some("0")));
+    }
+
+    // ---------- effective_listen_addr ----------
+
+    /// Regression guard. Cockpit's deleted in-process daemon ignored
+    /// `listen_addr` and hard-bound loopback. The spawned `ryuzi start` that
+    /// replaced it honours the setting, so without this a user who had ever
+    /// set `listen_addr` to a LAN address got a daemon that answers 401 to
+    /// the control token, a connect poll that expires, and a Cockpit that
+    /// exits without ever showing a window.
+    #[test]
+    fn a_managed_host_forces_a_loopback_bind() {
+        assert_eq!(
+            super::effective_listen_addr(Some("1"), "192.168.1.5".to_string()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some("1"), "0.0.0.0".to_string()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some("1"), "::".to_string()),
+            "127.0.0.1"
+        );
+    }
+
+    /// The other direction matters just as much: a standalone daemon is how a
+    /// paired remote client reaches this machine, and that needs the
+    /// configured address to survive untouched.
+    #[test]
+    fn a_standalone_daemon_keeps_its_configured_bind() {
+        assert_eq!(
+            super::effective_listen_addr(None, "192.168.1.5".to_string()),
+            "192.168.1.5"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some("0"), "0.0.0.0".to_string()),
+            "0.0.0.0"
+        );
+        assert_eq!(
+            super::effective_listen_addr(Some(""), "127.0.0.1".to_string()),
+            "127.0.0.1"
+        );
     }
 
     // ---------- bak_path ----------
