@@ -976,7 +976,12 @@ async fn deliver_to_home_chat(
     let Some(home_pk) = job.home_session_pk.filter(|pk| !pk.trim().is_empty()) else {
         return;
     };
-    let target = cp.store().get_session(&home_pk).await.ok().flatten();
+    // A store error is NOT evidence the chat is gone, so it must not unbind:
+    // that would let one transient read failure throw away a setting only the
+    // user can restore. Skip this one report and try again next run.
+    let Ok(target) = cp.store().get_session(&home_pk).await else {
+        return;
+    };
     let deliverable = matches!(&target, Some(s) if s.status != crate::domain::SessionStatus::Ended);
     if !deliverable {
         let _ = clear_home_session(cp.store(), job_id).await;

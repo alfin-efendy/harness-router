@@ -608,6 +608,40 @@ subtask = false
         );
     }
 
+    // Where a job reports is a pure user preference — no manifest declares it,
+    // and `sync_one_job` rebuilds the whole `JobRow` on every re-sync. If the
+    // rebuild dropped it, every plugin update would silently unbind the user's
+    // choice and the job would just quietly stop reporting weeks later.
+    #[tokio::test]
+    async fn a_plugin_update_does_not_unbind_the_chat_a_job_reports_into() {
+        let store = mem_store().await;
+        let plugin = plugin_with_hooks_and_jobs("gh");
+        sync_plugin_automations(&store, &plugin).await.unwrap();
+
+        // The user nominates a chat in the Cockpit job editor.
+        let mut job = scheduler::get_job(&store, "gh/nightly")
+            .await
+            .unwrap()
+            .expect("the manifest's job synced");
+        assert_eq!(job.home_session_pk, None, "a fresh sync reports nowhere");
+        job.home_session_pk = Some("chat-1".into());
+        scheduler::upsert_job(&store, job).await.unwrap();
+
+        // The plugin ships a new release and re-syncs.
+        sync_plugin_automations(&store, &plugin).await.unwrap();
+
+        assert_eq!(
+            scheduler::get_job(&store, "gh/nightly")
+                .await
+                .unwrap()
+                .unwrap()
+                .home_session_pk
+                .as_deref(),
+            Some("chat-1"),
+            "a plugin update must not silently unbind the user's chosen chat"
+        );
+    }
+
     // F3: a plugin update whose manifest drops a previously-declared hook
     // must prune that hook (and its run history) on re-sync, while leaving
     // hooks the manifest still declares — and another plugin's rows, and a
