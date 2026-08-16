@@ -213,6 +213,11 @@ pub struct JobInfo {
     /// rows from user-created ones.
     #[serde(default)]
     pub plugin_id: Option<String>,
+    /// The chat this job reports its successful runs into — mirrors
+    /// `crate::scheduler::JobRow.home_session_pk`. `None` (the default) means
+    /// the job reports nowhere and its output only lives in the run history.
+    #[serde(default)]
+    pub home_session_pk: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -231,6 +236,13 @@ pub struct JobInput {
     /// See `JobInfo::model_override`.
     #[serde(default)]
     pub model_override: Option<String>,
+    /// See `JobInfo::home_session_pk`. Validated by
+    /// `api::scheduler_api::resolve_home_session`: it must name an existing
+    /// CHAT session, so a job can never be pointed at a project or worker
+    /// session. Optional on the wire, so `JobNewView` (which never offers the
+    /// picker) keeps compiling.
+    #[serde(default)]
+    pub home_session_pk: Option<String>,
 }
 
 // --- automation_api (Hook persistence contract; RPC wiring follows in Task 5) ---
