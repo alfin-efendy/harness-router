@@ -175,6 +175,14 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
+      - uses: ./.github/actions/setup-bun
+      # `tauri-build` resolves `bundle.externalBin` inside build.rs on every
+      # compile of this crate — the dev profile too, not just `tauri build` —
+      # and the staging slot is a gitignored build artifact, so a clean
+      # checkout cannot compile ryuzi-cockpit until the sidecar is in place.
+      # Debug profile: nothing in this job runs the binary, it only has to exist.
+      - name: Stage the control-plane sidecar
+        run: bun run cockpit:sidecar --debug
       - run: cargo clippy -p ryuzi-cockpit --all-targets -- -D warnings
       - name: cargo test
         run: cargo test -p ryuzi-cockpit

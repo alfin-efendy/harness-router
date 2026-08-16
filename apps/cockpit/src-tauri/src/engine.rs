@@ -310,7 +310,13 @@ pub(crate) const CONTROL_BIN: &str = if cfg!(windows) { "ryuzi.exe" } else { "ry
 
 /// Locate the `ryuzi` control-plane binary. See
 /// [`resolve_control_binary_in`] for the search order.
-#[cfg_attr(not(test), allow(dead_code))]
+// Nothing calls this until Task 4 wires it into `spawn_engine_daemon`; delete
+// the attribute there (Task 4 Step 4), when this and `lookup_on_path` go live.
+// The plan's `#[cfg_attr(not(test), allow(dead_code))]` cannot do that job:
+// `--all-targets` builds the lib-test target, where `cfg(test)` holds and the
+// allow would switch itself off — exactly where the lint fires, since the
+// resolver tests only call `resolve_control_binary_in`.
+#[allow(dead_code)]
 fn resolve_control_binary() -> anyhow::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let exe_dir = exe
@@ -360,7 +366,8 @@ fn resolve_control_binary_in(
 }
 
 /// First entry in `PATH` that holds a file called `name`.
-#[cfg_attr(not(test), allow(dead_code))]
+// Dead until Task 4; see `resolve_control_binary` above.
+#[allow(dead_code)]
 fn lookup_on_path(name: &str) -> Option<std::path::PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)

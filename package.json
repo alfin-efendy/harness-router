@@ -10,7 +10,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit && tsc --noEmit -p apps/cockpit && tsc --noEmit -p packages/ui && tsc --noEmit -p apps/oauth-proxy",
     "cockpit:sidecar": "bun scripts/cockpit/stage-sidecar.ts",
-    "cockpit:dev": "cargo build -p ryuzi-control && cd apps/cockpit && bun run tauri dev",
+    "cockpit:dev": "bun run cockpit:sidecar --debug && cd apps/cockpit && bun run tauri dev",
     "cockpit:build": "bun run cockpit:sidecar && cd apps/cockpit && bun run tauri build",
     "e2e:cockpit": "bun run --cwd apps/cockpit e2e",
     "lint": "biome ci .",
