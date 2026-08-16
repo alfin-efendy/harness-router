@@ -88,6 +88,28 @@ fn resolve_cron(input: &JobInput) -> Result<String, ApiError> {
     Ok(cron)
 }
 
+/// Validate a job's report-to-chat binding.
+///
+/// A job may only report into a CHAT session that exists: pointing one at a
+/// project/worker/review session, or at a session pk that is gone, would queue
+/// rail rows nothing can ever deliver. An empty string means "report nowhere"
+/// and normalizes to `None`.
+async fn resolve_home_session(
+    cp: &ControlPlane,
+    requested: Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(pk) = requested.filter(|pk| !pk.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match cp.store().get_session(&pk).await? {
+        Some(s) if s.kind == crate::domain::SessionKind::Chat => Ok(Some(pk)),
+        Some(_) => Err(ApiError::bad_request(
+            "a job can only report into a chat session",
+        )),
+        None => Err(ApiError::bad_request(format!("unknown chat session: {pk}"))),
+    }
+}
+
 /// Wall-clock duration of a run; a run that hasn't finished has none yet.
 fn run_duration_ms(started_at: i64, finished_at: Option<i64>) -> Option<i64> {
     finished_at.map(|f| f - started_at)
@@ -125,6 +147,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<JobInfo>> {
             notify_fail: job.notify_fail,
             model_override: job.model_override,
             plugin_id: job.plugin_id,
+            home_session_pk: job.home_session_pk,
             history: runs
                 .into_iter()
                 .map(|r| RunInfo {
@@ -147,6 +170,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<JobInfo>> {
 async fn create_job(state: &ApiState, input: JobInput) -> Result<Vec<JobInfo>, ApiError> {
     let cp = &state.cp;
     let cron = resolve_cron(&input)?;
+    let home_session_pk = resolve_home_session(cp, input.home_session_pk).await?;
     let id = format!("j-{}", &crate::paths::new_id()[..8]);
     scheduler::upsert_job(
         cp.store(),
@@ -167,6 +191,7 @@ async fn create_job(state: &ApiState, input: JobInput) -> Result<Vec<JobInfo>, A
             pre_check: String::new(),
             model_override: input.model_override,
             plugin_id: None,
+            home_session_pk,
         },
     )
     .await?;
@@ -183,6 +208,7 @@ async fn update_job(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("unknown job: {id}")))?;
     let cron = resolve_cron(&input)?;
+    let home_session_pk = resolve_home_session(cp, input.home_session_pk).await?;
     scheduler::upsert_job(
         cp.store(),
         JobRow {
@@ -204,6 +230,7 @@ async fn update_job(
             // a plugin-installed job the user fills in a project for stays
             // attributed to that plugin.
             plugin_id: existing.plugin_id,
+            home_session_pk,
         },
     )
     .await?;
@@ -262,6 +289,7 @@ mod tests {
             notify_success: false,
             notify_fail: false,
             model_override: None,
+            home_session_pk: None,
         }
     }
 
@@ -323,5 +351,26 @@ mod tests {
         assert_eq!(toggled[0]["enabled"], false);
         let after = dispatch(&s, "delete_job", json!({"id": id})).await.unwrap();
         assert_eq!(after, json!([]));
+    }
+
+    // Only the user's own chats are bindable: a job pointed at a session that
+    // does not exist (or is not a chat) must be refused at the API boundary,
+    // not discovered later by a rail row nothing can deliver.
+    #[tokio::test]
+    async fn binding_a_job_to_an_unknown_chat_is_refused() {
+        let s = state().await;
+        let err = dispatch(
+            &s,
+            "create_job",
+            json!({ "input": {
+                "name": "nightly", "mode": "cron", "natural": "", "cron": "0 3 * * *",
+                "projectId": "p1", "branch": "", "gateway": "",
+                "prompt": "check things", "notifySuccess": false, "notifyFail": true,
+                "homeSessionPk": "no-such-chat"
+            }}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.message, "unknown chat session: no-such-chat");
     }
 }

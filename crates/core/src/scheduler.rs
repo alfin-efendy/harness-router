@@ -39,6 +39,14 @@ pub struct JobRow {
     /// `plugins::automation_sync` — the Scheduler screen's create/update
     /// commands never set this.
     pub plugin_id: Option<String>,
+    /// The chat this job reports into: a `sessions.session_pk`, or `None` for
+    /// a job that reports nowhere (the default). Written ONLY by the Cockpit
+    /// job editor via `api::scheduler_api::update_job` — never by an agent
+    /// (`control::app_control::create_job` always writes `None`) and never by
+    /// a plugin manifest, because each delivery spends a real agent turn in
+    /// that chat and the user has to have asked for it. Cleared automatically
+    /// when the chat turns out to be gone (see `deliver_to_home_chat`).
+    pub home_session_pk: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,7 +192,7 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 const JOB_COLS: &str =
-    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id";
+    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id,home_session_pk";
 
 fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
@@ -203,6 +211,7 @@ fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         pre_check: r.get(12)?,
         model_override: r.get(13)?,
         plugin_id: r.get(14)?,
+        home_session_pk: r.get(15)?,
     })
 }
 
@@ -239,8 +248,8 @@ pub async fn upsert_job(store: &Store, job: JobRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
+                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,plugin_id,home_session_pk,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
                  ON CONFLICT(id) DO UPDATE SET \
                    name=excluded.name, cron=excluded.cron, mode=excluded.mode, \
                    natural_text=excluded.natural_text, project_id=excluded.project_id, \
@@ -248,12 +257,12 @@ pub async fn upsert_job(store: &Store, job: JobRow) -> anyhow::Result<()> {
                    enabled=excluded.enabled, prompt=excluded.prompt, \
                    notify_success=excluded.notify_success, notify_fail=excluded.notify_fail, \
                    pre_check=excluded.pre_check, model_override=excluded.model_override, \
-                   plugin_id=excluded.plugin_id",
+                   plugin_id=excluded.plugin_id, home_session_pk=excluded.home_session_pk",
                 params![
                     job.id, job.name, job.cron, job.mode, job.natural_text, job.project_id,
                     job.branch, job.gateway, job.enabled as i64, job.prompt,
                     job.notify_success as i64, job.notify_fail as i64, job.pre_check,
-                    job.model_override, job.plugin_id, now
+                    job.model_override, job.plugin_id, job.home_session_pk, now
                 ],
             )
             .map(|_| ())
@@ -336,6 +345,24 @@ pub async fn delete_job(store: &Store, id: &str) -> anyhow::Result<()> {
             c.execute("DELETE FROM job_runs WHERE job_id=?1", params![id])?;
             c.execute("DELETE FROM jobs WHERE id=?1", params![id])
                 .map(|_| ())
+        })
+        .await
+}
+
+/// Clear a job's report-to-chat binding. Called by the run watcher when the
+/// bound chat turns out to be gone — an undeliverable rail row can never be
+/// claimed (`Store::claim_deliverable_background_event` joins `sessions` and
+/// requires `status='idle'`), so leaving the binding in place would queue one
+/// permanently-pending row per run, forever.
+pub async fn clear_home_session(store: &Store, job_id: &str) -> anyhow::Result<()> {
+    let job_id = job_id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE jobs SET home_session_pk=NULL WHERE id=?1",
+                params![job_id],
+            )
+            .map(|_| ())
         })
         .await
 }
@@ -832,23 +859,23 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
             note,
         )
         .await;
-        // Deliver a successful run's final text through the background rail
-        // when the job has a bound "home" chat (a `session_surfaces` row
-        // keyed by `(job.gateway, job.id)` — written by a future `app_jobs`
-        // tool or a test via `add_surface`). The rail is the ONLY delivery
-        // path: no direct/in-memory hand-off to that session. Absent a
-        // binding this is a no-op and the existing `add_event`/
-        // `JobRunChanged` notifications below are unchanged.
-        if status == "success" {
+        // Deliver a successful, non-`[SILENT]` run's report into the chat the
+        // user bound this job to. The background rail is the ONLY delivery
+        // path: no direct/in-memory hand-off to that session. Absent a binding
+        // this is a no-op and the `add_event`/`JobRunChanged` notifications
+        // below are unchanged.
+        //
+        // Three gates, because the rail replays this block through
+        // `ControlPlane::continue_session_with_prompt` — one delivery is one
+        // full agent turn in that chat, with real tokens and real tools:
+        //   1. the run succeeded (a failure belongs in the run history and the
+        //      notification path, not in a turn that says "it broke");
+        //   2. the reply did not open with `[SILENT]` (`notify`), which is the
+        //      whole point of the `SCHED_HEADER` convention;
+        //   3. the user explicitly nominated a chat.
+        if status == "success" && notify {
             if let Some(text) = &final_text {
-                if let Ok(Some(home)) = cp2.store().resolve_by_conversation(&gateway, &job_id).await
-                {
-                    let block = format!("[SCHEDULED JOB — {job_name}]\n\n{text}");
-                    let _ = cp2
-                        .store()
-                        .enqueue_background_event(&home.session_pk, "job", &block)
-                        .await;
-                }
+                deliver_to_home_chat(&cp2, &job_id, &job_name, &gateway, text).await;
             }
         }
         let notify_user = should_notify_terminal(status, notify_success, notify_fail, notify);
@@ -909,6 +936,67 @@ async fn finalize_partial_session(
             .map(|_| ())
         })
         .await
+}
+
+/// The framing every scheduled-job report carries into its home chat.
+///
+/// The rail replays a report as a USER turn, so it needs framing: without it,
+/// a run whose output reads "TODO: fix the flaky test" reads to the home
+/// chat's agent as an instruction, and it goes and does it unattended. Pure
+/// and separate so the delivered shape is unit-testable and named once.
+pub(crate) fn scheduled_report_header(job_name: &str) -> String {
+    format!(
+        "[SCHEDULED JOB — {job_name}]\nThis is a finished scheduled run reporting in. \
+         Relay what matters to me and stop; do not start new work unless I ask.\n\n"
+    )
+}
+
+/// Enqueue a finished run's report onto the background rail, addressed to the
+/// chat `job_id` is bound to. A no-op when the job has no binding.
+///
+/// Self-heals a dangling binding: when the bound chat's row is gone, or its
+/// status is `Ended`, the binding is cleared and one line lands in the gateway
+/// log. That is not politeness — `Store::claim_deliverable_background_event`
+/// joins `sessions` and requires `status='idle'`, so a row aimed at such a
+/// session can NEVER be claimed and would sit pending forever, one per run. An
+/// ARCHIVED chat is still a live idle session and still receives reports;
+/// archiving is list hygiene, not a lifecycle end.
+async fn deliver_to_home_chat(
+    cp: &Arc<ControlPlane>,
+    job_id: &str,
+    job_name: &str,
+    gateway: &str,
+    text: &str,
+) {
+    // Re-read the job instead of capturing the binding when the run started,
+    // so a chat the user picked (or cleared) during a long run wins.
+    let Ok(Some(job)) = get_job(cp.store(), job_id).await else {
+        return;
+    };
+    let Some(home_pk) = job.home_session_pk.filter(|pk| !pk.trim().is_empty()) else {
+        return;
+    };
+    let target = cp.store().get_session(&home_pk).await.ok().flatten();
+    let deliverable = matches!(&target, Some(s) if s.status != crate::domain::SessionStatus::Ended);
+    if !deliverable {
+        let _ = clear_home_session(cp.store(), job_id).await;
+        let _ = crate::gateways::add_event(
+            cp.store(),
+            gateway,
+            "error",
+            &format!(
+                "job {job_name}: the chat it reported to no longer exists — unbound; \
+                 pick another chat in the job's detail view"
+            ),
+        )
+        .await;
+        return;
+    }
+    let block = format!("{}{text}", scheduled_report_header(job_name));
+    let _ = cp
+        .store()
+        .enqueue_background_event(&home_pk, "job", &block)
+        .await;
 }
 
 /// Background loop: every 30s, fire enabled jobs whose next occurrence (after
@@ -1291,6 +1379,7 @@ mod tests {
             pre_check: "git status --short".into(),
             model_override: None,
             plugin_id: None,
+            home_session_pk: None,
         };
         upsert_job(&store, job.clone()).await.unwrap();
         assert_eq!(get_job(&store, "j1").await.unwrap().unwrap(), job);
@@ -1431,6 +1520,7 @@ mod tests {
             pre_check: String::new(),
             model_override: None,
             plugin_id: None,
+            home_session_pk: None,
         }
     }
 
@@ -1514,6 +1604,72 @@ mod tests {
         assert_eq!(got.model_override, None);
     }
 
+    // The binding is a first-class job column, not a `session_surfaces` row:
+    // it must survive `upsert_job`'s ON CONFLICT overwrite in both directions,
+    // and `clear_home_session` must be able to drop it without touching
+    // anything else on the row.
+    #[tokio::test]
+    async fn home_session_binding_roundtrips_and_clears() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        let mut job = sample_job("j-home");
+        assert_eq!(job.home_session_pk, None, "a new job reports nowhere");
+
+        job.home_session_pk = Some("chat-1".into());
+        upsert_job(&store, job.clone()).await.unwrap();
+        assert_eq!(
+            get_job(&store, "j-home")
+                .await
+                .unwrap()
+                .unwrap()
+                .home_session_pk
+                .as_deref(),
+            Some("chat-1")
+        );
+
+        clear_home_session(&store, "j-home").await.unwrap();
+        let cleared = get_job(&store, "j-home").await.unwrap().unwrap();
+        assert_eq!(cleared.home_session_pk, None);
+        // Clearing the binding must not disturb the rest of the row.
+        assert_eq!(
+            JobRow {
+                home_session_pk: Some("chat-1".into()),
+                ..cleared
+            },
+            job
+        );
+    }
+
+    // A run whose reply opts out with `[SILENT]` must not spend an agent turn
+    // in the home chat saying nothing. `run_note_for`'s first element is that
+    // decision and the delivery gate now ANDs it in.
+    #[test]
+    fn silent_runs_are_not_worth_a_turn_in_the_home_chat() {
+        let (notify_silent, _) = run_note_for(Some("[SILENT] nothing to report"));
+        let (notify_real, _) = run_note_for(Some("found 3 new issues"));
+        assert!(!notify_silent, "a [SILENT] run must not deliver");
+        assert!(notify_real, "a run with something to say must deliver");
+    }
+
+    /// The framing is what stops the home chat's agent from treating a report
+    /// like an instruction, so pin its shape rather than just its prefix.
+    #[test]
+    fn a_report_is_framed_as_a_report_not_a_task() {
+        let header = scheduled_report_header("nightly audit");
+        assert!(
+            header.starts_with("[SCHEDULED JOB — nightly audit]\n"),
+            "{header:?}"
+        );
+        assert!(
+            header.contains("do not start new work unless I ask"),
+            "the framing must tell the home agent not to act on the report: {header:?}"
+        );
+        assert!(
+            header.ends_with("\n\n"),
+            "the run's own text follows on its own paragraph: {header:?}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Rail-delivery test fixtures. Mirrors the fake-harness pattern each
     // test module keeps privately (see `control::tests`, `background_rail`,
@@ -1538,11 +1694,14 @@ mod tests {
 
     /// A fake `HarnessSession` that persists a deterministic assistant reply
     /// so `final_assistant_text` (and thus the rail delivery block) has
-    /// something real to read, without touching a live LLM.
+    /// something real to read, without touching a live LLM. The reply is
+    /// configurable so a test can drive the `[SILENT]` opt-out through the
+    /// real watcher instead of only unit-testing `run_note_for`.
     struct FakeJobSession {
         store: std::sync::Arc<Store>,
         events: tokio::sync::broadcast::Sender<CoreEvent>,
         session_pk: String,
+        reply: String,
     }
 
     #[async_trait::async_trait]
@@ -1563,7 +1722,7 @@ mod tests {
                     &self.session_pk,
                     "assistant",
                     "text",
-                    serde_json::json!({ "text": "done" }),
+                    serde_json::json!({ "text": self.reply }),
                 ))
                 .await
             {
@@ -1573,7 +1732,7 @@ mod tests {
                     run_id: None,
                     role: "assistant".into(),
                     block_type: "text".into(),
-                    payload: serde_json::json!({ "text": "done" }),
+                    payload: serde_json::json!({ "text": self.reply }),
                     tool_call_id: None,
                     status: None,
                     tool_kind: None,
@@ -1593,7 +1752,9 @@ mod tests {
         }
     }
 
-    struct FakeJobHarness;
+    struct FakeJobHarness {
+        reply: String,
+    }
 
     #[async_trait::async_trait]
     impl crate::harness::Harness for FakeJobHarness {
@@ -1605,15 +1766,36 @@ mod tests {
                 store: ctx.store.clone(),
                 events: ctx.events.clone(),
                 session_pk: ctx.session_pk.clone(),
+                reply: self.reply.clone(),
             }))
         }
     }
 
-    struct FakeJobHarnessFactory;
+    struct FakeJobHarnessFactory {
+        reply: String,
+    }
+
+    impl FakeJobHarnessFactory {
+        /// The ordinary "the run had something to say" harness.
+        fn new() -> Self {
+            FakeJobHarnessFactory {
+                reply: "done".to_string(),
+            }
+        }
+        /// A harness whose every session replies with `reply` — used to drive
+        /// the `[SILENT]` opt-out through the real run watcher.
+        fn replying(reply: &str) -> Self {
+            FakeJobHarnessFactory {
+                reply: reply.to_string(),
+            }
+        }
+    }
 
     impl crate::harness::HarnessFactory for FakeJobHarnessFactory {
         fn create(&self) -> anyhow::Result<std::sync::Arc<dyn crate::harness::Harness>> {
-            Ok(std::sync::Arc::new(FakeJobHarness))
+            Ok(std::sync::Arc::new(FakeJobHarness {
+                reply: self.reply.clone(),
+            }))
         }
     }
 
@@ -1642,7 +1824,7 @@ mod tests {
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
         prepare_test_agent_persistence(&store).await;
         let mut regs = crate::plugins::Registries::new();
-        regs.harness = std::sync::Arc::new(FakeJobHarnessFactory);
+        regs.harness = std::sync::Arc::new(FakeJobHarnessFactory::new());
         let cp = {
             let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
                 .await
@@ -1667,7 +1849,7 @@ mod tests {
             .await
             .unwrap();
 
-        // A chat that owns the job's delivery surface (keyed by job id).
+        // The chat the user bound this job to.
         let home = cp
             .start_chat_session(
                 crate::harness::TurnPrompt::text("home", "home"),
@@ -1696,11 +1878,8 @@ mod tests {
         let mut job = sample_job("j-deliver");
         job.project_id = "p-deliver".into();
         job.gateway = "local".into();
+        job.home_session_pk = Some(home.session_pk.clone());
         upsert_job(cp.store(), job.clone()).await.unwrap();
-        cp.store()
-            .add_surface("local", "j-deliver", &home.session_pk)
-            .await
-            .unwrap();
 
         execute_job(&cp, &job).await.unwrap();
 
@@ -1708,9 +1887,185 @@ mod tests {
         assert_eq!(row.kind, "job");
         assert_eq!(row.target_session_pk, home.session_pk);
         assert!(
+            row.payload
+                .starts_with(&scheduled_report_header("test job")),
+            "the report must carry the relay framing, got: {}",
+            row.payload
+        );
+        assert!(
             row.payload.contains("done"),
             "expected the job's final assistant text in the rail payload, got: {}",
             row.payload
+        );
+    }
+
+    // The regression this plan fixes, driven through the real watcher rather
+    // than through `run_note_for` alone: the old delivery block gated on
+    // `status == "success"` only, so a run that correctly answered "[SILENT]
+    // nothing to report" still burned a full agent turn in the user's chat to
+    // say nothing — on an hourly job, every hour. The binding must survive
+    // (this is a silent run, not a broken one) and the rail must stay empty.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_silent_run_delivers_nothing_and_keeps_its_binding() {
+        let _guard = SchedulerStateDirGuard::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
+        let mut regs = crate::plugins::Registries::new();
+        regs.harness = std::sync::Arc::new(FakeJobHarnessFactory::replying(
+            "[SILENT] nothing to report",
+        ));
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
+        cp.store()
+            .insert_project(crate::domain::Project {
+                project_id: "p-silent".into(),
+                name: "demo".into(),
+                workdir: std::env::temp_dir().to_string_lossy().into_owned(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: Some(crate::paths::now_ms()),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        // A real, live, idle chat — so the ONLY thing that can suppress the
+        // delivery is the `[SILENT]` gate, not an undeliverable target.
+        let home = cp
+            .start_chat_session(
+                crate::harness::TurnPrompt::text("home", "home"),
+                "test",
+                &[],
+            )
+            .await
+            .unwrap();
+        for _ in 0..400 {
+            if cp
+                .store()
+                .get_session(&home.session_pk)
+                .await
+                .unwrap()
+                .map(|s| s.status == crate::domain::SessionStatus::Idle)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let mut job = sample_job("j-silent");
+        job.project_id = "p-silent".into();
+        job.gateway = "local".into();
+        job.home_session_pk = Some(home.session_pk.clone());
+        upsert_job(cp.store(), job.clone()).await.unwrap();
+
+        execute_job(&cp, &job).await.unwrap();
+
+        // Wait for the watcher to actually finish the run, so "no rail row"
+        // means "the gate suppressed it", not "the run hadn't closed yet".
+        let mut closed = false;
+        for _ in 0..400 {
+            let runs = list_runs(cp.store(), "j-silent", 5).await.unwrap();
+            if runs.iter().any(|r| r.status == "success") {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(closed, "the silent run should still have closed as success");
+
+        assert!(
+            cp.store()
+                .claim_deliverable_background_event("test-poll")
+                .await
+                .unwrap()
+                .is_none(),
+            "a [SILENT] run must not spend an agent turn in the home chat"
+        );
+        assert_eq!(
+            get_job(cp.store(), "j-silent")
+                .await
+                .unwrap()
+                .unwrap()
+                .home_session_pk
+                .as_deref(),
+            Some(home.session_pk.as_str()),
+            "a silent run is not a broken binding — it must stay bound"
+        );
+    }
+
+    // A chat that was deleted (or ended) can never receive a rail row —
+    // `claim_deliverable_background_event` joins `sessions` and requires
+    // `status='idle'` — so a report aimed at one would sit pending forever,
+    // once per run. The watcher must clear the binding instead of enqueuing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_report_to_a_vanished_chat_unbinds_instead_of_queueing_forever() {
+        let _guard = SchedulerStateDirGuard::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
+        let mut regs = crate::plugins::Registries::new();
+        regs.harness = std::sync::Arc::new(FakeJobHarnessFactory::new());
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
+        cp.store()
+            .insert_project(crate::domain::Project {
+                project_id: "p-ghost".into(),
+                name: "demo".into(),
+                workdir: std::env::temp_dir().to_string_lossy().into_owned(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: Some(crate::paths::now_ms()),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        let mut job = sample_job("j-ghost");
+        job.project_id = "p-ghost".into();
+        job.home_session_pk = Some("chat-that-never-existed".into());
+        upsert_job(cp.store(), job.clone()).await.unwrap();
+
+        execute_job(&cp, &job).await.unwrap();
+
+        // The watcher runs on a spawned task; poll (bounded) for the unbind.
+        let mut cleared = false;
+        for _ in 0..400 {
+            if get_job(cp.store(), "j-ghost")
+                .await
+                .unwrap()
+                .unwrap()
+                .home_session_pk
+                .is_none()
+            {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(cleared, "a binding to a vanished chat must be cleared");
+        assert!(
+            cp.store()
+                .claim_deliverable_background_event("test-poll")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing may be queued for a chat that cannot receive it"
         );
     }
 }

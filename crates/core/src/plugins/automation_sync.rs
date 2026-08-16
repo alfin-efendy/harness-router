@@ -46,9 +46,9 @@
 //!   `project_id`/`branch`/`gateway` are preserved from the stored row
 //!   whenever non-empty; `cron`/`mode`/`natural_text`/`prompt`/
 //!   `model_override` always refresh from the manifest.
-//! - `notify_success`/`notify_fail`/`pre_check` are pure user preferences a
-//!   manifest never declares — always carried over from the stored row
-//!   (defaulted only when the row is brand new).
+//! - `notify_success`/`notify_fail`/`pre_check`/`home_session_pk` are pure
+//!   user preferences a manifest never declares — always carried over from the
+//!   stored row (defaulted only when the row is brand new).
 //!
 //! # Errors are per-row, never fatal
 //! An unknown trigger spelling (shouldn't happen — manifest `validate()`
@@ -308,37 +308,47 @@ async fn sync_one_job(
     };
 
     let existing = scheduler::get_job(store, &id).await?;
-    let (enabled, project_id, branch, gateway, notify_success, notify_fail, pre_check) =
-        match &existing {
-            Some(existing) => (
-                existing.enabled,
-                existing.project_id.clone(),
-                if existing.branch.trim().is_empty() {
-                    "main".to_string()
-                } else {
-                    existing.branch.clone()
-                },
-                if existing.gateway.trim().is_empty() {
-                    "local".to_string()
-                } else {
-                    existing.gateway.clone()
-                },
-                existing.notify_success,
-                existing.notify_fail,
-                existing.pre_check.clone(),
-            ),
-            // First sync: no target project a plugin could ever guess, so
-            // this installs disabled — see module doc.
-            None => (
-                false,
-                String::new(),
-                "main".to_string(),
-                "local".to_string(),
-                false,
-                false,
-                String::new(),
-            ),
-        };
+    let (
+        enabled,
+        project_id,
+        branch,
+        gateway,
+        notify_success,
+        notify_fail,
+        pre_check,
+        home_session_pk,
+    ) = match &existing {
+        Some(existing) => (
+            existing.enabled,
+            existing.project_id.clone(),
+            if existing.branch.trim().is_empty() {
+                "main".to_string()
+            } else {
+                existing.branch.clone()
+            },
+            if existing.gateway.trim().is_empty() {
+                "local".to_string()
+            } else {
+                existing.gateway.clone()
+            },
+            existing.notify_success,
+            existing.notify_fail,
+            existing.pre_check.clone(),
+            existing.home_session_pk.clone(),
+        ),
+        // First sync: no target project a plugin could ever guess, so
+        // this installs disabled — see module doc.
+        None => (
+            false,
+            String::new(),
+            "main".to_string(),
+            "local".to_string(),
+            false,
+            false,
+            String::new(),
+            None,
+        ),
+    };
 
     let job = JobRow {
         id,
@@ -356,6 +366,7 @@ async fn sync_one_job(
         pre_check,
         model_override: def.model_override.clone(),
         plugin_id: Some(plugin_id.to_string()),
+        home_session_pk,
     };
     scheduler::upsert_job(store, job).await?;
     Ok(true)
@@ -699,6 +710,7 @@ subtask = false
                 pre_check: String::new(),
                 model_override: None,
                 plugin_id: None,
+                home_session_pk: None,
             },
         )
         .await

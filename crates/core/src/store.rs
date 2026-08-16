@@ -221,6 +221,21 @@ CREATE INDEX pending_approvals_session_idx ON pending_approvals(session_pk);
 const MCP_OAUTH_CLIENT_USER_ASSERTED_MIGRATION_SQL: &str =
     "ALTER TABLE mcp_oauth_clients ADD COLUMN user_asserted INTEGER NOT NULL DEFAULT 0;";
 
+/// v11 -> v12: the chat a scheduled job reports into, or NULL for a job that
+/// reports nowhere (the default, and every pre-existing row).
+///
+/// The scheduler's run watcher has always known how to push a finished run's
+/// final text onto the background rail, but there was no place to record WHICH
+/// chat it belongs to — the read side resolved a `session_surfaces` row keyed
+/// by `(job.gateway, job.id)` that nothing ever wrote. That namespace belongs
+/// to real gateway conversations (`router.rs` routes inbound messages through
+/// it), and its key includes `gateway`, which the job editor can change out
+/// from under the binding. The binding belongs to the job, so it lives here.
+///
+/// Nullable and NULL on every existing row: a job reports nowhere until the
+/// user picks a chat in the Cockpit job editor, which is the only writer.
+const JOB_HOME_SESSION_MIGRATION_SQL: &str = "ALTER TABLE jobs ADD COLUMN home_session_pk TEXT;";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -234,6 +249,7 @@ fn migrations() -> Migrations<'static> {
         M::up(DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL),
         M::up(PENDING_APPROVALS_MIGRATION_SQL),
         M::up(MCP_OAUTH_CLIENT_USER_ASSERTED_MIGRATION_SQL),
+        M::up(JOB_HOME_SESSION_MIGRATION_SQL),
     ])
 }
 
@@ -932,9 +948,9 @@ impl Store {
         // 7 = + mcp_oauth_clients.token_endpoint, 8 = + gateways.fs_mode
         // permissive default, 9 = duplicate primary-key indexes on
         // messages/provider_turns dropped, 10 = + pending_approvals, 11 =
-        // + mcp_oauth_clients.user_asserted.)
+        // + mcp_oauth_clients.user_asserted, 12 = + jobs.home_session_pk.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 11;
+        const LATEST_VERSION: i64 = 12;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -11111,8 +11127,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 11,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes + pending-approvals + mcp-oauth-client-user-asserted migrations must be user_version 11"
+            user_version, 12,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes + pending-approvals + mcp-oauth-client-user-asserted + job-home-session migrations must be user_version 12"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(
@@ -11169,7 +11185,8 @@ mod tests {
                         "CREATE INDEX idx_messages_session ON messages(session_pk, seq);\
                          CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);\
                          DROP TABLE IF EXISTS pending_approvals;\
-                         ALTER TABLE mcp_oauth_clients DROP COLUMN user_asserted;",
+                         ALTER TABLE mcp_oauth_clients DROP COLUMN user_asserted;\
+                         ALTER TABLE jobs DROP COLUMN home_session_pk;",
                     )?;
                     c.pragma_update(None, "user_version", 8)
                 })
@@ -11193,7 +11210,7 @@ mod tests {
             .unwrap();
         assert_eq!(duplicates, 0, "v8 -> v9 must drop both duplicate indexes");
         assert_eq!(
-            version, 11,
+            version, 12,
             "the upgrade must replay every migration above v8 and land on the latest version"
         );
         let has_pending_approvals: i64 = store
@@ -11225,6 +11242,21 @@ mod tests {
         assert_eq!(
             has_user_asserted, 1,
             "and v10 -> v11, which is what lets a user-supplied client id be recorded at all"
+        );
+        let has_home_session_pk: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('jobs') \
+                     WHERE name='home_session_pk'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            has_home_session_pk, 1,
+            "and v11 -> v12, which is what lets a scheduled job report into a chat at all"
         );
 
         // Coverage is unchanged: each table keeps exactly one index, the

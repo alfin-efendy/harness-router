@@ -4625,6 +4625,7 @@ async fn reconcile_fails_job_runs_left_running_by_a_restart() {
         pre_check: String::new(),
         model_override: None,
         plugin_id: None,
+        home_session_pk: None,
     };
     crate::scheduler::upsert_job(&store, job).await.unwrap();
     crate::scheduler::insert_run(

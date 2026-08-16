@@ -106,6 +106,10 @@ impl AppControl for AppControlImpl {
             pre_check: String::new(),
             model_override: spec.model_override,
             plugin_id: None,
+            // An agent-created job never reports into a chat: each delivery
+            // spends a real agent turn there, so only the user (through the
+            // Cockpit job editor) may bind one.
+            home_session_pk: None,
         };
         crate::scheduler::upsert_job(cp.store(), job).await?;
         self.audit("app_jobs", "create").await;
