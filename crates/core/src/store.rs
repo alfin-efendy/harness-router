@@ -11168,7 +11168,8 @@ mod tests {
                     c.execute_batch(
                         "CREATE INDEX idx_messages_session ON messages(session_pk, seq);\
                          CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);\
-                         DROP TABLE IF EXISTS pending_approvals;",
+                         DROP TABLE IF EXISTS pending_approvals;\
+                         ALTER TABLE mcp_oauth_clients DROP COLUMN user_asserted;",
                     )?;
                     c.pragma_update(None, "user_version", 8)
                 })
@@ -11192,7 +11193,7 @@ mod tests {
             .unwrap();
         assert_eq!(duplicates, 0, "v8 -> v9 must drop both duplicate indexes");
         assert_eq!(
-            version, 10,
+            version, 11,
             "the upgrade must replay every migration above v8 and land on the latest version"
         );
         let has_pending_approvals: i64 = store
@@ -11209,6 +11210,21 @@ mod tests {
         assert_eq!(
             has_pending_approvals, 1,
             "the same replay must also re-apply v9 -> v10"
+        );
+        let has_user_asserted: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mcp_oauth_clients') \
+                     WHERE name='user_asserted'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            has_user_asserted, 1,
+            "and v10 -> v11, which is what lets a user-supplied client id be recorded at all"
         );
 
         // Coverage is unchanged: each table keeps exactly one index, the

@@ -1,6 +1,14 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, type AddAppInput, type AppInfo, type CmdError, type McpConnectStart, type Result } from "./bindings";
+import {
+  commands,
+  type AddAppInput,
+  type AppInfo,
+  type CmdError,
+  type ManualMcpOauthClient,
+  type McpConnectStart,
+  type Result,
+} from "./bindings";
 
 // Apps (MCP servers) domain store. Definitions persist in the engine; probes
 // do a real MCP handshake; enabled servers attach to agent sessions for real.
@@ -34,6 +42,16 @@ type AppsState = {
   beginMcpConnect: (id: string) => Promise<McpConnectStart | null>;
   completeMcpConnect: (id: string, code: string, verifier: string, issuerTokenEndpoint: string, clientId: string) => Promise<boolean>;
   disconnectMcp: (id: string) => Promise<boolean>;
+  /** OAuth client ids the user recorded by hand, for authorization servers
+   *  that offer no dynamic client registration. Keyed by the AS's issuer URL
+   *  — the same string the daemon's discovery reports in its failure message,
+   *  matched verbatim, so it is never normalized on either side. There is no
+   *  token endpoint here by design: the daemon may only learn that from a
+   *  real discovery run (see `apps_api::require_registered_token_endpoint`). */
+  manualOauthClients: ManualMcpOauthClient[];
+  hydrateManualOauthClients: () => Promise<void>;
+  setManualOauthClient: (issuer: string, clientId: string) => Promise<boolean>;
+  deleteManualOauthClient: (issuer: string) => Promise<boolean>;
 };
 
 function applyResult(set: (partial: Partial<AppsState>) => void, res: Result<AppInfo[], CmdError>, action: string): boolean {
@@ -45,11 +63,25 @@ function applyResult(set: (partial: Partial<AppsState>) => void, res: Result<App
   return false;
 }
 
+function applyManualResult(
+  set: (partial: Partial<AppsState>) => void,
+  res: Result<ManualMcpOauthClient[], CmdError>,
+  action: string,
+): boolean {
+  if (res.status === "ok") {
+    set({ manualOauthClients: res.data });
+    return true;
+  }
+  toast.error(`${action} failed: ${res.error.message}`);
+  return false;
+}
+
 export const useApps = create<AppsState>((set, get) => ({
   apps: [],
   loaded: false,
   hydrating: false,
   probing: null,
+  manualOauthClients: [],
 
   hydrate: async () => {
     if (get().hydrating) return;
@@ -109,6 +141,16 @@ export const useApps = create<AppsState>((set, get) => ({
     applyResult(set, await commands.completeMcpConnect("local", id, code, verifier, issuerTokenEndpoint, clientId), "Connect"),
 
   disconnectMcp: async (id) => applyResult(set, await commands.disconnectMcp("local", id), "Disconnect"),
+
+  hydrateManualOauthClients: async () => {
+    applyManualResult(set, await commands.listManualMcpOauthClients("local"), "Client id list");
+  },
+
+  setManualOauthClient: async (issuer, clientId) =>
+    applyManualResult(set, await commands.setManualMcpOauthClient("local", issuer, clientId), "Save client id"),
+
+  deleteManualOauthClient: async (issuer) =>
+    applyManualResult(set, await commands.deleteManualMcpOauthClient("local", issuer), "Remove client id"),
 }));
 
 export function appById(apps: AppInfo[], id: string): AppInfo | undefined {

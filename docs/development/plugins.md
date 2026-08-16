@@ -390,6 +390,18 @@ token endpoint `https://auth.atlassian.com/oauth/token`. Several path-scoped
 issuers at one provider legitimately share a single endpoint while each holds
 its own client id, so the lookup returns every match and accepts on any.
 
+A row can also carry a client id the **user** supplied, for an authorization
+server that offers no RFC 7591 dynamic registration at all — common for
+enterprise and self-hosted deployments, where registration is an admin action.
+Such a row is flagged `user_asserted` and is written with **no**
+`token_endpoint`, which is what keeps the binding above exactly as strong as it
+was: a NULL endpoint matches nothing, so a user-supplied row authorizes no token
+exchange on its own. `mcp_oauth::begin_mcp_connect` reuses the client id
+verbatim instead of registering a new one, and records the `token_endpoint` from
+the authorization server's real RFC 8414 metadata on that same connect — before
+any completion can happen. No RPC, command or form anywhere accepts a token
+endpoint from a caller, and none may be added.
+
 This is a **deliberately separate store from `plugin_oauth_tokens`** — the
 table a declarative connector's own `[auth]` / `[[oauth]]` flow already
 uses — and the two are never allowed to leak into each other (pinned by a

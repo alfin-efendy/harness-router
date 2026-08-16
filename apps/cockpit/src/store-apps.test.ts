@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { agentAllowed, useApps } from "./store-apps";
-import { commands, type AppInfo } from "./bindings";
+import { commands, type AppInfo, type ManualMcpOauthClient } from "./bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 function makeApp(overrides: Partial<AppInfo> = {}): AppInfo {
@@ -71,4 +71,17 @@ test("toggleAgent flips the native row optimistically and persists agent_id nati
   expect(agentAllowed(useApps.getState().apps[0])).toBe(false);
   spy.mockRestore();
   useApps.setState({ apps: [], loaded: false });
+});
+
+test("setManualOauthClient sends the issuer and client id and stores the returned list", async () => {
+  useApps.setState({ manualOauthClients: [] });
+  const recorded: ManualMcpOauthClient[] = [{ issuer: "https://as.example", clientId: "manual-client" }];
+  const spy = spyOn(commands, "setManualMcpOauthClient").mockResolvedValue({ status: "ok", data: recorded });
+
+  await useApps.getState().setManualOauthClient("https://as.example", "manual-client");
+
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "https://as.example", "manual-client");
+  expect(useApps.getState().manualOauthClients).toEqual(recorded);
+  spy.mockRestore();
+  useApps.setState({ manualOauthClients: [] });
 });

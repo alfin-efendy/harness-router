@@ -901,6 +901,43 @@ async disconnectMcp(runnerId: string | null, id: string) : Promise<Result<AppInf
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Every OAuth client id the user recorded by hand, for an authorization
+ * server that offers no dynamic client registration.
+ */
+async listManualMcpOauthClients(runnerId: string | null) : Promise<Result<ManualMcpOauthClient[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_manual_mcp_oauth_clients", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Record a client id for an authorization server's `issuer`. Deliberately
+ * takes no token endpoint: that value is a security binding the daemon may
+ * only learn from a real discovery run (see the daemon's
+ * `apps_api::require_registered_token_endpoint`).
+ */
+async setManualMcpOauthClient(runnerId: string | null, issuer: string, clientId: string) : Promise<Result<ManualMcpOauthClient[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_manual_mcp_oauth_client", { runnerId, issuer, clientId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget a client id the user recorded.
+ */
+async deleteManualMcpOauthClient(runnerId: string | null, issuer: string) : Promise<Result<ManualMcpOauthClient[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_manual_mcp_oauth_client", { runnerId, issuer }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listDir(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_dir", { runnerId, sessionPk, rel }) };
@@ -2829,6 +2866,18 @@ export type KeychainStatus =
 export type KnowledgeConceptInfo = { id: string; relativePath: string; conceptType: string; title: string; description: string; body: string; scope: string | null; projectId: string | null; tags: string[]; timestamp: string }
 export type KnowledgeConceptMutationInfo = { title: string; description: string; body: string; scope: string; projectId: string | null; tags: string[] }
 export type LearningReviewInfo = { conceptId: string; title: string; description: string; timestamp: string }
+/**
+ * One authorization server for which the USER supplied an OAuth client id,
+ * because that server offers no RFC 7591 dynamic client registration.
+ *
+ * There is deliberately no token-endpoint field here, and there must never be
+ * one: the token endpoint is the binding
+ * `apps_api::require_registered_token_endpoint` checks before the daemon POSTs
+ * an authorization code, and it is only trustworthy while a real discovery run
+ * is the sole writer. `mcp_oauth::begin_mcp_connect` records it from the
+ * authorization server's own RFC 8414 metadata on the next connect.
+ */
+export type ManualMcpOauthClient = { issuer: string; clientId: string }
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 /**
  * `begin_mcp_connect` RPC result — the daemon has already discovered the
