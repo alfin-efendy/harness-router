@@ -676,6 +676,22 @@ pub struct McpConnectStart {
     pub client_id: String,
 }
 
+/// One authorization server for which the USER supplied an OAuth client id,
+/// because that server offers no RFC 7591 dynamic client registration.
+///
+/// There is deliberately no token-endpoint field here, and there must never be
+/// one: the token endpoint is the binding
+/// `apps_api::require_registered_token_endpoint` checks before the daemon POSTs
+/// an authorization code, and it is only trustworthy while a real discovery run
+/// is the sole writer. `mcp_oauth::begin_mcp_connect` records it from the
+/// authorization server's own RFC 8414 metadata on the next connect.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualMcpOauthClient {
+    pub issuer: String,
+    pub client_id: String,
+}
+
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AddAppInput {

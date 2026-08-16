@@ -490,7 +490,8 @@ pub async fn begin_mcp_connect(
         None => {
             let registration = metadata.registration_endpoint.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "{issuer} supports no dynamic client registration — a client id for it must be supplied manually before {} can connect",
+                    "{issuer} supports no dynamic client registration — record a client id for \
+                     that issuer on {}'s page (Connection → Client ID) and connect again",
                     server.name
                 )
             })?;
@@ -1290,6 +1291,52 @@ mod tests {
         mcp_url
     }
 
+    /// An authorization server that serves RFC 8414 metadata with **no**
+    /// `registration_endpoint` — the enterprise/self-hosted shape this codebase
+    /// could not connect to before a user could supply a client id by hand.
+    ///
+    /// Its metadata names its OWN bound URL as `issuer`, the way
+    /// `spawn_oauth_fixture`'s `handle_as_metadata` does, rather than a fixed
+    /// fake string: a self-consistent document survives any future check that
+    /// the `issuer` field matches the URL the document was fetched from.
+    async fn spawn_as_without_registration() -> String {
+        use axum::extract::State;
+        use axum::routing::get;
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct AsState {
+            as_url: Arc<Mutex<String>>,
+        }
+
+        async fn handle_metadata(State(state): State<AsState>) -> axum::Json<Value> {
+            let as_url = state.as_url.lock().unwrap().clone();
+            axum::Json(json!({
+                "issuer": as_url,
+                "authorization_endpoint": format!("{as_url}/authorize"),
+                "token_endpoint": format!("{as_url}/token"),
+            }))
+        }
+
+        let slot = Arc::new(Mutex::new(String::new()));
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(handle_metadata),
+            )
+            .with_state(AsState {
+                as_url: slot.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let as_url = format!("http://{addr}");
+        *slot.lock().unwrap() = as_url.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        as_url
+    }
+
     /// A full, self-contained OAuth round: the remote MCP server that 401s
     /// and points at its own protected-resource metadata, and a SEPARATE
     /// authorization server serving RFC 8414 metadata, RFC 7591
@@ -1711,6 +1758,65 @@ mod tests {
             err.to_string().contains("no authorization server"),
             "got: {err}"
         );
+    }
+
+    /// PROPERTY: an authorization server with no `registration_endpoint` is
+    /// connectable once — and only once — the user has recorded a client id for
+    /// its issuer. Before that the failure must name the issuer, because that
+    /// string is the exact key the user has to record the client id under.
+    #[tokio::test]
+    async fn a_user_recorded_client_id_replaces_dynamic_registration() {
+        let as_url = spawn_as_without_registration().await;
+        let mcp_url = spawn_mcp_401_with_prm(json!({
+            "resource": "placeholder",
+            "authorization_servers": [as_url.clone()],
+        }))
+        .await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let http = reqwest::Client::new();
+        let spec = mcp_spec(&mcp_url);
+
+        let err = begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect_err("no registration endpoint and no stored client id means no connect");
+        let message = err.to_string();
+        assert!(
+            message.contains("supports no dynamic client registration"),
+            "the failure must say why, not fail generically: {message}"
+        );
+        assert!(
+            message.contains(&as_url),
+            "the failure must name the ISSUER, because that is the key the user has to record \
+             the client id under: {message}"
+        );
+
+        store
+            .upsert_user_asserted_mcp_oauth_client(&as_url, "manual-client")
+            .await
+            .unwrap();
+
+        let start = begin_mcp_connect(&store, &http, &spec)
+            .await
+            .expect("a recorded client id must make the same server connectable");
+        assert_eq!(
+            start.client_id, "manual-client",
+            "the flow must use the client id the user recorded, not invent one"
+        );
+        assert_eq!(
+            start.issuer_token_endpoint,
+            format!("{as_url}/token"),
+            "the token endpoint must come from the authorization server's own metadata"
+        );
+
+        // PROPERTY: the endpoint the completion gate will accept was written by
+        // THIS discovery run, not by the user — the user-asserted row carried
+        // none, so nothing could have been authorized before this point.
+        let ids = store
+            .mcp_oauth_client_ids_for_token_endpoint(&format!("{as_url}/token"))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["manual-client".to_string()]);
     }
 
     /// Bind an MCP server that 401s with a `WWW-Authenticate` header pointing at

@@ -37,7 +37,7 @@ use tokio::sync::oneshot;
 // DTO surface; specta still emits them via the type graph either way.
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
-    AddAppInput, AgentAccessInfo, AppInfo, McpConnectStart, ToolInfo,
+    AddAppInput, AgentAccessInfo, AppInfo, ManualMcpOauthClient, McpConnectStart, ToolInfo,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -401,5 +401,57 @@ pub async fn disconnect_mcp(
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc("disconnect_mcp", serde_json::json!({ "id": id }))
+        .await
+}
+
+/// Every OAuth client id the user recorded by hand, for an authorization
+/// server that offers no dynamic client registration.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_manual_mcp_oauth_clients(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<ManualMcpOauthClient>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("list_manual_mcp_oauth_clients", serde_json::json!({}))
+        .await
+}
+
+/// Record a client id for an authorization server's `issuer`. Deliberately
+/// takes no token endpoint: that value is a security binding the daemon may
+/// only learn from a real discovery run (see the daemon's
+/// `apps_api::require_registered_token_endpoint`).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_manual_mcp_oauth_client(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    issuer: String,
+    client_id: String,
+) -> R<Vec<ManualMcpOauthClient>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "set_manual_mcp_oauth_client",
+            serde_json::json!({ "issuer": issuer, "client_id": client_id }),
+        )
+        .await
+}
+
+/// Forget a client id the user recorded.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_manual_mcp_oauth_client(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    issuer: String,
+) -> R<Vec<ManualMcpOauthClient>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "delete_manual_mcp_oauth_client",
+            serde_json::json!({ "issuer": issuer }),
+        )
         .await
 }

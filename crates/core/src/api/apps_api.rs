@@ -26,6 +26,9 @@ pub(crate) const HANDLES: &[&str] = &[
     "begin_mcp_connect",
     "complete_mcp_connect",
     "disconnect_mcp",
+    "list_manual_mcp_oauth_clients",
+    "set_manual_mcp_oauth_client",
+    "delete_manual_mcp_oauth_client",
 ];
 
 #[derive(Deserialize)]
@@ -65,6 +68,15 @@ struct McpCompleteConnectP {
     issuer_token_endpoint: String,
     /// Carried forward verbatim from `McpConnectStart.client_id`.
     client_id: String,
+}
+#[derive(Deserialize)]
+struct ManualClientP {
+    issuer: String,
+    client_id: String,
+}
+#[derive(Deserialize)]
+struct IssuerP {
+    issuer: String,
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
@@ -117,6 +129,15 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "disconnect_mcp" => {
             let a: IdP = params(p)?;
             ok(disconnect_mcp(state, &a.id).await?)
+        }
+        "list_manual_mcp_oauth_clients" => ok(manual_oauth_clients(cp).await?),
+        "set_manual_mcp_oauth_client" => {
+            let a: ManualClientP = params(p)?;
+            ok(set_manual_oauth_client(cp, &a.issuer, &a.client_id).await?)
+        }
+        "delete_manual_mcp_oauth_client" => {
+            let a: IssuerP = params(p)?;
+            ok(delete_manual_oauth_client(cp, &a.issuer).await?)
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
@@ -238,6 +259,61 @@ async fn require_registered_token_endpoint(
     Err(ApiError::bad_request(
         "the supplied client_id is not the one registered with that authorization server",
     ))
+}
+
+/// Validate an `(issuer, client_id)` pair a USER typed, before it becomes a
+/// `mcp_oauth_clients` row. Pure and unit-tested — the Tauri command and the
+/// RPC handler stay thin, and the rules live where a test can reach them.
+///
+/// The issuer is NOT normalized beyond trimming surrounding whitespace. It is
+/// the PRIMARY KEY `mcp_oauth::begin_mcp_connect` looks the client id up by,
+/// and the key that lookup uses is the issuer string the MCP server's own
+/// protected-resource metadata listed, VERBATIM. Lowercasing a host or dropping
+/// a trailing slash here would produce a row discovery can never find, and the
+/// user would be told to supply a client id they had already supplied.
+///
+/// No token endpoint is accepted, here or anywhere on this path — see
+/// [`require_registered_token_endpoint`] for why that is the whole point.
+fn validate_manual_oauth_client(
+    issuer: &str,
+    client_id: &str,
+) -> Result<(String, String), ApiError> {
+    let issuer = issuer.trim();
+    let client_id = client_id.trim();
+    if issuer.is_empty() {
+        return Err(ApiError::bad_request(
+            "an authorization server issuer URL is required",
+        ));
+    }
+    if client_id.is_empty() {
+        return Err(ApiError::bad_request("a client id is required"));
+    }
+    if client_id.len() > 512 {
+        return Err(ApiError::bad_request(
+            "that client id is too long to be a client id",
+        ));
+    }
+    if client_id
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(ApiError::bad_request(
+            "a client id cannot contain spaces or control characters",
+        ));
+    }
+    let parsed = url::Url::parse(issuer)
+        .map_err(|e| ApiError::bad_request(format!("invalid issuer URL {issuer}: {e}")))?;
+    if !is_loopback_url(&parsed) {
+        require_https(issuer).map_err(|_| {
+            ApiError::bad_request("an authorization server issuer must use https://")
+        })?;
+    }
+    if parsed.fragment().is_some() || parsed.query().is_some() {
+        return Err(ApiError::bad_request(
+            "an issuer URL must carry no query string and no fragment",
+        ));
+    }
+    Ok((issuer.to_string(), client_id.to_string()))
 }
 
 /// Validate a captured MCP OAuth loopback callback against the `state` this
@@ -695,8 +771,22 @@ async fn begin_mcp_connect(state: &ApiState, id: &str) -> Result<McpConnectStart
     // `register_oauth_client` borrow, and both would otherwise follow redirects
     // with no deadline. See `hardened_http_client`.
     let http = crate::harness::native::mcp_http::hardened_http_client()?;
-    let start =
-        crate::harness::native::mcp_oauth::begin_mcp_connect(cp.store(), &http, &spec).await?;
+    // Annotated onto the row, not merely returned: the reason a connect could
+    // not even START is often "this authorization server does not do dynamic
+    // registration, record a client id for <issuer>" — and the issuer is a URL
+    // the user has to copy. Returned alone it is a toast that disappears;
+    // recorded here it renders on the card (`AppInfo::oauth_connect_error`),
+    // the same way a completion failure already does.
+    let start = match crate::harness::native::mcp_oauth::begin_mcp_connect(cp.store(), &http, &spec)
+        .await
+    {
+        Ok(start) => start,
+        Err(e) => {
+            let reason = format!("{e:#}");
+            note_connect_failure(cp, id, &reason).await;
+            return Err(ApiError::bad_request(reason));
+        }
+    };
     Ok(McpConnectStart {
         authorize_url: start.url,
         state: start.state,
@@ -809,6 +899,44 @@ async fn disconnect_mcp(state: &ApiState, id: &str) -> Result<Vec<AppInfo>, ApiE
     // saying, so it must not survive to caption the "Not connected" state.
     clear_connect_failure(cp, id).await?;
     Ok(assemble(cp).await?)
+}
+
+/// Every client id the user recorded by hand, for the Cockpit surface that
+/// lists and removes them.
+async fn manual_oauth_clients(cp: &ControlPlane) -> Result<Vec<ManualMcpOauthClient>, ApiError> {
+    Ok(cp
+        .store()
+        .list_user_asserted_mcp_oauth_clients()
+        .await?
+        .into_iter()
+        .map(|(issuer, client_id)| ManualMcpOauthClient { issuer, client_id })
+        .collect())
+}
+
+/// Record a client id for an authorization server that offers no dynamic
+/// registration. `mcp_oauth::begin_mcp_connect` reuses a stored client id for
+/// an issuer verbatim, so recording one here is exactly what unblocks the next
+/// Connect — no other wiring is needed for it to take effect.
+async fn set_manual_oauth_client(
+    cp: &ControlPlane,
+    issuer: &str,
+    client_id: &str,
+) -> Result<Vec<ManualMcpOauthClient>, ApiError> {
+    let (issuer, client_id) = validate_manual_oauth_client(issuer, client_id)?;
+    cp.store()
+        .upsert_user_asserted_mcp_oauth_client(&issuer, &client_id)
+        .await?;
+    manual_oauth_clients(cp).await
+}
+
+async fn delete_manual_oauth_client(
+    cp: &ControlPlane,
+    issuer: &str,
+) -> Result<Vec<ManualMcpOauthClient>, ApiError> {
+    cp.store()
+        .delete_user_asserted_mcp_oauth_client(issuer.trim())
+        .await?;
+    manual_oauth_clients(cp).await
 }
 
 #[cfg(test)]
@@ -1328,6 +1456,121 @@ mod tests {
         require_registered_token_endpoint(store, "https://legacy.example/token", "legacy-client")
             .await
             .expect_err("a row with no recorded token endpoint must authorize nothing");
+    }
+
+    #[test]
+    fn manual_oauth_client_validation_rejects_what_cannot_be_an_issuer() {
+        assert!(validate_manual_oauth_client("", "c").is_err());
+        assert!(validate_manual_oauth_client("https://as.example", "   ").is_err());
+
+        let err = validate_manual_oauth_client("http://as.example", "c")
+            .expect_err("a plaintext issuer on a public host must be refused");
+        assert!(err.message.contains("https://"), "{}", err.message);
+
+        // The loopback carve-out `is_loopback_url` documents: a request that
+        // never leaves the machine has no transport to intercept.
+        assert!(validate_manual_oauth_client("http://127.0.0.1:9", "c").is_ok());
+
+        assert!(validate_manual_oauth_client("https://as.example?x=1", "c").is_err());
+        assert!(validate_manual_oauth_client("https://as.example#f", "c").is_err());
+        assert!(validate_manual_oauth_client("https://as.example", "a b").is_err());
+
+        // The trailing slash MUST survive. The issuer is matched verbatim
+        // against the string the MCP server's protected-resource metadata
+        // listed, so normalizing it here would write a row
+        // `mcp_oauth::begin_mcp_connect` can never find — and the user would be
+        // told to supply a client id they had already supplied.
+        assert_eq!(
+            validate_manual_oauth_client("  https://as.example/tenant/  ", " client-1 ").unwrap(),
+            (
+                "https://as.example/tenant/".to_string(),
+                "client-1".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_oauth_clients_round_trip_through_the_rpc() {
+        let s = state().await;
+        let store = s.cp.store();
+
+        dispatch(
+            &s,
+            "set_manual_mcp_oauth_client",
+            json!({ "issuer": "https://as.example", "client_id": "manual-client" }),
+        )
+        .await
+        .expect("recording a client id must succeed");
+
+        let listed = dispatch(&s, "list_manual_mcp_oauth_clients", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed,
+            json!([{ "issuer": "https://as.example", "clientId": "manual-client" }])
+        );
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("manual-client"),
+            "`begin_mcp_connect` must be able to find the recorded row"
+        );
+
+        let after_delete = dispatch(
+            &s,
+            "delete_manual_mcp_oauth_client",
+            json!({ "issuer": "https://as.example" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_delete, json!([]));
+    }
+
+    /// PROPERTY: the new user-facing write path widens
+    /// [`require_registered_token_endpoint`] by exactly nothing. The user
+    /// asserts a client id, never an endpoint, so the completion gate has
+    /// nothing to bind to until a real discovery run records one.
+    #[tokio::test]
+    async fn a_user_recorded_client_id_authorizes_no_token_endpoint_on_its_own() {
+        let s = state().await;
+        let store = s.cp.store();
+
+        dispatch(
+            &s,
+            "set_manual_mcp_oauth_client",
+            json!({ "issuer": "https://as.example", "client_id": "manual-client" }),
+        )
+        .await
+        .unwrap();
+
+        require_registered_token_endpoint(store, "https://as.example/token", "manual-client")
+            .await
+            .expect_err(
+                "a row the USER wrote carries no token endpoint, so it may authorize no exchange",
+            );
+        require_registered_token_endpoint(store, "https://evil.example/token", "manual-client")
+            .await
+            .expect_err("and certainly not an endpoint at some unrelated origin");
+
+        // Stands in for the discovery write `mcp_oauth::begin_mcp_connect`
+        // performs on the next connect, from the authorization server's own
+        // RFC 8414 metadata.
+        store
+            .upsert_mcp_oauth_client(
+                "https://as.example",
+                "manual-client",
+                "https://as.example/token",
+            )
+            .await
+            .unwrap();
+
+        require_registered_token_endpoint(store, "https://as.example/token", "manual-client")
+            .await
+            .expect("the endpoint became acceptable only because DISCOVERY recorded it");
     }
 
     #[tokio::test]

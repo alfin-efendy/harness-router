@@ -19,6 +19,7 @@ import {
 import type { PluginToolEntry } from "@/bindings";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
+import { ManualOauthClientModal } from "@/components/modals/ManualOauthClientModal";
 import { PluginToolsList } from "@/components/plugins/PluginToolsList";
 import { NATIVE_AGENT } from "@/constants";
 import { appStatusToHubStatus, statusPresentation } from "@/lib/plugin-hub";
@@ -60,12 +61,29 @@ const TAB_LABEL: Record<DetailTab, string> = {
 
 export function AppDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent, beginMcpConnect, disconnectMcp } = useApps();
+  const {
+    apps,
+    loaded,
+    hydrate,
+    probing,
+    probe,
+    remove,
+    setScope,
+    setToolPerm,
+    toggleAgent,
+    beginMcpConnect,
+    disconnectMcp,
+    manualOauthClients,
+    hydrateManualOauthClients,
+    setManualOauthClient,
+    deleteManualOauthClient,
+  } = useApps();
   const gateways = useGateways((s) => s.gateways);
   const [tab, setTab] = useState<DetailTab>("overview");
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectPending, setConnectPending] = useState(false);
   const [connectExpired, setConnectExpired] = useState(false);
+  const [clientIdOpen, setClientIdOpen] = useState(false);
   // The connect flow's IDENTITY, bumped by every Connect and by Cancel. Each
   // run of `startConnect` captures it and guards every state write with it, so
   // only the newest flow can write — the flow-identity guard
@@ -86,6 +104,13 @@ export function AppDetailView({ id }: { id: string }) {
   useEffect(() => {
     if (!loaded) void hydrate();
   }, [loaded, hydrate]);
+
+  // Unconditional rather than gated on `oauthConnectAvailable`: `app` is not
+  // resolved yet at this point in the component (hooks must run above the
+  // `if (!app) return null` below), and the call is one cheap list read.
+  useEffect(() => {
+    void hydrateManualOauthClients();
+  }, [hydrateManualOauthClients]);
 
   const app = appById(apps, id);
   if (!app) return null;
@@ -139,7 +164,16 @@ export function AppDetailView({ id }: { id: string }) {
     // `busy` belongs to this flow: a second one cannot start while Connect is
     // disabled by it, so clearing it here can never un-disable another's.
     setConnectBusy(false);
-    if (stale() || !start) return; // `!start` ⇒ the store already toasted it
+    if (stale()) return;
+    if (!start) {
+      // The store already toasted it, but the daemon ALSO persisted the
+      // reason on the row (`AppInfo::oauth_connect_error`) — and when that
+      // reason is "record a client id for <issuer>", the issuer is a URL the
+      // user has to copy. Refreshing puts it on the card, where a toast
+      // cannot.
+      await hydrate();
+      return;
+    }
     void openUrl(start.authorizeUrl);
     setConnectPending(true);
 
@@ -295,6 +329,17 @@ export function AppDetailView({ id }: { id: string }) {
                       {connectBusy ? "Opening…" : app.oauthReconnectRequired || app.oauthTokenStored ? "Reconnect" : "Connect"}
                     </Button>
                   </CardRow>
+                  <CardRow>
+                    <span className={rowLabel}>Client ID</span>
+                    <span className="flex-1 text-[12.5px] text-muted-foreground">
+                      {manualOauthClients.length > 0
+                        ? `${manualOauthClients.length} recorded for authorization servers that don't register apps automatically.`
+                        : "Only needed if this server's authorization server won't register apps automatically."}
+                    </span>
+                    <Button variant="outline" size="sm" onClick={() => setClientIdOpen(true)}>
+                      Client ID…
+                    </Button>
+                  </CardRow>
                   {connectPending && (
                     <div className="flex items-center gap-3 border-t border-border px-[18px] py-3">
                       <span className="text-[12.5px] text-muted-foreground">Waiting for you to finish signing in in the browser…</span>
@@ -433,6 +478,16 @@ export function AppDetailView({ id }: { id: string }) {
               </Card>
             )}
           </div>
+        )}
+
+        {clientIdOpen && (
+          <ManualOauthClientModal
+            serverName={app.name}
+            clients={manualOauthClients}
+            onClose={() => setClientIdOpen(false)}
+            onSave={setManualOauthClient}
+            onDelete={deleteManualOauthClient}
+          />
         )}
       </div>
     </div>
