@@ -6198,9 +6198,7 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
-            .await
-            .unwrap();
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         run_turn(
             &deps,
             TurnPrompt::text("go", "go"),
@@ -6293,9 +6291,7 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
-            .await
-            .unwrap();
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let sink = Arc::new(BlockingAutomationSink {
@@ -10485,9 +10481,7 @@ mod tests {
 
         let llm = Arc::new(V2RecordingLlm::new(vec![]));
         let mut deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
-            .await
-            .unwrap();
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         enable_v2(&mut deps);
         deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
         let compiled = crate::harness::native::tool_plan::compile_candidate(
@@ -13575,9 +13569,7 @@ mod tests {
         ];
         let llm = Arc::new(V2RecordingLlm::new(vec![tool_turn]));
         let mut deps = deps_at(dir.path(), llm).await;
-        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path())
-            .await
-            .unwrap();
+        crate::harness::native::hooks::trust_current_hooks(&deps.store, dir.path()).await;
         enable_v2(&mut deps);
         deps.agent.tools = crate::harness::native::agents::ToolFilter::All;
         deps.tools = Arc::new(ToolRegistry::with_extra(vec![

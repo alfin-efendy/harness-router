@@ -250,11 +250,19 @@ pub async fn trust_hooks(
 // Every caller needs an executable hook script and is therefore `#[cfg(unix)]`,
 // which leaves this genuinely unused on Windows.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) async fn trust_current_hooks(store: &Store, work_dir: &Path) -> TrustOutcome {
+pub(crate) async fn trust_current_hooks(store: &Store, work_dir: &Path) {
     let digest = hook_set_digest(work_dir).expect("a hook set to trust");
-    trust_hooks(store, work_dir, &digest)
+    match trust_hooks(store, work_dir, &digest)
         .await
         .expect("trust row write")
+    {
+        TrustOutcome::Recorded(_) => {}
+        // The digest was taken one line above this call, so `Changed` means the
+        // fixture moved underneath the test. Fail loudly rather than return:
+        // `Changed` records nothing, and a silently untrusted hook set would
+        // make every assertion after this call meaningless.
+        TrustOutcome::Changed(_) => panic!("hook set changed between digest and trust"),
+    }
 }
 
 /// Run all hooks registered for `event`, feeding `payload` as JSON on stdin.

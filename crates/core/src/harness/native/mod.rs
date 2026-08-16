@@ -1530,9 +1530,7 @@ pub(crate) mod tests {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
-        crate::harness::native::hooks::trust_current_hooks(&store, dir.path())
-            .await
-            .unwrap();
+        crate::harness::native::hooks::trust_current_hooks(&store, dir.path()).await;
         let factory = Arc::new(ScriptedFactory { turns: vec![] });
         let plugin = native_plugin_with_llm_factory(factory);
         let harness = plugin.harness.unwrap().create().unwrap();
@@ -1577,9 +1575,7 @@ pub(crate) mod tests {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
-        crate::harness::native::hooks::trust_current_hooks(&store, dir.path())
-            .await
-            .unwrap();
+        crate::harness::native::hooks::trust_current_hooks(&store, dir.path()).await;
         let factory = Arc::new(ScriptedFactory { turns: vec![] });
         let plugin = native_plugin_with_llm_factory(factory);
         let harness = plugin.harness.unwrap().create().unwrap();
