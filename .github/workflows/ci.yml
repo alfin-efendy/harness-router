@@ -44,6 +44,16 @@ jobs:
               - "package.json"
               - "bun.lock"
               - ".github/**"
+              # Not TypeScript, but the inputs of scripts/test/release-config.test.ts,
+              # which pins every release-please `package-name` to the real Cargo
+              # `[package] name`. `bun test` runs only in the `ts` job, so without
+              # these a package rename (S6 renames ryuzi-control) would set rust=true
+              # and ts=false, skipping the one guard that catches the drift.
+              # release.yml, the third input, is already covered by `.github/**`.
+              - "release-please-config.json"
+              - ".release-please-manifest.json"
+              - "crates/**/Cargo.toml"
+              - "apps/**/Cargo.toml"
             rust:
               - "crates/**"
               - "apps/cockpit/src-tauri/**"
