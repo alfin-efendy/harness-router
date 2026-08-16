@@ -197,6 +197,30 @@ CREATE TABLE pending_approvals (
 CREATE INDEX pending_approvals_session_idx ON pending_approvals(session_pk);
 ";
 
+/// v10 -> v11: whether a `mcp_oauth_clients` row's `client_id` was supplied by
+/// the USER rather than obtained by RFC 7591 dynamic client registration.
+///
+/// Plenty of authorization servers — most enterprise and self-hosted ones —
+/// gate client registration behind an admin and expose no
+/// `registration_endpoint` at all. Before this column there was no way to
+/// connect to an MCP server behind one: `mcp_oauth::begin_mcp_connect` told the
+/// user a client id "must be supplied manually" and nothing in the product
+/// could record one.
+///
+/// The flag is provenance, not permission. A user-asserted row is written with
+/// `token_endpoint` NULL and never carries one, because that column is the
+/// binding `api::apps_api::require_registered_token_endpoint` checks before the
+/// daemon POSTs an authorization code, and it is only meaningful while a real
+/// RFC 8414 discovery run is the only thing that writes it. So a row the user
+/// wrote authorizes no exchange on its own; `begin_mcp_connect` fills the
+/// endpoint in from the authorization server's own metadata on the next
+/// connect, and leaves this flag alone so the client id's origin stays legible.
+///
+/// `DEFAULT 0` so every pre-existing row — all of them written by discovery —
+/// keeps reading as machine-registered without a data migration.
+const MCP_OAUTH_CLIENT_USER_ASSERTED_MIGRATION_SQL: &str =
+    "ALTER TABLE mcp_oauth_clients ADD COLUMN user_asserted INTEGER NOT NULL DEFAULT 0;";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(BASELINE_SQL),
@@ -209,6 +233,7 @@ fn migrations() -> Migrations<'static> {
         M::up(GATEWAY_FS_MODE_PERMISSIVE_DEFAULT_MIGRATION_SQL),
         M::up(DROP_DUPLICATE_PK_INDEXES_MIGRATION_SQL),
         M::up(PENDING_APPROVALS_MIGRATION_SQL),
+        M::up(MCP_OAUTH_CLIENT_USER_ASSERTED_MIGRATION_SQL),
     ])
 }
 
@@ -906,9 +931,10 @@ impl Store {
         // + mcp_oauth_tokens/mcp_oauth_clients, 6 = + mcp_servers.headers_json,
         // 7 = + mcp_oauth_clients.token_endpoint, 8 = + gateways.fs_mode
         // permissive default, 9 = duplicate primary-key indexes on
-        // messages/provider_turns dropped, 10 = + pending_approvals.)
+        // messages/provider_turns dropped, 10 = + pending_approvals, 11 =
+        // + mcp_oauth_clients.user_asserted.)
         // MUST track the number of `M::up` entries in `migrations()` above.
-        const LATEST_VERSION: i64 = 10;
+        const LATEST_VERSION: i64 = 11;
         let current_version: i64 = interact_on(&pool, |c| {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
         })
@@ -3701,6 +3727,80 @@ impl Store {
             )?;
             let rows = stmt.query_map(params![token_endpoint], |r| r.get::<_, String>(0))?;
             rows.collect()
+        })
+        .await
+    }
+
+    /// Record a client id a USER supplied for `issuer` — the path for an
+    /// authorization server that offers no RFC 7591 dynamic registration, where
+    /// `mcp_oauth::begin_mcp_connect` would otherwise have nothing to register
+    /// with and no way to proceed.
+    ///
+    /// Deliberately writes NO `token_endpoint`, and clears any a previous
+    /// discovery run recorded. That column is a security binding, not a cache:
+    /// `api::apps_api::require_registered_token_endpoint` will only let the
+    /// daemon POST an authorization code to an endpoint recorded there, and the
+    /// invariant that makes the check worth anything is that ONLY a real RFC
+    /// 8414 discovery run writes it. A row written here therefore authorizes no
+    /// exchange at all until `begin_mcp_connect` runs, discovers the
+    /// authorization server for real, and upserts the endpoint from its
+    /// metadata — which it does on every connect, before any completion can
+    /// happen. Clearing a previously recorded endpoint matters for the same
+    /// reason: it was bound to the client id this call is replacing.
+    pub async fn upsert_user_asserted_mcp_oauth_client(
+        &self,
+        issuer: &str,
+        client_id: &str,
+    ) -> anyhow::Result<()> {
+        let issuer = issuer.to_string();
+        let client_id = client_id.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO mcp_oauth_clients(issuer, client_id, created_at, token_endpoint, user_asserted) \
+                 VALUES (?1, ?2, ?3, NULL, 1) \
+                 ON CONFLICT(issuer) DO UPDATE SET \
+                    client_id=excluded.client_id, token_endpoint=NULL, user_asserted=1",
+                params![issuer, client_id, created_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Every `(issuer, client_id)` pair a user supplied, for the Cockpit
+    /// surface that lists and removes them. Discovery-registered rows are
+    /// excluded: they are machine state a user has no business editing.
+    pub async fn list_user_asserted_mcp_oauth_clients(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT issuer, client_id FROM mcp_oauth_clients \
+                 WHERE user_asserted=1 ORDER BY issuer",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Forget a user-supplied client id. Scoped to `user_asserted=1` so this
+    /// can never delete a row dynamic registration owns — losing one of those
+    /// would silently orphan a client at the authorization server and force a
+    /// re-registration some servers rate-limit. Returns whether a row went.
+    pub async fn delete_user_asserted_mcp_oauth_client(
+        &self,
+        issuer: &str,
+    ) -> anyhow::Result<bool> {
+        let issuer = issuer.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM mcp_oauth_clients WHERE issuer=?1 AND user_asserted=1",
+                params![issuer],
+            )
+            .map(|rows| rows > 0)
         })
         .await
     }
@@ -8882,6 +8982,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_asserted_client_row_records_no_token_endpoint() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_user_asserted_mcp_oauth_client("https://as.example", "manual-client")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("manual-client"),
+            "`begin_mcp_connect`'s reuse branch must find the row the user wrote"
+        );
+        // This is the property that keeps
+        // `api::apps_api::require_registered_token_endpoint` exactly as strong
+        // as it was: a row the user wrote carries no token endpoint, so it can
+        // authorize no token exchange at all.
+        assert!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://as.example/token")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a user-asserted row must authorize no token endpoint whatsoever"
+        );
+        assert_eq!(
+            store.list_user_asserted_mcp_oauth_clients().await.unwrap(),
+            vec![(
+                "https://as.example".to_string(),
+                "manual-client".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_upsert_over_a_user_asserted_row_records_the_endpoint_and_keeps_the_flag() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_user_asserted_mcp_oauth_client("https://as.example", "manual-client")
+            .await
+            .unwrap();
+        // Stands in for the unconditional write `begin_mcp_connect` performs
+        // on every connect, reused client id included.
+        store
+            .upsert_mcp_oauth_client(
+                "https://as.example",
+                "manual-client",
+                "https://as.example/token",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .mcp_oauth_client_ids_for_token_endpoint("https://as.example/token")
+                .await
+                .unwrap(),
+            vec!["manual-client".to_string()],
+            "only the DISCOVERED endpoint makes the row usable for a completion"
+        );
+        assert_eq!(
+            store.list_user_asserted_mcp_oauth_clients().await.unwrap(),
+            vec![(
+                "https://as.example".to_string(),
+                "manual-client".to_string()
+            )],
+            "the provenance flag must survive a discovery write, so the UI keeps \
+             showing the user what they entered"
+        );
+
+        // A row discovery owns must be untouchable through the user-facing
+        // delete: losing it would orphan a client at the authorization server.
+        store
+            .upsert_mcp_oauth_client(
+                "https://other.example",
+                "dcr-client",
+                "https://other.example/token",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .delete_user_asserted_mcp_oauth_client("https://other.example")
+                .await
+                .unwrap(),
+            "a discovery-registered row is not the user's to delete"
+        );
+        assert_eq!(
+            store
+                .get_mcp_oauth_client("https://other.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dcr-client")
+        );
+
+        assert!(store
+            .delete_user_asserted_mcp_oauth_client("https://as.example")
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .delete_user_asserted_mcp_oauth_client("https://as.example")
+                .await
+                .unwrap(),
+            "a second delete must report that nothing went"
+        );
+    }
+
+    #[tokio::test]
     async fn marking_reconnect_required_survives_a_read() {
         use_test_key_file();
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -10871,13 +11086,14 @@ mod tests {
     }
 
     // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 9 database (v1 squashed baseline + v2
+    // produce a `user_version` 11 database (v1 squashed baseline + v2
     // agent_tool_usage/pets-stats migration + v3
     // plugin_oauth_profile_clients.client_secret_setting + v4
     // automation_hooks/jobs/mcp_servers.plugin_id origin columns + v5
     // mcp_oauth_tokens/mcp_oauth_clients + v6 mcp_servers.headers_json + v7
     // mcp_oauth_clients.token_endpoint + v8 gateways.fs_mode permissive
-    // default + v9 duplicate-pk-index drop)
+    // default + v9 duplicate-pk-index drop + v10 pending_approvals + v11
+    // mcp_oauth_clients.user_asserted)
     // whose schema + seeded rows exactly match the golden fixture.
     //
     // The fixture is also what proves a FRESH database and an UPGRADED one
@@ -10895,8 +11111,8 @@ mod tests {
         let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
         let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
-            user_version, 10,
-            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes + pending-approvals migrations must be user_version 10"
+            user_version, 11,
+            "squashed baseline + agent_stats + oauth-client-secret-setting + plugin-origin + mcp-oauth + mcp-server-headers + mcp-oauth-client-token-endpoint + gateway-fs-mode-permissive-default + drop-duplicate-pk-indexes + pending-approvals + mcp-oauth-client-user-asserted migrations must be user_version 11"
         );
         let golden = include_str!("../tests/fixtures/baseline_schema.sql");
         assert_eq!(
